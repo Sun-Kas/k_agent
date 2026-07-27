@@ -1,0 +1,26 @@
+{
+  "models": [
+    {
+      "id": "deepseek-v4-flash",
+      "name": "DeepSeek V4 Flash",
+      "model": "deepseek-v4-flash",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": null,
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "multimodal": false,
+      "supportsReasoning": true,
+      "enabled": true
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "model": "deepseek-v4-pro",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": null,
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "multimodal": false,
+      "supportsReasoning": true,
+      "enabled": true
+    }
+  ]
+}
