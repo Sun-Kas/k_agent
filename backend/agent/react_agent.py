@@ -19,12 +19,12 @@ from backend.agent.callbacks import (
     ToolResultPayload,
     TraceCallback,
 )
-from backend.config import get_or_init_settings
+from backend.agent.contracts import AgentRunRequest
 from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager, McpToolDescriptor
-from backend.schemas import ChatMessage, ChatMeta, ChatRole
-from backend.tools import ToolDefinition
-from backend.validation import validate_tool_arguments
+from backend.permissions import check_permission
+from backend.api.schemas import ChatMessage, ChatMeta, ChatRole
+from backend.tools import ToolDefinition, validate_tool_arguments
 
 
 class OpenAIAgent:
@@ -37,18 +37,17 @@ class OpenAIAgent:
     ):
         if not config:
             config = Settings()
-        self.config = config 
+        self.config = config
         self.tools = tools
         self.mcp_client_manager = mcp_client_manager
-        self.client = AsyncOpenAI(
-            api_key=self.config.openai_api_key,
-            base_url=self.config.openai_base_url,
-        )
         self.callbacks = callbacks or []
 
-    async def run(self, messages: list[ChatMessage]) -> dict[str, Any]:
+    async def run(
+        self,
+        request: AgentRunRequest,
+    ) -> dict[str, Any]:
         final_state = None
-        async for event in self.run_stream(messages):
+        async for event in self.run_stream(request):
             if event["type"] == "final":
                 final_state = event["payload"]
         if final_state is None:
@@ -57,31 +56,37 @@ class OpenAIAgent:
 
     async def run_stream(
         self,
-        messages: list[ChatMessage],
-        model_config: dict[str, Any] | None = None,
-        mcp_server_ids: set[str] | None = None,
-        system_prompt: str | None = None,
-        reasoning_effort: str | None = None,
-        attachments: list[dict[str, Any]] | None = None,
+        request: AgentRunRequest,
     ) -> AsyncIterator[dict[str, Any]]:
         trace: list[str] = []
         thinking: list[dict[str, Any]] = []
-        selected_model = (model_config or {}).get("model", self.config.openai_model)
-        client = self.client if model_config is None else AsyncOpenAI(
-            api_key=model_config.get("apiKey") or self.config.openai_api_key,
-            base_url=model_config.get("baseUrl") or self.config.openai_base_url,
+        selected_model = request.model_config.get("model", self.config.openai_model)
+        client = AsyncOpenAI(
+            api_key=request.model_config.get("apiKey") or self.config.openai_api_key,
+            base_url=request.model_config.get("baseUrl") or self.config.openai_base_url,
         )
         context = AgentRunContext()
         callbacks = CallbackManager([TraceCallback(trace), *self.callbacks])
-        working_messages = list(messages)
+        working_messages = list(request.messages)
         await callbacks.on_agent_start(context, working_messages)
 
         try:
             mcp_tools = await self.mcp_client_manager.list_tools()
-            if mcp_server_ids is not None:
-                mcp_tools = [tool for tool in mcp_tools if tool.server_id in mcp_server_ids]
+            if request.mcp_server_ids:
+                mcp_tools = [
+                    tool for tool in mcp_tools
+                    if tool.server_id in request.mcp_server_ids
+                ]
             tool_specs = self._build_tool_specs(mcp_tools)
             yield {"type": "trace", "payload": {"entry": trace[-1]}}
+            if request.loaded_memory_paths:
+                trace.append(
+                    f"memory:eager_loaded:{len(request.loaded_memory_paths)} files"
+                )
+                yield {"type": "trace", "payload": {"entry": trace[-1]}}
+            if mcp_tools:
+                trace.append(f"prompt:mcp_dynamic_section:{len(mcp_tools)} tools")
+                yield {"type": "trace", "payload": {"entry": trace[-1]}}
             preparation = self._thinking_step(
                 thinking,
                 phase="analysis",
@@ -93,12 +98,8 @@ class OpenAIAgent:
             yield {"type": "thinking", "payload": preparation}
             yield {"type": "status", "payload": {"message": self.config.status_model_started}}
 
-            # Build the conversation history for Chat Completions API
-            api_messages = self._build_api_messages(
-                working_messages,
-                system_prompt=system_prompt,
-                attachments=attachments,
-            )
+            # The access layer owns message and prompt composition.
+            api_messages = list(request.api_messages)
 
             for iteration in range(self.config.max_model_iterations + 1):
                 model_step = self._thinking_step(
@@ -129,8 +130,8 @@ class OpenAIAgent:
                 if tool_specs:
                     kwargs["tools"] = tool_specs
                     kwargs["tool_choice"] = "auto"
-                if reasoning_effort and reasoning_effort != "none":
-                    kwargs["reasoning_effort"] = reasoning_effort
+                if request.reasoning_effort and request.reasoning_effort != "none":
+                    kwargs["reasoning_effort"] = request.reasoning_effort
 
                 # Stream the response
                 stream = await client.chat.completions.create(**kwargs)
@@ -156,6 +157,9 @@ class OpenAIAgent:
                     reasoning_content = getattr(delta, "reasoning_content", None)
                     if reasoning_content:
                         reasoning_buffer += reasoning_content
+                        # DeepSeek 会通过 reasoning_content 流式返回思考文本，这里同步到前端“思考过程”面板。
+                        model_step["detail"] = reasoning_buffer
+                        yield {"type": "thinking", "payload": model_step}
                         if not reasoning_status_sent:
                             reasoning_status_sent = True
                             yield {"type": "status", "payload": {"message": "正在思考..."}}
@@ -201,13 +205,14 @@ class OpenAIAgent:
                     for idx in sorted(tool_call_buffers.keys())
                 ]
                 model_step["status"] = "complete"
-                model_step["detail"] = (
-                    f"分析完成，决定调用 {len(tool_calls)} 个工具。"
-                    if tool_calls
-                    else "分析完成，已形成最终回答。"
-                )
                 if reasoning_buffer:
-                    model_step["detail"] += " 模型已完成内部推理。"
+                    model_step["detail"] = reasoning_buffer
+                else:
+                    model_step["detail"] = (
+                        f"分析完成，决定调用 {len(tool_calls)} 个工具。"
+                        if tool_calls
+                        else "分析完成，已形成最终回答。"
+                    )
                 yield {"type": "thinking", "payload": model_step}
 
                 await callbacks.after_model(
@@ -227,15 +232,6 @@ class OpenAIAgent:
                     if content_buffer.strip():
                         assistant_message = self._message("assistant", content_buffer.strip())
                         working_messages.append(assistant_message)
-                    completed_step = self._thinking_step(
-                        thinking,
-                        phase="synthesis",
-                        title="整理最终回答",
-                        detail="已综合上下文与工具结果，完成回答。",
-                        status="complete",
-                        iteration=iteration,
-                    )
-                    yield {"type": "thinking", "payload": completed_step}
                     result = self._final_state(working_messages, trace, thinking)
                     await callbacks.on_agent_end(context, result)
                     yield {"type": "trace", "payload": {"entry": trace[-1]}}
@@ -311,7 +307,6 @@ class OpenAIAgent:
                         "tool_call_id": tc["id"],
                         "content": tool_result,
                     })
-
                 yield {"type": "status", "payload": {"message": self.config.status_model_started}}
 
             # Reached iteration limit
@@ -349,6 +344,9 @@ class OpenAIAgent:
     ) -> str:
         local_tool = next((tool for tool in self.tools if tool.name == tool_name), None)
         if local_tool is not None:
+            decision = check_permission(tool_name, self._permission_subject(tool_name, arguments))
+            if decision.behavior != "allow":
+                raise RuntimeError(decision.reason or f"Permission required for {tool_name}")
             before_payload = ToolCallPayload(
                 iteration=iteration,
                 name=tool_name,
@@ -377,6 +375,9 @@ class OpenAIAgent:
             raise RuntimeError(f"Unknown tool requested: {tool_name}")
 
         server_id, name = target
+        decision = check_permission("mcp", f"{server_id}:{name}")
+        if decision.behavior != "allow":
+            raise RuntimeError(decision.reason or f"Permission required for MCP tool {server_id}:{name}")
         await callbacks.before_tool(
             context,
             ToolCallPayload(
@@ -403,6 +404,23 @@ class OpenAIAgent:
         )
         return result
 
+    @staticmethod
+    def _permission_subject(tool_name: str, arguments: dict[str, Any]) -> str:
+        """为不同工具提取可匹配的权限对象，例如 Bash 命令或文件路径。"""
+        if tool_name == "Bash":
+            return str(arguments.get("command") or tool_name)
+        if tool_name in {"Read", "Write", "Edit", "Glob", "Grep", "LS", "NotebookEdit"}:
+            return str(arguments.get("file_path") or arguments.get("path") or tool_name)
+        if tool_name == "WebFetch":
+            return str(arguments.get("url") or tool_name)
+        if tool_name == "WebSearch":
+            return str(arguments.get("query") or tool_name)
+        if tool_name == "ReadMcpResourceTool":
+            return f"{arguments.get('server_id') or arguments.get('serverId') or ''}:{arguments.get('uri') or ''}"
+        if tool_name == "Skill":
+            return str(arguments.get("skill") or tool_name)
+        return tool_name
+
     def _build_tool_specs(self, mcp_tools: list[McpToolDescriptor]) -> list[dict[str, Any]]:
         local_specs = [
             {
@@ -428,27 +446,6 @@ class OpenAIAgent:
         ]
         return [*local_specs, *mcp_specs]
 
-    def _build_api_messages(
-        self,
-        messages: list[ChatMessage],
-        system_prompt: str | None = None,
-        attachments: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Convert internal ChatMessage list to OpenAI Chat Completions API message format."""
-        api_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt or self.config.system_prompt},
-        ]
-        for index, msg in enumerate(messages):
-            content: Any = msg.content
-            if attachments and index == len(messages) - 1 and msg.role == "user":
-                content = [{"type": "text", "text": msg.content}]
-                content.extend({
-                    "type": "image_url",
-                    "image_url": {"url": attachment["dataUrl"]},
-                } for attachment in attachments if attachment.get("dataUrl"))
-            api_messages.append({"role": msg.role, "content": content})
-        return api_messages
-
     def _parse_mcp_tool(self, tool_name: str) -> tuple[str, str] | None:
         if not tool_name.startswith("mcp__"):
             return None
@@ -464,17 +461,6 @@ class OpenAIAgent:
             meta=ChatMeta(toolName=tool_name) if tool_name else None,
         )
 
-    def _extract_tasks(self, messages: list[ChatMessage]) -> list[str]:
-        tasks: list[str] = []
-        for message in reversed(messages):
-            if message.role != "user":
-                continue
-            lines = [line.strip("- ").strip() for line in message.content.splitlines()]
-            tasks = [line for line in lines if line][:4]
-            if tasks:
-                break
-        return tasks
-
     def _final_state(
         self,
         messages: list[ChatMessage],
@@ -484,7 +470,6 @@ class OpenAIAgent:
         return {
             "messages": messages,
             "trace": trace,
-            "tasks": self._extract_tasks(messages),
             "thinking": thinking,
         }
 

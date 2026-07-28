@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import unittest
+from dataclasses import dataclass
+from os import environ
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from access_layer.session_memory import MEMORY_SESSIONS
+from backend.memory import (
+    MemoryFile,
+    MemoryType,
+    append_auto_memory,
+    clear_memory_cache,
+    compact_auto_memory,
+    get_memory_context,
+    get_memory_files,
+    read_auto_memory,
+    search_auto_memory,
+)
+from backend.prompts import (
+    build_nested_memory_context,
+    build_prompt_bundle,
+    classify_paths_for_memory,
+    prepend_user_context,
+    prompt_lifecycle_state,
+    reset_prompt_caches,
+)
+
+
+@dataclass
+class FakeMcpTool:
+    server_id: str
+    name: str
+    description: str | None
+
+
+class PromptMemoryTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        clear_memory_cache()
+
+    def test_memory_order_include_and_context_injection(self) -> None:
+        with TemporaryDirectory() as tmp, patch.dict(environ, {"K_AGENT_MEMORY_BASE_DIR": tmp}, clear=False):
+            root = Path(tmp)
+            memory = root / "memory" / "MEMORY.md"
+            memory.parent.mkdir()
+            memory.write_text("automem instruction\n", encoding="utf-8")
+
+            files = get_memory_files(root)
+            self.assertEqual([item.path for item in files], [memory.resolve()])
+
+            bundle = build_prompt_bundle("base", cwd=root)
+            messages = prepend_user_context([{"role": "user", "content": "hello"}], bundle.user_context)
+            self.assertEqual(messages[0]["role"], "user")
+            self.assertTrue(messages[0]["content"].startswith("<system-reminder>"))
+            self.assertEqual(messages[-1]["content"], "hello")
+
+    def test_project_memory_files_are_not_discovered(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as memory_base, patch.dict(
+            environ, {"K_AGENT_MEMORY_BASE_DIR": memory_base}, clear=False
+        ):
+            root = Path(tmp)
+            (root / "K_AGENT.md").write_text("old project instruction\n", encoding="utf-8")
+
+            files = get_memory_files(root)
+
+            self.assertEqual(files, [])
+
+    def test_mcp_prompt_is_after_dynamic_boundary(self) -> None:
+        bundle = build_prompt_bundle(
+            "base",
+            mcp_tools=[FakeMcpTool(server_id="calendar", name="create_event", description="Create an event.")],
+        )
+        before, after = bundle.system_prompt.split("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", 1)
+        self.assertNotIn("mcp__calendar__create_event", before)
+        self.assertIn("mcp__calendar__create_event", after)
+
+    def test_nested_memory_loads_conditional_rules(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "notes" / "plan.md"
+            target.parent.mkdir()
+            target.write_text("x", encoding="utf-8")
+            rules = root / ".k_agent" / "rules"
+            rules.mkdir(parents=True)
+            (rules / "plans.md").write_text("---\npaths:\n- \"**/*.md\"\n---\nmarkdown rule", encoding="utf-8")
+
+            eager = build_prompt_bundle("base", cwd=root)
+            nested, loaded = build_nested_memory_context(root, [target], set(eager.memory_paths))
+            self.assertEqual(nested, {})
+            self.assertEqual(loaded, [])
+
+    def test_memory_cache_invalidates_when_file_changes(self) -> None:
+        with TemporaryDirectory() as tmp, patch.dict(environ, {"K_AGENT_MEMORY_BASE_DIR": tmp}, clear=False):
+            root = Path(tmp)
+            memory = root / "memory" / "MEMORY.md"
+            memory.parent.mkdir()
+            memory.write_text("first", encoding="utf-8")
+            self.assertIn("first", get_memory_files(root)[0].content)
+            memory.write_text("second", encoding="utf-8")
+            self.assertIn("second", get_memory_files(root)[0].content)
+
+    def test_auto_memory_read_append_search(self) -> None:
+        with TemporaryDirectory() as tmp, patch.dict(environ, {"K_AGENT_MEMORY_BASE_DIR": tmp}, clear=False):
+            path = append_auto_memory("likes morning planning", Path(tmp))
+            append_auto_memory("likes morning planning", Path(tmp))
+            read_path, content = read_auto_memory(Path(tmp))
+            search_path, matches = search_auto_memory("morning", Path(tmp))
+            compact_path, before, after = compact_auto_memory(Path(tmp))
+            self.assertEqual(path, read_path)
+            self.assertEqual(path, search_path)
+            self.assertEqual(path, compact_path)
+            self.assertIn("likes morning planning", content)
+            self.assertEqual(matches[0]["text"], "- likes morning planning")
+            self.assertEqual((before, after), (1, 1))
+
+    def test_lifecycle_reset_tracks_generation(self) -> None:
+        before = prompt_lifecycle_state().generation
+        state = reset_prompt_caches("unit_test")
+        self.assertEqual(state.generation, before + 1)
+        self.assertEqual(state.reason, "unit_test")
+
+    def test_classify_memory_paths(self) -> None:
+        memory_paths, regular_paths = classify_paths_for_memory([
+            Path("/tmp/K_AGENT.md"),
+            Path("/tmp/work/item.txt"),
+        ])
+        self.assertEqual(len(memory_paths), 1)
+        self.assertEqual(len(regular_paths), 1)
+
+    def test_memory_budget_preserves_local_priority(self) -> None:
+        files = [
+            MemoryFile(path=Path("/tmp/global.md"), content="g" * 200, type=MemoryType.USER),
+            MemoryFile(path=Path("/tmp/local.md"), content="local priority", type=MemoryType.LOCAL),
+        ]
+        rendered = get_memory_context(files, max_chars=80)
+        self.assertIn("local priority", rendered)
+
+    def test_session_memory_state_tracks_loaded_and_triggers(self) -> None:
+        MEMORY_SESSIONS.clear("test-session")
+        state = MEMORY_SESSIONS.get("test-session")
+        state.mark_loaded(["/tmp/K_AGENT.md"])
+        state.queue_triggers([Path("/tmp/a.txt")])
+        self.assertIn("/tmp/K_AGENT.md", state.loaded_paths)
+        self.assertEqual(state.consume_triggers(), [Path("/tmp/a.txt")])
+        self.assertEqual(state.consume_triggers(), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

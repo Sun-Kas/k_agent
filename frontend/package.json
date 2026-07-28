@@ -1,0 +1,36 @@
+{
+  "name": "k_agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n access,agent,client -c blue,magenta,green \"npm run dev:access\" \"npm run dev:agent\" \"npm run dev:client\"",
+    "dev:client": "vite",
+    "dev:server": "npm run dev:access",
+    "dev:access": "cd .. && .venv/bin/python -m access_layer.run_server --reload",
+    "dev:agent": "cd .. && .venv/bin/python -m backend.run_server --reload",
+    "build": "npm run build:client",
+    "build:client": "vite build",
+    "preview": "vite preview",
+    "start": "concurrently -n access,agent -c blue,magenta \"npm run start:access\" \"npm run start:agent\"",
+    "start:access": "cd .. && .venv/bin/python -m access_layer.run_server",
+    "start:agent": "cd .. && .venv/bin/python -m backend.run_server",
+    "check": "npm run check:boundary && tsc --noEmit",
+    "check:boundary": "node scripts/check-boundary.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.23",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^5.4.19"
+  }
+}

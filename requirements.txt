@@ -1,7 +1,9 @@
 fastapi==0.116.1
+httpx==0.28.1
 ag-ui-protocol==0.1.19
 mcp==1.12.4
 openai==1.98.0
 pydantic==2.11.7
 pydantic-settings==2.10.1
 uvicorn[standard]==0.35.0
+python-multipart==0.0.20

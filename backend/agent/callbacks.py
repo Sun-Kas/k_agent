@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from backend.schemas import ChatMessage
+from backend.api.schemas import ChatMessage
 
 
 AgentEventType = Literal[

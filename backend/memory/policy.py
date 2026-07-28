@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+from backend.memory.constants import ALLOWED_INCLUDE_EXTENSIONS
+
+
+@dataclass(frozen=True)
+class MemoryPolicy:
+    include_external: bool = False
+    allow_user_memory: bool = True
+    allow_project_memory: bool = True
+    allow_local_memory: bool = True
+    allow_auto_memory: bool = True
+    allow_legacy_claude_paths: bool = True
+
+
+def policy_from_env(*, include_external: bool = False) -> MemoryPolicy:
+    return MemoryPolicy(
+        include_external=include_external or _truthy(os.getenv("K_AGENT_ALLOW_EXTERNAL_MEMORY_INCLUDES")),
+        allow_user_memory=not _truthy(os.getenv("K_AGENT_DISABLE_USER_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_USER_MEMORY")),
+        allow_project_memory=not _truthy(os.getenv("K_AGENT_DISABLE_PROJECT_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_PROJECT_MEMORY")),
+        allow_local_memory=not _truthy(os.getenv("K_AGENT_DISABLE_LOCAL_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_LOCAL_MEMORY")),
+        allow_auto_memory=not _truthy(os.getenv("K_AGENT_DISABLE_AUTO_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY")),
+        allow_legacy_claude_paths=not _truthy(os.getenv("K_AGENT_DISABLE_LEGACY_CLAUDE_MEMORY")),
+    )
+
+
+def can_read_memory_path(path: Path) -> tuple[bool, str | None]:
+    if path.suffix.lower() not in ALLOWED_INCLUDE_EXTENSIONS:
+        return False, f"unsupported extension: {path}"
+    return True, None
+
+
+def can_include_path(path: Path, base_dir: Path, policy: MemoryPolicy) -> tuple[bool, str | None]:
+    allowed, reason = can_read_memory_path(path)
+    if not allowed:
+        return False, reason
+    if not policy.include_external and not is_relative_to(path, base_dir):
+        return False, f"external include not approved: {path}"
+    return True, None
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def truthy(value: str | None) -> bool:
+    return _truthy(value)
+
+
+def _truthy(value: str | None) -> bool:
+    return value is not None and value.lower() not in {"", "0", "false", "no", "off"}
+
