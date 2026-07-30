@@ -160,6 +160,17 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .session-item:hover, .session-item.active { background: #1a1e1b; }
 .session-item.active { box-shadow: inset 2px 0 var(--lime); }
 .session-glyph { color: #626a63; font-size: 11px; }
+.session-run-indicator {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border: 2px solid color-mix(in srgb, var(--lime) 35%, transparent);
+  border-top-color: var(--lime);
+  border-radius: 50%;
+  animation: session-run-spin .8s linear infinite;
+}
+.session-item.running .session-copy small,
+.session-item.running.active .session-copy small { color: var(--lime); }
 .session-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .session-copy strong { overflow: hidden; color: #b4bab4; font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .session-copy small { color: #555b56; font: 9px "DM Mono", monospace; }
@@ -171,6 +182,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .connection strong { font-size: 11px; font-weight: 500; }
 .connection small { overflow: hidden; color: #5f665f; font: 8px "DM Mono", monospace; white-space: nowrap; text-overflow: ellipsis; }
 .connection i { margin-left: auto; color: var(--dim); font-style: normal; }
+@keyframes session-run-spin { to { transform: rotate(360deg); } }
 .settings-link { width: 100%; margin-top: 7px; padding: 9px; border: 0; border-radius: 7px; display: flex; align-items: center; gap: 8px; text-align: left; color: #777e78; background: transparent; }
 .settings-link:hover { color: var(--ink); background: #181b19; }
 .settings-link > span { color: var(--lime); }

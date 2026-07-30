@@ -1,4 +1,5 @@
 import { appConfig } from "../config";
+import { nextRenderOpportunity } from "./stream-scheduler";
 import type {
   AgUiEvent,
   AgUiRunInput,
@@ -237,7 +238,7 @@ export async function streamAgentRun(
       if (event) {
         onEvent(event);
         if (event.type === "TEXT_MESSAGE_CONTENT") {
-          await nextPaint();
+          await nextRenderOpportunity();
         }
       }
     }
@@ -250,13 +251,6 @@ export async function streamAgentRun(
       return;
     }
   }
-}
-
-function nextPaint(): Promise<void> {
-  if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 
 function parseSseFrame(frame: string): AgUiEvent | null {

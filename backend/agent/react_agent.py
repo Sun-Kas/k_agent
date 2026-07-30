@@ -347,7 +347,15 @@ class OpenAIAgent:
 
                 for tc in tool_calls:
                     tool_name = tc["name"]
-                    raw_arguments = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                    argument_error: Exception | None = None
+                    try:
+                        raw_arguments = self._decode_tool_arguments(tc["arguments"])
+                    except Exception as exc:
+                        # Malformed model-generated arguments are a recoverable
+                        # tool observation; the model needs the reason in its
+                        # tool result so it can repair the next call.
+                        raw_arguments = {}
+                        argument_error = exc
                     tool_step = self._thinking_step(
                         thinking,
                         phase="tool",
@@ -369,16 +377,30 @@ class OpenAIAgent:
                         "type": "status",
                         "payload": {"message": f"调用工具 {tool_name}"},
                     }
-                    tool_result = await self._run_tool(
-                        callbacks=callbacks,
-                        context=context,
-                        iteration=iteration,
-                        tool_name=tool_name,
-                        arguments=raw_arguments,
-                    )
+                    if argument_error is not None:
+                        tool_result = await self._recoverable_tool_error(
+                            callbacks=callbacks,
+                            context=context,
+                            tool_name=tool_name,
+                            arguments=raw_arguments,
+                            error=argument_error,
+                        )
+                    else:
+                        tool_result = await self._run_tool(
+                            callbacks=callbacks,
+                            context=context,
+                            iteration=iteration,
+                            tool_name=tool_name,
+                            arguments=raw_arguments,
+                        )
                     working_messages.append(self._message("tool", tool_result, tool_name=tool_name))
-                    tool_step["status"] = "complete"
-                    tool_step["detail"] = f"{tool_name} 已返回结果，准备继续分析。"
+                    tool_failed = self._tool_result_failed(tool_result)
+                    tool_step["status"] = "error" if tool_failed else "complete"
+                    tool_step["detail"] = (
+                        f"{tool_name} 执行失败，已把原因返回模型以便修正。"
+                        if tool_failed
+                        else f"{tool_name} 已返回结果，准备继续分析。"
+                    )
                     yield {"type": "thinking", "payload": tool_step}
                     yield {
                         "type": "tool_result",
@@ -430,7 +452,37 @@ class OpenAIAgent:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> str:
-        """执行本地或 MCP 工具并生成工具消息和 trace。"""
+        """Execute one tool and convert its exceptions into model-visible results."""
+
+        try:
+            return await self._execute_tool(
+                callbacks=callbacks,
+                context=context,
+                iteration=iteration,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+        except Exception as exc:
+            # Tool failures must not abort the whole run. Cancellation and
+            # process-level BaseException subclasses still propagate normally.
+            return await self._recoverable_tool_error(
+                callbacks=callbacks,
+                context=context,
+                tool_name=tool_name,
+                arguments=arguments,
+                error=exc,
+            )
+
+    async def _execute_tool(
+        self,
+        callbacks: CallbackManager,
+        context: AgentRunContext,
+        iteration: int,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Execute a validated local or MCP tool; callers own recovery."""
+
         local_tool = next((tool for tool in self.tools if tool.name == tool_name), None)
         selected_skill = self._selected_skill(tool_name)
         if local_tool is None and selected_skill is not None:
@@ -507,6 +559,69 @@ class OpenAIAgent:
             ),
         )
         return result
+
+    async def _recoverable_tool_error(
+        self,
+        *,
+        callbacks: CallbackManager,
+        context: AgentRunContext,
+        tool_name: str,
+        arguments: dict[str, Any],
+        error: Exception,
+    ) -> str:
+        """Record a tool failure without allowing observability to break recovery."""
+
+        try:
+            await callbacks.on_error(
+                context,
+                AgentErrorPayload(
+                    error=error,
+                    stage="tool_run",
+                    detail={"toolName": tool_name, "arguments": arguments},
+                ),
+            )
+        except Exception:
+            # Error reporting is fail-open: the model must still receive the
+            # original tool failure even if an observability callback fails.
+            pass
+        message = str(error).strip() or "Tool execution failed without an error message."
+        return json.dumps(
+            {
+                "ok": False,
+                "tool": tool_name,
+                "error": message,
+                "errorType": type(error).__name__,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _decode_tool_arguments(raw_arguments: str) -> dict[str, Any]:
+        """Decode provider arguments while enforcing the object tool contract."""
+
+        if not raw_arguments:
+            return {}
+        decoded = json.loads(raw_arguments)
+        if not isinstance(decoded, dict):
+            raise ValueError("Tool arguments must be a JSON object.")
+        return decoded
+
+    @staticmethod
+    def _tool_result_failed(result: str) -> bool:
+        """Recognize the common structured failure contracts used by tools."""
+
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and (
+                payload.get("ok") is False
+                or payload.get("success") is False
+                or payload.get("isError") is True
+            )
+        )
 
     def _selected_skill(self, tool_name: str) -> dict[str, Any] | None:
         """Resolve a direct function name only against this request's Skills."""

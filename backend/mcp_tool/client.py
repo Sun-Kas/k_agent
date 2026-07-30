@@ -192,6 +192,24 @@ class McpSession:
             item.model_dump(mode="json") if hasattr(item, "model_dump") else str(item)
             for item in result.content
         ]
+        if getattr(result, "isError", False):
+            # MCP can report a tool-level failure without raising. Preserve its
+            # content in the same recoverable contract used by local tools.
+            reason = "\n".join(
+                str(item.get("text"))
+                for item in serialized
+                if isinstance(item, dict) and item.get("text")
+            ) or "MCP tool reported an execution error."
+            return json.dumps(
+                {
+                    "ok": False,
+                    "tool": tool_name,
+                    "error": reason,
+                    "errorType": "McpToolError",
+                    "content": serialized,
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(serialized, ensure_ascii=False)
 
 

@@ -10,10 +10,11 @@ from unittest.mock import AsyncMock, patch
 
 from backend.agent.callbacks import AgentRunContext, CallbackManager
 from backend.agent.react_agent import OpenAIAgent
-from backend.mcp_tool.client import McpClientManager, McpServerConfig
+from backend.mcp_tool.client import McpClientManager, McpServerConfig, McpSession
 from backend.mcp_tool.config import McpTransport, load_scoped_mcp_servers
 from backend.permissions import check_permission
 from backend.skills import clear_skill_caches, get_available_skills, activate_skills_for_paths
+from backend.tools import ToolDefinition
 from backend.tools.local import build_skill_tool, invoke_skill
 from backend.watchers import PollingChangeWatcher
 
@@ -73,6 +74,35 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
 
         session.close.assert_awaited_once()
         self.assertIn("cold-uvx", manager.failed)
+
+    async def test_mcp_protocol_error_uses_recoverable_result_contract(self) -> None:
+        server = McpServerConfig(
+            id="failing-mcp",
+            scope="local",
+            type="stdio",
+            command="test",
+            args=[],
+            env={},
+        )
+        mcp_session = McpSession(server)
+        content = SimpleNamespace(
+            model_dump=lambda mode: {
+                "type": "text",
+                "text": "remote validation failed",
+            }
+        )
+        mcp_session.session = SimpleNamespace(
+            call_tool=AsyncMock(
+                return_value=SimpleNamespace(isError=True, content=[content])
+            )
+        )
+
+        result = json.loads(await mcp_session.call_tool("remote_tool", {}))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "remote_tool")
+        self.assertEqual(result["errorType"], "McpToolError")
+        self.assertEqual(result["error"], "remote validation failed")
 
     def test_skill_dir_frontmatter_and_conditional_activation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -184,17 +214,14 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             result["content"],
         )
 
-    async def test_unselected_direct_skill_name_still_fails_closed(self) -> None:
+    async def test_unselected_direct_skill_name_returns_recoverable_error(self) -> None:
         agent = OpenAIAgent(
             [build_skill_tool(skills=[])],
             McpClientManager([]),
             skills=[],
         )
 
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "Unknown tool requested: find-skill-skillhub",
-        ):
+        result = json.loads(
             await agent._run_tool(
                 callbacks=CallbackManager(),
                 context=AgentRunContext(run_id="test-run"),
@@ -202,6 +229,62 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 tool_name="find-skill-skillhub",
                 arguments={"skill": "外卖"},
             )
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "find-skill-skillhub")
+        self.assertEqual(result["errorType"], "RuntimeError")
+        self.assertEqual(
+            result["error"],
+            "Unknown tool requested: find-skill-skillhub",
+        )
+
+    async def test_local_tool_exception_returns_reason_for_model_retry(self) -> None:
+        async def fail(_: dict) -> str:
+            raise ValueError("path is outside workspace: /tmp/result.md")
+
+        agent = OpenAIAgent(
+            [
+                ToolDefinition(
+                    name="Read",
+                    description="Read a file.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                        "additionalProperties": False,
+                    },
+                    execute=fail,
+                )
+            ],
+            McpClientManager([]),
+        )
+
+        result = json.loads(
+            await agent._run_tool(
+                callbacks=CallbackManager(),
+                context=AgentRunContext(run_id="test-run"),
+                iteration=0,
+                tool_name="Read",
+                arguments={"file_path": "/tmp/result.md"},
+            )
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "ok": False,
+                "tool": "Read",
+                "error": "path is outside workspace: /tmp/result.md",
+                "errorType": "ValueError",
+            },
+        )
+
+    def test_malformed_tool_arguments_are_recoverable(self) -> None:
+        agent = OpenAIAgent([], McpClientManager([]))
+
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            agent._decode_tool_arguments("[1, 2]")
 
     def test_permission_rules_deny(self) -> None:
         with TemporaryDirectory() as tmp, patch.dict("os.environ", {"K_AGENT_PERMISSION_RULES": str(Path(tmp) / "permissions.json")}, clear=False):

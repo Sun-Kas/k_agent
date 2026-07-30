@@ -69,6 +69,13 @@ type CopyFeedback = {
   status: "success" | "error";
 };
 
+type ActiveConversationRun = {
+  controller: AbortController;
+  events: AgUiEvent[];
+  initialMessages: ChatMessage[];
+  pendingAssistantId: string;
+};
+
 const createMessage = (role: ChatMessage["role"], content: string): ChatMessage => ({
   id: createClientId(),
   role,
@@ -106,6 +113,15 @@ function safeStringify(value: unknown): string {
     return JSON.stringify(value, null, 2);
   } catch {
     return String(value);
+  }
+}
+
+function toolResultFailed(content: string): boolean {
+  try {
+    const payload = JSON.parse(content) as Record<string, unknown>;
+    return payload?.ok === false || payload?.success === false || payload?.isError === true;
+  } catch {
+    return false;
   }
 }
 
@@ -236,6 +252,8 @@ export function App() {
   const [input, setInput] = useState("");
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("k-agent-sidebar-collapsed") === "true");
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -264,7 +282,12 @@ export function App() {
   const streamEndRef = useRef<HTMLDivElement>(null);
   const messageStreamRef = useRef<HTMLElement>(null);
   const streamPinnedRef = useRef(true);
-  const abortRef = useRef<AbortController | null>(null);
+  // Runs belong to sessions rather than the mounted chat view. Keeping their
+  // controllers and received events here lets navigation detach and reattach
+  // the visible conversation without cancelling or corrupting another session.
+  const activeRunsRef = useRef<Map<string, ActiveConversationRun>>(new Map());
+  const activeSessionIdRef = useRef<string | null>(null);
+  const sessionNavigationTokenRef = useRef(0);
   const speechRef = useRef<{ start: () => void; stop: () => void } | null>(null);
   const pendingAssistantIdRef = useRef<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
@@ -292,7 +315,8 @@ export function App() {
     const savedId = localStorage.getItem(appConfig.storageKey);
     if (savedId) void openSession(savedId);
     return () => {
-      abortRef.current?.abort();
+      activeRunsRef.current.forEach((run) => run.controller.abort());
+      activeRunsRef.current.clear();
       if (copyFeedbackTimerRef.current !== null) {
         window.clearTimeout(copyFeedbackTimerRef.current);
       }
@@ -314,6 +338,16 @@ export function App() {
     if (!streamPinnedRef.current) return;
     streamEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
   }, [messages, tools, loading]);
+
+  useEffect(() => {
+    if (view !== "chat" || !streamPinnedRef.current) return;
+    // The chat DOM is absent while ConfigCenter is open. Scroll after it mounts
+    // so events received in the background are visible immediately on return.
+    const frameId = window.requestAnimationFrame(() => {
+      streamEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [view]);
 
   useEffect(() => {
     const textarea = composerTextareaRef.current;
@@ -362,9 +396,19 @@ export function App() {
 
   async function refreshSessions() {
     try {
-      setSessions(normalizeSessionSummaries(await listSessions()));
+      const persistedSessions = normalizeSessionSummaries(await listSessions());
+      setSessions((current) => {
+        // A just-started run can predate the first session-store write by a
+        // fraction of a second. Preserve its optimistic sidebar row meanwhile.
+        const persistedIds = new Set(persistedSessions.map((session) => session.id));
+        const optimisticRuns = current.filter(
+          (session) => activeRunsRef.current.has(session.id) && !persistedIds.has(session.id)
+        );
+        return [...optimisticRuns, ...persistedSessions];
+      });
     } catch {
-      setSessions([]);
+      // A transient list failure must not erase navigation back to local runs.
+      setSessions((current) => current.filter((session) => activeRunsRef.current.has(session.id)));
     }
   }
 
@@ -405,10 +449,22 @@ export function App() {
   }
 
   async function openSession(nextId: string) {
-    if (loading) return;
+    const navigationToken = sessionNavigationTokenRef.current + 1;
+    sessionNavigationTokenRef.current = navigationToken;
+    const bufferedRun = activeRunsRef.current.get(nextId);
+    const bufferedEventCount = bufferedRun?.events.length ?? 0;
+    activeSessionIdRef.current = null;
+    setSessionId(nextId);
+    resetRunViewState();
+    setSessionLoading(true);
+    setLoading(Boolean(bufferedRun));
+    setStatus(bufferedRun ? appConfig.status.processing : "正在加载会话");
+    setSidebarOpen(false);
     try {
       const data = await getSession(nextId);
+      if (sessionNavigationTokenRef.current !== navigationToken) return;
       setSessionId(data.sessionId);
+      activeSessionIdRef.current = data.sessionId;
       localStorage.setItem(appConfig.storageKey, data.sessionId);
       const remembered = data.capabilities ?? null;
       capabilitySelectionRef.current = remembered;
@@ -449,16 +505,42 @@ export function App() {
         setTasks(normalizeStringList(data.tasks));
         setThinking(normalizeThinking(data.thinking));
       }
-      setStatus(appConfig.status.idle);
-      setSidebarOpen(false);
+      // Events arriving while getSession was in flight are newer than its
+      // snapshot. Replaying only this tail prevents both gaps and duplicate
+      // deltas when the user returns to an actively streaming conversation.
+      bufferedRun?.events.slice(bufferedEventCount).forEach((event) => applyAgUiEvent(event));
+      const isRunning = activeRunsRef.current.has(data.sessionId);
+      setSessionLoading(false);
+      setLoading(isRunning);
+      setStatus(isRunning ? appConfig.status.processing : appConfig.status.idle);
     } catch {
+      if (sessionNavigationTokenRef.current !== navigationToken) return;
+      const localRun = activeRunsRef.current.get(nextId);
+      if (localRun) {
+        // RUN_STARTED may not have reached persistence yet. The local event
+        // buffer is sufficient to reconstruct the in-flight view until it does.
+        resetRunViewState();
+        setMessages(localRun.initialMessages);
+        pendingAssistantIdRef.current = localRun.pendingAssistantId;
+        activeSessionIdRef.current = nextId;
+        localRun.events.forEach((event) => applyAgUiEvent(event));
+        setSessionLoading(false);
+        setLoading(true);
+        setStatus(appConfig.status.processing);
+        localStorage.setItem(appConfig.storageKey, nextId);
+        return;
+      }
       localStorage.removeItem(appConfig.storageKey);
+      setSessionId(null);
+      setSessionLoading(false);
+      setLoading(false);
       setStatus("会话已失效");
     }
   }
 
   function startNewSession() {
-    if (loading) return;
+    sessionNavigationTokenRef.current += 1;
+    activeSessionIdRef.current = null;
     localStorage.removeItem(appConfig.storageKey);
     setSessionId(null);
     capabilitySelectionRef.current = null;
@@ -466,6 +548,8 @@ export function App() {
     setSelectedSkills([]);
     persistedMessageIdsRef.current = new Set();
     resetRunViewState();
+    setSessionLoading(false);
+    setLoading(false);
     setStatus(appConfig.status.idle);
     setSidebarOpen(false);
   }
@@ -490,8 +574,8 @@ export function App() {
   }
 
   function stopRun() {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    if (!sessionId) return;
+    activeRunsRef.current.get(sessionId)?.controller.abort();
     setLoading(false);
     setStatus("已停止");
   }
@@ -585,7 +669,7 @@ export function App() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const prompt = input.trim();
-    if ((!prompt && !attachments.length) || loading || !modelId) return;
+    if ((!prompt && !attachments.length) || loading || sessionLoading || !modelId) return;
 
     const selectedModel = models.find((model) => model.id === modelId);
     const validReasoningOptions = reasoningOptionsForModel(selectedModel);
@@ -593,8 +677,9 @@ export function App() {
     const pendingAssistantId = createClientId();
     const userMessage = createMessage("user", prompt);
     const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
+    const targetSessionId = sessionId ?? createClientId();
     const runInput: AgUiRunInput = {
-      threadId: sessionId ?? createClientId(),
+      threadId: targetSessionId,
       runId: createClientId(),
       state: {},
       messages: [
@@ -616,7 +701,28 @@ export function App() {
     };
 
     const controller = new AbortController();
-    abortRef.current = controller;
+    const activeRun: ActiveConversationRun = {
+      controller,
+      events: [],
+      initialMessages: nextMessages,
+      pendingAssistantId
+    };
+    activeRunsRef.current.set(targetSessionId, activeRun);
+    activeSessionIdRef.current = targetSessionId;
+    setRunningSessionIds((current) => new Set(current).add(targetSessionId));
+    setSessionId(targetSessionId);
+    localStorage.setItem(appConfig.storageKey, targetSessionId);
+    setSessions((current) => current.some((session) => session.id === targetSessionId)
+      ? current
+      : [
+        {
+          id: targetSessionId,
+          title: prompt || attachments[0]?.name || "新会话",
+          updatedAt: new Date().toISOString(),
+          messageCount: nextMessages.length
+        },
+        ...current
+      ]);
     streamPinnedRef.current = true;
     setMessages(nextMessages);
     pendingAssistantIdRef.current = pendingAssistantId;
@@ -631,35 +737,37 @@ export function App() {
     setStatus(appConfig.status.preparing);
 
     try {
-      await streamAgentRun(runInput, applyAgUiEvent, controller.signal);
-      await Promise.all([refreshSessions(), refreshHealth()]);
+      await streamAgentRun(
+        runInput,
+        (streamEvent) => {
+          activeRun.events.push(streamEvent);
+          if (activeSessionIdRef.current === targetSessionId) {
+            applyAgUiEvent(streamEvent);
+          }
+        },
+        controller.signal
+      );
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       const detail = error instanceof Error ? error.message : "未知错误";
-      setStatus(appConfig.status.failed);
-      const pendingAssistantId = pendingAssistantIdRef.current;
-      const failedRunId = activeRunIdRef.current;
-      pendingAssistantIdRef.current = null;
-      activeRunIdRef.current = null;
-      setActiveRunId(null);
-      setMessages((current) =>
-        pendingAssistantId && current.some((message) => message.id === pendingAssistantId)
-          ? current.map((message) =>
-            message.id === pendingAssistantId
-              ? { ...message, content: `${appConfig.text.requestErrorPrefix}${detail}` }
-              : message
-          )
-          : [
-            ...current,
-            {
-              ...createMessage("assistant", `${appConfig.text.requestErrorPrefix}${detail}`),
-              meta: failedRunId ? { runId: failedRunId } : undefined
-            }
-          ]
-      );
+      const errorEvent: AgUiEvent = { type: "RUN_ERROR", message: detail };
+      activeRun.events.push(errorEvent);
+      if (activeSessionIdRef.current === targetSessionId) {
+        applyAgUiEvent(errorEvent);
+      }
     } finally {
-      if (abortRef.current === controller) abortRef.current = null;
-      setLoading(false);
+      if (activeRunsRef.current.get(targetSessionId)?.controller === controller) {
+        activeRunsRef.current.delete(targetSessionId);
+      }
+      setRunningSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(targetSessionId);
+        return next;
+      });
+      if (activeSessionIdRef.current === targetSessionId) {
+        setLoading(false);
+      }
+      await Promise.all([refreshSessions(), refreshHealth()]);
     }
   }
 
@@ -911,7 +1019,9 @@ export function App() {
         break;
       case "TOOL_CALL_RESULT":
         updateTool(event.toolCallId, (tool) => ({
-          ...tool, result: event.content, status: "complete"
+          ...tool,
+          result: event.content,
+          status: toolResultFailed(event.content) ? "error" : "complete"
         }));
         break;
       case "CUSTOM":
@@ -1228,15 +1338,28 @@ export function App() {
           )}
           {filteredSessions.map((session) => (
             <button
-              className={`session-item ${session.id === sessionId ? "active" : ""}`}
+              className={`session-item ${session.id === sessionId ? "active" : ""} ${runningSessionIds.has(session.id) ? "running" : ""}`}
               key={session.id}
               type="button"
               onClick={() => void openSession(session.id)}
             >
-              <span className="session-glyph">◫</span>
+              {runningSessionIds.has(session.id)
+                ? (
+                  <span
+                    className="session-run-indicator"
+                    role="status"
+                    aria-label="正在流式执行"
+                    title="正在流式执行"
+                  />
+                )
+                : <span className="session-glyph">◫</span>}
               <span className="session-copy">
                 <strong>{session.title}</strong>
-                <small>{formatRelativeTime(session.updatedAt)} · {session.messageCount} 条</small>
+                <small>
+                  {runningSessionIds.has(session.id)
+                    ? "正在流式执行"
+                    : `${formatRelativeTime(session.updatedAt)} · ${session.messageCount} 条`}
+                </small>
               </span>
             </button>
           ))}
@@ -1463,7 +1586,7 @@ export function App() {
               {loading ? (
                 <button className="stop-button" type="button" onClick={stopRun} aria-label="停止生成">■</button>
               ) : (
-                <button className="send-button" type="submit" disabled={(!input.trim() && !attachments.length) || !modelId} aria-label="发送">↑</button>
+                <button className="send-button" type="submit" disabled={(!input.trim() && !attachments.length) || sessionLoading || !modelId} aria-label="发送">↑</button>
               )}
             </div>
           </div>

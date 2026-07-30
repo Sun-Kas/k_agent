@@ -18,7 +18,8 @@
     "start:agent": "cd .. && .venv/bin/python -m backend.run_server",
     "check": "npm run check:boundary && tsc --noEmit",
     "check:boundary": "node scripts/check-boundary.mjs",
-    "test:history": "node --import tsx scripts/test-history.ts"
+    "test:history": "node --import tsx scripts/test-history.ts",
+    "test:stream": "node --import tsx scripts/test-stream-scheduler.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
