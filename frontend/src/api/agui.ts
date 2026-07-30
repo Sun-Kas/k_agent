@@ -6,14 +6,15 @@ import type {
   McpCapabilities,
   McpServerConfig,
   ModelProfile,
+  RuntimeOption,
   SkillConfig,
   SessionState,
   SessionSummary
 } from "../types";
 
 const apiUrl = (path: string) => `${appConfig.apiBaseUrl}${path}`;
-const configFetch = (path: string, init?: RequestInit) =>
-  fetch(apiUrl(path), { ...init, signal: AbortSignal.timeout(5000) });
+const configFetch = (path: string, init?: RequestInit, timeoutMs = 5000) =>
+  fetch(apiUrl(path), { ...init, signal: AbortSignal.timeout(timeoutMs) });
 
 export async function listSessions(): Promise<SessionSummary[]> {
   const response = await fetch(apiUrl("/api/sessions"));
@@ -37,6 +38,20 @@ export async function getModelsConfig(): Promise<{ path: string; source: string;
   return response.json() as Promise<{ path: string; source: string; models: ModelProfile[] }>;
 }
 
+export async function getRuntimeCatalog(): Promise<{
+  mcpServers: RuntimeOption[];
+  skills: RuntimeOption[];
+  sources: { mcp: string; skills: string };
+}> {
+  const response = await configFetch("/api/catalog");
+  if (!response.ok) throw new Error(`Unable to load runtime catalog (${response.status})`);
+  return response.json() as Promise<{
+    mcpServers: RuntimeOption[];
+    skills: RuntimeOption[];
+    sources: { mcp: string; skills: string };
+  }>;
+}
+
 export async function saveModelsConfig(models: ModelProfile[]): Promise<void> {
   const response = await configFetch("/api/config/models", {
     method: "PUT",
@@ -54,13 +69,79 @@ export async function getMcpConfig(): Promise<{ path: string; source?: string; f
   return response.json() as Promise<{ path: string; source?: string; format?: string; isTemplate?: boolean; servers: McpServerConfig[]; warnings?: string[]; blocked?: string[]; suppressed?: Array<Record<string, string>> }>;
 }
 
-export async function saveMcpConfig(servers: McpServerConfig[]): Promise<void> {
+export async function saveMcpConfig(servers: McpServerConfig[]): Promise<{
+  ok: boolean;
+  restartRequired: boolean;
+  servers: McpServerConfig[];
+  warnings?: string[];
+  blocked?: string[];
+}> {
   const response = await configFetch("/api/config/mcp", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ servers: servers.map(({ connected: _, status: __, scope: ___, transport: ____, toolCount: _____, resourceCount: ______, error: _______, ...server }) => server) })
-  });
-  if (!response.ok) throw new Error(`Unable to save MCP config (${response.status})`);
+    body: JSON.stringify({ servers: servers.map(sanitizeMcpServerForSave) })
+  }, 120000);
+  if (!response.ok) {
+    throw new Error(await configResponseError(response, "MCP 配置保存失败"));
+  }
+  return response.json() as Promise<{
+    ok: boolean;
+    restartRequired: boolean;
+    servers: McpServerConfig[];
+    warnings?: string[];
+    blocked?: string[];
+  }>;
+}
+
+function sanitizeMcpServerForSave(server: McpServerConfig): McpServerConfig {
+  const type = server.type ?? "stdio";
+  const optional = (value?: string) => value?.trim() || undefined;
+  const cleanRecord = (value?: Record<string, string>) => Object.fromEntries(
+    Object.entries(value ?? {})
+      .filter(([key]) => key.trim())
+      .map(([key, itemValue]) => [key.trim(), itemValue])
+  );
+  return {
+    id: server.id.trim(),
+    name: optional(server.name),
+    description: server.description ?? "",
+    type,
+    command: type === "stdio" ? optional(server.command) : undefined,
+    args: type === "stdio"
+      ? (server.args ?? []).map((item) => item.trim()).filter(Boolean)
+      : [],
+    env: type === "stdio" ? cleanRecord(server.env) : {},
+    envPassthrough: type === "stdio"
+      ? (server.envPassthrough ?? []).map((item) => item.trim()).filter(Boolean)
+      : [],
+    cwd: type === "stdio" ? optional(server.cwd) : undefined,
+    url: type === "http" ? optional(server.url) : undefined,
+    bearerTokenEnv: type === "http" ? optional(server.bearerTokenEnv) : undefined,
+    headers: type === "http" ? cleanRecord(server.headers) : {},
+    envHeaders: type === "http" ? cleanRecord(server.envHeaders) : {},
+    enabled: server.enabled
+  };
+}
+
+async function configResponseError(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json() as {
+      detail?: string | Array<{ loc?: Array<string | number>; msg?: string }>;
+    };
+    if (typeof payload.detail === "string" && payload.detail.trim()) {
+      return `${fallback}：${payload.detail}`;
+    }
+    if (Array.isArray(payload.detail)) {
+      const issues = payload.detail.map((issue) => {
+        const field = issue.loc?.slice(1).join(".") || "请求字段";
+        return `${field} ${issue.msg || "格式不正确"}`;
+      });
+      if (issues.length) return `${fallback}：${issues.join("；")}`;
+    }
+  } catch {
+    // Some proxy errors are not JSON; preserve a useful status fallback.
+  }
+  return `${fallback}（${response.status}）`;
 }
 
 export async function getMcpCapabilities(): Promise<McpCapabilities> {
@@ -70,14 +151,14 @@ export async function getMcpCapabilities(): Promise<McpCapabilities> {
 }
 
 export async function reloadMcp(): Promise<void> {
-  const response = await configFetch("/api/mcp/reload", { method: "POST" });
+  const response = await configFetch("/api/mcp/reload", { method: "POST" }, 120000);
   if (!response.ok) throw new Error(`Unable to reload MCP (${response.status})`);
 }
 
-export async function getSkillsConfig(): Promise<{ path: string; projectSkillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }> {
+export async function getSkillsConfig(): Promise<{ path: string; skillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }> {
   const response = await configFetch("/api/config/skills");
   if (!response.ok) throw new Error(`Unable to load skills config (${response.status})`);
-  return response.json() as Promise<{ path: string; projectSkillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }>;
+  return response.json() as Promise<{ path: string; skillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }>;
 }
 
 export async function saveSkillsConfig(skills: SkillConfig[]): Promise<void> {
@@ -89,7 +170,7 @@ export async function saveSkillsConfig(skills: SkillConfig[]): Promise<void> {
   if (!response.ok) throw new Error(`Unable to save skills config (${response.status})`);
 }
 
-export async function importProjectSkill(file: File): Promise<{ id: string; name: string; filePath: string; skills?: SkillConfig[] }> {
+export async function importSkill(file: File): Promise<{ id: string; name: string; filePath: string; skills?: SkillConfig[]; loadedSkills?: SkillConfig[] }> {
   const body = new FormData();
   body.append("file", file);
   const response = await fetch(apiUrl("/api/skills"), {
@@ -107,7 +188,7 @@ export async function importProjectSkill(file: File): Promise<{ id: string; name
     }
     throw new Error(detail);
   }
-  return response.json() as Promise<{ id: string; name: string; filePath: string; skills?: SkillConfig[] }>;
+  return response.json() as Promise<{ id: string; name: string; filePath: string; skills?: SkillConfig[]; loadedSkills?: SkillConfig[] }>;
 }
 
 export async function getSession(sessionId: string): Promise<SessionState> {

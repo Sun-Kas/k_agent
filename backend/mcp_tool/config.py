@@ -1,3 +1,5 @@
+"""Load, normalize, merge, and policy-filter MCP server configuration."""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +12,7 @@ from typing import Any
 
 
 class McpScope(str, Enum):
+    """枚举 MCP 配置来源范围。"""
     LOCAL = "local"
     USER = "user"
     PROJECT = "project"
@@ -19,23 +22,26 @@ class McpScope(str, Enum):
 
 
 class McpTransport(str, Enum):
+    """枚举 MCP 连接传输类型。"""
     STDIO = "stdio"
-    SSE = "sse"
     HTTP = "http"
-    WS = "ws"
-    SDK = "sdk"
 
 
 @dataclass(slots=True)
 class ScopedMcpServerConfig:
+    """描述带来源范围的 MCP server 配置。"""
     id: str
     scope: McpScope
     type: McpTransport = McpTransport.STDIO
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    env_passthrough: list[str] = field(default_factory=list)
+    cwd: str | None = None
     url: str | None = None
+    bearer_token_env: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+    env_headers: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
     source_path: str | None = None
     plugin_source: str | None = None
@@ -43,6 +49,7 @@ class ScopedMcpServerConfig:
 
 @dataclass(slots=True)
 class McpConfigLoadResult:
+    """承载 MCP 配置加载结果、警告和过滤记录。"""
     servers: list[ScopedMcpServerConfig]
     suppressed: list[dict[str, str]]
     blocked: list[str]
@@ -55,6 +62,7 @@ def load_scoped_mcp_servers(
     explicit_config_path: str | None = None,
     dynamic_servers: list[dict[str, Any]] | None = None,
 ) -> McpConfigLoadResult:
+    """按优先级加载并合并 scoped MCP server 配置。"""
     cwd = (cwd or Path.cwd()).resolve()
     warnings: list[str] = []
     blocked: list[str] = []
@@ -79,16 +87,16 @@ def load_scoped_mcp_servers(
 
 
 def server_signature(server: ScopedMcpServerConfig) -> str | None:
+    """生成 MCP server 去重签名。"""
     if server.type == McpTransport.STDIO and server.command:
         return "stdio:" + json.dumps([server.command, *server.args], ensure_ascii=False)
     if server.url:
         return "url:" + _unwrap_proxy_url(server.url)
-    if server.type == McpTransport.SDK:
-        return None
     return None
 
 
 def _config_sources(cwd: Path, explicit_config_path: str | None) -> list[tuple[Path, McpScope]]:
+    """列出当前工作区可能存在的 MCP 配置源。"""
     sources: list[tuple[Path, McpScope]] = []
     managed = os.getenv("K_AGENT_MANAGED_MCP_CONFIG")
     if managed:
@@ -102,6 +110,7 @@ def _config_sources(cwd: Path, explicit_config_path: str | None) -> list[tuple[P
 
 
 def _read_mcp_config_file(path: Path, scope: McpScope, warnings: list[str]) -> list[ScopedMcpServerConfig]:
+    """读取并解析单个 MCP 配置文件。"""
     if not path.exists():
         return []
     try:
@@ -130,16 +139,24 @@ def _normalize_server(
     source_path: str | None,
     warnings: list[str],
 ) -> ScopedMcpServerConfig | None:
+    """把原始 MCP server 条目规范化为内部结构。"""
     if not name or not isinstance(item, dict):
         warnings.append(f"invalid MCP server entry: {name}")
         return None
-    transport = McpTransport(item.get("type", "stdio"))
+    raw_transport = item.get("type", "stdio")
+    if raw_transport == "sse":
+        raw_transport = "http"
+    try:
+        transport = McpTransport(raw_transport)
+    except ValueError:
+        warnings.append(f"MCP server {name} unsupported transport: {raw_transport}")
+        return None
     command = item.get("command")
     url = item.get("url")
     if transport == McpTransport.STDIO and not command:
         warnings.append(f"MCP server {name} missing command")
         return None
-    if transport in {McpTransport.SSE, McpTransport.HTTP, McpTransport.WS} and not url:
+    if transport == McpTransport.HTTP and not url:
         warnings.append(f"MCP server {name} missing url")
         return None
     return ScopedMcpServerConfig(
@@ -149,8 +166,12 @@ def _normalize_server(
         command=command,
         args=[str(arg) for arg in item.get("args", [])],
         env={str(key): str(value) for key, value in item.get("env", {}).items()},
+        env_passthrough=[str(value) for value in item.get("envPassthrough", [])],
+        cwd=str(item.get("cwd")) if item.get("cwd") else None,
         url=url,
+        bearer_token_env=str(item.get("bearerTokenEnv")) if item.get("bearerTokenEnv") else None,
         headers={str(key): str(value) for key, value in item.get("headers", {}).items()},
+        env_headers={str(key): str(value) for key, value in item.get("envHeaders", {}).items()},
         enabled=bool(item.get("enabled", True)),
         source_path=source_path,
         plugin_source=item.get("pluginSource"),
@@ -158,6 +179,7 @@ def _normalize_server(
 
 
 def _dedupe_servers(servers: list[ScopedMcpServerConfig]) -> tuple[list[ScopedMcpServerConfig], list[dict[str, str]]]:
+    """按签名去重 MCP server 并记录被抑制项。"""
     by_name: dict[str, ScopedMcpServerConfig] = {}
     by_signature: dict[str, str] = {}
     suppressed: list[dict[str, str]] = []
@@ -176,6 +198,7 @@ def _dedupe_servers(servers: list[ScopedMcpServerConfig]) -> tuple[list[ScopedMc
 
 
 def _allowed_by_policy(server: ScopedMcpServerConfig) -> bool:
+    """根据 allow/block 策略判断 MCP server 是否允许。"""
     if not server.enabled:
         return False
     denied = _policy_list("K_AGENT_DENIED_MCP_SERVERS")
@@ -186,6 +209,7 @@ def _allowed_by_policy(server: ScopedMcpServerConfig) -> bool:
 
 
 def _matches_policy(server: ScopedMcpServerConfig, entries: list[str]) -> bool:
+    """判断 MCP server 是否命中某条策略。"""
     signature = server_signature(server) or ""
     command = " ".join([server.command or "", *server.args]).strip()
     values = [server.id, signature, command, server.url or ""]
@@ -193,21 +217,25 @@ def _matches_policy(server: ScopedMcpServerConfig, entries: list[str]) -> bool:
 
 
 def _policy_list(env_name: str) -> list[str]:
+    """从环境变量读取逗号分隔的策略列表。"""
     raw = os.getenv(env_name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def _glob_match(value: str, pattern: str) -> bool:
+    """执行大小写不敏感的 glob 匹配。"""
     regex = "^" + re.escape(pattern).replace("\\*", ".*") + "$"
     return re.match(regex, value) is not None
 
 
 def _normalize_name(name: str) -> str:
+    """把名称规范化为稳定的 MCP server ID。"""
     normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", name.strip())
     return normalized.strip("_") or "mcp"
 
 
 def _unwrap_proxy_url(url: str) -> str:
+    """从代理 URL 中还原真实目标 URL。"""
     for marker in ("/v2/session_ingress/shttp/mcp/", "/v2/ccr-sessions/"):
         if marker in url and "mcp_url=" in url:
             from urllib.parse import parse_qs, urlparse

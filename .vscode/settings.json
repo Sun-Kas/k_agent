@@ -3,5 +3,9 @@
   "python.analysis.extraPaths": [
     "${workspaceFolder}"
   ],
-  "python.analysis.typeCheckingMode": "off"
+  "python.analysis.typeCheckingMode": "off",
+  "cursorpyright.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ],
+  "cursorpyright.analysis.typeCheckingMode": "off"
 }

@@ -1,3 +1,5 @@
+"""Assemble and request-bind the complete tool registry available to agent runs."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -49,6 +51,7 @@ def get_all_base_tools() -> list[ToolDefinition]:
 
 
 async def load_local_tools() -> list[ToolDefinition]:
+    """按配置加载本地工具并附加 Skill 工具。"""
     settings = await get_or_init_settings()
     all_tools = {tool.name: tool for tool in get_all_base_tools()}
     names = _configured_names(settings.local_tool_names)
@@ -58,10 +61,15 @@ async def load_local_tools() -> list[ToolDefinition]:
 
 
 def replace_skill_tool(tools: Iterable[ToolDefinition], skill_tool: ToolDefinition) -> list[ToolDefinition]:
+    """用新的 Skill 工具替换工具列表中的旧定义。"""
     return [skill_tool if tool.name == "Skill" else tool for tool in tools]
 
 
-def bind_request_scoped_tools(tools: Iterable[ToolDefinition], mcp_manager: McpClientManager) -> list[ToolDefinition]:
+def bind_request_scoped_tools(
+    tools: Iterable[ToolDefinition],
+    mcp_manager: McpClientManager,
+    skills: list[dict] | None = None,
+) -> list[ToolDefinition]:
     """把依赖请求级 MCP manager 的工具换成闭包实例，避免跨请求复用连接状态。"""
     bound_mcp_tools = {
         tool.name: tool
@@ -70,7 +78,7 @@ def bind_request_scoped_tools(tools: Iterable[ToolDefinition], mcp_manager: McpC
     result = []
     for tool in tools:
         if tool.name == "Skill":
-            result.append(build_skill_tool(mcp_manager.call_prompt))
+            result.append(build_skill_tool(mcp_manager.call_prompt, skills))
         elif tool.name in bound_mcp_tools:
             result.append(bound_mcp_tools[tool.name])
         else:
@@ -79,6 +87,7 @@ def bind_request_scoped_tools(tools: Iterable[ToolDefinition], mcp_manager: McpC
 
 
 def _configured_names(raw_names: str | None) -> list[str] | None:
+    """解析启用工具名配置。"""
     if raw_names is None:
         return None
     names = [item.strip() for item in raw_names.split(",") if item.strip()]
@@ -86,6 +95,7 @@ def _configured_names(raw_names: str | None) -> list[str] | None:
 
 
 def _uniq_by_name(tools: Iterable[ToolDefinition]) -> list[ToolDefinition]:
+    """按工具名去重并保留首次出现项。"""
     seen: set[str] = set()
     result: list[ToolDefinition] = []
     for tool in tools:

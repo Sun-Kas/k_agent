@@ -1,3 +1,5 @@
+"""Supplementary Claude-Code-like tools for web, notebooks, and MCP resources."""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,10 +17,12 @@ from backend.tools.local import ToolDefinition
 
 
 def _json(payload: dict[str, Any]) -> str:
+    """把工具输出对象序列化为紧凑 JSON 字符串。"""
     return json.dumps(payload, ensure_ascii=False)
 
 
 def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
+    """按最大字符数截断工具输出。"""
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars] + f"\n\n[truncated: kept first {max_chars} chars]", True
@@ -158,6 +162,7 @@ def _html_to_text(raw: str) -> str:
 
 
 def _parse_duckduckgo_results(text: str, max_results: int) -> list[dict[str, str]]:
+    """从 DuckDuckGo HTML 文本中提取搜索结果。"""
     results: list[dict[str, str]] = []
     # DuckDuckGo 的无脚本页面会把标题、摘要与 URL 渲染成连续文本；这里做保守提取，失败时返回空结果而不是编造。
     for match in re.finditer(r"(https?://[^\\s]+)", text):
@@ -181,11 +186,13 @@ def build_mcp_resource_tools(
     """构造 MCP 资源工具；实际执行函数会在请求级 manager 绑定后注入。"""
 
     async def execute_list(_: dict[str, Any]) -> str:
+        """列出 MCP resources 或 prompts。"""
         if list_resources is None:
             return _json({"ok": False, "error": "MCP manager is not bound"})
         return _json({"ok": True, "resources": await list_resources()})
 
     async def execute_read(payload: dict[str, Any]) -> str:
+        """读取指定 MCP resource 内容。"""
         if read_resource is None:
             return _json({"ok": False, "error": "MCP manager is not bound"})
         server_id = str(payload.get("server_id") or payload.get("serverId") or "").strip()

@@ -6,6 +6,7 @@ from .client import (
     McpToolDescriptor,
     load_mcp_manager,
     load_mcp_servers,
+    mcp_manager_from_runtime,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "McpToolDescriptor",
     "load_mcp_manager",
     "load_mcp_servers",
+    "mcp_manager_from_runtime",
 ]

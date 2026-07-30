@@ -9,6 +9,9 @@
       "apiKeyEnv": "OPENAI_API_KEY",
       "multimodal": false,
       "supportsReasoning": true,
+      "contextWindow": 128000,
+      "maxOutputTokens": 8192,
+      "contextSafetyTokens": 4096,
       "enabled": true
     },
     {
@@ -20,6 +23,9 @@
       "apiKeyEnv": "OPENAI_API_KEY",
       "multimodal": false,
       "supportsReasoning": true,
+      "contextWindow": 128000,
+      "maxOutputTokens": 8192,
+      "contextSafetyTokens": 4096,
       "enabled": true
     }
   ]

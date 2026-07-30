@@ -32,7 +32,6 @@ frontend/src/App.tsx
 正常完成时的尾部顺序为：
 
 ```text
-STATE_SNAPSHOT
 RUN_FINISHED
 ```
 
@@ -41,7 +40,6 @@ RUN_FINISHED
 | 事件 | 作用 |
 | --- | --- |
 | `RUN_STARTED` | 建立本次 `threadId`、`runId` 的运行状态。 |
-| `STATE_SNAPSHOT` | 提交最终消息、thinking、工具活动、任务和轨迹快照。 |
 | `RUN_FINISHED` | 标记本次运行正常结束。 |
 | `RUN_ERROR` | 标记运行失败，携带错误消息和错误码。 |
 
@@ -63,44 +61,44 @@ TEXT_MESSAGE_END
 
 正文是否结束只由 `TEXT_MESSAGE_END` 判断。前端不能通过“停止收到 token”“出现工具事件”或“收到最终快照”推断正文结束。
 
-## 4. Thinking 协议
+## 4. Reasoning 协议
 
-一个 thinking 块使用外层 thinking 生命周期，块内文本使用 thinking text message 生命周期：
+一个 reasoning 块使用外层 reasoning 生命周期，块内文本使用 reasoning message 生命周期：
 
 ```text
-THINKING_START
-  THINKING_TEXT_MESSAGE_START
-  THINKING_TEXT_MESSAGE_CONTENT × N
-  THINKING_TEXT_MESSAGE_END
-  ...可继续出现下一条 thinking text message
-THINKING_END
+REASONING_START
+  REASONING_MESSAGE_START
+  REASONING_MESSAGE_CONTENT × N
+  REASONING_MESSAGE_END
+  ...可继续出现下一条 reasoning message
+REASONING_END
 ```
 
 | 事件 | 关键字段 | 前端行为 |
 | --- | --- | --- |
-| `THINKING_START` | `title?` | 开始一个新的 thinking 块。 |
-| `THINKING_TEXT_MESSAGE_START` | `rawEvent?` | 在当前块中创建一条 thinking 文本步骤。 |
-| `THINKING_TEXT_MESSAGE_CONTENT` | `delta`, `rawEvent?` | 只向当前活动 thinking 步骤追加文本。 |
-| `THINKING_TEXT_MESSAGE_END` | `rawEvent?` | 封口当前 thinking 文本步骤。 |
-| `THINKING_END` | — | 封口整个 thinking 块；此后不得再向该块写入。 |
+| `REASONING_START` | `messageId` | 开始一个新的 reasoning 块。 |
+| `REASONING_MESSAGE_START` | `messageId`, `role="reasoning"`, `rawEvent?` | 在当前块中创建一条 reasoning 文本步骤。 |
+| `REASONING_MESSAGE_CONTENT` | `messageId`, `delta`, `rawEvent?` | 只向同 `messageId` 的 reasoning 步骤追加文本。 |
+| `REASONING_MESSAGE_END` | `messageId`, `rawEvent?` | 封口同 `messageId` 的 reasoning 文本步骤。 |
+| `REASONING_END` | `messageId` | 封口整个 reasoning 块；此后不得再向该块写入。 |
 
 ### 4.1 分块规则
 
-`THINKING_END` 是 thinking 块唯一的分隔标准：
+`REASONING_END` 是 reasoning 块唯一的分隔标准：
 
-- 收到 `THINKING_END` 后，当前块立即变为只读。
-- 后续如果再次收到 `THINKING_START`，前端必须新建 thinking 块。
-- `TEXT_MESSAGE_*`、`TOOL_CALL_*` 或 `CUSTOM` 事件不能直接关闭 thinking 块。
-- 接入层必须先发送 `THINKING_END`，再发送后续正文或工具的 start 事件。
-- 已关闭 thinking 的迟到更新只允许修正最终持久化快照，不得重新向前端续写。
+- 收到 `REASONING_END` 后，当前块立即变为只读。
+- 后续如果再次收到 `REASONING_START`，前端必须新建 reasoning 块。
+- `TEXT_MESSAGE_*`、`TOOL_CALL_*` 或 `CUSTOM` 事件不能直接关闭 reasoning 块。
+- 接入层必须先发送 `REASONING_END`，再发送后续正文或工具的 start 事件。
+- 已关闭 reasoning 的迟到更新不得重新向前端续写；如果需要持久化状态，应写入独立状态事件，不能冒充新的流式 reasoning。
 
 ### 4.2 `rawEvent` 元数据
 
-AG-UI thinking text 事件本身承载文本生命周期；K Agent 使用标准事件允许的 `rawEvent` 字段携带展示元数据：
+AG-UI reasoning message 事件本身承载文本生命周期；K Agent 使用标准事件允许的 `rawEvent` 字段携带展示元数据：
 
 ```json
 {
-  "id": "thinking-step-id",
+  "id": "reasoning-step-id",
   "phase": "reasoning",
   "title": "分析并决定下一步",
   "status": "active",
@@ -112,9 +110,9 @@ AG-UI thinking text 事件本身承载文本生命周期；K Agent 使用标准�
 约束：
 
 - 生命周期只由事件 `type` 决定，不能由 `rawEvent.status` 代替 start/end。
-- thinking 正文只通过 `THINKING_TEXT_MESSAGE_CONTENT.delta` 传输。
+- reasoning 正文只通过 `REASONING_MESSAGE_CONTENT.delta` 传输。
 - `rawEvent` 只用于步骤 ID、标题、阶段、状态和时间等 UI 元数据。
-- 如果上游将占位文本整体替换为真实 thinking，接入层会结束旧的 thinking text message，再以新的 start/content/end 标准序列发送，不进行隐式覆盖。
+- 如果上游将占位文本整体替换为真实 reasoning，接入层会结束旧的 reasoning message，再以新的 start/content/end 标准序列发送，不进行隐式覆盖。
 
 ## 5. 工具调用协议
 
@@ -136,11 +134,11 @@ TOOL_CALL_RESULT
 
 `TOOL_CALL_END` 表示模型输出的工具调用及参数已经结束，不表示工具执行结果已经返回。工具块只有在收到 `TOOL_CALL_RESULT` 后才是执行完成状态。
 
-Thinking 中不得保存或渲染 `phase="tool"` 的伪步骤。工具必须通过 `TOOL_CALL_*` 事件创建和更新。
+Reasoning 中不得保存或渲染 `phase="tool"` 的伪步骤。工具必须通过 `TOOL_CALL_*` 事件创建和更新。
 
 ## 6. 跨类型事件顺序
 
-典型的“思考 → 工具 → 再思考 → 正文”顺序如下：
+典型的“思考 → 工具 → 再 reasoning → 正文”顺序如下：
 
 ```mermaid
 sequenceDiagram
@@ -148,58 +146,66 @@ sequenceDiagram
     participant F as Frontend
 
     A->>F: RUN_STARTED
-    A->>F: THINKING_START
-    A->>F: THINKING_TEXT_MESSAGE_START
-    A->>F: THINKING_TEXT_MESSAGE_CONTENT
-    A->>F: THINKING_TEXT_MESSAGE_END
-    A->>F: THINKING_END
+    A->>F: REASONING_START
+    A->>F: REASONING_MESSAGE_START
+    A->>F: REASONING_MESSAGE_CONTENT
+    A->>F: REASONING_MESSAGE_END
+    A->>F: REASONING_END
     A->>F: TOOL_CALL_START
     A->>F: TOOL_CALL_ARGS
     A->>F: TOOL_CALL_END
     A->>F: TOOL_CALL_RESULT
-    A->>F: THINKING_START
-    A->>F: THINKING_TEXT_MESSAGE_START
-    A->>F: THINKING_TEXT_MESSAGE_CONTENT
-    A->>F: THINKING_TEXT_MESSAGE_END
-    A->>F: THINKING_END
+    A->>F: REASONING_START
+    A->>F: REASONING_MESSAGE_START
+    A->>F: REASONING_MESSAGE_CONTENT
+    A->>F: REASONING_MESSAGE_END
+    A->>F: REASONING_END
     A->>F: TEXT_MESSAGE_START
     A->>F: TEXT_MESSAGE_CONTENT
     A->>F: TEXT_MESSAGE_END
-    A->>F: STATE_SNAPSHOT
     A->>F: RUN_FINISHED
 ```
 
 必须满足的顺序不变量：
 
-1. Thinking 之后出现工具：`THINKING_END < TOOL_CALL_START`。
-2. 工具执行结束后重新思考：`TOOL_CALL_RESULT < THINKING_START`。
-3. Thinking 之后输出正文：`THINKING_END < TEXT_MESSAGE_START/CONTENT`。
+1. Reasoning 之后出现工具：`REASONING_END < TOOL_CALL_START`。
+2. 工具执行结束后重新思考：`TOOL_CALL_RESULT < REASONING_START`。
+3. Reasoning 之后输出正文：`REASONING_END < TEXT_MESSAGE_START/CONTENT`。
 4. 正常完成的流中，每个 start 必须由同类型的 end 封口；不能用其他类型事件代替。
 5. 不同工具调用通过 `toolCallId` 隔离，不同正文消息通过 `messageId` 隔离。
 
 如果运行异常或客户端主动中止，尚未结束的子流可能直接被 `RUN_ERROR` 或连接关闭打断；前端应将其标记为中断，不能伪造一个正常完成的 end。
 
-## 7. 快照与历史持久化
+## 7. 事件日志与历史持久化
 
-流式事件用于实时 UI，最终 `STATE_SNAPSHOT` 用于会话持久化和重新加载。
+流式事件用于实时 UI，同时也是历史持久化源。
 
-快照包含：
+会话存储包含：
 
 | 字段 | 内容 |
 | --- | --- |
 | `sessionId` | 当前会话 ID。 |
-| `messages` | 最终消息列表。 |
+| `messages` | 完整消息列表；assistant 正文只在对应 `TEXT_MESSAGE_END` 到达后写入。 |
 | `trace` | 执行轨迹。 |
 | `tasks` | 当前任务列表。 |
-| `thinking` | 本轮 thinking 步骤汇总。 |
-| `thinkingGroups` | 已按 `THINKING_START/END` 划分的 thinking 块。 |
+| `thinking` | 本轮 thinking 步骤汇总，仅用于调试/详情面板。 |
+| `events` | 该会话所有运行实际发送给前端的标准 AG-UI event log，按到达顺序追加。 |
 
-最后一条 assistant 消息的 `meta` 还会保存：
+请求开始时只合并本次输入中新增的真实消息，不得清空已有 `messages` 或
+`events`。每个 AG-UI event 发送前立即 append 到 `events`。
 
-- `thinkingGroups`：thinking 块、步骤和顺序。
-- `toolActivities`：工具 ID、名称、参数、结果、状态和顺序。
+正文持久化使用和协议一致的批次边界：
 
-历史加载时必须保留事件形成的块边界，不得因为两个块之间没有正文而自动合并。
+1. `TEXT_MESSAGE_START` 创建仅存在于服务端内存中的正文缓冲区。
+2. `TEXT_MESSAGE_CONTENT` 只追加到该 `messageId` 的缓冲区；此时不得向
+   `messages` 写入半截正文或空 assistant 消息。
+3. `TEXT_MESSAGE_END` 封口该缓冲区，并一次性把完整 assistant 正文写入
+   `messages`。
+4. 没有非空正文的批次不得产生 assistant 历史消息。
+
+历史加载时以 `messages` 恢复用户/助手对话顺序，以 `events` replay 每个
+`RUN_STARTED` / `RUN_FINISHED` 之间的 UI timeline。不同 run 的事件不得合并
+到同一个可视 Agent 回合。
 
 ## 8. `CUSTOM` 事件边界
 
@@ -219,8 +225,10 @@ sequenceDiagram
 1. start 创建，content/args 追加，end 封口，result 完成工具执行。
 2. 事件只能更新自己的活动 ID；不能把新内容写入已结束的对象。
 3. Thinking、工具和正文分别维护生命周期，互不充当对方的分隔符。
-4. `STATE_SNAPSHOT` 用于最终校准和持久化，不替代实时 start/end。
-5. 未知事件可以忽略，但不能据此猜测另一个事件流已经结束。
+4. 未知事件可以忽略，但不能据此猜测另一个事件流已经结束。
+5. 一个 run 只创建一个可视 Agent 回合；同一 run 中多个
+   `TEXT_MESSAGE_START/END` 批次按事件顺序显示在该回合内部，不能各自创建
+   空白头像行。
 
 ## 10. 代码与测试位置
 

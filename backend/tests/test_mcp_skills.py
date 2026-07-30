@@ -5,11 +5,14 @@ import unittest
 import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+from backend.agent.callbacks import AgentRunContext, CallbackManager
+from backend.agent.react_agent import OpenAIAgent
+from backend.mcp_tool.client import McpClientManager, McpServerConfig
 from backend.mcp_tool.config import McpTransport, load_scoped_mcp_servers
 from backend.permissions import check_permission
-from access_layer.sessions.store import SessionStore
 from backend.skills import clear_skill_caches, get_available_skills, activate_skills_for_paths
 from backend.tools.local import build_skill_tool, invoke_skill
 from backend.watchers import PollingChangeWatcher
@@ -46,10 +49,36 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.servers[0].type, McpTransport.HTTP)
             self.assertEqual(result.servers[0].url, "https://example.test/mcp")
 
+    async def test_mcp_connect_timeout_closes_cold_start_process(self) -> None:
+        async def wait_forever() -> None:
+            await asyncio.Event().wait()
+
+        session = SimpleNamespace(
+            session=None,
+            connect=AsyncMock(side_effect=wait_forever),
+            close=AsyncMock(),
+        )
+        server = McpServerConfig(
+            id="cold-uvx",
+            scope="local",
+            type="stdio",
+            command="uvx",
+            args=["example-mcp"],
+            env={},
+        )
+        manager = McpClientManager([server], connect_timeout_seconds=0.01)
+
+        with patch("backend.mcp_tool.client.McpSession", return_value=session):
+            await manager.connect_all()
+
+        session.close.assert_awaited_once()
+        self.assertIn("cold-uvx", manager.failed)
+
     def test_skill_dir_frontmatter_and_conditional_activation(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            skill_dir = root / ".k_agent" / "skills" / "planner"
+            data_skills = root / "data" / "skill"
+            skill_dir = data_skills / "planner"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
                 "---\n"
@@ -61,23 +90,60 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 "Plan $ARGUMENTS from ${K_AGENT_SKILL_DIR}",
                 encoding="utf-8",
             )
-            self.assertEqual(get_available_skills(root), [])
-            activated = activate_skills_for_paths([root / "notes.md"], root)
-            self.assertEqual([skill.name for skill in activated], ["planner"])
-            self.assertEqual(get_available_skills(root)[0].argument_hint, "<topic>")
+            with patch("backend.skills.loader.DATA_SKILLS_DIR", data_skills):
+                self.assertEqual(get_available_skills(root), [])
+                activated = activate_skills_for_paths([root / "notes.md"], root)
+                self.assertEqual([skill.id for skill in activated], ["planner"])
+                self.assertEqual(get_available_skills(root)[0].argument_hint, "<topic>")
 
     async def test_skill_tool_expands_content_on_invocation(self) -> None:
-        with TemporaryDirectory() as tmp, patch.dict("os.environ", {"K_AGENT_SKILLS_DIR": str(Path(tmp) / "skills")}, clear=False):
-            skill_dir = Path(tmp) / "skills" / "remember"
+        with TemporaryDirectory() as tmp:
+            data_skills = Path(tmp) / "data" / "skill"
+            skill_dir = data_skills / "remember"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
                 "---\ndescription: Remember things\narguments: item\n---\nRemember ${item}.",
                 encoding="utf-8",
             )
-            clear_skill_caches()
-            result = json.loads(await invoke_skill({"skill": "remember", "args": "tea"}))
+            result = json.loads(
+                await invoke_skill(
+                    {"skill": "remember", "args": "tea"},
+                    [
+                        {
+                            "id": "remember",
+                            "name": "remember",
+                            "instructions": "Remember ${item}.",
+                            "argumentNames": ["item"],
+                            "baseDir": str(skill_dir),
+                            "enabled": True,
+                        }
+                    ],
+                )
+            )
             self.assertTrue(result["success"])
             self.assertIn("Remember tea.", result["content"])
+
+    def test_only_data_skill_directory_is_loaded(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_skills = root / "data" / "skill"
+            data_skill = data_skills / "writer"
+            project_skill = root / ".k_agent" / "skills" / "ignored"
+            user_skill = root / "user-skills" / "ignored-user"
+            for directory, name in (
+                (data_skill, "写作助手"),
+                (project_skill, "项目 Skill"),
+                (user_skill, "用户 Skill"),
+            ):
+                directory.mkdir(parents=True)
+                (directory / "SKILL.md").write_text(
+                    f"---\nname: {name}\ndescription: test\n---\nDo work.",
+                    encoding="utf-8",
+                )
+            with patch("backend.skills.loader.DATA_SKILLS_DIR", data_skills):
+                clear_skill_caches()
+                loaded = get_available_skills(root)
+            self.assertEqual([(skill.id, skill.name) for skill in loaded], [("writer", "写作助手")])
 
     async def test_skill_tool_can_call_mcp_prompt(self) -> None:
         async def call_prompt(server_id: str, prompt_name: str, arguments: dict):
@@ -87,6 +153,55 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         result = json.loads(await tool.execute({"skill": "mcp__calendar__create_event", "args": "tomorrow"}))
         self.assertEqual(result["server"], "calendar")
         self.assertEqual(result["prompt"], "create_event")
+
+    async def test_selected_skill_name_is_normalized_to_skill_tool(self) -> None:
+        skill = {
+            "id": "find-skill-skillhub",
+            "name": "find-skill-skillhub",
+            "instructions": "Search SkillHub for $ARGUMENTS.",
+            "enabled": True,
+        }
+        agent = OpenAIAgent(
+            [build_skill_tool(skills=[skill])],
+            McpClientManager([]),
+            skills=[skill],
+        )
+
+        result = json.loads(
+            await agent._run_tool(
+                callbacks=CallbackManager(),
+                context=AgentRunContext(run_id="test-run"),
+                iteration=0,
+                tool_name="find-skill-skillhub",
+                arguments={"skill": "外卖 点餐 订餐 food delivery"},
+            )
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["commandName"], "find-skill-skillhub")
+        self.assertIn(
+            "Search SkillHub for 外卖 点餐 订餐 food delivery.",
+            result["content"],
+        )
+
+    async def test_unselected_direct_skill_name_still_fails_closed(self) -> None:
+        agent = OpenAIAgent(
+            [build_skill_tool(skills=[])],
+            McpClientManager([]),
+            skills=[],
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Unknown tool requested: find-skill-skillhub",
+        ):
+            await agent._run_tool(
+                callbacks=CallbackManager(),
+                context=AgentRunContext(run_id="test-run"),
+                iteration=0,
+                tool_name="find-skill-skillhub",
+                arguments={"skill": "外卖"},
+            )
 
     def test_permission_rules_deny(self) -> None:
         with TemporaryDirectory() as tmp, patch.dict("os.environ", {"K_AGENT_PERMISSION_RULES": str(Path(tmp) / "permissions.json")}, clear=False):
@@ -101,7 +216,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as tmp:
             changed = asyncio.Event()
             root = Path(tmp)
-            watched = root / "K_AGENT.md"
+            watched = root / "CLAUDE.md"
             watched.write_text("initial", encoding="utf-8")
             watcher = PollingChangeWatcher([root], lambda _: changed.set(), interval_seconds=0.05)
             watcher.start()
@@ -109,61 +224,6 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             watched.write_text("updated", encoding="utf-8")
             await asyncio.wait_for(changed.wait(), timeout=1)
             await watcher.stop()
-
-    def test_session_load_keeps_thinking_boundaries_and_removes_tool_steps(self) -> None:
-        payload = {
-            "id": "session-1",
-            "title": "legacy",
-            "messages": [
-                {
-                    "id": "assistant-1",
-                    "role": "assistant",
-                    "content": "done",
-                    "createdAt": "2026-07-28T12:00:00+00:00",
-                    "meta": {
-                        "thinkingGroups": [
-                            {
-                                "id": "g1",
-                                "steps": [{"id": "s1", "phase": "reasoning", "title": "分析并决定下一步"}],
-                                "closed": True,
-                                "textStart": 0,
-                                "textEnd": 0,
-                            },
-                            {
-                                "id": "g2",
-                                "steps": [{"id": "s2", "phase": "tool", "title": "调用 append_personal_memory"}],
-                                "closed": True,
-                                "textStart": 8,
-                                "textEnd": 8,
-                            },
-                        ]
-                    },
-                }
-            ],
-            "thinkingGroups": [
-                {
-                    "id": "g1",
-                    "steps": [{"id": "s1", "phase": "reasoning", "title": "分析并决定下一步"}],
-                    "closed": True,
-                    "textStart": 0,
-                    "textEnd": 0,
-                },
-                {
-                    "id": "g2",
-                    "steps": [{"id": "s2", "phase": "tool", "title": "调用 append_personal_memory"}],
-                    "closed": True,
-                    "textStart": 8,
-                    "textEnd": 8,
-                },
-            ],
-            "updatedAt": "2026-07-28T12:00:00+00:00",
-        }
-
-        record = SessionStore._record_from_payload(payload)
-        self.assertEqual(len(record.thinking_groups), 1)
-        self.assertEqual(len(record.messages[0].meta.thinking_groups), 1)
-        self.assertEqual([step["id"] for step in record.messages[0].meta.thinking_groups[0]["steps"]], ["s1"])
-
 
 if __name__ == "__main__":
     unittest.main()

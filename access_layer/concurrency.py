@@ -1,3 +1,5 @@
+"""Concurrency guards for global request capacity and per-session serialization."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +10,8 @@ from typing import AsyncIterator
 
 @dataclass(frozen=True, slots=True)
 class ConcurrencySnapshot:
+    """Point-in-time usage counters exposed for health and diagnostics."""
+
     max_concurrent_requests: int
     active_requests: int
     available_request_slots: int
@@ -27,6 +31,7 @@ class RequestConcurrencyLimiter:
     """
 
     def __init__(self, max_concurrent_requests: int, acquire_timeout_seconds: float) -> None:
+        """初始化对象依赖和内部状态。"""
         self.max_concurrent_requests = max(1, max_concurrent_requests)
         self.acquire_timeout_seconds = max(0.0, acquire_timeout_seconds)
         self._request_slots = asyncio.BoundedSemaphore(self.max_concurrent_requests)
@@ -64,6 +69,8 @@ class RequestConcurrencyLimiter:
                 self._request_slots.release()
 
     async def snapshot(self) -> ConcurrencySnapshot:
+        """Return counters without exposing or mutating the underlying locks."""
+
         async with self._active_guard:
             active = self._active_requests
         return ConcurrencySnapshot(
@@ -74,6 +81,7 @@ class RequestConcurrencyLimiter:
         )
 
     async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """按 session_id 获取或创建串行化锁。"""
         async with self._session_locks_guard:
             lock = self._session_locks.get(session_id)
             if lock is None:
@@ -83,4 +91,4 @@ class RequestConcurrencyLimiter:
 
 
 class ConcurrencyLimitExceeded(RuntimeError):
-    pass
+    """Raised when request capacity cannot be acquired before the timeout."""

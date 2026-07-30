@@ -7,16 +7,7 @@ export interface ChatMessage {
   createdAt: string;
   meta?: {
     toolName?: string;
-    thinkingGroups?: Array<{
-      id: string;
-      steps: ThinkingActivity[];
-      closed: boolean;
-      textStart?: number;
-      textEnd?: number;
-      sequence?: number;
-    }>;
-    toolActivities?: ToolActivity[];
-    textActivities?: TextActivity[];
+    runId?: string;
   };
 }
 
@@ -33,13 +24,14 @@ export interface SessionState {
   trace: string[];
   tasks: string[];
   thinking: ThinkingActivity[];
-  thinkingGroups?: Array<{
-    id: string;
-    steps: ThinkingActivity[];
-    closed: boolean;
-    textStart?: number;
-    textEnd?: number;
-  }>;
+  events?: AgUiEvent[];
+  contextSummary?: string;
+  compactedMessageIds?: string[];
+  contextStats?: Record<string, unknown>;
+  capabilities?: {
+    mcpServerIds: string[];
+    skillIds: string[];
+  } | null;
 }
 
 export interface HealthState {
@@ -60,19 +52,29 @@ export interface ModelProfile {
   apiKeyEnv?: string;
   multimodal: boolean;
   supportsReasoning: boolean;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  contextSafetyTokens?: number;
   enabled: boolean;
+  isNew?: boolean;
 }
 
 export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
 
 export interface McpServerConfig {
   id: string;
-  type?: "stdio" | "sse" | "http" | "ws" | "sdk";
+  name?: string;
+  description?: string;
+  type?: "stdio" | "http";
   command?: string;
   args: string[];
   env: Record<string, string>;
+  envPassthrough?: string[];
+  cwd?: string;
   url?: string;
+  bearerTokenEnv?: string;
   headers?: Record<string, string>;
+  envHeaders?: Record<string, string>;
   enabled: boolean;
   connected?: boolean;
   status?: "connected" | "failed" | "disabled" | "pending" | "unknown";
@@ -81,6 +83,7 @@ export interface McpServerConfig {
   toolCount?: number;
   resourceCount?: number;
   error?: string | null;
+  isNew?: boolean;
 }
 
 export interface SkillConfig {
@@ -97,6 +100,14 @@ export interface SkillConfig {
   whenToUse?: string | null;
   userInvocable?: boolean;
   editable?: boolean;
+  isNew?: boolean;
+}
+
+export interface RuntimeOption {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
 }
 
 export interface McpCapabilities {
@@ -112,6 +123,11 @@ export type AgUiEvent =
   | { type: "TEXT_MESSAGE_START"; messageId: string; role: "assistant" }
   | { type: "TEXT_MESSAGE_CONTENT"; messageId: string; delta: string }
   | { type: "TEXT_MESSAGE_END"; messageId: string }
+  | { type: "REASONING_START"; messageId: string }
+  | { type: "REASONING_MESSAGE_START"; messageId: string; role: "reasoning"; rawEvent?: unknown }
+  | { type: "REASONING_MESSAGE_CONTENT"; messageId: string; delta: string; rawEvent?: unknown }
+  | { type: "REASONING_MESSAGE_END"; messageId: string; rawEvent?: unknown }
+  | { type: "REASONING_END"; messageId: string }
   | { type: "THINKING_START"; title?: string }
   | { type: "THINKING_TEXT_MESSAGE_START"; rawEvent?: unknown }
   | { type: "THINKING_TEXT_MESSAGE_CONTENT"; delta: string; rawEvent?: unknown }
@@ -127,21 +143,7 @@ export type AgUiEvent =
       content: string;
       role?: "tool";
     }
-  | { type: "STATE_SNAPSHOT"; snapshot: AgentState }
   | { type: "CUSTOM"; name: string; value: Record<string, unknown> };
-
-export interface AgentState {
-  sessionId: string;
-  messages: ChatMessage[];
-  trace: string[];
-  tasks: string[];
-  thinking: ThinkingActivity[];
-  thinkingGroups?: Array<{
-    id: string;
-    steps: ThinkingActivity[];
-    closed: boolean;
-  }>;
-}
 
 export interface ThinkingActivity {
   id: string;
@@ -156,11 +158,7 @@ export interface ThinkingActivity {
 export interface AgUiRunInput {
   threadId: string;
   runId: string;
-  state: {
-    sessionId: string | null;
-    trace: string[];
-    tasks: string[];
-  };
+  state: Record<string, never>;
   messages: Array<Pick<ChatMessage, "id" | "role" | "content">>;
   tools: unknown[];
   context: unknown[];
@@ -175,16 +173,18 @@ export interface AgUiRunInput {
 
 export interface ToolActivity {
   id: string;
+  turnId: string;
   name: string;
   arguments: string;
   result?: string;
-  status: "preparing" | "running" | "waiting" | "complete";
+  status: "preparing" | "running" | "waiting" | "complete" | "error";
   sequence?: number;
   textOffset?: number;
 }
 
 export interface TextActivity {
   id: string;
+  turnId: string;
   content: string;
   status: "streaming" | "complete";
   sequence: number;

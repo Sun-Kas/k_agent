@@ -1,3 +1,50 @@
 {
-  "servers": []
+  "mcpServers": {
+    "mcd-mcp": {
+      "type": "http",
+      "command": null,
+      "args": [],
+      "env": {},
+      "envPassthrough": [],
+      "cwd": null,
+      "url": "https://mcp.mcd.cn",
+      "bearerTokenEnv": "MCD_MCP_APIKEY",
+      "headers": {},
+      "envHeaders": {},
+      "enabled": true
+    },
+    "flight-price-compare": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--with",
+        "mcp[cli]>=1.9.2,<2",
+        "flight-price-compare-mcp==3.3.3"
+      ],
+      "env": {},
+      "envPassthrough": [],
+      "cwd": null,
+      "url": null,
+      "bearerTokenEnv": null,
+      "headers": {},
+      "envHeaders": {},
+      "enabled": true
+    },
+    "12306-mcp": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "12306-mcp"
+      ],
+      "env": {},
+      "envPassthrough": [],
+      "cwd": null,
+      "url": null,
+      "bearerTokenEnv": null,
+      "headers": {},
+      "envHeaders": {},
+      "enabled": true
+    }
+  }
 }

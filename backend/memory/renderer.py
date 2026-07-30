@@ -1,3 +1,5 @@
+"""Render discovered memory files into bounded prompt context sections."""
+
 from __future__ import annotations
 
 from backend.memory.constants import MAX_MEMORY_CHARACTER_COUNT, MEMORY_INSTRUCTION_PROMPT
@@ -19,6 +21,7 @@ def get_memory_context(
     *,
     max_chars: int = MAX_MEMORY_CHARACTER_COUNT,
 ) -> str:
+    """按预算把 memory 文件渲染为 prompt 上下文。"""
     blocks: list[str] = []
     total_chars = 0
     for memory_file in _budgeted_files(memory_files, max_chars=max_chars):
@@ -58,6 +61,7 @@ def _budgeted_files(memory_files: list[MemoryFile], *, max_chars: int) -> list[M
 
 
 def _description(memory_type: MemoryType) -> str:
+    """把 memory 类型转换为 prompt 中的说明文字。"""
     if memory_type == MemoryType.PROJECT:
         return " (workspace instructions, shared with this project)"
     if memory_type == MemoryType.LOCAL:

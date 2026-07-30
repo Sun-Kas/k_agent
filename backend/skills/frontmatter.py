@@ -1,3 +1,5 @@
+"""Parse the supported YAML-like frontmatter subset used by Skill markdown files."""
+
 from __future__ import annotations
 
 import re
@@ -5,6 +7,7 @@ from typing import Any
 
 
 def parse_markdown_frontmatter(content: str) -> tuple[dict[str, Any], str]:
+    """拆分 SKILL.md frontmatter 和正文。"""
     if not content.startswith("---\n"):
         return {}, content
     end = content.find("\n---", 4)
@@ -18,6 +21,7 @@ def parse_markdown_frontmatter(content: str) -> tuple[dict[str, Any], str]:
 
 
 def split_frontmatter_list(value: Any) -> list[str]:
+    """把 frontmatter 字段转换为字符串列表。"""
     if value is None:
         return []
     if isinstance(value, list):
@@ -31,6 +35,7 @@ def split_frontmatter_list(value: Any) -> list[str]:
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
+    """按常见字符串规则解析布尔配置。"""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -39,6 +44,7 @@ def parse_bool(value: Any, default: bool = False) -> bool:
 
 
 def _parse_simple_yaml(raw: str) -> dict[str, Any]:
+    """解析当前支持的简单 YAML frontmatter。"""
     result: dict[str, Any] = {}
     current_key: str | None = None
     for line in raw.splitlines():
@@ -60,4 +66,3 @@ def _parse_simple_yaml(raw: str) -> dict[str, Any]:
         else:
             result[key] = value.strip("\"'")
     return result
-

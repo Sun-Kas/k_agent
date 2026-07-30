@@ -7,6 +7,10 @@ const forbiddenPatterns = [
   /\.\.\/\.\.\/backend/,
   /from\s+["'][^"']*backend/,
   /import\s*\([^)]*backend/,
+  /\/internal\//,
+  /localhost:3002/,
+  /127\.0\.0\.1:3002/,
+  /\bAGENT_BACKEND\b/,
   /\bfs\b/,
   /readFile|writeFile/
 ];
@@ -33,7 +37,7 @@ for (const file of collectFiles(sourceRoot)) {
 }
 
 if (violations.length) {
-  console.error("Frontend boundary violation: frontend/src must use HTTP APIs instead of backend files.");
+  console.error("Frontend boundary violation: frontend/src must only communicate with the Access Layer /api/* surface.");
   console.error(violations.join("\n"));
   process.exit(1);
 }

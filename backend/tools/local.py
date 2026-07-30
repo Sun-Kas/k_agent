@@ -1,3 +1,5 @@
+"""Built-in local tools for memory operations, utility calls, and Skill invocation."""
+
 from __future__ import annotations
 
 import json
@@ -7,14 +9,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.memory import append_auto_memory, compact_auto_memory, read_auto_memory, search_auto_memory
-from backend.skills import get_available_skills
-
-
 ToolExecutor = Callable[[dict[str, Any]], Awaitable[str]]
 
 
 @dataclass(slots=True)
 class ToolDefinition:
+    """描述一个本地工具的 schema 和执行函数。"""
     name: str
     description: str
     parameters: dict[str, Any]
@@ -22,19 +22,23 @@ class ToolDefinition:
 
 
 async def get_current_time(_: dict[str, Any]) -> str:
+    """返回当前 ISO 时间。"""
     return json.dumps({"now": datetime.now(timezone.utc).isoformat()})
 
 
 async def echo_text(payload: dict[str, Any]) -> str:
+    """返回输入文本用于工具链路测试。"""
     return json.dumps({"echoed": str(payload.get("text", ""))})
 
 
 async def read_personal_memory(_: dict[str, Any]) -> str:
+    """读取个人 memory 工具实现。"""
     path, content = read_auto_memory()
     return json.dumps({"path": str(path), "content": content}, ensure_ascii=False)
 
 
 async def append_personal_memory(payload: dict[str, Any]) -> str:
+    """追加个人 memory 工具实现。"""
     text = str(payload.get("text", "")).strip()
     if not text:
         return json.dumps({"ok": False, "error": "text is required"}, ensure_ascii=False)
@@ -43,36 +47,53 @@ async def append_personal_memory(payload: dict[str, Any]) -> str:
 
 
 async def search_personal_memory(payload: dict[str, Any]) -> str:
+    """搜索个人 memory 工具实现。"""
     query = str(payload.get("query", "")).strip().lower()
     path, matches = search_auto_memory(query)
     return json.dumps({"path": str(path), "matches": matches}, ensure_ascii=False)
 
 
 async def compact_personal_memory(payload: dict[str, Any]) -> str:
+    """压缩个人 memory 工具实现。"""
     max_items = int(payload.get("maxItems", 200))
     path, before, after = compact_auto_memory(max_items=max_items)
     return json.dumps({"ok": True, "path": str(path), "itemsBefore": before, "itemsAfter": after}, ensure_ascii=False)
 
 
-async def invoke_skill(payload: dict[str, Any]) -> str:
+async def invoke_skill(
+    payload: dict[str, Any], skills: list[dict[str, Any]] | None = None
+) -> str:
+    """Execute a Skill definition supplied with the current run."""
     skill_name = str(payload.get("skill", "")).strip().lstrip("/")
     args = str(payload.get("args", "")).strip()
     if not skill_name:
         return json.dumps({"success": False, "error": "skill is required"}, ensure_ascii=False)
-    skill = next((item for item in get_available_skills() if item.name == skill_name), None)
+    skill = next(
+        (
+            item
+            for item in skills or []
+            if skill_name in {str(item.get("id")), str(item.get("name"))}
+        ),
+        None,
+    )
     if skill is None:
         return json.dumps({"success": False, "error": f"Unknown skill: {skill_name}"}, ensure_ascii=False)
-    if skill.disable_model_invocation:
+    if not skill.get("enabled", True):
         return json.dumps({"success": False, "error": f"Skill {skill_name} cannot be invoked by the model"}, ensure_ascii=False)
-    content = _render_skill_content(skill.content, args, skill.argument_names, skill.base_dir)
-    hook_notes = _render_skill_hooks(skill.hooks)
+    content = _render_skill_content(
+        str(skill.get("instructions") or ""),
+        args,
+        tuple(str(value) for value in skill.get("argumentNames", [])),
+        str(skill.get("baseDir")) if skill.get("baseDir") else None,
+    )
+    hook_notes = _render_skill_hooks(skill.get("hooks", {}))
     return json.dumps(
         {
             "success": True,
-            "commandName": skill.name,
-            "status": skill.execution_context,
-            "allowedTools": list(skill.allowed_tools),
-            "model": skill.model,
+            "commandName": skill.get("name") or skill.get("id"),
+            "status": skill.get("executionContext", "inline"),
+            "allowedTools": list(skill.get("allowedTools", [])),
+            "model": skill.get("model"),
             "content": content,
             "hooks": hook_notes,
         },
@@ -80,17 +101,21 @@ async def invoke_skill(payload: dict[str, Any]) -> str:
     )
 
 
-def build_skill_tool(mcp_prompt_caller: Callable[[str, str, dict[str, Any]], Awaitable[str]] | None = None) -> ToolDefinition:
+def build_skill_tool(
+    mcp_prompt_caller: Callable[[str, str, dict[str, Any]], Awaitable[str]] | None = None,
+    skills: list[dict[str, Any]] | None = None,
+) -> ToolDefinition:
     """Build Skill as a closure so MCP prompt skills can call the active manager."""
 
     async def execute(payload: dict[str, Any]) -> str:
+        """执行闭包绑定的工具逻辑。"""
         skill_name = str(payload.get("skill", "")).strip().lstrip("/")
         args = str(payload.get("args", "")).strip()
         if skill_name.startswith("mcp__") and mcp_prompt_caller is not None:
             _, server_id, *prompt_parts = skill_name.split("__")
             prompt_name = "__".join(prompt_parts)
             return await mcp_prompt_caller(server_id, prompt_name, {"args": args} if args else {})
-        return await invoke_skill(payload)
+        return await invoke_skill(payload, skills)
 
     return ToolDefinition(
         name="Skill",
@@ -115,6 +140,7 @@ def build_skill_tool(mcp_prompt_caller: Callable[[str, str, dict[str, Any]], Awa
 
 
 def _render_skill_content(content: str, args: str, argument_names: tuple[str, ...], base_dir: str | None) -> str:
+    """渲染 Skill 的正文、路径和使用条件。"""
     rendered = content.replace("$ARGUMENTS", args)
     for index, name in enumerate(argument_names):
         value = args.split()[index] if index < len(args.split()) else ""

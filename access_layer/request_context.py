@@ -1,3 +1,5 @@
+"""Request-scoped identifiers propagated across asynchronous access-layer work."""
+
 from __future__ import annotations
 
 import uuid
@@ -22,14 +24,17 @@ _request_context: ContextVar[RequestContext | None] = ContextVar("request_contex
 
 
 def new_request_context(path: str = "", method: str = "", request_id: str | None = None) -> RequestContext:
+    """创建带 request_id 的请求上下文对象。"""
     return RequestContext(request_id=request_id or str(uuid.uuid4()), path=path, method=method)
 
 
 def get_request_context() -> RequestContext | None:
+    """读取当前协程中的请求上下文。"""
     return _request_context.get()
 
 
 def set_request_context(context: RequestContext) -> Token[RequestContext | None]:
+    """设置当前协程请求上下文并返回恢复 token。"""
     return _request_context.set(context)
 
 
@@ -40,4 +45,5 @@ def update_request_context(**changes: str | None) -> Token[RequestContext | None
 
 
 def reset_request_context(token: Token[RequestContext | None]) -> None:
+    """用 token 恢复之前的请求上下文。"""
     _request_context.reset(token)

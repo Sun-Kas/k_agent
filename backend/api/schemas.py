@@ -1,23 +1,25 @@
+"""Pydantic schemas exposed by access-layer configuration and session APIs."""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 
 
 class ChatMeta(BaseModel):
+    """描述消息附加元数据，如工具名和 run ID。"""
     model_config = ConfigDict(populate_by_name=True)
     tool_name: str | None = Field(default=None, alias="toolName")
-    thinking_groups: list[dict[str, Any]] = Field(default_factory=list, alias="thinkingGroups")
-    tool_activities: list[dict[str, Any]] = Field(default_factory=list, alias="toolActivities")
-    text_activities: list[dict[str, Any]] = Field(default_factory=list, alias="textActivities")
+    run_id: str | None = Field(default=None, alias="runId")
 
 
 class ChatMessage(BaseModel):
+    """描述可写入历史并参与下一轮上下文的消息。"""
     model_config = ConfigDict(populate_by_name=True)
     id: str
     role: ChatRole
@@ -27,22 +29,33 @@ class ChatMessage(BaseModel):
 
 
 class SessionSummary(BaseModel):
+    """描述会话列表中的轻量摘要。"""
     id: str
     title: str
     updated_at: datetime = Field(alias="updatedAt")
     message_count: int = Field(alias="messageCount")
 
 
+class SessionCapabilities(BaseModel):
+    """Persisted MCP and Skill selection for one conversation session."""
+    model_config = ConfigDict(populate_by_name=True)
+    mcp_server_ids: list[str] = Field(default_factory=list, alias="mcpServerIds")
+    skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
+
+
 class SessionState(BaseModel):
+    """描述单个会话详情和原始 AG-UI events。"""
     session_id: str = Field(alias="sessionId")
     messages: list[ChatMessage]
     trace: list[str]
     tasks: list[str]
     thinking: list[dict[str, Any]] = Field(default_factory=list)
-    thinking_groups: list[dict[str, Any]] = Field(default_factory=list, alias="thinkingGroups")
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    capabilities: SessionCapabilities | None = None
 
 
 class HealthResponse(BaseModel):
+    """描述 Access Layer 健康检查响应。"""
     model_config = ConfigDict(populate_by_name=True)
     ok: bool
     model: str
@@ -52,6 +65,7 @@ class HealthResponse(BaseModel):
 
 
 class ModelProfileInput(BaseModel):
+    """描述配置中心提交的模型配置项。"""
     model_config = ConfigDict(populate_by_name=True)
     id: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=120)
@@ -61,31 +75,63 @@ class ModelProfileInput(BaseModel):
     api_key_env: str | None = Field(default=None, alias="apiKeyEnv")
     multimodal: bool = False
     supports_reasoning: bool = Field(default=False, alias="supportsReasoning")
+    context_window: int = Field(default=128_000, alias="contextWindow", ge=8_000)
+    max_output_tokens: int = Field(default=8_192, alias="maxOutputTokens", ge=256)
+    context_safety_tokens: int = Field(default=4_096, alias="contextSafetyTokens", ge=0)
     enabled: bool = True
 
 
 class ModelsConfigUpdate(BaseModel):
+    """描述模型配置更新请求。"""
     models: list[ModelProfileInput]
 
 
 class McpServerInput(BaseModel):
+    """描述配置中心提交的 MCP server 配置项。"""
     model_config = ConfigDict(populate_by_name=True)
 
     id: str = Field(min_length=1, max_length=80)
-    type: Literal["stdio", "sse", "http", "ws", "sdk"] = "stdio"
+    name: str | None = Field(default=None, max_length=120)
+    description: str = Field(default="", max_length=500)
+    type: Literal["stdio", "http"] = "stdio"
     command: str | None = None
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    env_passthrough: list[str] = Field(default_factory=list, alias="envPassthrough")
+    cwd: str | None = None
     url: str | None = None
+    bearer_token_env: str | None = Field(
+        default=None,
+        alias="bearerTokenEnv",
+        pattern=r"^[A-Z_][A-Z0-9_]*$",
+    )
     headers: dict[str, str] = Field(default_factory=dict)
+    env_headers: dict[str, str] = Field(default_factory=dict, alias="envHeaders")
     enabled: bool = True
+
+    @field_validator(
+        "command",
+        "cwd",
+        "url",
+        "bearer_token_env",
+        mode="before",
+    )
+    @classmethod
+    def empty_optional_strings_are_none(cls, value: Any) -> Any:
+        """Treat blank hidden form fields as absent before pattern validation."""
+
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 class McpConfigUpdate(BaseModel):
+    """描述 MCP 配置更新请求。"""
     servers: list[McpServerInput]
 
 
 class SkillInput(BaseModel):
+    """描述配置中心提交的 Skill 配置项。"""
     id: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
@@ -94,10 +140,12 @@ class SkillInput(BaseModel):
 
 
 class SkillsConfigUpdate(BaseModel):
+    """描述 Skill 配置更新请求。"""
     skills: list[SkillInput]
 
 
 class SkillCreateInput(BaseModel):
+    """描述创建 Skill 的请求字段。"""
     id: str = Field(min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)

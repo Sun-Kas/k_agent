@@ -1,3 +1,5 @@
+"""Storage backend factory selected from runtime settings."""
+
 from __future__ import annotations
 
 from backend.config import Settings

@@ -7,7 +7,6 @@ from backend.skills.loader import (
     clear_skill_caches,
     get_available_skills,
     load_skill_registry,
-    mcp_prompt_to_skill,
 )
 
 __all__ = [
@@ -17,5 +16,4 @@ __all__ = [
     "clear_skill_caches",
     "get_available_skills",
     "load_skill_registry",
-    "mcp_prompt_to_skill",
 ]

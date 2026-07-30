@@ -2,6 +2,58 @@
 
 > 维护约定：后续涉及前后端接口、MCP/Skill/Memory 加载链路、系统提示词拼接、权限边界或缓存策略的重要修改，都需要在本文追加记录。
 
+## 2026-07-29 Agent Backend Langfuse 可观测性
+
+- Agent Backend 启动时从进程环境读取 `LANGFUSE_PUBLIC_KEY`、
+  `LANGFUSE_SECRET_KEY`、`LANGFUSE_BASE_URL`，执行鉴权检查，并在
+  `GET /internal/health` 的 `langfuse` 字段返回
+  `configured/enabled/authenticated/lastError`，不返回凭据。
+- 每次 `/internal/agent/run` 创建一个 `agent` 根观测，以前端 session ID
+  作为 Langfuse session；每轮模型调用创建 `generation`，每次本地或 MCP
+  工具调用创建 `tool` 子观测。
+- Trace 元数据包含请求 run ID、模型、MCP/Skill ID、推理强度、Memory 数量和
+  request ID；模型输入输出、工具参数结果和耗时记录在对应观测中。
+- 常见 token、password、secret、Authorization 等字段统一脱敏；图片 Data URL
+  只记录媒体类型。SDK 初始化、更新、结束、刷新失败均采用 fail-open 策略，
+  不影响 Agent 正常执行。
+- 进程关闭时执行 `flush()` 和 `shutdown()`；可通过
+  `LANGFUSE_ENABLED`、`LANGFUSE_TRACING_ENVIRONMENT`、
+  `LANGFUSE_SAMPLE_RATE`、`LANGFUSE_TIMEOUT_SECONDS` 调整运行行为。
+
+## 2026-07-29 会话级 MCP/Skill 选择
+
+- 每次 `POST /api/agent` 开始运行时，Access Layer 把本轮
+  `mcpServerIds`、`skillIds` 写入对应的 `data/sessions/{sessionId}.json`。
+- `GET /api/sessions/{sessionId}` 新增可空的 `capabilities`：
+  `{"mcpServerIds": string[], "skillIds": string[]}`。缺少该字段表示旧会话尚未保存
+  选择；字段存在且数组为空表示用户明确取消全部能力。
+- 前端打开或切换会话时恢复该会话的选择，目录刷新只移除已禁用或已删除的条目；
+  同一会话后续消息默认沿用，直到用户修改。新会话仍使用 MCP 默认全选、Skill
+  默认不选，并且不会继承其他会话的偏好。
+
+## 2026-07-29 MCP/Skill 摘要目录归属 Access Layer
+
+- 新增 `data/mcp.json` 与 `data/skill.json`，仅保存前端选择列表需要的
+  `id/name/description/enabled`；`GET /api/catalog` 直接读取这两个文件，不连接
+  Agent Backend，也不扫描 `SKILL.md`。
+- `GET/PUT /api/config/mcp` 与 `GET/PUT /api/config/skills` 改由 Access Layer
+  管理。MCP 保存后仅通知 Agent Backend 重载连接；Skill 保存或导入不再要求
+  Agent Backend 重载列表。
+- `POST /internal/agent/run` 不再接收 `mcpServerIds`、`skillIds`，改为接收由
+  Access Layer 校验并解析好的 `mcpServers`、`skills` 对象数组。
+- Access Layer 仅在发起运行时读取被选中 Skill 的 `SKILL.md`，并把摘要、指令及
+  执行元数据一并发送。Agent Backend 的 Skill 工具只使用请求内定义，不访问
+  Skill 目录。
+- 每次运行的 MCP manager 只使用请求内携带的选中 MCP 连接定义；MCP/Skill
+  摘要同时进入本轮上下文，Agent Backend 不再提供内部配置列表接口。
+- MCP 配置保存或重新载入后，Access Layer 会把 Agent Backend 的真实连接状态
+  合并回每个服务，前端展示 `已连接/连接失败/已禁用/连接中`，并在失败时显示
+  原始错误摘要。`bearerTokenEnv` 只接受大写环境变量名，避免把令牌内容误填为
+  变量名。
+- 公共配置初始化时通过 `load_dotenv(..., override=False)` 一次性加载项目根目录
+  `.env`；进程已有变量保持最高优先级，后续 MCP、模型和其他模块统一通过
+  `os.getenv()` / `os.environ` 读取，不再各自解析 `.env`。
+
 ## 2026-07-28 接入层与无状态 Agent Backend
 
 - 请求链路调整为 `frontend -> access_layer -> backend/agent`，其中
@@ -57,7 +109,7 @@
   - `backend/config/runtime/models.config.json`
   - `backend/config/runtime/mcp.config.json`
   - `backend/config/runtime/mcp.config.example.json`
-  - `backend/config/runtime/skills.config.json`
+  - `data/skill/<skill-id>/SKILL.md`
 - `backend/config/config.py` 的 `MCP_CONFIG_PATH` 默认值改为后端运行配置目录。
 - `backend/main.py` 的模型与 Skill 配置常量改为绝对后端路径，避免受启动工作目录影响。
 - `frontend/package.json` 中的后端启动脚本会先 `cd ..` 回到项目根目录，再启动 FastAPI。
@@ -110,10 +162,10 @@
 - `GET /api/config/skills`
   - 用途：同时返回旧 JSON 可编辑 Skill 与后端实际载入 Skill。
   - 返回字段：
-    - `path`：`skills.config.json` 路径。
-    - `projectSkillDir`：项目目录型 Skill 位置，默认为 `.k_agent/skills`。
+    - `path`：统一 Skill 根目录 `data/skill`。
+    - `skillDir`：统一 Skill 根目录，不再区分托管、用户、项目或配置型 Skill。
     - `skills`：旧 JSON 配置项，仍可编辑保存。
-    - `loadedSkills`：后端真实载入列表，包含项目、用户、配置与 MCP Prompt 转换出的 Skill。
+    - `loadedSkills`：后端从 `data/skill` 真实载入的 Skill 列表。
   - `loadedSkills` 元数据：`source/loadedFrom/filePath/baseDir/paths/whenToUse/userInvocable/editable`。
 
 - `PUT /api/config/skills`
@@ -123,7 +175,7 @@
 - `POST /api/skills`
   - 用途：通过 zip 压缩包导入项目目录型 Skill。
   - 请求体：`multipart/form-data`，字段 `file` 为 `.zip` 文件。
-  - 写入位置：`.k_agent/skills/{normalized-name}/`，其中 `normalized-name` 来自 `SKILL.md` frontmatter 的 `name`。
+  - 写入位置：`data/skill/{normalized-name}/`，其中 `normalized-name` 来自 `SKILL.md` frontmatter 的 `name`。
   - 校验规则：
     - 必须是有效 `.zip`，压缩包不超过 20MB，解压后不超过 50MB，文件数不超过 500。
     - 压缩包必须包含且只能包含一个 Skill 入口 `SKILL.md`。

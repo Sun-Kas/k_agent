@@ -1,3 +1,5 @@
+"""Load and evaluate ordered allow/deny rules for agent tool execution."""
+
 from __future__ import annotations
 
 import json
@@ -13,12 +15,16 @@ PermissionBehavior = Literal["allow", "deny", "ask"]
 
 @dataclass(frozen=True)
 class PermissionDecision:
+    """Resolved behavior and optional human-readable matching reason."""
+
     behavior: PermissionBehavior
     reason: str | None = None
 
 
 @dataclass(frozen=True)
 class PermissionRule:
+    """One ordered wildcard rule for a tool and its invocation subject."""
+
     tool: str
     pattern: str
     behavior: PermissionBehavior
@@ -66,6 +72,7 @@ def check_permission(tool_name: str, subject: str | None = None) -> PermissionDe
 
 
 def _rule_paths() -> list[Path]:
+    """返回权限规则文件的候选路径。"""
     configured = os.getenv("K_AGENT_PERMISSION_RULES")
     paths = [Path(configured).expanduser()] if configured else []
     paths.extend([
@@ -76,5 +83,6 @@ def _rule_paths() -> list[Path]:
 
 
 def _matches(pattern: str, value: str) -> bool:
+    """判断权限模式是否匹配工具名或对象。"""
     regex = "^" + re.escape(pattern).replace("\\*", ".*") + "$"
     return re.match(regex, value) is not None

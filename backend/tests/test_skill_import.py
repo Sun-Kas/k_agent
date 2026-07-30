@@ -13,13 +13,31 @@ from access_layer import main
 
 
 class SkillImportTests(unittest.TestCase):
+    def test_configuration_center_writes_data_skill_directories(self) -> None:
+        with TemporaryDirectory() as tmp, patch.object(main, "DATA_SKILLS_DIR", Path(tmp)):
+            main._write_data_skills([
+                {
+                    "id": "writer",
+                    "name": "写作助手",
+                    "description": "帮助写作",
+                    "instructions": "先确认写作目标。",
+                    "enabled": True,
+                }
+            ])
+            skill_file = Path(tmp, "writer", "SKILL.md")
+            self.assertTrue(skill_file.is_file())
+            self.assertIn("name: 写作助手", skill_file.read_text(encoding="utf-8"))
+
+            main._write_data_skills([])
+            self.assertFalse(skill_file.parent.exists())
+
     def test_imports_valid_skill_zip(self) -> None:
         with TemporaryDirectory() as tmp:
             archive = _zip_bytes({
                 "demo-skill/SKILL.md": "---\nname: Demo Skill\ndescription: Useful demo\n---\n\nDo the work.\n",
                 "demo-skill/references/guide.md": "Guide",
             })
-            with patch.object(main, "PROJECT_SKILLS_DIR", Path(tmp)):
+            with patch.object(main, "DATA_SKILLS_DIR", Path(tmp)):
                 skill_id, skill_name, skill_dir = main._validate_and_install_skill_zip(archive, "demo.zip")
 
             self.assertEqual(skill_id, "demo-skill")
@@ -32,7 +50,7 @@ class SkillImportTests(unittest.TestCase):
             "bad/SKILL.md": "---\nname: Bad Skill\n---\n\nMissing description.\n",
         })
 
-        with TemporaryDirectory() as tmp, patch.object(main, "PROJECT_SKILLS_DIR", Path(tmp)):
+        with TemporaryDirectory() as tmp, patch.object(main, "DATA_SKILLS_DIR", Path(tmp)):
             with self.assertRaises(HTTPException) as raised:
                 main._validate_and_install_skill_zip(archive, "bad.zip")
 
@@ -45,7 +63,7 @@ class SkillImportTests(unittest.TestCase):
             "../escape.txt": "nope",
         })
 
-        with TemporaryDirectory() as tmp, patch.object(main, "PROJECT_SKILLS_DIR", Path(tmp)):
+        with TemporaryDirectory() as tmp, patch.object(main, "DATA_SKILLS_DIR", Path(tmp)):
             with self.assertRaises(HTTPException) as raised:
                 main._validate_and_install_skill_zip(archive, "bad.zip")
 
@@ -58,7 +76,7 @@ class SkillImportTests(unittest.TestCase):
             "extra.txt": "unexpected",
         })
 
-        with TemporaryDirectory() as tmp, patch.object(main, "PROJECT_SKILLS_DIR", Path(tmp)):
+        with TemporaryDirectory() as tmp, patch.object(main, "DATA_SKILLS_DIR", Path(tmp)):
             with self.assertRaises(HTTPException) as raised:
                 main._validate_and_install_skill_zip(archive, "good.zip")
 

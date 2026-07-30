@@ -1,3 +1,5 @@
+"""Parse memory frontmatter, includes, rules, and bounded automatic-memory content."""
+
 from __future__ import annotations
 
 import re
@@ -8,6 +10,7 @@ from backend.memory.models import MemoryType, ParsedMemory
 
 
 def parse_memory(raw: str, memory_type: MemoryType) -> ParsedMemory:
+    """解析 memory 文件的 frontmatter、include 和正文。"""
     content = _strip_block_html_comments(raw)
     frontmatter, content = _split_frontmatter(content)
     globs = tuple(_frontmatter_globs(frontmatter))
@@ -24,6 +27,7 @@ def parse_memory(raw: str, memory_type: MemoryType) -> ParsedMemory:
 
 
 def resolve_include(include_path: str, base_dir: Path) -> Path:
+    """根据当前文件目录解析 include 路径。"""
     if include_path.startswith("~/"):
         return Path.home() / include_path[2:]
     if include_path.startswith("/"):
@@ -32,6 +36,7 @@ def resolve_include(include_path: str, base_dir: Path) -> Path:
 
 
 def _split_frontmatter(content: str) -> tuple[str, str]:
+    """拆分 markdown frontmatter 和正文。"""
     if not content.startswith("---\n"):
         return "", content
     end = content.find("\n---", 4)
@@ -44,6 +49,7 @@ def _split_frontmatter(content: str) -> tuple[str, str]:
 
 
 def _frontmatter_globs(frontmatter: str) -> list[str]:
+    """解析 frontmatter 中的路径 glob。"""
     globs: list[str] = []
     capture = False
     for raw_line in frontmatter.splitlines():
@@ -64,6 +70,7 @@ def _frontmatter_globs(frontmatter: str) -> list[str]:
 
 
 def _extract_includes(content: str) -> list[str]:
+    """提取 memory 文件中的 include 指令。"""
     includes: list[str] = []
     in_fenced_block = False
     for line in content.splitlines():
@@ -80,10 +87,12 @@ def _extract_includes(content: str) -> list[str]:
 
 
 def _strip_block_html_comments(content: str) -> str:
+    """移除 memory 正文中的 HTML 注释块。"""
     return re.sub(r"(?ms)^<!--.*?-->\s*", "", content)
 
 
 def _truncate_auto_memory(content: str) -> str:
+    """限制自动 memory 注入到 prompt 的长度。"""
     lines = content.splitlines()
     truncated = False
     if len(lines) > MAX_AUTOMEM_ENTRYPOINT_LINES:
@@ -96,4 +105,3 @@ def _truncate_auto_memory(content: str) -> str:
     if truncated:
         content += "\n\n[Auto memory truncated. Use memory tools or files to inspect the full memory.]"
     return content
-

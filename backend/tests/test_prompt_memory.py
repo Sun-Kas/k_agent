@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from access_layer.session_memory import MEMORY_SESSIONS
+from backend.config import DEFAULT_SYSTEM_PROMPT
 from backend.memory import (
     MemoryFile,
     MemoryType,
@@ -56,25 +57,29 @@ class PromptMemoryTests(unittest.TestCase):
             self.assertTrue(messages[0]["content"].startswith("<system-reminder>"))
             self.assertEqual(messages[-1]["content"], "hello")
 
-    def test_project_memory_files_are_not_discovered(self) -> None:
+    def test_project_memory_files_are_discovered(self) -> None:
         with TemporaryDirectory() as tmp, TemporaryDirectory() as memory_base, patch.dict(
             environ, {"K_AGENT_MEMORY_BASE_DIR": memory_base}, clear=False
         ):
             root = Path(tmp)
-            (root / "K_AGENT.md").write_text("old project instruction\n", encoding="utf-8")
+            (root / "K_AGENT.md").write_text("ignored legacy instruction\n", encoding="utf-8")
+            (root / "CLAUDE.md").write_text("project instruction\n", encoding="utf-8")
 
             files = get_memory_files(root)
 
-            self.assertEqual(files, [])
+            self.assertEqual([item.path for item in files], [(root / "CLAUDE.md").resolve()])
+            self.assertEqual(files[0].type, MemoryType.PROJECT)
 
-    def test_mcp_prompt_is_after_dynamic_boundary(self) -> None:
+    def test_default_prompt_has_one_identity_and_no_internal_context_leaks(self) -> None:
         bundle = build_prompt_bundle(
-            "base",
+            DEFAULT_SYSTEM_PROMPT,
             mcp_tools=[FakeMcpTool(server_id="calendar", name="create_event", description="Create an event.")],
         )
-        before, after = bundle.system_prompt.split("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", 1)
-        self.assertNotIn("mcp__calendar__create_event", before)
-        self.assertIn("mcp__calendar__create_event", after)
+
+        self.assertEqual(bundle.system_prompt.count("You are K Agent"), 1)
+        self.assertNotIn("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", bundle.system_prompt)
+        self.assertNotIn("gitStatus:", bundle.system_prompt)
+        self.assertIn("mcp__calendar__create_event", bundle.system_prompt)
 
     def test_nested_memory_loads_conditional_rules(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -82,14 +87,14 @@ class PromptMemoryTests(unittest.TestCase):
             target = root / "notes" / "plan.md"
             target.parent.mkdir()
             target.write_text("x", encoding="utf-8")
-            rules = root / ".k_agent" / "rules"
+            rules = root / ".claude" / "rules"
             rules.mkdir(parents=True)
             (rules / "plans.md").write_text("---\npaths:\n- \"**/*.md\"\n---\nmarkdown rule", encoding="utf-8")
 
             eager = build_prompt_bundle("base", cwd=root)
             nested, loaded = build_nested_memory_context(root, [target], set(eager.memory_paths))
-            self.assertEqual(nested, {})
-            self.assertEqual(loaded, [])
+            self.assertIn("markdown rule", nested["nestedMemory"])
+            self.assertEqual(loaded, [str((rules / "plans.md").resolve())])
 
     def test_memory_cache_invalidates_when_file_changes(self) -> None:
         with TemporaryDirectory() as tmp, patch.dict(environ, {"K_AGENT_MEMORY_BASE_DIR": tmp}, clear=False):
@@ -123,7 +128,7 @@ class PromptMemoryTests(unittest.TestCase):
 
     def test_classify_memory_paths(self) -> None:
         memory_paths, regular_paths = classify_paths_for_memory([
-            Path("/tmp/K_AGENT.md"),
+            Path("/tmp/CLAUDE.md"),
             Path("/tmp/work/item.txt"),
         ])
         self.assertEqual(len(memory_paths), 1)
@@ -140,9 +145,9 @@ class PromptMemoryTests(unittest.TestCase):
     def test_session_memory_state_tracks_loaded_and_triggers(self) -> None:
         MEMORY_SESSIONS.clear("test-session")
         state = MEMORY_SESSIONS.get("test-session")
-        state.mark_loaded(["/tmp/K_AGENT.md"])
+        state.mark_loaded(["/tmp/CLAUDE.md"])
         state.queue_triggers([Path("/tmp/a.txt")])
-        self.assertIn("/tmp/K_AGENT.md", state.loaded_paths)
+        self.assertIn("/tmp/CLAUDE.md", state.loaded_paths)
         self.assertEqual(state.consume_triggers(), [Path("/tmp/a.txt")])
         self.assertEqual(state.consume_triggers(), [])
 

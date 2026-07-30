@@ -1,8 +1,9 @@
+"""Compose system, user, memory, Skill, and MCP context into effective prompts."""
+
 from __future__ import annotations
 
-import os
 import json
-import subprocess
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,19 +17,6 @@ if TYPE_CHECKING:
     from backend.skills.loader import SkillDefinition
 
 
-# The prompt pipeline keeps long-lived behavior separate from per-request context:
-# system prompt = durable behavior and runtime state;
-# user context = memory/date wrapped in a <system-reminder> before the transcript.
-SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
-
-
-CLI_SYSTEM_PREFIX = """
-You are K Agent, an interactive personal assistant.
-Help the user think, plan, answer questions, and complete tasks across their workspace.
-Use available tools when they improve accuracy or let you take concrete action.
-""".strip()
-
-
 MEMORY_BEHAVIOR_PROMPT = """
 Memory files may contain user and project instructions. Treat them as durable guidance for this workspace.
 When memory instructions conflict with generic behavior, follow the memory instructions unless they are unsafe or impossible.
@@ -38,6 +26,8 @@ Do not mention memory files unless they are relevant to the user's request.
 
 @dataclass(frozen=True)
 class EffectivePrompt:
+    """Rendered prompt plus traceability metadata for its loaded context."""
+
     system_prompt: str
     user_context: dict[str, str]
     system_context: dict[str, str]
@@ -100,7 +90,7 @@ def build_prompt_bundle(
         proactive=proactive,
         mcp_tools=mcp_tools,
     )
-    system_context = get_system_context(cwd)
+    system_context = get_system_context()
     user_context, memory_paths = get_user_context(cwd, referenced_paths=referenced_paths)
     return EffectivePrompt(
         system_prompt=append_system_context(system_prompt, system_context),
@@ -110,12 +100,9 @@ def build_prompt_bundle(
     )
 
 
-def get_system_context(cwd: Path) -> dict[str, str]:
+def get_system_context() -> dict[str, str]:
+    """读取需要随请求变化的系统上下文片段。"""
     context: dict[str, str] = {}
-    if not _truthy(os.getenv("K_AGENT_DISABLE_GIT_CONTEXT") or os.getenv("CLAUDE_CODE_DISABLE_GIT_CONTEXT")):
-        git_status = _git_status(cwd)
-        if git_status:
-            context["gitStatus"] = git_status
     cache_breaker = os.getenv("K_AGENT_SYSTEM_PROMPT_INJECTION") or os.getenv("CLAUDE_CODE_SYSTEM_PROMPT_INJECTION")
     if cache_breaker:
         context["cacheBreaker"] = cache_breaker
@@ -123,6 +110,7 @@ def get_system_context(cwd: Path) -> dict[str, str]:
 
 
 def get_user_context(cwd: Path, *, referenced_paths: list[Path] | None = None) -> tuple[dict[str, str], list[str]]:
+    """读取 memory 和日期等用户上下文。"""
     context: dict[str, str] = {
         "currentDate": f"Today's date is {datetime.now().date().isoformat()}."
     }
@@ -140,6 +128,7 @@ def get_user_context(cwd: Path, *, referenced_paths: list[Path] | None = None) -
 
 
 def append_system_context(system_prompt: str, context: dict[str, str]) -> str:
+    """把系统上下文追加进 system prompt。"""
     context_block = "\n".join(f"{key}: {value}" for key, value in context.items() if value)
     if not context_block:
         return system_prompt
@@ -201,6 +190,7 @@ def extract_paths_from_value(value: object) -> list[Path]:
 
 
 def classify_paths_for_memory(paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    """把路径候选分成文件路径和目录路径。"""
     memory_paths = []
     regular_paths = []
     for path in paths:
@@ -212,29 +202,23 @@ def classify_paths_for_memory(paths: list[Path]) -> tuple[list[Path], list[Path]
 
 
 def _default_system_prompt(base_prompt: str, *, mcp_tools: list[McpPromptTool] | None = None) -> str:
+    """生成包含默认行为和工具说明的系统提示词。"""
     static_fingerprint = fingerprint_text(base_prompt)
     static_prompt = SECTION_CACHE.get(
         "default_system_static",
         static_fingerprint,
-        lambda: render_sections([
-            PromptSection("identity", CLI_SYSTEM_PREFIX),
-            PromptSection("base", base_prompt.strip()),
-        ]),
+        lambda: render_sections([PromptSection("base", base_prompt.strip())]),
     )
     dynamic_prompt = render_sections([
         PromptSection("memory_behavior", MEMORY_BEHAVIOR_PROMPT, cacheable=False),
         PromptSection("mcp_tools", build_mcp_dynamic_prompt(mcp_tools or []), cacheable=False),
         PromptSection("style", "Use concise, direct language. Prefer concrete actions and verified facts.", cacheable=False),
     ])
-    sections = [
-        static_prompt,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
-        dynamic_prompt,
-    ]
-    return "\n\n".join(section for section in sections if section)
+    return "\n\n".join(section for section in (static_prompt, dynamic_prompt) if section)
 
 
 def _append_skills(base_prompt: str, skills: list[dict | "SkillDefinition"]) -> str:
+    """把可用 Skill 摘要追加到系统提示词。"""
     enabled = [skill for skill in skills if _skill_enabled(skill)]
     if not enabled:
         return base_prompt
@@ -242,18 +226,22 @@ def _append_skills(base_prompt: str, skills: list[dict | "SkillDefinition"]) -> 
     return (
         f"{base_prompt.rstrip()}\n\n"
         "# Available Skills\n\n"
-        "Use the Skill tool to load a skill's full instructions only when its description or when_to_use matches the task.\n\n"
+        "Use the single `Skill` tool to load a matching skill. Pass the selected "
+        "name as `skill` and the user's task arguments as `args`. Never use a "
+        "skill name as the tool/function name itself.\n\n"
         f"{blocks}"
     )
 
 
 def _skill_enabled(skill: dict | "SkillDefinition") -> bool:
+    """判断 Skill 是否允许模型主动调用。"""
     if not isinstance(skill, dict):
         return not bool(getattr(skill, "disable_model_invocation", False))
     return bool(skill.get("enabled", True)) and bool(skill.get("instructions", skill.get("description", "")).strip())
 
 
 def _skill_summary(skill: dict | "SkillDefinition") -> str:
+    """生成单个 Skill 的系统提示词摘要。"""
     if not isinstance(skill, dict):
         parts = [f"- {getattr(skill, 'name')}: {getattr(skill, 'description')}"]
         if getattr(skill, "when_to_use", None):
@@ -268,24 +256,8 @@ def _skill_summary(skill: dict | "SkillDefinition") -> str:
     return f"- {name}: {description}"
 
 
-def _git_status(cwd: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "status", "--short", "--branch"],
-            cwd=cwd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
-
-
 def _dedupe_memory_files(memory_files: list) -> list:
+    """按路径去重 memory 文件。"""
     seen: set[Path] = set()
     deduped = []
     for memory_file in memory_files:
@@ -298,10 +270,12 @@ def _dedupe_memory_files(memory_files: list) -> list:
 
 
 def _truthy(value: str | None) -> bool:
+    """按常见字符串规则解析布尔值。"""
     return value is not None and value.lower() not in {"", "0", "false", "no", "off"}
 
 
 def json_like_text(value: object) -> str:
+    """把结构化值转成便于路径提取的文本。"""
     if isinstance(value, str):
         return value
     try:
@@ -311,6 +285,7 @@ def json_like_text(value: object) -> str:
 
 
 def re_path_candidates(text: str) -> list[str]:
+    """从文本中提取可能的文件路径。"""
     import re
 
     pattern = r"(?<![\\w.-])(?:/[^\\s'\"`<>]+|\\.\\.?/[^\\s'\"`<>]+)"

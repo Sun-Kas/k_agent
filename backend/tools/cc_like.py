@@ -1,3 +1,5 @@
+"""Workspace-scoped file, search, shell, and task-list tools for the agent."""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +16,7 @@ from backend.tools.local import ToolDefinition
 
 
 async def _workspace_root() -> Path:
+    """返回当前工作区根目录。"""
     settings = await get_or_init_settings()
     root = Path(settings.local_tool_workspace_root).expanduser()
     if not root.is_absolute():
@@ -36,21 +39,26 @@ async def _resolve_workspace_path(raw_path: str) -> Path:
 
 
 async def _tool_limits() -> tuple[float, int]:
+    """读取工具执行超时和输出长度限制。"""
     settings = await get_or_init_settings()
     return settings.local_tool_bash_timeout_seconds, settings.local_tool_max_output_chars
 
 
 def _json(payload: dict[str, Any]) -> str:
+    """把工具输出对象序列化为紧凑 JSON 字符串。"""
     return json.dumps(payload, ensure_ascii=False)
 
 
 def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
+    """按最大字符数截断工具输出。"""
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars] + f"\n\n[truncated: kept first {max_chars} chars]", True
 
 
 async def cc_read(payload: dict[str, Any]) -> str:
+    """Read a bounded UTF-8 representation of a workspace file."""
+
     path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
     if not path.exists():
         return _json({"ok": False, "error": "file not found", "path": str(path)})
@@ -62,6 +70,8 @@ async def cc_read(payload: dict[str, Any]) -> str:
 
 
 async def cc_write(payload: dict[str, Any]) -> str:
+    """Write a file after resolving its target inside the workspace boundary."""
+
     path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
     content = str(payload.get("content") or "")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +80,8 @@ async def cc_write(payload: dict[str, Any]) -> str:
 
 
 async def cc_edit(payload: dict[str, Any]) -> str:
+    """Apply an exact replacement and reject ambiguous matches by default."""
+
     path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
     old_string = str(payload.get("old_string") or payload.get("oldString") or "")
     new_string = str(payload.get("new_string") or payload.get("newString") or "")
@@ -90,6 +102,7 @@ async def cc_edit(payload: dict[str, Any]) -> str:
 
 
 async def cc_glob(payload: dict[str, Any]) -> str:
+    """按 glob 模式在工作区内查找文件。"""
     root = await _resolve_workspace_path(str(payload.get("path") or "."))
     pattern = str(payload.get("pattern") or "**/*")
     _, max_chars = await _tool_limits()
@@ -107,6 +120,7 @@ async def cc_glob(payload: dict[str, Any]) -> str:
 
 
 async def cc_grep(payload: dict[str, Any]) -> str:
+    """按正则在工作区文件内容中搜索。"""
     root = await _resolve_workspace_path(str(payload.get("path") or "."))
     pattern = str(payload.get("pattern") or "")
     include = str(payload.get("include") or "**/*")
@@ -131,6 +145,8 @@ async def cc_grep(payload: dict[str, Any]) -> str:
 
 
 async def cc_bash(payload: dict[str, Any]) -> str:
+    """Run a time- and output-bounded shell command from the workspace root."""
+
     root = await _workspace_root()
     command = str(payload.get("command") or "").strip()
     if not command:
@@ -162,6 +178,7 @@ async def cc_bash(payload: dict[str, Any]) -> str:
 
 
 async def cc_todo_write(payload: dict[str, Any]) -> str:
+    """记录并返回模型提交的任务列表。"""
     todos = payload.get("todos")
     if not isinstance(todos, list):
         return _json({"ok": False, "error": "todos must be a list"})

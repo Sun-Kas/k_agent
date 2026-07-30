@@ -1,9 +1,13 @@
+"""Validate tool arguments against the supported JSON Schema subset."""
+
 from __future__ import annotations
 
 from typing import Any
 
 
 def validate_tool_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -> None:
+    """Raise ``ValueError`` when arguments violate the supported schema subset."""
+
     expected_type = schema.get("type")
     if expected_type == "object" and not isinstance(arguments, dict):
         raise ValueError("Tool arguments must be an object.")
@@ -30,6 +34,7 @@ def validate_tool_arguments(schema: dict[str, Any], arguments: dict[str, Any]) -
 
 
 def _validate_value(name: str, value: Any, schema: dict[str, Any]) -> None:
+    """按 JSON schema 递归校验单个参数值。"""
     schema_type = schema.get("type")
     if schema_type == "string" and not isinstance(value, str):
         raise ValueError(f'Tool argument "{name}" must be a string.')

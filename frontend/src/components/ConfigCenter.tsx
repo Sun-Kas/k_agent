@@ -4,7 +4,7 @@ import {
   getMcpConfig,
   getModelsConfig,
   getSkillsConfig,
-  importProjectSkill,
+  importSkill,
   reloadMcp,
   saveMcpConfig,
   saveModelsConfig,
@@ -43,13 +43,13 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
       .then((mcpData) => {
         setMcpIsTemplate(Boolean(mcpData.isTemplate));
         setMcpWarnings([...(mcpData.warnings ?? []), ...(mcpData.blocked ?? []).map((id) => `已按策略屏蔽：${id}`)]);
-        setServers(mcpData.servers);
+        setServers(mcpData.servers.map((server) => ({ ...server, isNew: false })));
       })
       .catch((error: Error) => setNotice((current) => current || `MCP 配置加载失败：${error.message}`))
       .finally(complete);
     void getSkillsConfig()
       .then((skillsData) => {
-        setSkills(skillsData.skills);
+        setSkills(skillsData.skills.map((skill) => ({ ...skill, isNew: false })));
         setLoadedSkills(skillsData.loadedSkills ?? skillsData.skills);
       })
       .catch((error: Error) => setNotice((current) => current || `Skills 配置加载失败：${error.message}`))
@@ -69,27 +69,40 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
     setNotice("");
     try {
       if (tab === "model") {
+        assertUniqueIds(models, "模型");
         await saveModelsConfig(models);
         setModels((current) => current.map((model) => ({
           ...model,
+          isNew: false,
           apiKey: "",
           apiKeyConfigured: model.apiKeyConfigured || Boolean(model.apiKey)
         })));
         setNotice("模型配置已保存，可立即在对话中选择");
       } else if (tab === "mcp") {
-        await saveMcpConfig(servers);
-        const [mcpData, capabilityData] = await Promise.all([getMcpConfig(), getMcpCapabilities()]);
-        setServers(mcpData.servers);
+        assertUniqueIds(servers, "MCP 服务");
+        const mcpData = await saveMcpConfig(servers);
+        const capabilityData = await getMcpCapabilities();
+        setServers(mcpData.servers.map((server) => ({ ...server, isNew: false })));
         setMcpCapabilities(capabilityData);
-        setNotice("MCP 配置已保存，并已热重载连接状态");
+        setMcpWarnings([...(mcpData.warnings ?? []), ...(mcpData.blocked ?? []).map((id) => `已按策略屏蔽：${id}`)]);
+        setNotice(mcpConnectionNotice(mcpData.servers));
       } else {
+        assertUniqueIds(skills, "Skill");
         await saveSkillsConfig(skills);
         const skillsData = await getSkillsConfig();
+        setSkills(skillsData.skills.map((skill) => ({ ...skill, isNew: false })));
         setLoadedSkills(skillsData.loadedSkills ?? skillsData.skills);
         setNotice("Skills 已保存，并已即时应用到 Agent");
       }
     } catch (error) {
-      setNotice(`保存失败：${error instanceof Error ? error.message : "未知错误"}`);
+      const message = error instanceof Error ? error.message : "未知错误";
+      const isTimeout = error instanceof DOMException
+        && (error.name === "TimeoutError" || error.name === "AbortError");
+      setNotice(
+        isTimeout
+          ? "保存失败：MCP 下载或连接超过 120 秒，请检查网络后重试"
+          : `保存失败：${message}`
+      );
     } finally {
       setSaving(false);
     }
@@ -126,9 +139,9 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
                   <div className="path-bar"><span>读取方式</span><code>GET /api/config/models</code></div>
                   <div className="config-cards">
                     {models.map((model, index) => (
-                      <ModelCard key={`${model.id}-${index}`} model={model} onChange={(next) => setModels(models.map((item, i) => i === index ? next : item))} onRemove={() => setModels(models.filter((_, i) => i !== index))} />
+                      <ModelCard key={index} model={model} onChange={(next) => setModels(models.map((item, i) => i === index ? next : item))} onRemove={() => setModels(models.filter((_, i) => i !== index))} />
                     ))}
-                    <button className="add-config" type="button" onClick={() => setModels([...models, { id: `model-${models.length + 1}`, name: "新模型", model: "", baseUrl: "https://api.openai.com/v1", apiKeyConfigured: false, apiKey: "", apiKeyEnv: "OPENAI_API_KEY", multimodal: false, supportsReasoning: false, enabled: true }])}>
+                    <button className="add-config" type="button" onClick={() => setModels([...models, { id: nextId("model", models), name: "新模型", model: "", baseUrl: "https://api.openai.com/v1", apiKeyConfigured: false, apiKey: "", apiKeyEnv: "OPENAI_API_KEY", multimodal: false, supportsReasoning: false, contextWindow: 128000, maxOutputTokens: 8192, contextSafetyTokens: 4096, enabled: true, isNew: true }])}>
                       <span>＋</span><strong>添加模型</strong><small>配置 URL、模型名、密钥和能力</small>
                     </button>
                   </div>
@@ -137,14 +150,14 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
 
               {tab === "mcp" && (
                 <section className="config-section">
-                  <ConfigHeading eyebrow="MODEL CONTEXT PROTOCOL" title="MCP 服务" copy="管理 Agent 可调用的外部工具服务。保存后后端会重新载入连接和动态提示词。" />
-                  <div className="path-bar"><span>读取方式</span><code>GET /api/config/mcp</code>{mcpIsTemplate && <b>当前使用后端示例配置</b>}</div>
+                  <ConfigHeading eyebrow="MODEL CONTEXT PROTOCOL" title="MCP 服务" copy="接入层统一管理服务摘要与连接配置；保存后通知 Agent Backend 重新载入连接。" />
+                  <div className="path-bar"><span>列表摘要</span><code>data/mcp.json</code>{mcpIsTemplate && <b>当前使用示例配置</b>}</div>
                   <CapabilityStrip capabilities={mcpCapabilities} warnings={mcpWarnings} onReload={async () => { await reloadMcp(); const [mcpData, capabilityData] = await Promise.all([getMcpConfig(), getMcpCapabilities()]); setServers(mcpData.servers); setMcpCapabilities(capabilityData); setNotice("MCP 已重新载入"); }} />
                   <div className="config-cards">
                     {servers.map((server, index) => (
-                      <McpCard key={`${server.id}-${index}`} server={server} onChange={(next) => setServers(servers.map((item, i) => i === index ? next : item))} onRemove={() => setServers(servers.filter((_, i) => i !== index))} />
+                      <McpCard key={index} server={server} onChange={(next) => setServers(servers.map((item, i) => i === index ? next : item))} onRemove={() => setServers(servers.filter((_, i) => i !== index))} />
                     ))}
-                    <button className="add-config" type="button" onClick={() => setServers([...servers, { id: `server-${servers.length + 1}`, type: "stdio", command: "npx", args: [], env: {}, headers: {}, enabled: true }])}>
+                    <button className="add-config" type="button" onClick={() => setServers([...servers, { id: nextId("server", servers), name: "新 MCP 服务", description: "", type: "stdio", command: "", args: [], env: {}, envPassthrough: [], cwd: "", url: "", bearerTokenEnv: "", headers: {}, envHeaders: {}, enabled: true, isNew: true }])}>
                       <span>＋</span><strong>添加 MCP 服务</strong><small>配置 stdio 命令、参数和环境变量</small>
                     </button>
                   </div>
@@ -153,22 +166,24 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
 
               {tab === "skills" && (
                 <section className="config-section">
-                  <ConfigHeading eyebrow="REUSABLE INSTRUCTIONS" title="Skills" copy="把稳定的专业流程保存为 Skill。启用后，它们会自动加入 Agent 的系统上下文。" />
-                  <div className="path-bar"><span>读取方式</span><code>GET /api/config/skills</code></div>
+                  <ConfigHeading eyebrow="REUSABLE INSTRUCTIONS" title="Skills" copy="接入层从 data/skill.json 提供列表，选中后再读取对应 Skill 指令并随运行请求发送。" />
+                  <div className="path-bar"><span>列表摘要</span><code>data/skill.json</code></div>
                   <div className="config-cards">
                     {skills.map((skill, index) => (
-                      <SkillCard key={`${skill.id}-${index}`} skill={skill} onChange={(next) => setSkills(skills.map((item, i) => i === index ? next : item))} onRemove={() => setSkills(skills.filter((_, i) => i !== index))} />
+                      <SkillCard key={index} skill={skill} onChange={(next) => setSkills(skills.map((item, i) => i === index ? next : item))} onRemove={() => setSkills(skills.filter((_, i) => i !== index))} />
                     ))}
-                    <button className="add-config" type="button" onClick={() => setSkills([...skills, { id: `skill-${skills.length + 1}`, name: "新 Skill", description: "", instructions: "", enabled: true }])}>
+                    <button className="add-config" type="button" onClick={() => setSkills([...skills, { id: nextId("skill", skills), name: "新 Skill", description: "", instructions: "", enabled: true, isNew: true }])}>
                       <span>＋</span><strong>创建 Skill</strong><small>添加一组可复用的 Agent 专业指令</small>
                     </button>
                   </div>
                   <LoadedSkills skills={loadedSkills} onImport={async (file) => {
-                    const result = await importProjectSkill(file);
+                    const result = await importSkill(file);
                     if (result.skills) {
-                      setLoadedSkills(result.skills);
+                      setSkills(result.skills.map((skill) => ({ ...skill, isNew: false })));
+                      setLoadedSkills(result.loadedSkills ?? result.skills);
                     } else {
                       const skillsData = await getSkillsConfig();
+                      setSkills(skillsData.skills.map((skill) => ({ ...skill, isNew: false })));
                       setLoadedSkills(skillsData.loadedSkills ?? skillsData.skills);
                     }
                     setNotice(`Skill「${result.name}」已通过 zip 校验并导入`);
@@ -176,7 +191,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
                 </section>
               )}
               <footer className="config-footer">
-                <p className={notice.startsWith("保存失败") || notice.startsWith("加载失败") ? "error" : ""}>{notice}</p>
+                <p className={notice.startsWith("保存失败") || notice.startsWith("加载失败") || notice.startsWith("连接失败") ? "error" : ""}>{notice}</p>
                 <button type="submit" disabled={saving}>{saving ? "保存中…" : "保存更改"}</button>
               </footer>
             </>
@@ -196,75 +211,197 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 }
 
 function ModelCard({ model, onChange, onRemove }: { model: ModelProfile; onChange: (model: ModelProfile) => void; onRemove: () => void }) {
+  const [expanded, setExpanded] = useState(Boolean(model.isNew));
+  useEffect(() => {
+    if (model.isNew === false) setExpanded(false);
+  }, [model.isNew]);
   return (
-    <article className="config-card model-card">
-      <header>
-        <div className="config-card-icon">AI</div>
-        <div><input aria-label="模型显示名称" value={model.name} onChange={(e) => onChange({ ...model, name: e.target.value })} /><small>{model.id}</small></div>
-        <Toggle checked={model.enabled} onChange={(enabled) => onChange({ ...model, enabled })} />
-        <button className="remove-button" type="button" onClick={onRemove}>×</button>
-      </header>
-      <div className="field-grid two">
-        <Field label="模型 ID" hint="请求时发送的 model"><input required value={model.model} onChange={(e) => onChange({ ...model, model: e.target.value })} placeholder="gpt-4.1" /></Field>
-        <Field label="配置 ID" hint="用于会话选择"><input required value={model.id} onChange={(e) => onChange({ ...model, id: e.target.value })} /></Field>
-      </div>
-      <Field label="API Base URL" hint="OpenAI 兼容接口地址"><input type="url" required value={model.baseUrl} onChange={(e) => onChange({ ...model, baseUrl: e.target.value })} /></Field>
-      <Field label="API Key" hint={model.apiKeyConfigured ? "已配置；留空保持不变" : "尚未配置"}>
-        <input type="password" autoComplete="new-password" value={model.apiKey ?? ""} onChange={(e) => onChange({ ...model, apiKey: e.target.value })} placeholder={model.apiKeyConfigured ? "••••••••••••••••" : "sk-…"} />
-      </Field>
-      <Field label="API Key 环境变量" hint="推荐通过环境变量安全引用">
-        <input value={model.apiKeyEnv ?? ""} onChange={(e) => onChange({ ...model, apiKeyEnv: e.target.value })} placeholder="OPENAI_API_KEY" />
-      </Field>
-      <div className="capability-switches">
-        <label><span><strong>多模态输入</strong><small>允许在对话中上传图片</small></span><Toggle checked={model.multimodal} onChange={(multimodal) => onChange({ ...model, multimodal })} /></label>
-        <label><span><strong>思考强度</strong><small>支持 reasoning_effort 参数</small></span><Toggle checked={model.supportsReasoning} onChange={(supportsReasoning) => onChange({ ...model, supportsReasoning })} /></label>
-      </div>
+    <article className={`config-card model-card ${expanded ? "expanded" : "collapsed"}`}>
+      <ConfigCardHeader icon="AI" title={model.name || "未命名模型"} summary={`${model.id} · ${model.model || "尚未设置模型"}`} enabled={model.enabled} expanded={expanded} onToggleExpanded={() => setExpanded(!expanded)} onToggleEnabled={(enabled) => onChange({ ...model, enabled })} onRemove={onRemove} />
+      {expanded && <div className="config-card-details">
+        <Field label="显示名称"><input required value={model.name} onChange={(e) => onChange({ ...model, name: e.target.value })} /></Field>
+        <div className="field-grid two">
+          <Field label="模型 ID" hint="请求时发送的 model"><input required value={model.model} onChange={(e) => onChange({ ...model, model: e.target.value })} placeholder="gpt-4.1" /></Field>
+          <Field label="配置 ID" hint="用于会话选择"><input required value={model.id} onChange={(e) => onChange({ ...model, id: e.target.value })} /></Field>
+        </div>
+        <Field label="API Base URL" hint="OpenAI 兼容接口地址"><input type="url" required value={model.baseUrl} onChange={(e) => onChange({ ...model, baseUrl: e.target.value })} /></Field>
+        <Field label="API Key" hint={model.apiKeyConfigured ? "已配置；留空保持不变" : "尚未配置"}>
+          <input type="password" autoComplete="new-password" value={model.apiKey ?? ""} onChange={(e) => onChange({ ...model, apiKey: e.target.value })} placeholder={model.apiKeyConfigured ? "••••••••••••••••" : "sk-…"} />
+        </Field>
+        <Field label="API Key 环境变量" hint="推荐通过环境变量安全引用">
+          <input value={model.apiKeyEnv ?? ""} onChange={(e) => onChange({ ...model, apiKeyEnv: e.target.value })} placeholder="OPENAI_API_KEY" />
+        </Field>
+        <div className="field-grid two">
+          <Field label="上下文窗口" hint="模型可接受的总 token">
+            <input type="number" min={8000} step={1000} value={model.contextWindow ?? 128000} onChange={(e) => onChange({ ...model, contextWindow: Number(e.target.value) })} />
+          </Field>
+          <Field label="最大输出 Token" hint="为模型回答预留">
+            <input type="number" min={256} step={256} value={model.maxOutputTokens ?? 8192} onChange={(e) => onChange({ ...model, maxOutputTokens: Number(e.target.value) })} />
+          </Field>
+        </div>
+        <Field label="上下文安全余量" hint="避免在压缩前撞到模型上限">
+          <input type="number" min={0} step={256} value={model.contextSafetyTokens ?? 4096} onChange={(e) => onChange({ ...model, contextSafetyTokens: Number(e.target.value) })} />
+        </Field>
+        <div className="capability-switches">
+          <label><span><strong>多模态输入</strong><small>允许在对话中上传图片</small></span><Toggle checked={model.multimodal} onChange={(multimodal) => onChange({ ...model, multimodal })} /></label>
+          <label><span><strong>思考强度</strong><small>支持 reasoning_effort 参数</small></span><Toggle checked={model.supportsReasoning} onChange={(supportsReasoning) => onChange({ ...model, supportsReasoning })} /></label>
+        </div>
+      </div>}
     </article>
   );
 }
 
 function McpCard({ server, onChange, onRemove }: { server: McpServerConfig; onChange: (server: McpServerConfig) => void; onRemove: () => void }) {
-  const envText = Object.entries(server.env).map(([key, value]) => `${key}=${value}`).join("\n");
-  const headerText = Object.entries(server.headers ?? {}).map(([key, value]) => `${key}=${value}`).join("\n");
-  const isRemote = (server.type ?? "stdio") !== "stdio";
+  const [expanded, setExpanded] = useState(Boolean(server.isNew));
+  useEffect(() => {
+    if (server.isNew === false) setExpanded(false);
+  }, [server.isNew]);
+  const type = server.type ?? "stdio";
+  const isRemote = type === "http";
   return (
-    <article className="config-card">
-      <header><div className="config-card-icon">⌁</div><div><input aria-label="MCP ID" value={server.id} onChange={(e) => onChange({ ...server, id: e.target.value })} /><small>{server.status ?? (server.connected ? "connected" : "pending")} · {server.scope ?? "local"} · {server.toolCount ?? 0} 工具 · {server.resourceCount ?? 0} 资源</small></div><Toggle checked={server.enabled} onChange={(enabled) => onChange({ ...server, enabled })} /><button className="remove-button" type="button" onClick={onRemove}>×</button></header>
-      <Field label="传输类型" hint="stdio 用本地命令；远程服务使用 URL">
-        <select value={server.type ?? "stdio"} onChange={(e) => onChange({ ...server, type: e.target.value as McpServerConfig["type"] })}>
-          <option value="stdio">stdio</option>
-          <option value="http">http</option>
-          <option value="sse">sse</option>
-          <option value="ws">ws</option>
-        </select>
-      </Field>
+    <article className={`config-card ${expanded ? "expanded" : "collapsed"}`}>
+      <ConfigCardHeader icon="⌁" title={server.name || server.id || "未命名 MCP"} summary={`${server.id} · ${server.description || "暂无简介"}`} status={server.status} enabled={server.enabled} expanded={expanded} onToggleExpanded={() => setExpanded(!expanded)} onToggleEnabled={(enabled) => onChange({ ...server, enabled })} onRemove={onRemove} />
+      {expanded && <div className="config-card-details">
       <div className="field-grid two">
-        <Field label={isRemote ? "服务 URL" : "启动命令"}><input value={isRemote ? server.url ?? "" : server.command ?? ""} onChange={(e) => onChange(isRemote ? { ...server, url: e.target.value } : { ...server, command: e.target.value })} /></Field>
-        <Field label="命令参数" hint="每行一个"><textarea rows={3} value={server.args.join("\n")} onChange={(e) => onChange({ ...server, args: e.target.value.split("\n").filter(Boolean) })} /></Field>
+        <Field label="显示名称"><input required value={server.name ?? ""} onChange={(e) => onChange({ ...server, name: e.target.value })} placeholder="MCP 服务名称" /></Field>
+        <Field label="MCP ID"><input required value={server.id} onChange={(e) => onChange({ ...server, id: e.target.value })} placeholder="MCP server ID" /></Field>
       </div>
-      <Field label="环境变量" hint="KEY=VALUE，每行一个；*** 表示保留现有值">
-        <textarea rows={3} value={envText} onChange={(e) => onChange({ ...server, env: parseEnv(e.target.value) })} placeholder="API_KEY=…" />
-      </Field>
-      {isRemote && (
-        <Field label="请求头" hint="KEY=VALUE，每行一个；*** 表示保留现有值">
-          <textarea rows={3} value={headerText} onChange={(e) => onChange({ ...server, headers: parseEnv(e.target.value) })} placeholder="Authorization=Bearer …" />
-        </Field>
+      <Field label="简介"><input value={server.description ?? ""} onChange={(e) => onChange({ ...server, description: e.target.value })} placeholder="这个 MCP 服务提供什么能力？" /></Field>
+      <div className="mcp-type-row">
+        <strong>类型</strong>
+        <div className="mcp-type-switch" role="group" aria-label="MCP 类型">
+          <button type="button" className={type === "stdio" ? "active" : ""} onClick={() => onChange({ ...server, type: "stdio" })}>STDIO</button>
+          <button type="button" className={type === "http" ? "active" : ""} onClick={() => onChange({ ...server, type: "http" })}>流式 HTTP</button>
+        </div>
+      </div>
+      {isRemote ? (
+        <>
+          <Field label="URL"><input type="url" required value={server.url ?? ""} onChange={(e) => onChange({ ...server, url: e.target.value })} placeholder="https://mcp.example.com/mcp" /></Field>
+          <Field label="Bearer 令牌环境变量" hint="填写大写变量名，不要填写令牌内容"><input value={server.bearerTokenEnv ?? ""} onChange={(e) => onChange({ ...server, bearerTokenEnv: e.target.value })} placeholder="MCP_BEARER_TOKEN" pattern="[A-Z_][A-Z0-9_]*" /></Field>
+          <KeyValueList title="标头" addLabel="添加标头" keyPlaceholder="键" valuePlaceholder="值" value={server.headers ?? {}} onChange={(headers) => onChange({ ...server, headers })} />
+          <KeyValueList title="来自环境变量的标头" addLabel="添加变量" keyPlaceholder="键" valuePlaceholder="环境变量名" value={server.envHeaders ?? {}} onChange={(envHeaders) => onChange({ ...server, envHeaders })} />
+        </>
+      ) : (
+        <>
+          <Field label="启动命令"><input required value={server.command ?? ""} onChange={(e) => onChange({ ...server, command: e.target.value })} placeholder="openai-dev-mcp serve-sqlite" /></Field>
+          <StringList title="参数" addLabel="添加参数" placeholder="" value={server.args} onChange={(args) => onChange({ ...server, args })} />
+          <KeyValueList title="环境变量" addLabel="添加环境变量" keyPlaceholder="键" valuePlaceholder="值" value={server.env} onChange={(env) => onChange({ ...server, env })} />
+          <StringList title="环境变量传递" addLabel="添加变量" placeholder="" value={server.envPassthrough ?? []} onChange={(envPassthrough) => onChange({ ...server, envPassthrough })} />
+          <Field label="工作目录"><input value={server.cwd ?? ""} onChange={(e) => onChange({ ...server, cwd: e.target.value })} placeholder="~/code" /></Field>
+        </>
       )}
       {server.error && <p className="config-error-line">{server.error}</p>}
+      </div>}
     </article>
   );
 }
 
-function SkillCard({ skill, onChange, onRemove }: { skill: SkillConfig; onChange: (skill: SkillConfig) => void; onRemove: () => void }) {
+function StringList({ title, addLabel, placeholder, value, onChange }: { title: string; addLabel: string; placeholder: string; value: string[]; onChange: (value: string[]) => void }) {
+  const rows = value.length ? value : [""];
   return (
-    <article className="config-card skill-card">
-      <header><div className="config-card-icon">✦</div><div><input aria-label="Skill 名称" value={skill.name} onChange={(e) => onChange({ ...skill, name: e.target.value })} /><small>{skill.id}</small></div><Toggle checked={skill.enabled} onChange={(enabled) => onChange({ ...skill, enabled })} /><button className="remove-button" type="button" onClick={onRemove}>×</button></header>
-      <Field label="简介"><input value={skill.description} onChange={(e) => onChange({ ...skill, description: e.target.value })} placeholder="这个 Skill 擅长什么？" /></Field>
-      <Field label="Skill 指令" hint="启用后会注入系统上下文">
-        <textarea className="config-editor" rows={8} value={skill.instructions} onChange={(e) => onChange({ ...skill, instructions: e.target.value })} placeholder="描述角色、工作流程、输出要求和限制…" />
-      </Field>
+    <section className="config-list-field">
+      <strong>{title}</strong>
+      {rows.map((item, index) => (
+        <div className="config-list-row single" key={index}>
+          <input value={item} placeholder={placeholder} onChange={(event) => onChange(updateArray(rows, index, event.target.value).filter((entry, entryIndex) => entry || entryIndex < rows.length - 1))} />
+          <button type="button" aria-label={`删除${title}`} onClick={() => onChange(rows.filter((_, rowIndex) => rowIndex !== index))}>×</button>
+        </div>
+      ))}
+      <button className="config-list-add" type="button" onClick={() => onChange([...value, ""])}>＋ {addLabel}</button>
+    </section>
+  );
+}
+
+function KeyValueList({ title, addLabel, keyPlaceholder, valuePlaceholder, value, onChange }: { title: string; addLabel: string; keyPlaceholder: string; valuePlaceholder: string; value: Record<string, string>; onChange: (value: Record<string, string>) => void }) {
+  const rows = Object.entries(value);
+  const visibleRows = rows.length ? rows : [["", ""] as [string, string]];
+  const update = (nextRows: Array<[string, string]>) => onChange(Object.fromEntries(nextRows.filter(([key]) => key.trim()).map(([key, itemValue]) => [key.trim(), itemValue])));
+  return (
+    <section className="config-list-field">
+      <strong>{title}</strong>
+      {visibleRows.map(([key, itemValue], index) => (
+        <div className="config-list-row" key={index}>
+          <input value={key} placeholder={keyPlaceholder} onChange={(event) => update(updatePair(visibleRows, index, 0, event.target.value))} />
+          <input value={itemValue} placeholder={valuePlaceholder} onChange={(event) => update(updatePair(visibleRows, index, 1, event.target.value))} />
+          <button type="button" aria-label={`删除${title}`} onClick={() => update(visibleRows.filter((_, rowIndex) => rowIndex !== index))}>×</button>
+        </div>
+      ))}
+      <button className="config-list-add" type="button" onClick={() => update([...rows, ["", ""]])}>＋ {addLabel}</button>
+    </section>
+  );
+}
+
+function SkillCard({ skill, onChange, onRemove }: { skill: SkillConfig; onChange: (skill: SkillConfig) => void; onRemove: () => void }) {
+  const [expanded, setExpanded] = useState(Boolean(skill.isNew));
+  useEffect(() => {
+    if (skill.isNew === false) setExpanded(false);
+  }, [skill.isNew]);
+  return (
+    <article className={`config-card skill-card ${expanded ? "expanded" : "collapsed"}`}>
+      <ConfigCardHeader icon="✦" title={skill.name || "未命名 Skill"} summary={`${skill.id} · ${skill.description || "暂无简介"}`} enabled={skill.enabled} expanded={expanded} onToggleExpanded={() => setExpanded(!expanded)} onToggleEnabled={(enabled) => onChange({ ...skill, enabled })} onRemove={onRemove} />
+      {expanded && <div className="config-card-details">
+        <div className="field-grid two">
+          <Field label="Skill 名称"><input required value={skill.name} onChange={(e) => onChange({ ...skill, name: e.target.value })} /></Field>
+          <Field label="Skill ID"><input required value={skill.id} onChange={(e) => onChange({ ...skill, id: e.target.value })} /></Field>
+        </div>
+        <Field label="简介"><input value={skill.description} onChange={(e) => onChange({ ...skill, description: e.target.value })} placeholder="这个 Skill 擅长什么？" /></Field>
+        <Field label="Skill 指令" hint="启用后会注入系统上下文">
+          <textarea className="config-editor" rows={8} value={skill.instructions} onChange={(e) => onChange({ ...skill, instructions: e.target.value })} placeholder="描述角色、工作流程、输出要求和限制…" />
+        </Field>
+      </div>}
     </article>
   );
+}
+
+function ConfigCardHeader({ icon, title, summary, status, enabled, expanded, onToggleExpanded, onToggleEnabled, onRemove }: {
+  icon: string;
+  title: string;
+  summary: string;
+  status?: McpServerConfig["status"];
+  enabled: boolean;
+  expanded: boolean;
+  onToggleExpanded: () => void;
+  onToggleEnabled: (enabled: boolean) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <header className="config-card-header">
+      <button className="config-card-summary" type="button" aria-expanded={expanded} onClick={onToggleExpanded}>
+        <span className="config-card-chevron" aria-hidden="true">
+          <svg viewBox="0 0 20 20" focusable="false">
+            <path d="M5 7.5 10 12.5 15 7.5" />
+          </svg>
+        </span>
+        <span className="config-card-icon">{icon}</span>
+        <span className="config-card-copy"><strong>{title}</strong><small>{summary}</small></span>
+      </button>
+      {status && <span className={`mcp-status ${status}`}>{mcpStatusLabel(status)}</span>}
+      <Toggle checked={enabled} onChange={onToggleEnabled} />
+      <button className="remove-button" type="button" aria-label={`删除 ${title}`} title="删除" onClick={onRemove}>×</button>
+    </header>
+  );
+}
+
+function mcpStatusLabel(status: NonNullable<McpServerConfig["status"]>) {
+  if (status === "connected") return "已连接";
+  if (status === "failed") return "连接失败";
+  if (status === "disabled") return "已禁用";
+  if (status === "pending") return "连接中";
+  return "状态未知";
+}
+
+function mcpConnectionNotice(servers: McpServerConfig[]) {
+  const failed = servers.filter((server) => server.enabled && server.status === "failed");
+  if (failed.length) {
+    return `连接失败：${failed.map((server) => `${server.name || server.id}${server.error ? `（${server.error}）` : ""}`).join("；")}`;
+  }
+  const enabled = servers.filter((server) => server.enabled);
+  const connected = enabled.filter((server) => server.status === "connected");
+  if (enabled.length && connected.length === enabled.length) {
+    return `MCP 配置已保存，${connected.length} 个服务连接成功`;
+  }
+  if (!enabled.length) return "MCP 配置已保存；当前没有启用的服务";
+  return `MCP 配置已保存；已连接 ${connected.length}/${enabled.length}，请查看各服务状态`;
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
@@ -308,7 +445,7 @@ function LoadedSkills({ skills, onImport }: { skills: SkillConfig[]; onImport: (
 
   return (
     <section className="loaded-skills">
-      <header><strong>后端载入结果</strong><small>{skills.length} 个 Skill，包含项目、用户、配置与 MCP Prompt</small></header>
+      <header><strong>运行时载入结果</strong><small>{skills.length} 个 Skill，全部来自 data/skill</small></header>
       <div className="skill-table">
         {skills.map((skill) => (
           <div key={`${skill.source}-${skill.id}`}>
@@ -334,9 +471,24 @@ function LoadedSkills({ skills, onImport }: { skills: SkillConfig[]; onImport: (
   );
 }
 
-function parseEnv(value: string) {
-  return Object.fromEntries(value.split("\n").filter(Boolean).map((line) => {
-    const index = line.indexOf("=");
-    return index < 0 ? [line.trim(), ""] : [line.slice(0, index).trim(), line.slice(index + 1)];
-  }).filter(([key]) => key));
+function updateArray(items: string[], index: number, value: string) {
+  return items.map((item, itemIndex) => itemIndex === index ? value : item);
+}
+
+function updatePair(items: Array<[string, string]>, index: number, column: 0 | 1, value: string): Array<[string, string]> {
+  return items.map((item, itemIndex) => itemIndex === index ? (column === 0 ? [value, item[1]] : [item[0], value]) : item);
+}
+
+function nextId(prefix: string, items: Array<{ id: string }>) {
+  const existing = new Set(items.map((item) => item.id));
+  let index = items.length + 1;
+  while (existing.has(`${prefix}-${index}`)) index += 1;
+  return `${prefix}-${index}`;
+}
+
+function assertUniqueIds(items: Array<{ id: string }>, label: string) {
+  const ids = items.map((item) => item.id.trim());
+  const duplicate = ids.find((id, index) => id && ids.indexOf(id) !== index);
+  if (duplicate) throw new Error(`${label} ID「${duplicate}」重复`);
+  if (ids.some((id) => !id)) throw new Error(`${label} ID 不能为空`);
 }

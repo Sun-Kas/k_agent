@@ -11,26 +11,27 @@ import {
 } from "react";
 import {
   getHealth,
-  getMcpConfig,
   getModelsConfig,
+  getRuntimeCatalog,
   getSession,
-  getSkillsConfig,
   listSessions,
   streamAgentRun
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ConfigCenter } from "./components/ConfigCenter";
+import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
+import { mergeHistoricalMessages } from "./history";
+import { createClientId } from "./id";
 import type {
   AgUiEvent,
   AgUiRunInput,
   ChatMessage,
   HealthState,
-  McpServerConfig,
   ModelProfile,
   ReasoningEffort,
+  RuntimeOption,
   SessionSummary,
-  SkillConfig,
   TextActivity,
   ThinkingActivity,
   ToolActivity
@@ -50,17 +51,16 @@ const colorThemes = [
   { id: "dusk", name: "暮色", colors: ["#160f16", "#251824", "#ff806e"] }
 ] as const;
 type ColorTheme = typeof colorThemes[number]["id"];
-type ThinkingGroup = {
+type ThinkingBlock = {
   id: string;
+  turnId: string;
   steps: ThinkingActivity[];
   closed: boolean;
-  textStart: number;
-  textEnd: number;
   sequence: number;
 };
 
 type InlineActivity =
-  | { type: "thinking"; sequence: number; group: ThinkingGroup }
+  | { type: "thinking"; sequence: number; block: ThinkingBlock }
   | { type: "tool"; sequence: number; tool: ToolActivity }
   | { type: "text"; sequence: number; text: TextActivity };
 
@@ -70,7 +70,7 @@ type CopyFeedback = {
 };
 
 const createMessage = (role: ChatMessage["role"], content: string): ChatMessage => ({
-  id: crypto.randomUUID(),
+  id: createClientId(),
   role,
   content,
   createdAt: new Date().toISOString()
@@ -177,84 +177,35 @@ function normalizeThinkingStep(value: unknown): ThinkingActivity | null {
   return normalizeThinking([value])[0] ?? null;
 }
 
-function normalizeThinkingGroups(value: unknown, fallbackSteps: ThinkingActivity[], fallbackId: string): ThinkingGroup[] {
-  if (!Array.isArray(value)) {
-    return fallbackSteps.length ? [{ id: fallbackId, steps: fallbackSteps, closed: true, textStart: 0, textEnd: 0, sequence: 0 }] : [];
-  }
-  const stepOwners = new Map<string, number>();
-  const groups: ThinkingGroup[] = [];
-  value.forEach((group, index) => {
-    if (!group || typeof group !== "object") return [];
-    const record = group as Record<string, unknown>;
-    const steps = normalizeThinking(record.steps);
-    if (!steps.length) return;
-    const groupIndex = groups.length;
-    const uniqueSteps = steps.filter((step) => {
-      const owner = stepOwners.get(step.id);
-      if (owner === undefined) {
-        stepOwners.set(step.id, groupIndex);
-        return true;
-      }
-      // 修复旧数据中同一个 step 被保存到多个分组导致的重复折叠块。
-      groups[owner].steps = groups[owner].steps.map((item) => item.id === step.id ? step : item);
-      return false;
-    });
-    if (!uniqueSteps.length) return;
-    groups.push({
-      id: typeof record.id === "string" && record.id ? record.id : `${fallbackId}-thinking-${index}`,
-      steps: uniqueSteps,
-      closed: typeof record.closed === "boolean" ? record.closed : true,
-      textStart: typeof record.textStart === "number" ? record.textStart : 0,
-      textEnd: typeof record.textEnd === "number" ? record.textEnd : 0,
-      sequence: typeof record.sequence === "number" ? record.sequence : index * 2
-    });
-  });
-  return groups;
-}
-
-function normalizeToolActivities(value: unknown): ToolActivity[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((tool, index) => {
-    if (!tool || typeof tool !== "object") return [];
-    const record = tool as Record<string, unknown>;
-    if (typeof record.id !== "string" || typeof record.name !== "string") return [];
-    return [{
-      id: record.id,
-      name: record.name,
-      arguments: typeof record.arguments === "string" ? record.arguments : "",
-      result: typeof record.result === "string" ? record.result : undefined,
-      status: record.status === "complete" ? "complete" as const : "running" as const,
-      sequence: typeof record.sequence === "number" ? record.sequence : index * 2 + 1,
-      textOffset: typeof record.textOffset === "number" ? record.textOffset : 0
-    }];
-  });
-}
-
-function normalizeTextActivities(value: unknown, fallbackContent = ""): TextActivity[] {
-  if (!Array.isArray(value)) {
-    return fallbackContent ? [{ id: "text-fallback", content: fallbackContent, status: "complete", sequence: 0 }] : [];
-  }
-  const texts = value.flatMap((text, index) => {
-    if (!text || typeof text !== "object") return [];
-    const record = text as Record<string, unknown>;
-    const content = typeof record.content === "string" ? record.content : "";
-    if (!content) return [];
-    return [{
-      id: typeof record.id === "string" && record.id ? record.id : `text-${index}`,
-      content,
-      status: record.status === "streaming" ? "streaming" as const : "complete" as const,
-      sequence: typeof record.sequence === "number" ? record.sequence : index * 2
-    }];
-  });
-  return texts.length ? texts : fallbackContent ? [{ id: "text-fallback", content: fallbackContent, status: "complete", sequence: 0 }] : [];
-}
-
-function inlineTimeline(texts: TextActivity[], groups: ThinkingGroup[], tools: ToolActivity[]): InlineActivity[] {
+function inlineTimeline(texts: TextActivity[], blocks: ThinkingBlock[], tools: ToolActivity[]): InlineActivity[] {
   return [
     ...texts.map((text) => ({ type: "text" as const, sequence: text.sequence, text })),
-    ...groups.map((group) => ({ type: "thinking" as const, sequence: group.sequence, group })),
+    ...blocks.map((block) => ({ type: "thinking" as const, sequence: block.sequence, block })),
     ...tools.map((tool, index) => ({ type: "tool" as const, sequence: tool.sequence ?? index * 2 + 1, tool }))
   ].sort((left, right) => left.sequence - right.sequence);
+}
+
+function groupDisplayMessages(messages: ChatMessage[]): ChatMessage[] {
+  const grouped: ChatMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const runId = message.role === "assistant" ? message.meta?.runId : undefined;
+    const previous = grouped[grouped.length - 1];
+    if (
+      runId
+      && previous?.role === "assistant"
+      && previous.meta?.runId === runId
+    ) {
+      const separator = previous.content.trim() && message.content.trim() ? "\n\n" : "";
+      grouped[grouped.length - 1] = {
+        ...previous,
+        content: `${previous.content}${separator}${message.content}`
+      };
+      continue;
+    }
+    grouped.push(message);
+  }
+  return grouped;
 }
 
 function visibleTextLength(value: string): number {
@@ -276,9 +227,10 @@ export function App() {
   const [trace, setTrace] = useState<string[]>([]);
   const [tasks, setTasks] = useState<string[]>([]);
   const [thinking, setThinking] = useState<ThinkingActivity[]>([]);
-  const [thinkingGroups, setThinkingGroups] = useState<ThinkingGroup[]>([]);
+  const [thinkingBlocks, setThinkingBlocks] = useState<ThinkingBlock[]>([]);
   const [tools, setTools] = useState<ToolActivity[]>([]);
-  const [textActivities, setTextActivities] = useState<TextActivity[]>([]);
+  const [textBlocks, setTextBlocks] = useState<TextActivity[]>([]);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
   const [status, setStatus] = useState<string>(appConfig.status.idle);
   const [input, setInput] = useState("");
@@ -291,8 +243,8 @@ export function App() {
   const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 310);
   const [view, setView] = useState<"chat" | "config">("chat");
   const [models, setModels] = useState<ModelProfile[]>([]);
-  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([]);
-  const [skills, setSkills] = useState<SkillConfig[]>([]);
+  const [mcpServers, setMcpServers] = useState<RuntimeOption[]>([]);
+  const [skills, setSkills] = useState<RuntimeOption[]>([]);
   const [modelId, setModelId] = useState("");
   const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
@@ -300,7 +252,11 @@ export function App() {
   const [attachments, setAttachments] = useState<Array<{ name: string; dataUrl: string; type: string }>>([]);
   const [listening, setListening] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedback | null>(null);
+  const [desktopPetEnabled, setDesktopPetEnabled] = useState(
+    () => localStorage.getItem("k-agent-desktop-pet-enabled") !== "false"
+  );
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposerComposingRef = useRef(false);
   const [colorTheme, setColorTheme] = useState<ColorTheme>(() => {
     const savedTheme = localStorage.getItem("k-agent-color-theme");
     return colorThemes.some((theme) => theme.id === savedTheme) ? savedTheme as ColorTheme : "snow";
@@ -311,14 +267,23 @@ export function App() {
   const abortRef = useRef<AbortController | null>(null);
   const speechRef = useRef<{ start: () => void; stop: () => void } | null>(null);
   const pendingAssistantIdRef = useRef<string | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  const persistedMessageIdsRef = useRef<Set<string>>(new Set());
+  const replayingHistoryRef = useRef(false);
   const activeTextActivityIdRef = useRef<string | null>(null);
   const activeTextMessageIdRef = useRef<string | null>(null);
-  const activeThinkingGroupIdRef = useRef<string | null>(null);
+  const activeThinkingBlockIdRef = useRef<string | null>(null);
   const activeThinkingStepIdRef = useRef<string | null>(null);
   const activeThinkingTitleRef = useRef("思考过程");
   const assistantVisibleTextLengthRef = useRef(0);
   const activitySequenceRef = useRef(0);
   const copyFeedbackTimerRef = useRef<number | null>(null);
+  // null 表示新会话或旧会话尚未保存过能力偏好；空数组则表示用户明确取消了全部能力。
+  const capabilitySelectionRef = useRef<{
+    mcpServerIds: string[];
+    skillIds: string[];
+  } | null>(null);
+  const catalogLoadedRef = useRef(false);
 
   useEffect(() => {
     void refreshSessions();
@@ -366,17 +331,26 @@ export function App() {
     localStorage.setItem("k-agent-sidebar-collapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
 
+  useEffect(() => {
+    localStorage.setItem("k-agent-desktop-pet-enabled", String(desktopPetEnabled));
+  }, [desktopPetEnabled]);
+
   const filteredSessions = sessions.filter((session) =>
     session.title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
   );
   const activeSession = sessions.find((session) => session.id === sessionId);
-  const visibleMessages = messages.filter((message) =>
-    message.role === "user" || message.role === "assistant"
-  );
-  const displayMessages = visibleMessages.filter((message, index) =>
-    !(message.role === "assistant" && !message.content && visibleMessages.slice(index + 1).some((next) => next.role === "assistant"))
-  );
-  const lastAssistantMessageId = [...displayMessages].reverse().find((message) => message.role === "assistant")?.id;
+  const groupedMessages = groupDisplayMessages(messages);
+  const activityTurnIds = new Set([
+    ...thinkingBlocks.map((block) => block.turnId),
+    ...tools.map((tool) => tool.turnId),
+    ...textBlocks.map((text) => text.turnId)
+  ]);
+  const displayMessages = groupedMessages.filter((message, index) => {
+    if (message.role !== "assistant") return true;
+    if (message.content.trim()) return true;
+    if (message.meta?.runId && activityTurnIds.has(message.meta.runId)) return true;
+    return loading && index === groupedMessages.length - 1;
+  });
 
   async function refreshHealth() {
     try {
@@ -396,19 +370,34 @@ export function App() {
 
   async function refreshOptions() {
     try {
-      const [modelData, mcpData, skillData] = await Promise.all([
-        getModelsConfig(), getMcpConfig(), getSkillsConfig()
+      const [modelData, catalog] = await Promise.all([
+        getModelsConfig(), getRuntimeCatalog()
       ]);
       const enabledModels = modelData.models.filter((model) => model.enabled);
-      const enabledMcp = mcpData.servers.filter((server) => server.enabled);
-      const enabledSkills = skillData.skills.filter((skill) => skill.enabled);
+      const enabledMcp = catalog.mcpServers.filter((server) => server.enabled);
+      const enabledSkills = catalog.skills.filter((skill) => skill.enabled);
       setModels(enabledModels);
       setMcpServers(enabledMcp);
       setSkills(enabledSkills);
+      catalogLoadedRef.current = true;
       setModelId((current) => enabledModels.some((model) => model.id === current) ? current : enabledModels[0]?.id ?? "");
-      setSelectedMcp((current) => current.length ? current.filter((id) => enabledMcp.some((server) => server.id === id)) : enabledMcp.map((server) => server.id));
-      setSelectedSkills((current) => current.filter((id) => enabledSkills.some((skill) => skill.id === id)));
+      const remembered = capabilitySelectionRef.current;
+      const nextMcp = remembered
+        ? remembered.mcpServerIds.filter((id) => enabledMcp.some((server) => server.id === id))
+        : enabledMcp.map((server) => server.id);
+      const nextSkills = remembered
+        ? remembered.skillIds.filter((id) => enabledSkills.some((skill) => skill.id === id))
+        : [];
+      setSelectedMcp(nextMcp);
+      setSelectedSkills(nextSkills);
+      if (remembered) {
+        capabilitySelectionRef.current = {
+          mcpServerIds: nextMcp,
+          skillIds: nextSkills
+        };
+      }
     } catch {
+      catalogLoadedRef.current = false;
       setModels([]);
       setMcpServers([]);
       setSkills([]);
@@ -421,19 +410,45 @@ export function App() {
       const data = await getSession(nextId);
       setSessionId(data.sessionId);
       localStorage.setItem(appConfig.storageKey, data.sessionId);
+      const remembered = data.capabilities ?? null;
+      capabilitySelectionRef.current = remembered;
+      if (remembered) {
+        setSelectedMcp(
+          catalogLoadedRef.current
+            ? remembered.mcpServerIds.filter((id) => mcpServers.some((server) => server.id === id))
+            : remembered.mcpServerIds
+        );
+        setSelectedSkills(
+          catalogLoadedRef.current
+            ? remembered.skillIds.filter((id) => skills.some((skill) => skill.id === id))
+            : remembered.skillIds
+        );
+      } else {
+        // 旧会话没有 capabilities；即使目录请求仍在进行，也应保持“默认选择”
+        // 语义，让随后完成的 refreshOptions 应用当前全部可用 MCP。
+        setSelectedMcp(mcpServers.map((server) => server.id));
+        setSelectedSkills([]);
+      }
+      resetRunViewState();
       const normalizedMessages = normalizeMessages(data.messages);
-      const normalizedThinking = normalizeThinking(data.thinking);
-      setMessages(normalizedMessages);
-      setTrace(normalizeStringList(data.trace));
-      setTasks(normalizeStringList(data.tasks));
-      setThinking(normalizedThinking);
-      setThinkingGroups(normalizeThinkingGroups(data.thinkingGroups, normalizedThinking, data.sessionId));
-      activeThinkingGroupIdRef.current = null;
-      activeThinkingStepIdRef.current = null;
-      activitySequenceRef.current = 0;
-      const latestAssistant = [...normalizedMessages].reverse().find((message) => message.role === "assistant");
-      setTools(normalizeToolActivities(latestAssistant?.meta?.toolActivities));
-      setTextActivities(normalizeTextActivities(latestAssistant?.meta?.textActivities, latestAssistant?.content ?? ""));
+      persistedMessageIdsRef.current = new Set(normalizedMessages.map((message) => message.id));
+      const historicalEvents = Array.isArray(data.events) ? data.events : [];
+      setMessages(mergeHistoricalMessages(
+        normalizedMessages,
+        historicalEvents,
+        appConfig.text.requestErrorPrefix
+      ));
+      if (Array.isArray(data.events) && data.events.length) {
+        setTasks(normalizeStringList(data.tasks));
+        replayingHistoryRef.current = true;
+        data.events.forEach((event) => applyAgUiEvent(event));
+        replayingHistoryRef.current = false;
+      }
+      if (!Array.isArray(data.events) || !data.events.length) {
+        setTrace(normalizeStringList(data.trace));
+        setTasks(normalizeStringList(data.tasks));
+        setThinking(normalizeThinking(data.thinking));
+      }
       setStatus(appConfig.status.idle);
       setSidebarOpen(false);
     } catch {
@@ -446,20 +461,32 @@ export function App() {
     if (loading) return;
     localStorage.removeItem(appConfig.storageKey);
     setSessionId(null);
+    capabilitySelectionRef.current = null;
+    setSelectedMcp(mcpServers.map((server) => server.id));
+    setSelectedSkills([]);
+    persistedMessageIdsRef.current = new Set();
+    resetRunViewState();
+    setStatus(appConfig.status.idle);
+    setSidebarOpen(false);
+  }
+
+  function resetRunViewState() {
     setMessages([]);
     setTrace([]);
     setTasks([]);
     setThinking([]);
-    setThinkingGroups([]);
-    setTextActivities([]);
-    activeThinkingGroupIdRef.current = null;
+    setThinkingBlocks([]);
+    setTextBlocks([]);
+    setActiveRunId(null);
+    activeRunIdRef.current = null;
+    pendingAssistantIdRef.current = null;
+    activeThinkingBlockIdRef.current = null;
     activeThinkingStepIdRef.current = null;
     activeTextActivityIdRef.current = null;
     activeTextMessageIdRef.current = null;
+    assistantVisibleTextLengthRef.current = 0;
     activitySequenceRef.current = 0;
     setTools([]);
-    setStatus(appConfig.status.idle);
-    setSidebarOpen(false);
   }
 
   function stopRun() {
@@ -467,6 +494,22 @@ export function App() {
     abortRef.current = null;
     setLoading(false);
     setStatus("已停止");
+  }
+
+  function changeSelectedMcp(ids: string[]) {
+    setSelectedMcp(ids);
+    capabilitySelectionRef.current = {
+      mcpServerIds: ids,
+      skillIds: selectedSkills
+    };
+  }
+
+  function changeSelectedSkills(ids: string[]) {
+    setSelectedSkills(ids);
+    capabilitySelectionRef.current = {
+      mcpServerIds: selectedMcp,
+      skillIds: ids
+    };
   }
 
   async function copyMessage(messageId: string, content: string) {
@@ -547,15 +590,20 @@ export function App() {
     const selectedModel = models.find((model) => model.id === modelId);
     const validReasoningOptions = reasoningOptionsForModel(selectedModel);
     const effectiveReasoningEffort = validReasoningOptions.some((option) => option.id === reasoningEffort) ? reasoningEffort : "none";
-    const pendingAssistantId = crypto.randomUUID();
-    const nextMessages = [...messages, createMessage("user", prompt), createStreamingMessage(pendingAssistantId)];
+    const pendingAssistantId = createClientId();
+    const userMessage = createMessage("user", prompt);
+    const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
     const runInput: AgUiRunInput = {
-      threadId: sessionId ?? crypto.randomUUID(),
-      runId: crypto.randomUUID(),
-      state: { sessionId, trace, tasks },
-      messages: nextMessages
-        .filter((message) => message.role !== "tool")
-        .map(({ id, role, content }) => ({ id, role, content })),
+      threadId: sessionId ?? createClientId(),
+      runId: createClientId(),
+      state: {},
+      messages: [
+        {
+          id: userMessage.id,
+          role: userMessage.role,
+          content: userMessage.content
+        }
+      ],
       tools: [],
       context: [],
       forwardedProps: {
@@ -574,17 +622,11 @@ export function App() {
     pendingAssistantIdRef.current = pendingAssistantId;
     setInput("");
     setAttachments([]);
-    setTrace([]);
-    setThinking([]);
-    setThinkingGroups([]);
-    setTextActivities([]);
-    activeThinkingGroupIdRef.current = null;
+    activeThinkingBlockIdRef.current = null;
     activeThinkingStepIdRef.current = null;
     activeTextActivityIdRef.current = null;
     activeTextMessageIdRef.current = null;
     assistantVisibleTextLengthRef.current = 0;
-    activitySequenceRef.current = 0;
-    setTools([]);
     setLoading(true);
     setStatus(appConfig.status.preparing);
 
@@ -596,7 +638,10 @@ export function App() {
       const detail = error instanceof Error ? error.message : "未知错误";
       setStatus(appConfig.status.failed);
       const pendingAssistantId = pendingAssistantIdRef.current;
+      const failedRunId = activeRunIdRef.current;
       pendingAssistantIdRef.current = null;
+      activeRunIdRef.current = null;
+      setActiveRunId(null);
       setMessages((current) =>
         pendingAssistantId && current.some((message) => message.id === pendingAssistantId)
           ? current.map((message) =>
@@ -604,7 +649,13 @@ export function App() {
               ? { ...message, content: `${appConfig.text.requestErrorPrefix}${detail}` }
               : message
           )
-          : [...current, createMessage("assistant", `${appConfig.text.requestErrorPrefix}${detail}`)]
+          : [
+            ...current,
+            {
+              ...createMessage("assistant", `${appConfig.text.requestErrorPrefix}${detail}`),
+              meta: failedRunId ? { runId: failedRunId } : undefined
+            }
+          ]
       );
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
@@ -615,19 +666,43 @@ export function App() {
   function applyAgUiEvent(event: AgUiEvent) {
     switch (event.type) {
       case "RUN_STARTED":
+        activeRunIdRef.current = event.runId;
+        setActiveRunId(event.runId);
         setSessionId(event.threadId);
         localStorage.setItem(appConfig.storageKey, event.threadId);
         setStatus(appConfig.status.processing);
+        if (!replayingHistoryRef.current) {
+          const pendingAssistantId = pendingAssistantIdRef.current;
+          if (pendingAssistantId) {
+            setMessages((current) => current.map((message) =>
+              message.id === pendingAssistantId
+                ? { ...message, meta: { ...message.meta, runId: event.runId } }
+                : message
+            ));
+          }
+        }
         break;
       case "TEXT_MESSAGE_START":
+      {
+        const textTurnId = activeRunIdRef.current ?? event.messageId;
+        const textSequence = activitySequenceRef.current + 1;
+        activitySequenceRef.current = textSequence;
         activeTextMessageIdRef.current = event.messageId;
         assistantVisibleTextLengthRef.current = 0;
-        activitySequenceRef.current += 1;
         activeTextActivityIdRef.current = event.messageId;
-        setTextActivities((current) => [
+        setTextBlocks((current) => [
           ...current,
-          { id: event.messageId, content: "", status: "streaming", sequence: activitySequenceRef.current }
+          {
+            id: event.messageId,
+            turnId: textTurnId,
+            content: "",
+            status: "streaming",
+            sequence: textSequence
+          }
         ]);
+        if (replayingHistoryRef.current && persistedMessageIdsRef.current.has(event.messageId)) {
+          break;
+        }
         setMessages((current) => {
           const pendingAssistantId = pendingAssistantIdRef.current;
           const fallbackPendingId = [...current].reverse().find((message) => message.role === "assistant" && !message.content)?.id;
@@ -637,14 +712,21 @@ export function App() {
           if (reusableAssistantId) {
             pendingAssistantIdRef.current = null;
             return current.map((message) =>
-              message.id === reusableAssistantId ? { ...message, id: event.messageId } : message
+              message.id === reusableAssistantId
+                ? {
+                  ...message,
+                  id: event.messageId,
+                  meta: { ...message.meta, runId: textTurnId }
+                }
+                : message
             );
           }
           return current.some((message) => message.id === event.messageId)
             ? current
-            : [...current, createStreamingMessage(event.messageId)];
+            : [...current, createStreamingMessage(event.messageId, textTurnId)];
         });
         break;
+      }
       case "TEXT_MESSAGE_END":
         if (activeTextMessageIdRef.current === event.messageId) {
           activeTextMessageIdRef.current = null;
@@ -652,16 +734,18 @@ export function App() {
         if (activeTextActivityIdRef.current === event.messageId) {
           activeTextActivityIdRef.current = null;
         }
-        setTextActivities((current) => current.map((text) =>
+        setTextBlocks((current) => current.map((text) =>
           text.id === event.messageId ? { ...text, status: "complete" } : text
         ));
         break;
       case "TEXT_MESSAGE_CONTENT":
+      {
+        const textTurnId = activeRunIdRef.current ?? event.messageId;
         {
           const visibleDeltaLength = visibleTextLength(event.delta);
           assistantVisibleTextLengthRef.current += visibleDeltaLength;
         }
-        setTextActivities((current) => {
+        setTextBlocks((current) => {
           if (current.some((text) => text.id === event.messageId)) {
             return current.map((text) =>
               text.id === event.messageId ? { ...text, content: text.content + event.delta } : text
@@ -671,9 +755,18 @@ export function App() {
           activeTextActivityIdRef.current = event.messageId;
           return [
             ...current,
-            { id: event.messageId, content: event.delta, status: "streaming", sequence: activitySequenceRef.current }
+            {
+              id: event.messageId,
+              turnId: textTurnId,
+              content: event.delta,
+              status: "streaming",
+              sequence: activitySequenceRef.current
+            }
           ];
         });
+        if (replayingHistoryRef.current && persistedMessageIdsRef.current.has(event.messageId)) {
+          break;
+        }
         setMessages((current) => {
           if (current.some((message) => message.id === event.messageId)) {
             return current.map((message) =>
@@ -691,22 +784,79 @@ export function App() {
           return reusableAssistantId
             ? current.map((message) =>
               message.id === reusableAssistantId
-                ? { ...message, id: event.messageId, content: event.delta }
+                ? {
+                  ...message,
+                  id: event.messageId,
+                  content: event.delta,
+                  meta: { ...message.meta, runId: textTurnId }
+                }
                 : message
             )
-            : [...current, { ...createStreamingMessage(event.messageId), content: event.delta }];
+            : [
+              ...current,
+              {
+                ...createStreamingMessage(event.messageId, textTurnId),
+                content: event.delta
+              }
+            ];
         });
         break;
-      case "THINKING_START":
+      }
+      case "REASONING_START":
+        activeThinkingTitleRef.current = "思考过程";
+        activeThinkingStepIdRef.current = null;
+        beginThinkingBlock(
+          event.messageId,
+          activeRunIdRef.current ?? event.messageId
+        );
+        break;
+      case "REASONING_MESSAGE_START": {
+        const rawStep = normalizeThinkingStep(event.rawEvent);
+        const step = rawStep
+          ? { ...rawStep, detail: "", status: "active" as const }
+          : {
+            id: event.messageId,
+            phase: "reasoning" as const,
+            title: activeThinkingTitleRef.current,
+            detail: "",
+            status: "active" as const,
+            iteration: thinking.length + 1,
+            createdAt: new Date().toISOString()
+          };
+        activeThinkingStepIdRef.current = step.id;
+        upsertThinkingStep(step);
+        break;
+      }
+      case "REASONING_MESSAGE_CONTENT":
+        appendThinkingStepDetail(event.messageId, event.delta);
+        break;
+      case "REASONING_MESSAGE_END": {
+        const rawStep = normalizeThinkingStep(event.rawEvent);
+        const stepId = rawStep?.id ?? event.messageId;
+        if (stepId) completeThinkingStep(stepId, rawStep);
+        if (activeThinkingStepIdRef.current === stepId) activeThinkingStepIdRef.current = null;
+        break;
+      }
+      case "REASONING_END":
+        activeThinkingStepIdRef.current = null;
+        closeActiveThinkingBlock();
+        break;
+      case "THINKING_START": {
+        const legacyBlockId = createClientId();
         activeThinkingTitleRef.current = event.title || "思考过程";
         activeThinkingStepIdRef.current = null;
+        beginThinkingBlock(
+          legacyBlockId,
+          activeRunIdRef.current ?? legacyBlockId
+        );
         break;
+      }
       case "THINKING_TEXT_MESSAGE_START": {
         const rawStep = normalizeThinkingStep(event.rawEvent);
         const step = rawStep
           ? { ...rawStep, detail: "", status: "active" as const }
           : {
-            id: crypto.randomUUID(),
+            id: createClientId(),
             phase: "reasoning" as const,
             title: activeThinkingTitleRef.current,
             detail: "",
@@ -732,20 +882,25 @@ export function App() {
       }
       case "THINKING_END":
         activeThinkingStepIdRef.current = null;
-        closeActiveThinkingGroup();
+        closeActiveThinkingBlock();
         break;
       case "TOOL_CALL_START":
-        activitySequenceRef.current += 1;
+      {
+        const toolTurnId = activeRunIdRef.current ?? event.toolCallId;
+        const toolSequence = activitySequenceRef.current + 1;
+        activitySequenceRef.current = toolSequence;
         setTools((current) => [...current, {
           id: event.toolCallId,
+          turnId: toolTurnId,
           name: event.toolCallName,
           arguments: "",
           status: "preparing",
-          sequence: activitySequenceRef.current,
+          sequence: toolSequence,
           textOffset: assistantVisibleTextLengthRef.current
         }]);
         setStatus(`调用 ${event.toolCallName}`);
         break;
+      }
       case "TOOL_CALL_ARGS":
         updateTool(event.toolCallId, (tool) => ({
           ...tool, arguments: tool.arguments + event.delta, status: "running"
@@ -768,31 +923,24 @@ export function App() {
           if (entry) setTrace((current) => [...current, entry]);
         }
         break;
-      case "STATE_SNAPSHOT": {
-        pendingAssistantIdRef.current = null;
-        const normalizedThinking = normalizeThinking(event.snapshot.thinking);
-        setMessages(normalizeMessages(event.snapshot.messages));
-        setTrace(normalizeStringList(event.snapshot.trace));
-        setTasks(normalizeStringList(event.snapshot.tasks));
-        setThinking(normalizedThinking);
-        setThinkingGroups(normalizeThinkingGroups(event.snapshot.thinkingGroups, normalizedThinking, event.snapshot.sessionId));
-        activeThinkingGroupIdRef.current = null;
-        activeThinkingStepIdRef.current = null;
-        activeTextActivityIdRef.current = null;
-        activeTextMessageIdRef.current = null;
-        const snapshotMessages = normalizeMessages(event.snapshot.messages);
-        const latestAssistant = [...snapshotMessages].reverse().find((message) => message.role === "assistant");
-        setTools(normalizeToolActivities(latestAssistant?.meta?.toolActivities));
-        setTextActivities(normalizeTextActivities(latestAssistant?.meta?.textActivities, latestAssistant?.content ?? ""));
-        break;
-      }
       case "RUN_FINISHED":
+        activeRunIdRef.current = null;
+        setActiveRunId(null);
+        pendingAssistantIdRef.current = null;
         setStatus(appConfig.status.complete);
         break;
       case "RUN_ERROR": {
         const pendingAssistantId = pendingAssistantIdRef.current;
+        const failedRunId = activeRunIdRef.current;
+        if (failedRunId) failRunActivities(failedRunId);
         pendingAssistantIdRef.current = null;
+        activeRunIdRef.current = null;
+        setActiveRunId(null);
         setStatus(appConfig.status.failed);
+        // Historical error rows were merged into their original run position
+        // before replay. Appending one here would move an older failed run
+        // behind later successful messages.
+        if (replayingHistoryRef.current) break;
         setMessages((current) =>
           pendingAssistantId && current.some((message) => message.id === pendingAssistantId)
             ? current.map((message) =>
@@ -800,61 +948,124 @@ export function App() {
                 ? { ...message, content: `${appConfig.text.requestErrorPrefix}${event.message}` }
                 : message
             )
-            : [...current, createMessage("assistant", `${appConfig.text.requestErrorPrefix}${event.message}`)]
+            : [
+              ...current,
+              {
+                ...createMessage("assistant", `${appConfig.text.requestErrorPrefix}${event.message}`),
+                meta: failedRunId ? { runId: failedRunId } : undefined
+              }
+            ]
         );
         break;
       }
     }
   }
 
+  function failRunActivities(runId: string) {
+    setTools((current) => current.map((tool) =>
+      tool.turnId === runId && tool.status !== "complete"
+        ? { ...tool, status: "error" }
+        : tool
+    ));
+    setTextBlocks((current) => current.map((text) =>
+      text.turnId === runId && text.status === "streaming"
+        ? { ...text, status: "complete" }
+        : text
+    ));
+    setThinking((current) => current.map((step) =>
+      step.status === "active" ? { ...step, status: "error" } : step
+    ));
+    setThinkingBlocks((current) => current.map((block) =>
+      block.turnId === runId
+        ? {
+          ...block,
+          closed: true,
+          steps: block.steps.map((step) =>
+            step.status === "active" ? { ...step, status: "error" } : step
+          )
+        }
+        : block
+    ));
+    activeThinkingBlockIdRef.current = null;
+    activeThinkingStepIdRef.current = null;
+    activeTextActivityIdRef.current = null;
+    activeTextMessageIdRef.current = null;
+  }
+
   function updateTool(id: string, transform: (tool: ToolActivity) => ToolActivity) {
     setTools((current) => current.map((tool) => tool.id === id ? transform(tool) : tool));
   }
 
-  function upsertThinkingStep(step: ThinkingActivity) {
+  function beginThinkingBlock(blockId: string, turnId: string) {
+    activeThinkingBlockIdRef.current = blockId;
+    const blockSequence = activitySequenceRef.current + 1;
+    activitySequenceRef.current = blockSequence;
+    setThinkingBlocks((current) =>
+      current.some((block) => block.id === blockId)
+        ? current
+        : [
+          ...current,
+          {
+            id: blockId,
+            turnId,
+            steps: [],
+            closed: false,
+            sequence: blockSequence
+          }
+        ]
+    );
+  }
+
+  function upsertThinkingStep(
+    step: ThinkingActivity,
+    turnId = activeRunIdRef.current ?? step.id
+  ) {
+    let blockId = activeThinkingBlockIdRef.current;
+    let blockSequence = activitySequenceRef.current;
+    if (!blockId) {
+      blockId = createClientId();
+      activeThinkingBlockIdRef.current = blockId;
+      blockSequence += 1;
+      activitySequenceRef.current = blockSequence;
+    }
     setThinking((current) => {
       const exists = current.some((item) => item.id === step.id);
       return exists
         ? current.map((item) => item.id === step.id ? step : item)
         : [...current, step];
     });
-    setThinkingGroups((current) => {
-      const existingGroup = current.find((group) => group.steps.some((item) => item.id === step.id));
-      if (existingGroup) {
-        return current.map((group) =>
-          group.id === existingGroup.id
+    setThinkingBlocks((current) => {
+      const existingBlock = current.find((block) => block.steps.some((item) => item.id === step.id));
+      if (existingBlock) {
+        return current.map((block) =>
+          block.id === existingBlock.id
             ? {
-              ...group,
-              textEnd: assistantVisibleTextLengthRef.current,
-              steps: group.steps.map((item) => item.id === step.id ? step : item)
+              ...block,
+              steps: block.steps.map((item) => item.id === step.id ? step : item)
             }
-            : group
+            : block
         );
       }
-      const activeGroupId = activeThinkingGroupIdRef.current;
-      const activeGroup = activeGroupId ? current.find((group) => group.id === activeGroupId) : null;
-      const groupId = activeGroup && !activeGroup.closed ? activeGroup.id : crypto.randomUUID();
-      activeThinkingGroupIdRef.current = groupId;
-      if (!activeGroup || activeGroup.closed) activitySequenceRef.current += 1;
-      const targetGroups = activeGroup && !activeGroup.closed
+      const targetBlocks = current.some((block) => block.id === blockId)
         ? current
-        : [...current, {
-          id: groupId,
-          steps: [],
-          closed: false,
-          textStart: assistantVisibleTextLengthRef.current,
-          textEnd: assistantVisibleTextLengthRef.current,
-          sequence: activitySequenceRef.current
-        }];
-      return targetGroups.map((group) => {
-        if (group.id !== groupId) return group;
-        const exists = group.steps.some((item) => item.id === step.id);
+        : [
+          ...current,
+          {
+            id: blockId,
+            turnId,
+            steps: [],
+            closed: false,
+            sequence: blockSequence
+          }
+        ];
+      return targetBlocks.map((block) => {
+        if (block.id !== blockId) return block;
+        const exists = block.steps.some((item) => item.id === step.id);
         return {
-          ...group,
-          textEnd: assistantVisibleTextLengthRef.current,
+          ...block,
           steps: exists
-            ? group.steps.map((item) => item.id === step.id ? step : item)
-            : [...group.steps, step],
+            ? block.steps.map((item) => item.id === step.id ? step : item)
+            : [...block.steps, step],
         };
       });
     });
@@ -864,9 +1075,9 @@ export function App() {
     setThinking((current) => current.map((step) =>
       step.id === id ? { ...step, detail: step.detail + delta } : step
     ));
-    setThinkingGroups((current) => current.map((group) => ({
-      ...group,
-      steps: group.steps.map((step) =>
+    setThinkingBlocks((current) => current.map((block) => ({
+      ...block,
+      steps: block.steps.map((step) =>
         step.id === id ? { ...step, detail: step.detail + delta } : step
       )
     })));
@@ -878,25 +1089,31 @@ export function App() {
         ? { ...(finalStep ?? step), id, status: "complete" as const }
         : step;
     setThinking((current) => current.map(complete));
-    setThinkingGroups((current) => current.map((group) => ({
-      ...group,
-      steps: group.steps.map(complete)
+    setThinkingBlocks((current) => current.map((block) => ({
+      ...block,
+      steps: block.steps.map(complete)
     })));
   }
 
-  function closeActiveThinkingGroup() {
-    const activeGroupId = activeThinkingGroupIdRef.current;
-    if (!activeGroupId) return;
-    activeThinkingGroupIdRef.current = null;
-    setThinkingGroups((current) => current.map((group) =>
-      group.id === activeGroupId
-        ? { ...group, closed: true, textEnd: assistantVisibleTextLengthRef.current }
-        : group
+  function closeActiveThinkingBlock() {
+    const activeBlockId = activeThinkingBlockIdRef.current;
+    if (!activeBlockId) return;
+    activeThinkingBlockIdRef.current = null;
+    setThinkingBlocks((current) => current.map((block) =>
+      block.id === activeBlockId
+        ? { ...block, closed: true }
+        : block
     ));
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
+      const nativeEvent = event.nativeEvent as KeyboardEvent<HTMLTextAreaElement>["nativeEvent"] & {
+        keyCode?: number;
+      };
+      if (isComposerComposingRef.current || nativeEvent.isComposing || nativeEvent.keyCode === 229) {
+        return;
+      }
       event.preventDefault();
       event.currentTarget.form?.requestSubmit();
     }
@@ -963,10 +1180,16 @@ export function App() {
   }
 
   if (view === "config") {
-    return <ConfigCenter onBack={() => { setView("chat"); void refreshOptions(); }} />;
+    return (
+      <>
+        <ConfigCenter onBack={() => { setView("chat"); void refreshOptions(); }} />
+        <DesktopPet enabled={desktopPetEnabled} onEnabledChange={setDesktopPetEnabled} />
+      </>
+    );
   }
 
   return (
+    <>
     <div
       className={`shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${inspectorOpen ? "" : "inspector-hidden"}`}
       style={{
@@ -1066,6 +1289,20 @@ export function App() {
               <i />{status}
             </span>
             <button
+              className={`topbar-icon-button desktop-pet-toggle ${desktopPetEnabled ? "active" : ""}`}
+              type="button"
+              aria-pressed={desktopPetEnabled}
+              aria-label={desktopPetEnabled ? "关闭桌宠" : "开启桌宠"}
+              title={desktopPetEnabled ? "桌宠已开启，点击关闭" : "桌宠已关闭，点击开启"}
+              onClick={() => setDesktopPetEnabled((current) => !current)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 8.2c-4 0-7.1 2.8-7.1 6.5 0 3.1 2.5 5.2 7.1 5.2s7.1-2.1 7.1-5.2c0-3.7-3.1-6.5-7.1-6.5Z" />
+                <path d="m6.4 11.1-.8-4.2 4 2.1M17.6 11.1l.8-4.2-4 2.1M12 8V4.8M12 5c.1-1.7 1.4-2.8 3.2-2.8-.1 1.7-1.4 2.8-3.2 2.8ZM11.9 5C11.8 3.6 10.7 2.7 9.3 2.7c.1 1.4 1.2 2.3 2.6 2.3Z" />
+                <path d="M9.2 14.3h.1M14.7 14.3h.1M10.8 16.5c.8.6 1.6.6 2.4 0" />
+              </svg>
+            </button>
+            <button
               className="topbar-icon-button theme-button"
               type="button"
               aria-label="切换页面主题"
@@ -1105,43 +1342,31 @@ export function App() {
             </div>
           )}
 
-          {displayMessages.length > 0 && displayMessages.map((message) => (
-            <MessageRenderBoundary key={message.id} messageId={message.id}>
-              <article className={`message-row ${message.role}`}>
-                <div className="avatar">{message.role === "user" ? "你" : "K"}</div>
-                <div className="message-body">
-                  {message.role === "assistant" && (() => {
-                    const storedGroups = normalizeThinkingGroups(
-                      message.meta?.thinkingGroups,
-                      [],
-                      message.id
-                    );
-                    const storedTools = normalizeToolActivities(message.meta?.toolActivities);
-                    const storedTexts = normalizeTextActivities(message.meta?.textActivities, message.content);
-                    const groups = message.id === lastAssistantMessageId && loading
-                      ? thinkingGroups
-                      : storedGroups.length
-                        ? storedGroups
-                        : message.id === lastAssistantMessageId
-                          ? thinkingGroups
-                          : [];
-                    const messageTools = message.id === lastAssistantMessageId && loading
-                      ? tools
-                        : storedTools.length
-                        ? storedTools
-                        : message.id === lastAssistantMessageId
-                          ? tools
-                          : [];
-                    const messageTexts = message.id === lastAssistantMessageId && loading
-                      ? textActivities
-                      : storedTexts.length
-                        ? storedTexts
-                        : message.id === lastAssistantMessageId
-                          ? textActivities
-                          : [];
-                    return inlineTimeline(messageTexts, groups, messageTools).map((activity) =>
+          {displayMessages.length > 0 && displayMessages.map((message) => {
+            const turnId = message.role === "assistant" ? message.meta?.runId : undefined;
+            const blocks = turnId
+              ? thinkingBlocks.filter((block) => block.turnId === turnId)
+              : [];
+            const messageTools = turnId
+              ? tools.filter((tool) => tool.turnId === turnId)
+              : [];
+            const messageTexts = turnId
+              ? textBlocks.filter((text) => text.turnId === turnId)
+              : [];
+            const timeline = inlineTimeline(messageTexts, blocks, messageTools);
+            const hasTimelineText = messageTexts.length > 0;
+            const isActiveAssistant = message.role === "assistant"
+              && loading
+              && (!turnId || turnId === activeRunId);
+
+            return (
+              <MessageRenderBoundary key={message.id} messageId={message.id}>
+                <article className={`message-row ${message.role}`}>
+                  <div className="avatar">{message.role === "user" ? "你" : "K"}</div>
+                  <div className="message-body">
+                    {message.role === "assistant" && timeline.map((activity) =>
                       activity.type === "thinking"
-                        ? <InlineThinking group={activity.group} key={`thinking-${activity.group.id}`} />
+                        ? <InlineThinking block={activity.block} key={`thinking-${activity.block.id}`} />
                         : activity.type === "tool"
                           ? <InlineTool tool={activity.tool} key={`tool-${activity.tool.id}`} />
                           : (
@@ -1149,44 +1374,50 @@ export function App() {
                               <MarkdownContent content={activity.text.content} />
                             </div>
                           )
-                    );
-                  })()}
-                  {message.role === "assistant"
-                    ? !message.content && <div className="assistant-output"><Typing /></div>
-                    : (
-                      <div className="bubble">
-                        {message.content ? <MarkdownContent content={message.content} /> : <Typing />}
-                      </div>
                     )}
-                  {!(loading && message.role === "assistant" && message.id === lastAssistantMessageId) && (
-                    <footer className="message-meta">
-                      <time>{formatTime(message.createdAt)}</time>
-                      {message.content && (
-                        <button
-                          className={copyFeedback?.messageId === message.id ? `copy-feedback ${copyFeedback.status}` : ""}
-                          type="button"
-                          aria-label={copyFeedback?.messageId === message.id
-                            ? copyFeedback.status === "success" ? "消息已复制" : "消息复制失败"
-                            : "复制消息"}
-                          title={copyFeedback?.messageId === message.id
-                            ? copyFeedback.status === "success" ? "已复制" : "复制失败"
-                            : "复制消息"}
-                          onClick={() => void copyMessage(message.id, message.content)}
-                        >
-                          <span aria-hidden="true">{copyFeedback?.messageId === message.id && copyFeedback.status === "success" ? "✓" : "⧉"}</span>
-                          {copyFeedback?.messageId === message.id && (
-                            <b role="status" aria-live="polite">
-                              {copyFeedback.status === "success" ? "已复制" : "复制失败"}
-                            </b>
-                          )}
-                        </button>
+                    {message.role === "assistant"
+                      ? !hasTimelineText && (
+                        <div className="assistant-output">
+                          {message.content
+                            ? <MarkdownContent content={message.content} />
+                            : <Typing />}
+                        </div>
+                      )
+                      : (
+                        <div className="bubble">
+                          {message.content ? <MarkdownContent content={message.content} /> : <Typing />}
+                        </div>
                       )}
-                    </footer>
-                  )}
-                </div>
-              </article>
-            </MessageRenderBoundary>
-          ))}
+                    {!isActiveAssistant && (
+                      <footer className="message-meta">
+                        <time>{formatTime(message.createdAt)}</time>
+                        {message.content && (
+                          <button
+                            className={copyFeedback?.messageId === message.id ? `copy-feedback ${copyFeedback.status}` : ""}
+                            type="button"
+                            aria-label={copyFeedback?.messageId === message.id
+                              ? copyFeedback.status === "success" ? "消息已复制" : "消息复制失败"
+                              : "复制消息"}
+                            title={copyFeedback?.messageId === message.id
+                              ? copyFeedback.status === "success" ? "已复制" : "复制失败"
+                              : "复制消息"}
+                            onClick={() => void copyMessage(message.id, message.content)}
+                          >
+                            <span aria-hidden="true">{copyFeedback?.messageId === message.id && copyFeedback.status === "success" ? "✓" : "⧉"}</span>
+                            {copyFeedback?.messageId === message.id && (
+                              <b role="status" aria-live="polite">
+                                {copyFeedback.status === "success" ? "已复制" : "复制失败"}
+                              </b>
+                            )}
+                          </button>
+                        )}
+                      </footer>
+                    )}
+                  </div>
+                </article>
+              </MessageRenderBoundary>
+            );
+          })}
           <div ref={streamEndRef} />
         </section>
 
@@ -1198,14 +1429,20 @@ export function App() {
             value={input}
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={handleComposerKeyDown}
+            onCompositionStart={() => {
+              isComposerComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposerComposingRef.current = false;
+            }}
             placeholder="描述任务，K Agent 会规划并执行…"
             rows={2}
           />
           <div className="composer-footer">
             <div className="composer-toolbar composer-toolbar-left">
               <label className={`attach-button ${models.find((model) => model.id === modelId)?.multimodal ? "" : "disabled"}`} title="添加图片">＋<span>图片</span><input type="file" accept="image/*" multiple onChange={(event) => { void addImages(event.target.files); event.target.value = ""; }} /></label>
-              <Picker label={`MCP ${selectedMcp.length}`} items={mcpServers.map((server) => ({ id: server.id, name: server.id }))} selected={selectedMcp} onChange={setSelectedMcp} />
-              <Picker label={`Skill ${selectedSkills.length}`} items={skills.map((skill) => ({ id: skill.id, name: skill.name }))} selected={selectedSkills} onChange={setSelectedSkills} />
+              <Picker label={`MCP ${selectedMcp.length}`} items={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description }))} selected={selectedMcp} onChange={changeSelectedMcp} />
+              <Picker label={`Skill ${selectedSkills.length}`} items={skills.map((skill) => ({ id: skill.id, name: skill.name, description: skill.description }))} selected={selectedSkills} onChange={changeSelectedSkills} />
             </div>
             <div className="composer-toolbar composer-toolbar-right">
               <ModelSettingsPicker
@@ -1273,7 +1510,7 @@ export function App() {
         <InspectorSection title="工具活动" count={tools.length}>
           {tools.length ? tools.map((tool) => (
             <details className="tool-row" key={tool.id}>
-              <summary><span>⌁</span><strong>{tool.name}</strong><i className={tool.status} /></summary>
+              <summary><ToolIcon className="tool-row-icon" /><strong>{tool.name}</strong><i className={tool.status} /></summary>
               {tool.arguments && <code>{tool.arguments}</code>}
               {tool.result && <p>{tool.result}</p>}
             </details>
@@ -1284,11 +1521,19 @@ export function App() {
         </InspectorSection>
       </aside>
     </div>
+    <DesktopPet enabled={desktopPetEnabled} onEnabledChange={setDesktopPetEnabled} />
+    </>
   );
 }
 
-function createStreamingMessage(id: string): ChatMessage {
-  return { id, role: "assistant", content: "", createdAt: new Date().toISOString() };
+function createStreamingMessage(id: string, runId?: string | null): ChatMessage {
+  return {
+    id,
+    role: "assistant",
+    content: "",
+    createdAt: new Date().toISOString(),
+    meta: runId ? { runId } : undefined
+  };
 }
 
 class MessageRenderBoundary extends Component<
@@ -1366,15 +1611,15 @@ function Typing() {
   return <span className="typing"><i /><i /><i /></span>;
 }
 
-function InlineThinking({ group }: { group: ThinkingGroup }) {
-  const { steps } = group;
+function InlineThinking({ block }: { block: ThinkingBlock }) {
+  const { steps } = block;
   const latestActive = [...steps].reverse().find((step) => step.status === "active") ?? steps[steps.length - 1];
-  const hasActive = !group.closed && steps.some((step) => step.status === "active");
-  const [open, setOpen] = useState(!group.closed);
+  const hasActive = !block.closed && steps.some((step) => step.status === "active");
+  const [open, setOpen] = useState(!block.closed);
 
   useEffect(() => {
-    setOpen(!group.closed);
-  }, [group.closed, group.id]);
+    setOpen(!block.closed);
+  }, [block.closed, block.id]);
 
   return (
     <section className={`inline-thinking ${open ? "open" : ""}`}>
@@ -1413,17 +1658,17 @@ function InlineTool({ tool }: { tool: ToolActivity }) {
   }, [tool.status]);
 
   return (
-    <section className={`inline-tool ${open ? "open" : ""}`}>
+    <section className={`inline-tool ${tool.status} ${open ? "open" : ""}`}>
       <button
         type="button"
         className="inline-tool-summary"
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
-        <span aria-hidden="true">⌁</span>
+        <ToolIcon className="inline-tool-icon" />
         <strong>调用工具</strong>
         <code>{tool.name}</code>
-        <b>{tool.status === "complete" ? "已完成" : "运行中"}</b>
+        <b>{tool.status === "complete" ? "已完成" : tool.status === "error" ? "失败" : "运行中"}</b>
         <i aria-hidden="true">⌃</i>
       </button>
       {open && (tool.arguments || tool.result) && (
@@ -1444,6 +1689,23 @@ function EmptyInspector({ text }: { text: string }) {
   return <div className="inspector-empty"><span>—</span><p>{text}</p></div>;
 }
 
+function ToolIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M11.7 4.1a4.1 4.1 0 0 0-4.9 5.3l-4.4 4.4a1.7 1.7 0 1 0 2.4 2.4l4.4-4.4a4.1 4.1 0 0 0 5.3-4.9l-2.5 2.5-1.9-1.9 2.5-2.5a4 4 0 0 0-.9-.9Z" />
+    </svg>
+  );
+}
+
 function SidebarIcon({ side }: { side: "left" | "right" }) {
   return (
     <svg className={side === "right" ? "mirrored" : ""} viewBox="0 0 24 24" aria-hidden="true">
@@ -1460,7 +1722,7 @@ function Picker({
   onChange
 }: {
   label: string;
-  items: Array<{ id: string; name: string }>;
+  items: Array<{ id: string; name: string; description?: string }>;
   selected: string[];
   onChange: (ids: string[]) => void;
 }) {
@@ -1495,7 +1757,7 @@ function Picker({
                   ? [...selected, item.id]
                   : selected.filter((id) => id !== item.id))}
               />
-              <span>{item.name}</span><i>{isSelected ? "✓" : ""}</i>
+              <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span><i>{isSelected ? "✓" : ""}</i>
             </label>
           );
         })}

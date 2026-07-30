@@ -1,9 +1,12 @@
+"""Render the MCP capability section injected into the system prompt."""
+
 from __future__ import annotations
 
 from typing import Protocol
 
 
 class McpPromptTool(Protocol):
+    """定义可注入 MCP prompt 的工具描述协议。"""
     server_id: str
     name: str
     description: str | None

@@ -32,7 +32,10 @@
 ```text
 frontend/             React 前端工程
 frontend/src/         React 前端源码
-access_layer/         接入层：协议、校验、会话、消息与 Prompt 拼接
+access_layer/         接入层：公开 API、完整会话持久化与 AG-UI 透传
+data/mcp.json         MCP 选择列表摘要（Access Layer 管理）
+data/skill.json       Skill 选择列表摘要（Access Layer 管理）
+data/skill/           Skill 正文与附属资源
 backend/              无状态 Agent 服务端
 backend/agent/        无状态 Agent Backend：模型循环与工具执行
 backend/config/       后端集中配置
@@ -46,10 +49,8 @@ frontend/src/config.ts 前端集中配置
 
 请求链路为 `frontend -> access layer (:3001) -> agent backend (:3002)`：
 
-- 接入层负责 AG-UI 协议适配、会话读写、并发串行化、模型/附件/Skill
-  校验、Memory/Skill/MCP 上下文组装以及最终状态持久化。
-- Agent Backend 只接收完整的 `AgentRunRequest`，负责模型推理循环、工具调用
-  和运行事件输出。
+- 接入层负责会话读写、并发串行化、MCP/Skill 摘要目录和选择校验；运行时把完整历史以及选中 MCP/Skill 的自包含定义转发给 Agent Backend。
+- Agent Backend 不读取 MCP/Skill 摘要列表，也不扫描 Skill 目录；它只消费本次内部请求携带的定义，负责系统提示词拼接、上下文预算、模型消息组装、推理与工具调用，并直接生成标准 AG-UI Event。
 - 接入层通过内部 NDJSON 流式 HTTP 调用 Agent Backend；两个服务是独立进程，
   并非进程内函数调用。
 - `access_layer/` 与 `backend/` 是并列的顶层目录，依赖方向为接入层调用后端。
@@ -64,6 +65,8 @@ frontend/src/config.ts 前端集中配置
 - 标准运行、文本消息、工具调用和状态同步事件
 - 服务端统一维护模型调用
 - 会话记忆与历史列表
+- Claude Code 风格的分层指令、自动记忆、上下文预算与持久化压缩
+- 旧工具结果优先裁剪，以及会话上下文查看和手动压缩接口
 - 本地 function tools
 - 工具参数基础校验
 - 将 MCP tools 暴露给模型
@@ -77,15 +80,17 @@ frontend/src/config.ts 前端集中配置
 
 - `RUN_STARTED` / `RUN_FINISHED` / `RUN_ERROR`
 - `TEXT_MESSAGE_START` / `TEXT_MESSAGE_CONTENT` / `TEXT_MESSAGE_END`
-- `THINKING_START` / `THINKING_TEXT_MESSAGE_START` /
-  `THINKING_TEXT_MESSAGE_CONTENT` / `THINKING_TEXT_MESSAGE_END` / `THINKING_END`
+- `REASONING_START` / `REASONING_MESSAGE_START` /
+  `REASONING_MESSAGE_CONTENT` / `REASONING_MESSAGE_END` / `REASONING_END`
 - `TOOL_CALL_START` / `TOOL_CALL_ARGS` / `TOOL_CALL_END` / `TOOL_CALL_RESULT`
-- `STATE_SNAPSHOT`
 - `CUSTOM`，用于状态提示和执行轨迹
 
 协议适配位于 `access_layer/agui.py`，业务 Agent 保持独立，后续可以直接接入
 其他兼容 AG-UI 的 React 客户端。完整事件顺序、前端状态机和持久化约定见
 [K Agent AG-UI 协议约定](docs/ag-ui-protocol.md)。
+
+上下文来源、预算、路径规则、自动压缩与持久化字段见
+[K Agent 上下文管理系统](docs/context-management.md)。
 
 ## Agent callbacks
 
@@ -113,18 +118,47 @@ agent = OpenAIAgent(LOCAL_TOOLS, mcp_manager, callbacks=[AuditCallback()])
 
 后端代码配置集中在 `backend/config/config.py`，运行配置文件集中在 `backend/config/runtime/`，会自动读取 `.env`。前端配置集中在 `frontend/src/config.ts`，支持 `VITE_*` 环境变量。
 
+MCP 与 Skill 的前端选择列表由 Access Layer 直接读取 `data/mcp.json` 和
+`data/skill.json`。MCP 连接参数仍保存在
+`backend/config/runtime/mcp.config.json`，Skill 完整指令保存在
+`data/skill/<skill-id>/SKILL.md`；这些完整定义只在用户发起运行并选中对应项时解析。
+
 常用配置项：
 
 - `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`
 - `HOST` / `PORT` / `APP_TITLE`
+- `AGENT_BACKEND_HOST` / `AGENT_BACKEND_PORT` / `AGENT_BACKEND_LOG_LEVEL`
 - `CORS_ALLOW_ORIGINS` / `CORS_ALLOW_METHODS` / `CORS_ALLOW_HEADERS`
 - `MCP_CONFIG_PATH`
 - `MAX_MODEL_ITERATIONS` / `STREAM_CHUNK_SIZE`
 - `DEFAULT_SESSION_TITLE` / `SESSION_TITLE_MAX_LENGTH`
+- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL`
+- `LANGFUSE_ENABLED` / `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_SAMPLE_RATE`
 - `VITE_API_BASE_URL` / `VITE_SESSION_STORAGE_KEY` / `VITE_CLIENT_PORT`
+
+## 内网部署
+
+当前机器作为内网服务器时，先构建前端，再以非 reload 模式启动两个服务：
+
+```bash
+cd frontend
+npm run deploy:lan
+```
+
+Access Layer 默认监听 `0.0.0.0:3001`，并在同一端口托管
+`frontend/dist`；Agent Backend 仅监听 `127.0.0.1:3002`，不会直接暴露到
+内网。局域网设备使用 `http://<服务器内网 IP>:3001` 访问。生产构建默认使用
+同源 `/api`，不要把 `VITE_API_BASE_URL` 固定成 `localhost`。
+
+Agent Backend 默认向终端输出 `INFO` 级别的单行文本日志，格式为
+`时间 [级别] 模块 [sess/run/trace] [组件] 事件 | key=value`，包括服务生命周期、
+请求、Prompt 拼接、MCP 配置与连接、上下文预算与压缩、模型调用、工具调用、完成、
+取消和异常。日志只记录关联 ID、计数、长度、预算、工具名和耗时，不记录消息正文、
+Prompt 正文、工具参数值、工具输出或凭据。可以通过
+`AGENT_BACKEND_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR` 调整级别。
 
 ## 后续建议
 
-- 将会话记忆持久化到数据库
+- 为上下文预算接入各模型提供方的精确 tokenizer
 - 为工具参数加入完整 JSON Schema 校验
-- 增加鉴权、日志和任务状态管理
+- 增加鉴权和任务状态管理
