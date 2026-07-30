@@ -1,8 +1,8 @@
 const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 
 export const appConfig = {
-  // Development keeps Vite and Access Layer on separate ports. Production is
-  // served by Access Layer itself, so same-origin requests work from any LAN IP.
+  // Development keeps Vite and Access Layer on separate loopback ports. A
+  // built client is served by Access Layer itself and therefore stays same-origin.
   apiBaseUrl: configuredApiBaseUrl ?? (import.meta.env.DEV ? "http://localhost:3001" : ""),
   storageKey: import.meta.env.VITE_SESSION_STORAGE_KEY ?? "k-agent-session-id",
   agUiEndpoint: "/api/agent",

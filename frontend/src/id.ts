@@ -1,5 +1,5 @@
 /**
- * Generate UI correlation IDs on both HTTPS and plain HTTP LAN deployments.
+ * Generate UI correlation IDs in both secure and ordinary local HTTP contexts.
  *
  * `crypto.randomUUID()` is restricted to secure contexts, while
  * `crypto.getRandomValues()` remains available in ordinary HTTP browsers.

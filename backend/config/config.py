@@ -30,7 +30,9 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
     openai_base_url: str = Field(default="https://api.openai.com/v1", alias="OPENAI_BASE_URL")
     port: int = Field(default=3001, alias="PORT")
-    host: str = Field(default="0.0.0.0", alias="HOST")
+    # Public APIs stay on the loopback interface by default so a local
+    # deployment is not accidentally reachable from the surrounding network.
+    host: str = Field(default="127.0.0.1", alias="HOST")
     agent_backend_host: str = Field(default="127.0.0.1", alias="AGENT_BACKEND_HOST")
     agent_backend_port: int = Field(default=3002, alias="AGENT_BACKEND_PORT")
     agent_backend_url: str = Field(
@@ -38,7 +40,13 @@ class Settings(BaseSettings):
     )
     reload: bool = Field(default=False, alias="RELOAD")
     app_title: str = Field(default="K Agent API", alias="APP_TITLE")
-    cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"], alias="CORS_ALLOW_ORIGINS")
+    cors_allow_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
+        alias="CORS_ALLOW_ORIGINS",
+    )
     cors_allow_credentials: bool = Field(default=True, alias="CORS_ALLOW_CREDENTIALS")
     cors_allow_methods: list[str] = Field(default_factory=lambda: ["*"], alias="CORS_ALLOW_METHODS")
     cors_allow_headers: list[str] = Field(default_factory=lambda: ["*"], alias="CORS_ALLOW_HEADERS")

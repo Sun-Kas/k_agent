@@ -763,9 +763,9 @@ def create_app() -> FastAPI:
             ),
         )
 
-    # Production/LAN deployments expose only the Access Layer. Mounting the
+    # Local built deployments expose only the Access Layer. Mounting the
     # compiled client after every API route preserves /api semantics while
-    # serving the workbench and its assets from the same trusted origin.
+    # serving the workbench and its assets from the same origin.
     if FRONTEND_DIST_DIR.is_dir():
         app.mount(
             "/",

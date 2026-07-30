@@ -56,7 +56,8 @@ frontend/src/config.ts 前端集中配置
 - `access_layer/` 与 `backend/` 是并列的顶层目录，依赖方向为接入层调用后端。
 - `backend/agent/` 不依赖 access layer、session、memory、prompt 或 skill 模块，也不保存任何
   按会话标识索引的缓存；每次运行所需状态都由请求显式传入并在运行结束后释放。
-- Agent Backend 默认只监听 `127.0.0.1:3002`，内部接口会携带模型凭据，不应暴露到公网。
+- Access Layer 与 Agent Backend 默认分别只监听 `127.0.0.1:3001` 和
+  `127.0.0.1:3002`；内部接口会携带模型凭据，两个服务都不应暴露到公网或局域网。
 
 ## 当前能力
 
@@ -136,19 +137,19 @@ MCP 与 Skill 的前端选择列表由 Access Layer 直接读取 `data/mcp.json`
 - `LANGFUSE_ENABLED` / `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_SAMPLE_RATE`
 - `VITE_API_BASE_URL` / `VITE_SESSION_STORAGE_KEY` / `VITE_CLIENT_PORT`
 
-## 内网部署
+## 本地部署
 
-当前机器作为内网服务器时，先构建前端，再以非 reload 模式启动两个服务：
+需要使用构建后的前端时，先构建前端，再以非 reload 模式启动两个本地服务：
 
 ```bash
 cd frontend
-npm run deploy:lan
+npm run deploy:local
 ```
 
-Access Layer 默认监听 `0.0.0.0:3001`，并在同一端口托管
-`frontend/dist`；Agent Backend 仅监听 `127.0.0.1:3002`，不会直接暴露到
-内网。局域网设备使用 `http://<服务器内网 IP>:3001` 访问。生产构建默认使用
-同源 `/api`，不要把 `VITE_API_BASE_URL` 固定成 `localhost`。
+Access Layer 默认监听 `127.0.0.1:3001`，并在同一端口托管
+`frontend/dist`；Agent Backend 监听 `127.0.0.1:3002`。两个端口都只允许
+当前机器访问，不再向局域网开放。启动后使用 `http://127.0.0.1:3001` 或
+`http://localhost:3001` 访问；构建后的前端默认通过同源 `/api` 调用接入层。
 
 Agent Backend 默认向终端输出 `INFO` 级别的单行文本日志，格式为
 `时间 [级别] 模块 [sess/run/trace] [组件] 事件 | key=value`，包括服务生命周期、
