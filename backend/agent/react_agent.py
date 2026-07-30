@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -32,8 +35,9 @@ from backend.context import (
 )
 from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager, McpToolDescriptor
-from backend.permissions import check_permission
+from backend.permissions import PermissionDecision, check_permission, check_permissions
 from backend.api.schemas import ChatMessage, ChatMeta, ChatRole
+from backend.sandbox import notice_from_tool_result
 from backend.tools import ToolDefinition, validate_tool_arguments
 
 
@@ -79,9 +83,12 @@ class OpenAIAgent:
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield observable thinking, message, tool, trace, and final events."""
 
+        # 本次 run 的全部可变状态都是这里的局部变量，不挂在 self 上：
+        # 同一个 OpenAIAgent 实例可能被并发调用，实例级状态会导致会话串味。
         trace: list[str] = []
         thinking: list[dict[str, Any]] = []
         selected_model = request.model_config.get("model", self.config.openai_model)
+        # 凭据优先取本次请求选中的模型档案，缺失时才回落到进程级默认配置。
         client = AsyncOpenAI(
             api_key=request.model_config.get("apiKey") or self.config.openai_api_key,
             base_url=request.model_config.get("baseUrl") or self.config.openai_base_url,
@@ -91,17 +98,21 @@ class OpenAIAgent:
 
         try:
             mcp_tools = await self.mcp_client_manager.list_tools()
+            # 未选中的 MCP server 的工具不能进入 tool specs，否则模型可能调用
+            # 用户本次并未授权的服务。空集合表示不限制（沿用 manager 已连接的全部）。
             if request.mcp_server_ids:
                 mcp_tools = [
                     tool for tool in mcp_tools
                     if tool.server_id in request.mcp_server_ids
                 ]
             tool_specs = self._build_tool_specs(mcp_tools)
+            # 工具定义会随每次请求发给模型，属于不可裁剪的固定开销，
+            # 必须计入预算，否则工具一多就会在 provider 侧超长。
             tool_definition_tokens = estimate_text_tokens(
                 json.dumps(tool_specs, ensure_ascii=False, separators=(",", ":"))
             )
             context_plan = build_context_plan(
-                [message for message in request.messages if message.content.strip()],
+                [message for message in request.messages if message.carries_context()],
                 system_prompt=request.system_prompt,
                 user_context=request.user_context,
                 model_config=request.model_config,
@@ -114,6 +125,9 @@ class OpenAIAgent:
                     "Treat it as continuity context, not a new user request.\n\n"
                     + context_plan.summary
                 )
+            # working_messages 是要回传给 Access Layer 持久化的会话消息，
+            # api_messages 是发给 provider 的载荷（含 system、上下文提醒、tool_calls）。
+            # 两者刻意分开：持久化不应污染成 provider 的私有格式。
             working_messages = list(context_plan.messages)
             api_messages = compose_api_messages(
                 context_plan.messages,
@@ -165,7 +179,11 @@ class OpenAIAgent:
             yield {"type": "thinking", "payload": preparation}
             yield {"type": "status", "payload": {"message": self.config.status_model_started}}
 
+            # 循环的正常出口是下面「模型不再请求工具」的分支；跑满迭代次数属于
+            # 异常兜底，会在循环后返回一条上限提示，而不是让 run 无限继续。
             for iteration in range(self.config.max_model_iterations + 1):
+                # 每轮开头裁剪一次：工具结果是上下文增长最快的来源，
+                # 若等到超预算再处理，本轮请求已经发不出去了。
                 before_tool_chars = self._tool_output_chars(api_messages)
                 before_tool_outputs = self._tool_output_contents(api_messages)
                 api_messages = prune_old_tool_outputs(api_messages)
@@ -213,10 +231,14 @@ class OpenAIAgent:
                     "messages": api_messages,
                     "stream": True,
                     "max_tokens": int(request.model_config.get("maxOutputTokens") or 8192),
+                    "timeout": self.config.model_request_timeout_seconds,
                 }
+                # 没有可用工具时连 tools 字段都不传：部分 OpenAI 兼容服务
+                # 收到空数组会直接报错。
                 if tool_specs:
                     kwargs["tools"] = tool_specs
                     kwargs["tool_choice"] = "auto"
+                # 同理，reasoning_effort 只在模型确实支持且用户选了非 none 时下发。
                 if request.reasoning_effort and request.reasoning_effort != "none":
                     kwargs["reasoning_effort"] = request.reasoning_effort
 
@@ -232,7 +254,7 @@ class OpenAIAgent:
                 message_started = False
                 reasoning_status_sent = False
 
-                async for chunk in stream:
+                async for chunk in self._iter_stream_with_idle_timeout(stream):
                     if chunk.id:
                         response_id = chunk.id
 
@@ -263,6 +285,9 @@ class OpenAIAgent:
                         }
 
                     # Accumulate tool calls
+                    # 工具调用是分片到达的：id 和函数名通常只在第一个分片里出现，
+                    # 参数 JSON 则跨多个分片拼接。必须按 index 归档累积，
+                    # 攒齐整个流之后才能解析，中途的参数串是不完整的 JSON。
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
                             idx = tc_delta.index
@@ -328,6 +353,9 @@ class OpenAIAgent:
 
                 # Has tool calls — process them
                 # Append assistant message with tool_calls to api_messages
+                # 这条带 tool_calls 的 assistant 消息只进 api_messages，不进
+                # working_messages：它是 provider 协议要求的配对前提（后面每条
+                # tool 消息都要能通过 tool_call_id 找到它），但对会话历史无意义。
                 assistant_api_msg: dict[str, Any] = {
                     "role": "assistant",
                     "content": content_buffer or None,
@@ -411,7 +439,12 @@ class OpenAIAgent:
                         },
                     }
                     yield {"type": "trace", "payload": {"entry": trace[-1], "output": tool_result}}
+                    notice = self._sandbox_user_notice(context, tool_name, tool_result)
+                    if notice is not None:
+                        yield {"type": "status", "payload": {"message": notice}}
                     # Append tool result to api_messages
+                    # 失败结果同样以正常 tool 消息回填。模型据此自行修正后重试，
+                    # 这正是工具错误可恢复的关键：异常不冒泡，只变成一次观测。
                     api_messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -440,9 +473,57 @@ class OpenAIAgent:
             yield {"type": "trace", "payload": {"entry": trace[-1]}}
             yield {"type": "final", "payload": result}
         except Exception as exc:
+            # Agent 级异常（模型不可达、上下文构建失败等）不像工具失败那样可恢复，
+            # 记录后继续上抛，由 agui 层转成 RUN_ERROR 告知前端。
             await callbacks.on_error(context, AgentErrorPayload(error=exc, stage="agent_run"))
-            yield {"type": "trace", "payload": {"entry": trace[-1]}}
+            # MCP discovery and context planning run before the first trace entry
+            # exists, so indexing blindly would raise an IndexError that replaces
+            # the failure the operator actually needs to see.
+            yield {
+                "type": "trace",
+                "payload": {
+                    "entry": trace[-1] if trace else f"agent:failed:{type(exc).__name__}"
+                },
+            }
             raise
+
+    async def _iter_stream_with_idle_timeout(self, stream: Any) -> AsyncIterator[Any]:
+        """Yield provider chunks, aborting when the stream stalls mid-response.
+
+        The request-level timeout only bounds the initial response. A provider
+        that opens the stream and then goes silent would otherwise hold this run,
+        an access-layer concurrency slot, and the session lock indefinitely.
+        """
+
+        idle_timeout = self.config.model_stream_idle_timeout_seconds
+        iterator = stream.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), idle_timeout)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as exc:
+                await self._close_stream(stream)
+                raise TimeoutError(
+                    f"Model stream stalled for more than {idle_timeout:g}s "
+                    "without sending a chunk."
+                ) from exc
+            yield chunk
+
+    @staticmethod
+    async def _close_stream(stream: Any) -> None:
+        """Release provider stream resources on the abort path."""
+
+        close = getattr(stream, "close", None)
+        if close is None:
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # Cleanup must not replace the timeout that triggered it.
+            pass
 
     async def _run_tool(
         self,
@@ -485,6 +566,8 @@ class OpenAIAgent:
 
         local_tool = next((tool for tool in self.tools if tool.name == tool_name), None)
         selected_skill = self._selected_skill(tool_name)
+        # 本地工具优先。只有名字对不上任何本地工具时，才考虑它是不是
+        # provider 把 Skill 名当成函数名直接调用了。
         if local_tool is None and selected_skill is not None:
             local_tool = next(
                 (tool for tool in self.tools if tool.name == "Skill"),
@@ -494,15 +577,14 @@ class OpenAIAgent:
                 arguments = self._skill_alias_arguments(tool_name, arguments)
         if local_tool is not None:
             permission_tool_name = local_tool.name
-            decision = check_permission(
+            self._enforce_skill_allowlist(context, permission_tool_name)
+            self._enforce_permission(
                 permission_tool_name,
-                self._permission_subject(permission_tool_name, arguments),
+                check_permissions(
+                    permission_tool_name,
+                    self._permission_subjects(permission_tool_name, arguments),
+                ),
             )
-            if decision.behavior != "allow":
-                raise RuntimeError(
-                    decision.reason
-                    or f"Permission required for {permission_tool_name}"
-                )
             before_payload = ToolCallPayload(
                 iteration=iteration,
                 name=tool_name,
@@ -510,6 +592,8 @@ class OpenAIAgent:
                 source="local",
             )
             await callbacks.before_tool(context, before_payload)
+            # 校验放在权限之后、执行之前：先确认这次调用被允许，再检查参数合法性，
+            # 避免为一次注定被拒的调用暴露参数结构细节。
             validate_tool_arguments(local_tool.parameters, arguments)
             started_at = time.perf_counter()
             result = await local_tool.execute(arguments)
@@ -524,16 +608,22 @@ class OpenAIAgent:
                     elapsed_ms=(time.perf_counter() - started_at) * 1000,
                 ),
             )
+            if permission_tool_name == "Skill":
+                self._activate_skill_allowlist(context, result)
             return result
 
         target = self._parse_mcp_tool(tool_name)
+        # 既不是本地工具也不符合 MCP 命名约定：可能是模型幻觉出的函数名，
+        # 直接拒绝执行，错误会作为工具结果回给模型让它改用真实工具。
         if target is None:
             raise RuntimeError(f"Unknown tool requested: {tool_name}")
 
         server_id, name = target
-        decision = check_permission("mcp", f"{server_id}:{name}")
-        if decision.behavior != "allow":
-            raise RuntimeError(decision.reason or f"Permission required for MCP tool {server_id}:{name}")
+        self._enforce_skill_allowlist(context, tool_name)
+        self._enforce_permission(
+            f"MCP tool {server_id}:{name}",
+            check_permission("mcp", f"{server_id}:{name}"),
+        )
         await callbacks.before_tool(
             context,
             ToolCallPayload(
@@ -559,6 +649,60 @@ class OpenAIAgent:
             ),
         )
         return result
+
+    @staticmethod
+    def _enforce_permission(target: str, decision: PermissionDecision) -> None:
+        """Reject anything the rules do not explicitly allow.
+
+        ``ask`` is fail-closed rather than silently downgraded to allow: there
+        is no interactive approval channel yet, and the wording tells the model
+        (and the user reading the transcript) that a rule change is what unblocks
+        the call, not a retry.
+        """
+
+        if decision.behavior == "allow":
+            return
+        if decision.behavior == "ask":
+            raise RuntimeError(
+                f"{target} requires manual approval, which this deployment cannot "
+                f"prompt for. {decision.reason or ''}".strip()
+            )
+        raise RuntimeError(decision.reason or f"Permission denied for {target}")
+
+    @staticmethod
+    def _enforce_skill_allowlist(context: AgentRunContext, tool_name: str) -> None:
+        """Apply the allowed-tools restriction declared by an invoked Skill."""
+
+        allowlist = context.skill_allowlist
+        if allowlist is None or tool_name in allowlist:
+            return
+        allowed = ", ".join(sorted(allowlist)) or "none"
+        raise RuntimeError(
+            f"Skill {context.skill_allowlist_owner} restricts tool use to: {allowed}. "
+            f"{tool_name} is not permitted while this skill is active."
+        )
+
+    @staticmethod
+    def _activate_skill_allowlist(context: AgentRunContext, result: str) -> None:
+        """Latch a skill's allowedTools for the rest of this run.
+
+        The Skill tool only returns instructions, so the skill stays in effect
+        until the run ends. Declaring allowedTools previously had no effect at
+        all, which made the field misleading in both the UI and the model's view.
+        """
+
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            return
+        allowed = payload.get("allowedTools")
+        if not isinstance(allowed, list) or not allowed:
+            return
+        # Skill itself stays available so one skill can hand off to another.
+        context.skill_allowlist = {str(item) for item in allowed} | {"Skill"}
+        context.skill_allowlist_owner = str(payload.get("commandName") or "skill")
 
     async def _recoverable_tool_error(
         self,
@@ -599,21 +743,49 @@ class OpenAIAgent:
     def _decode_tool_arguments(raw_arguments: str) -> dict[str, Any]:
         """Decode provider arguments while enforcing the object tool contract."""
 
+        # 无参工具的参数串通常为空，视为空对象而不是解析错误。
         if not raw_arguments:
             return {}
         decoded = json.loads(raw_arguments)
+        # 顶层必须是对象：后续按 key 取参数，数组或标量会在更深处引发
+        # 难以定位的类型错误。
         if not isinstance(decoded, dict):
             raise ValueError("Tool arguments must be a JSON object.")
         return decoded
+
+    def _sandbox_user_notice(
+        self,
+        context: AgentRunContext,
+        tool_name: str,
+        tool_result: str,
+    ) -> str | None:
+        """Surface sandbox install/degrade messages once (install outcomes always)."""
+
+        message = notice_from_tool_result(
+            tool_name, tool_result, settings=self.config
+        )
+        if message is None:
+            return None
+        # Install success/failure should always reach the status pill. Unavailable
+        # notices are once per run so repeated Bash calls do not spam the UI.
+        if tool_name == "InstallSandbox":
+            return message
+        if context.metadata.get("sandbox_notice_emitted"):
+            return None
+        context.metadata["sandbox_notice_emitted"] = True
+        return message
 
     @staticmethod
     def _tool_result_failed(result: str) -> bool:
         """Recognize the common structured failure contracts used by tools."""
 
+        # 纯文本结果无法判断成败，一律按成功处理，避免把正常输出误标为错误。
         try:
             payload = json.loads(result)
         except (TypeError, json.JSONDecodeError):
             return False
+        # 三种键分别来自不同来源：ok 是本地工具与恢复路径的约定，
+        # success 是部分工具的历史写法，isError 来自 MCP 协议。
         return (
             isinstance(payload, dict)
             and (
@@ -654,6 +826,8 @@ class OpenAIAgent:
             # name, then put the user's topic into the old `skill` field.
             raw_args = supplied_skill
         if raw_args is None:
+            # 兜底：取第一个非空的其他字段当作参数。别名调用下字段名不可预期，
+            # 拿不到就退回空串，交给 Skill 工具自己报缺参，而不是在这里抛异常。
             raw_args = next(
                 (
                     value
@@ -666,22 +840,35 @@ class OpenAIAgent:
             raw_args = json.dumps(raw_args, ensure_ascii=False)
         return {"skill": skill_name, "args": raw_args}
 
-    @staticmethod
-    def _permission_subject(tool_name: str, arguments: dict[str, Any]) -> str:
+    @classmethod
+    def _permission_subjects(cls, tool_name: str, arguments: dict[str, Any]) -> list[str]:
         """为不同工具提取可匹配的权限对象，例如 Bash 命令或文件路径。"""
         if tool_name == "Bash":
-            return str(arguments.get("command") or tool_name)
+            command = str(arguments.get("command") or tool_name)
+            # 命令串整体和拆分后的每一段都要过规则：否则 `cd /tmp && rm -rf x`
+            # 会绕开一条针对 `rm *` 的 deny 规则。
+            return [command, *cls._shell_segments(command)]
         if tool_name in {"Read", "Write", "Edit", "Glob", "Grep", "LS", "NotebookEdit"}:
-            return str(arguments.get("file_path") or arguments.get("path") or tool_name)
+            return [str(arguments.get("file_path") or arguments.get("path") or tool_name)]
         if tool_name == "WebFetch":
-            return str(arguments.get("url") or tool_name)
+            return [str(arguments.get("url") or tool_name)]
         if tool_name == "WebSearch":
-            return str(arguments.get("query") or tool_name)
+            return [str(arguments.get("query") or tool_name)]
         if tool_name == "ReadMcpResourceTool":
-            return f"{arguments.get('server_id') or arguments.get('serverId') or ''}:{arguments.get('uri') or ''}"
+            return [
+                f"{arguments.get('server_id') or arguments.get('serverId') or ''}"
+                f":{arguments.get('uri') or ''}"
+            ]
         if tool_name == "Skill":
-            return str(arguments.get("skill") or tool_name)
-        return tool_name
+            return [str(arguments.get("skill") or tool_name)]
+        return [tool_name]
+
+    @staticmethod
+    def _shell_segments(command: str) -> list[str]:
+        """Split a shell command on its chaining operators for rule matching."""
+
+        segments = re.split(r"&&|\|\||;|\||\n", command)
+        return [segment.strip() for segment in segments if segment.strip()]
 
     def _build_tool_specs(self, mcp_tools: list[McpToolDescriptor]) -> list[dict[str, Any]]:
         """把本地工具和 MCP 工具转成模型 tool schema。"""
@@ -713,6 +900,7 @@ class OpenAIAgent:
         """从工具名解析 MCP server ID 和真实工具名。"""
         if not tool_name.startswith("mcp__"):
             return None
+        # 工具名自身可能含 `__`，所以只切前两段，剩下的原样拼回去。
         _, server_id, *name_parts = tool_name.split("__")
         return server_id, "__".join(name_parts)
 
@@ -785,16 +973,3 @@ class OpenAIAgent:
         """Count tool-output characters without exposing their content to logs."""
 
         return sum(len(content) for content in cls._tool_output_contents(messages))
-
-    def _model_result_payload(self, iteration: int, response: Any, started_at: float) -> ModelResultPayload:
-        """把模型响应转换为生命周期回调 payload。"""
-        choice = response.choices[0]
-        tool_calls = choice.message.tool_calls or []
-        return ModelResultPayload(
-            iteration=iteration,
-            model=self.config.openai_model,
-            response_id=response.id,
-            output_text=(choice.message.content or "").strip(),
-            function_call_count=len(tool_calls),
-            elapsed_ms=(time.perf_counter() - started_at) * 1000,
-        )

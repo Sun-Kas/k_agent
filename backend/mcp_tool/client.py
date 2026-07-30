@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -17,6 +18,10 @@ from mcp.client.streamable_http import streamablehttp_client
 from backend.config import get_or_init_settings
 from backend.logging_config import log_event
 from backend.mcp_tool.config import McpConfigLoadResult, McpScope, McpTransport, ScopedMcpServerConfig, load_scoped_mcp_servers
+from backend.mcp_tool.stderr import McpStderrBridge
+
+if TYPE_CHECKING:
+    from backend.mcp_tool.pool import McpSessionPool
 
 
 @dataclass(slots=True)
@@ -74,12 +79,18 @@ class McpSession:
     def __init__(self, config: McpServerConfig):
         """初始化对象依赖和内部状态。"""
         self.config = config
+        # SDK 的传输层是异步上下文管理器，必须在同一个任务里进入和退出。
+        # 因此用一个常驻后台任务 _runner 持有它，再靠 _ready / _stop 两个
+        # 信号和外部协调：_ready 表示握手完成可以用，_stop 表示请求退出。
         self._runner: asyncio.Task[None] | None = None
         self._stop: asyncio.Event | None = None
         self._ready: asyncio.Future[None] | None = None
         self.session: ClientSession | None = None
         self.instructions: str | None = None
         self.server_info: Any = None
+        # Keep the bridge alive for the session lifetime so MCP does not fall
+        # back to the process stderr after the object is garbage-collected.
+        self._stderr_bridge: McpStderrBridge | None = None
 
     async def connect(self) -> None:
         """连接并初始化单个 MCP server 会话。"""
@@ -108,6 +119,8 @@ class McpSession:
                     self.server_info = getattr(init, "serverInfo", None)
                     if self._ready is not None and not self._ready.done():
                         self._ready.set_result(None)
+                    # 停在这里不返回，让上面两层 async with 保持打开；
+                    # 一旦返回，传输和会话就会被关掉。
                     if self._stop is not None:
                         await self._stop.wait()
         except asyncio.CancelledError:
@@ -115,6 +128,8 @@ class McpSession:
                 self._ready.cancel()
             raise
         except BaseException as exc:
+            # 捕到 BaseException 是刻意的：连接失败必须落到 _ready 上，
+            # 否则 connect() 会永远等待一个再也不会完成的 future。
             if self._ready is not None and not self._ready.done():
                 self._ready.set_exception(exc)
         finally:
@@ -137,12 +152,16 @@ class McpSession:
                 env=env or None,
                 cwd=self.config.cwd,
             )
-            return stdio_client(server_params)
+            if self._stderr_bridge is None:
+                self._stderr_bridge = McpStderrBridge(self.config.id)
+            return stdio_client(server_params, errlog=self._stderr_bridge)
         if self.config.type == McpTransport.HTTP.value:
             headers = dict(self.config.headers or {})
             for key, env_name in (self.config.env_headers or {}).items():
                 if env_name in os.environ:
                     headers[key] = os.environ[env_name]
+            # 令牌只允许通过环境变量名间接引用，配置文件里存的是变量名而非明文，
+            # 避免凭据被写进仓库或通过配置接口读出。
             if self.config.bearer_token_env:
                 token = os.getenv(self.config.bearer_token_env)
                 if not token:
@@ -175,6 +194,8 @@ class McpSession:
         if self._stop is not None:
             self._stop.set()
         if self._runner is not None:
+            # 先给 3 秒让它走正常收尾（子进程优雅退出、HTTP 连接关闭）；
+            # 超时则强制取消，不能让一个卡死的 server 拖住整个请求的结束。
             try:
                 await asyncio.wait_for(self._runner, timeout=3)
             except (TimeoutError, asyncio.CancelledError):
@@ -182,6 +203,9 @@ class McpSession:
         self._runner = None
         self._stop = None
         self._ready = None
+        if self._stderr_bridge is not None:
+            self._stderr_bridge.close()
+            self._stderr_bridge = None
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """调用指定工具并返回文本化结果。"""
@@ -226,12 +250,19 @@ class McpClientManager:
         *,
         log_context: dict[str, Any] | None = None,
         connect_timeout_seconds: float = 60.0,
+        call_timeout_seconds: float | None = None,
+        session_pool: "McpSessionPool | None" = None,
     ):
         """初始化对象依赖和内部状态。"""
         self.servers = servers
         self.load_result = load_result
         self.log_context = dict(log_context or {})
         self.connect_timeout_seconds = connect_timeout_seconds
+        self.call_timeout_seconds = call_timeout_seconds
+        # With a pool, this manager borrows shared connections and returns them
+        # on close_all instead of tearing down a child process per run.
+        self._session_pool = session_pool
+        self._leases: dict[str, str] = {}
         self.sessions: dict[str, McpSession] = {}
         self.failed: dict[str, str] = {}
         self.disabled: set[str] = {server.id for server in servers if not server.enabled}
@@ -258,10 +289,6 @@ class McpClientManager:
                     transport=server.type,
                 )
                 continue
-            session = self.sessions.get(server.id)
-            if session is None:
-                session = McpSession(server)
-                self.sessions[server.id] = session
             started_at = time.perf_counter()
             log_event(
                 "mcp.server.connect.started",
@@ -270,14 +297,32 @@ class McpClientManager:
                 transport=server.type,
                 scope=server.scope,
             )
+            session = self.sessions.get(server.id)
             try:
-                async with asyncio.timeout(self.connect_timeout_seconds):
-                    await session.connect()
+                if self._session_pool is not None:
+                    fingerprint, session = await self._session_pool.acquire(
+                        server,
+                        connect_timeout_seconds=self.connect_timeout_seconds,
+                    )
+                    self._leases[server.id] = fingerprint
+                else:
+                    if session is None:
+                        session = McpSession(server)
+                    async with asyncio.timeout(self.connect_timeout_seconds):
+                        await session.connect()
+                self.sessions[server.id] = session
             except Exception as exc:
                 # Do not leave a timed-out uvx/npx child process downloading in
                 # the background while this manager reports the server failed.
-                await session.close()
+                self.sessions.pop(server.id, None)
+                if session is not None and self._session_pool is None:
+                    await session.close()
                 self.failed[server.id] = str(exc)
+                # OSError/FileNotFoundError details are usually fd/path issues,
+                # not provider payloads — keep a short hint for operators.
+                detail = None
+                if isinstance(exc, (OSError, FileNotFoundError, TimeoutError)):
+                    detail = str(exc).replace("\n", " ").strip()[:160] or None
                 log_event(
                     "mcp.server.connect.failed",
                     level=logging.ERROR,
@@ -289,6 +334,7 @@ class McpClientManager:
                         3,
                     ),
                     errorType=type(exc).__name__,
+                    errorDetail=detail,
                 )
                 continue
             log_event(
@@ -314,6 +360,8 @@ class McpClientManager:
         """列出当前对象可用的工具定义。"""
         tools: list[McpToolDescriptor] = []
         for session in self.sessions.values():
+            # 单个 server 查询失败只影响它自己的工具，其余照常暴露给模型。
+            # 这类失败在 connect_all 阶段已经记过日志，这里不再重复刷屏。
             try:
                 tools.extend(await session.list_tools())
             except Exception:
@@ -365,7 +413,8 @@ class McpClientManager:
         session = self.sessions.get(server_id)
         if session is None or session.session is None:
             raise RuntimeError(f'MCP server "{server_id}" is not connected.')
-        result = await session.session.read_resource(uri)
+        async with self._call_timeout():
+            result = await session.session.read_resource(uri)
         return json.dumps(
             result.model_dump(mode="json") if hasattr(result, "model_dump") else str(result),
             ensure_ascii=False,
@@ -381,6 +430,7 @@ class McpClientManager:
         statuses = []
         for server in self.servers:
             session = self.sessions.get(server.id)
+            # 判定顺序即优先级：手动禁用 > 已连上 > 连接失败 > 尚未尝试。
             status = "disabled" if not server.enabled else "connected" if session and session.session else "failed" if server.id in self.failed else "pending"
             statuses.append(
                 McpServerStatus(
@@ -410,21 +460,46 @@ class McpClientManager:
         session = self.sessions.get(server_id)
         if session is None:
             raise RuntimeError(f'MCP server "{server_id}" is not connected.')
-        return await session.call_tool(tool_name, arguments)
+        # An MCP server that never answers would otherwise stall the whole run;
+        # the timeout surfaces as a recoverable tool error the model can react to.
+        async with self._call_timeout():
+            return await session.call_tool(tool_name, arguments)
+
+    def _call_timeout(self):
+        """Bound a single MCP request, or pass through when unconfigured."""
+
+        if self.call_timeout_seconds is None:
+            return contextlib.nullcontext()
+        return asyncio.timeout(self.call_timeout_seconds)
 
     async def call_prompt(self, server_id: str, prompt_name: str, arguments: dict[str, Any]) -> str:
         """Invoke an MCP prompt and serialize the returned prompt messages."""
         session = self.sessions.get(server_id)
         if session is None or session.session is None:
             raise RuntimeError(f'MCP server "{server_id}" is not connected.')
-        result = await session.session.get_prompt(prompt_name, arguments)
+        async with self._call_timeout():
+            result = await session.session.get_prompt(prompt_name, arguments)
         return json.dumps(
             result.model_dump(mode="json") if hasattr(result, "model_dump") else str(result),
             ensure_ascii=False,
         )
 
     async def close_all(self) -> None:
-        """关闭 manager 管理的全部 MCP 会话。"""
+        """释放本 manager 持有的全部 MCP 会话。"""
+        if self._session_pool is not None:
+            # Pooled sessions outlive the run; returning the lease is what keeps
+            # the next turn from paying another cold start.
+            for server_id, fingerprint in self._leases.items():
+                session = self.sessions.get(server_id)
+                # A session whose transport died during the run must not be
+                # handed to the next run; retiring it forces a fresh connect.
+                healthy = session is not None and session.session is not None
+                await self._session_pool.release(fingerprint, healthy=healthy)
+            self._leases.clear()
+            self.sessions.clear()
+            return
+        # 逐个关闭并吞掉异常，保证一个关不掉的 server 不会导致其余 server
+        # 泄漏子进程。每次 run 结束都会调用，这里漏一个就是持续泄漏。
         for session in list(self.sessions.values()):
             try:
                 await session.close()
@@ -440,7 +515,9 @@ async def load_mcp_servers() -> list[McpServerConfig]:
     return [_to_legacy_config(server) for server in result.servers]
 
 
-async def load_mcp_manager() -> McpClientManager:
+async def load_mcp_manager(
+    session_pool: "McpSessionPool | None" = None,
+) -> McpClientManager:
     """创建加载好配置的 MCP 客户端管理器。"""
     settings = await get_or_init_settings()
     result = load_scoped_mcp_servers(explicit_config_path=settings.mcp_config_path)
@@ -448,6 +525,8 @@ async def load_mcp_manager() -> McpClientManager:
         [_to_legacy_config(server) for server in result.servers],
         result,
         connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
+        call_timeout_seconds=settings.mcp_call_timeout_seconds,
+        session_pool=session_pool,
     )
 
 
@@ -456,8 +535,13 @@ def mcp_manager_from_runtime(
     *,
     log_context: dict[str, Any] | None = None,
     connect_timeout_seconds: float = 60.0,
+    call_timeout_seconds: float | None = None,
+    session_pool: "McpSessionPool | None" = None,
 ) -> McpClientManager:
     """Build a manager only from access-layer supplied runtime definitions."""
+    # 请求级 manager：只认 Access Layer 本次传来的定义，不读磁盘配置。
+    # 这是无状态边界的关键——用户本轮没选的 server 不会被连上，
+    # 返回的 manager 由调用方负责在 run 结束时 close_all。
     configs = [
         McpServerConfig(
             id=str(server["id"]),
@@ -498,6 +582,8 @@ def mcp_manager_from_runtime(
         configs,
         log_context=log_context,
         connect_timeout_seconds=connect_timeout_seconds,
+        call_timeout_seconds=call_timeout_seconds,
+        session_pool=session_pool,
     )
 
 

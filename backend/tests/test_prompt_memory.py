@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from access_layer.session_memory import MEMORY_SESSIONS
+from backend.api.schemas import ChatMessage
 from backend.config import DEFAULT_SYSTEM_PROMPT
+from backend.context import compose_api_messages
 from backend.memory import (
     MemoryFile,
     MemoryType,
@@ -24,7 +26,6 @@ from backend.prompts import (
     build_nested_memory_context,
     build_prompt_bundle,
     classify_paths_for_memory,
-    prepend_user_context,
     prompt_lifecycle_state,
     reset_prompt_caches,
 )
@@ -52,9 +53,20 @@ class PromptMemoryTests(unittest.TestCase):
             self.assertEqual([item.path for item in files], [memory.resolve()])
 
             bundle = build_prompt_bundle("base", cwd=root)
-            messages = prepend_user_context([{"role": "user", "content": "hello"}], bundle.user_context)
-            self.assertEqual(messages[0]["role"], "user")
-            self.assertTrue(messages[0]["content"].startswith("<system-reminder>"))
+            messages = compose_api_messages(
+                [
+                    ChatMessage(
+                        id="u-1",
+                        role="user",
+                        content="hello",
+                        createdAt=datetime.now(timezone.utc),
+                    )
+                ],
+                system_prompt=bundle.system_prompt,
+                user_context=bundle.user_context,
+            )
+            self.assertEqual(messages[1]["role"], "user")
+            self.assertTrue(messages[1]["content"].startswith("<system-reminder>"))
             self.assertEqual(messages[-1]["content"], "hello")
 
     def test_project_memory_files_are_discovered(self) -> None:
@@ -141,15 +153,6 @@ class PromptMemoryTests(unittest.TestCase):
         ]
         rendered = get_memory_context(files, max_chars=80)
         self.assertIn("local priority", rendered)
-
-    def test_session_memory_state_tracks_loaded_and_triggers(self) -> None:
-        MEMORY_SESSIONS.clear("test-session")
-        state = MEMORY_SESSIONS.get("test-session")
-        state.mark_loaded(["/tmp/CLAUDE.md"])
-        state.queue_triggers([Path("/tmp/a.txt")])
-        self.assertIn("/tmp/CLAUDE.md", state.loaded_paths)
-        self.assertEqual(state.consume_triggers(), [Path("/tmp/a.txt")])
-        self.assertEqual(state.consume_triggers(), [])
 
 
 if __name__ == "__main__":

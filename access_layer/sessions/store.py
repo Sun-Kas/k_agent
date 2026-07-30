@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from backend.config import get_or_init_settings
-from backend.api.schemas import ChatMessage, ChatMeta, SessionSummary
+from backend.api.schemas import ChatMessage, ChatMeta, SessionSummary, ToolCallRecord
 from backend.storage import StorageBackend
+
+
+logger = logging.getLogger("k_agent.access_layer.sessions")
 
 
 @dataclass(slots=True)
@@ -43,6 +47,9 @@ class SessionStore:
         self._sessions: dict[str, SessionRecord] = {}
         self._active_run_ids: dict[str, str] = {}
         self._text_buffers: dict[tuple[str, str], dict[str, Any]] = {}
+        # Tool calls are only complete once their result arrives, so the
+        # START/ARGS fragments are buffered until TOOL_CALL_RESULT pairs them.
+        self._tool_call_buffers: dict[tuple[str, str], dict[str, Any]] = {}
         self._loaded = False
         self._lock = asyncio.Lock()
 
@@ -124,11 +131,7 @@ class SessionStore:
         async with self._lock:
             session = self._sessions[session_id]
             self._active_run_ids.pop(session_id, None)
-            for key in [
-                key for key in self._text_buffers
-                if key[0] == session_id
-            ]:
-                self._text_buffers.pop(key, None)
+            self._drop_session_buffers(session_id)
             session.messages = self._merge_messages(session.messages, messages)
             session.mcp_server_ids = list(dict.fromkeys(mcp_server_ids))
             session.skill_ids = list(dict.fromkeys(skill_ids))
@@ -190,13 +193,32 @@ class SessionStore:
                             meta=ChatMeta(runId=buffer.get("runId")),
                         )
                         session.messages = self._upsert_message(session.messages, message)
+            elif event_type == "TOOL_CALL_START":
+                tool_call_id = event.get("toolCallId")
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    self._tool_call_buffers[(session_id, tool_call_id)] = {
+                        "name": str(event.get("toolCallName") or "tool"),
+                        "arguments": "",
+                        "createdAt": datetime.now(timezone.utc),
+                        "runId": self._active_run_ids.get(session_id),
+                    }
+            elif event_type == "TOOL_CALL_ARGS":
+                tool_call_id = event.get("toolCallId")
+                delta = event.get("delta")
+                if isinstance(tool_call_id, str) and isinstance(delta, str):
+                    buffer = self._tool_call_buffers.get((session_id, tool_call_id))
+                    if buffer is not None:
+                        buffer["arguments"] = str(buffer["arguments"]) + delta
+            elif event_type == "TOOL_CALL_RESULT":
+                session.messages = self._append_tool_turn(
+                    session_id, session.messages, event
+                )
             elif event_type in {"RUN_FINISHED", "RUN_ERROR"}:
                 self._active_run_ids.pop(session_id, None)
-                for key in [
-                    key for key in self._text_buffers
-                    if key[0] == session_id
-                ]:
-                    self._text_buffers.pop(key, None)
+                # Tool calls still buffered here never produced a result. Dropping
+                # them keeps history free of assistant tool_calls that no tool
+                # message answers, which providers reject on the next run.
+                self._drop_session_buffers(session_id)
 
             session.updated_at = datetime.now(timezone.utc)
             await self._persist(session)
@@ -208,6 +230,63 @@ class SessionStore:
         async with self._lock:
             return self._sessions.get(session_id)
 
+    def _drop_session_buffers(self, session_id: str) -> None:
+        """Discard partial text and tool-call state left by a finished run."""
+
+        for buffers in (self._text_buffers, self._tool_call_buffers):
+            for key in [key for key in buffers if key[0] == session_id]:
+                buffers.pop(key, None)
+
+    def _append_tool_turn(
+        self,
+        session_id: str,
+        messages: list[ChatMessage],
+        event: dict[str, Any],
+    ) -> list[ChatMessage]:
+        """Project a completed tool call into an assistant/tool message pair.
+
+        The provider contract requires each tool result to follow an assistant
+        message that declares the matching tool_call_id, so both halves are
+        written together and only once the result is known.
+        """
+
+        tool_call_id = event.get("toolCallId")
+        message_id = event.get("messageId")
+        content = event.get("content")
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return messages
+        if not isinstance(content, str):
+            return messages
+        buffer = self._tool_call_buffers.pop((session_id, tool_call_id), None)
+        if buffer is None:
+            return messages
+        created_at = buffer.get("createdAt") or datetime.now(timezone.utc)
+        run_id = buffer.get("runId") or self._active_run_ids.get(session_id)
+        tool_name = str(buffer.get("name") or "tool")
+        call_message = ChatMessage(
+            id=f"toolcall-{tool_call_id}",
+            role="assistant",
+            content="",
+            createdAt=created_at,
+            meta=ChatMeta(toolName=tool_name, runId=run_id),
+            toolCalls=[
+                ToolCallRecord(
+                    id=tool_call_id,
+                    name=tool_name,
+                    arguments=str(buffer.get("arguments") or ""),
+                )
+            ],
+        )
+        result_message = ChatMessage(
+            id=str(message_id) if message_id else f"toolresult-{tool_call_id}",
+            role="tool",
+            content=content,
+            createdAt=datetime.now(timezone.utc),
+            meta=ChatMeta(toolName=tool_name, runId=run_id, toolCallId=tool_call_id),
+        )
+        updated = self._upsert_message(messages, call_message)
+        return self._upsert_message(updated, result_message)
+
     async def _ensure_loaded(self) -> None:
         """首次访问时从存储目录加载会话缓存。"""
         async with self._lock:
@@ -216,10 +295,15 @@ class SessionStore:
                 return
             settings = await get_or_init_settings()
             for path in await self._storage.list(settings.session_storage_prefix, "*.json"):
-                payload = await self._storage.read_json(str(path))
-                if isinstance(payload, dict):
-                    session = self._record_from_payload(payload)
-                    self._sessions[session.id] = session
+                try:
+                    payload = await self._storage.read_json(str(path))
+                    if isinstance(payload, dict):
+                        session = self._record_from_payload(payload)
+                        self._sessions[session.id] = session
+                except Exception:
+                    # One unreadable session file must not take down the whole
+                    # session index and, with it, every other conversation.
+                    logger.error("Skipping unreadable session file %s", path, exc_info=True)
             self._loaded = True
 
     async def _persist(self, session: SessionRecord) -> None:

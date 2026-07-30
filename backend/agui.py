@@ -51,8 +51,12 @@ def to_chat_messages(messages: list[Any]) -> list[ChatMessage]:
             role = getattr(message, "role", None)
             content = getattr(message, "content", "")
             message_id = getattr(message, "id", None)
+        # 未知角色和非字符串正文一律丢弃：这里是不可信输入进入后端的入口，
+        # 放行畸形消息会在拼装 provider 请求时才炸，且难以定位。
         if role not in {"system", "user", "assistant"} or not isinstance(content, str):
             continue
+        # 空 assistant 消息是被中断或纯工具调用的残留，喂回模型没有信息量，
+        # 部分 provider 还会因为空 content 直接报错。
         if role == "assistant" and not content.strip():
             continue
         converted.append(
@@ -70,10 +74,15 @@ async def translate_agent_events(
     events: AsyncIterator[dict[str, Any]],
     thread_id: str,
     run_id: str,
-    previous_messages: list[ChatMessage] | None = None,
 ) -> AsyncIterator[Any]:
     """把 Agent 内部事件按流式顺序转换为标准 AG-UI events。"""
-    agui_events: list[dict[str, Any]] = []
+    # 内部 thinking 是「同一个 step 反复整体重发、detail 越来越长」的快照语义，
+    # 而 AG-UI reasoning 是「start / 增量 delta / end」的流式语义。下面四个变量
+    # 就是这两种语义之间的转换状态：
+    # - reasoning_message_id：外层 REASONING 块，跨多个 step 存在
+    # - active_reasoning_message_id / active_reasoning_step：当前正在增量输出的 step
+    #   及其上次快照，用来算出本次要发的 delta
+    # - completed_reasoning_message_ids：已经发过 END 的 step，用于丢弃迟到的重复完成态
     reasoning_message_id: str | None = None
     active_reasoning_message_id: str | None = None
     active_reasoning_step: dict[str, Any] | None = None
@@ -82,6 +91,8 @@ async def translate_agent_events(
     def reasoning_events(step: dict[str, Any]) -> list[Any]:
         """把内部 thinking step 转换为 AG-UI reasoning start/content/end 事件。"""
         nonlocal reasoning_message_id, active_reasoning_message_id, active_reasoning_step
+        # 工具阶段的 thinking 由 TOOL_CALL_* 事件表达，不再重复成 reasoning，
+        # 否则前端时间线上同一次调用会出现两条。
         if step.get("phase") == "tool":
             return []
 
@@ -90,16 +101,21 @@ async def translate_agent_events(
         events: list[Any] = []
         step_id = str(step.get("id") or uuid.uuid4())
         detail = str(step.get("detail") or "")
+        # 已收尾的 step 又来一次完成态（例如主循环最后统一更新 status），
+        # 直接丢弃，避免重开一个已经结束的 reasoning 消息。
         if (
             step.get("status") != "active"
             and step_id in completed_reasoning_message_ids
             and active_reasoning_message_id != step_id
         ):
             return []
+        # 外层 REASONING 块惰性开启，保证只有真的产生思考内容时前端才展开面板。
         if reasoning_message_id is None:
             reasoning_message_id = str(uuid.uuid4())
             events.append(ReasoningStartEvent(message_id=reasoning_message_id))
         if active_reasoning_message_id == step_id and active_reasoning_step is not None:
+            # 同一个 step 的后续快照：正常情况下新 detail 是旧 detail 的前缀扩展，
+            # 只把新增尾巴作为 delta 发出去。
             previous_detail = str(active_reasoning_step.get("detail") or "")
             active_reasoning_step = {**step, "id": step_id}
             if detail.startswith(previous_detail):
@@ -113,6 +129,9 @@ async def translate_agent_events(
                         )
                     )
             else:
+                # detail 被整体改写而不是追加（例如流式思考结束后换成结论摘要）。
+                # 增量无法表达这种替换，只能收尾旧消息再用同一个 ID 重开一条，
+                # 前端据此清空并重绘该块。
                 events.append(
                     ReasoningMessageEndEvent(
                         message_id=step_id,
@@ -142,6 +161,8 @@ async def translate_agent_events(
                 active_reasoning_step = None
             return events
 
+        # 换到了新的 step：先把上一个未收尾的 step 关掉，保证任意时刻
+        # 至多只有一条 reasoning 消息处于打开状态。
         if active_reasoning_message_id is not None:
             completed_reasoning_message_ids.add(active_reasoning_message_id)
             events.append(
@@ -198,22 +219,13 @@ async def translate_agent_events(
         reasoning_message_id = None
         return events
 
-    def event_payload(event: Any) -> dict[str, Any]:
-        """把 AG-UI 事件模型转为可持久化字典。"""
-        if hasattr(event, "model_dump"):
-            return event.model_dump(by_alias=True, mode="json", exclude_none=True)
-        return {"type": getattr(event, "type", type(event).__name__)}
-
-    def remember(event: Any) -> Any:
-        """记录即将输出的 AG-UI event 并返回原事件。"""
-        agui_events.append(event_payload(event))
-        return event
-
-    yield remember(RunStartedEvent(
+    # RUN_STARTED 在进入内部流之前就发，且刻意放在 try 之外：即使内部流第一步
+    # 就抛错，前端也已经建立好本次 run 的状态，才能正确接住随后的 RUN_ERROR。
+    yield RunStartedEvent(
         type=EventType.RUN_STARTED,
         thread_id=thread_id,
         run_id=run_id,
-    ))
+    )
 
     try:
         async for event in events:
@@ -222,54 +234,61 @@ async def translate_agent_events(
 
             if event_type == "message_start":
                 for reasoning_event in close_reasoning_events():
-                    yield remember(reasoning_event)
-                yield remember(TextMessageStartEvent(message_id=payload["messageId"]))
+                    yield reasoning_event
+                yield TextMessageStartEvent(message_id=payload["messageId"])
             elif event_type == "delta":
+                # 只有非空白增量才算正文开始。模型常常先吐几个换行或空格，
+                # 拿它们去关闭 reasoning 会让思考块在真正有正文前就提前收起。
                 if str(payload["content"]).strip():
                     for reasoning_event in close_reasoning_events():
-                        yield remember(reasoning_event)
-                yield remember(TextMessageContentEvent(
+                        yield reasoning_event
+                yield TextMessageContentEvent(
                     message_id=payload["messageId"],
                     delta=payload["content"],
-                ))
+                )
             elif event_type == "message_end":
-                yield remember(TextMessageEndEvent(message_id=payload["messageId"]))
+                yield TextMessageEndEvent(message_id=payload["messageId"])
             elif event_type == "tool_start":
                 for reasoning_event in close_reasoning_events():
-                    yield remember(reasoning_event)
+                    yield reasoning_event
+                # 内部事件在调用前就已拿到完整参数，不存在参数流式增量，
+                # 所以这里一次性补齐 START/ARGS/END 三件套，满足 AG-UI 的事件配对要求。
                 tool_call_id = payload["toolCallId"]
-                yield remember(ToolCallStartEvent(
+                yield ToolCallStartEvent(
                     tool_call_id=tool_call_id,
                     tool_call_name=payload["toolCallName"],
-                ))
-                yield remember(ToolCallArgsEvent(
+                )
+                yield ToolCallArgsEvent(
                     tool_call_id=tool_call_id,
                     delta=payload["arguments"],
-                ))
-                yield remember(ToolCallEndEvent(tool_call_id=tool_call_id))
+                )
+                yield ToolCallEndEvent(tool_call_id=tool_call_id)
             elif event_type == "tool_result":
-                yield remember(ToolCallResultEvent(
+                yield ToolCallResultEvent(
                     message_id=payload["messageId"],
                     tool_call_id=payload["toolCallId"],
                     content=payload["content"],
                     role="tool",
-                ))
+                )
             elif event_type == "status":
-                yield remember(CustomEvent(name="status", value=payload))
+                yield CustomEvent(name="status", value=payload)
             elif event_type == "trace":
-                yield remember(CustomEvent(name="trace", value=payload))
+                yield CustomEvent(name="trace", value=payload)
             elif event_type == "thinking":
                 for reasoning_event in reasoning_events(payload):
-                    yield remember(reasoning_event)
+                    yield reasoning_event
             elif event_type == "final":
                 for reasoning_event in close_reasoning_events():
-                    yield remember(reasoning_event)
-                yield remember(RunFinishedEvent(
+                    yield reasoning_event
+                yield RunFinishedEvent(
                     thread_id=thread_id,
                     run_id=run_id,
                     result={"sessionId": thread_id},
-                ))
+                )
     except Exception as exc:
+        # 异常在这里转成 RUN_ERROR 事件而不是向上抛：HTTP 响应头早已发出，
+        # 此时抛出只会让连接无声中断，前端会一直停在 running 状态。
+        # 收尾 reasoning 再发错误，前端才不会留下一个永远转圈的思考块。
         for reasoning_event in close_reasoning_events():
-            yield remember(reasoning_event)
-        yield remember(RunErrorEvent(message=str(exc), code="AGENT_RUN_ERROR"))
+            yield reasoning_event
+        yield RunErrorEvent(message=str(exc), code="AGENT_RUN_ERROR")

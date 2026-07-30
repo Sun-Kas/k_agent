@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any
 
 from ag_ui.core import RunAgentInput
@@ -20,6 +22,7 @@ from access_layer.request_context import (
 )
 from access_layer.sessions.store import SessionStore
 from backend.agui import to_chat_messages
+from backend.logging_config import log_event
 
 
 class AgentAccessLayer:
@@ -60,12 +63,6 @@ class AgentAccessLayer:
         except CatalogError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         session = await self._session_store.get_or_create(payload.thread_id)
-        await self._session_store.save_run_start(
-            session.id,
-            messages,
-            mcp_server_ids=mcp_ids,
-            skill_ids=skill_ids,
-        )
         context_token = update_request_context(session_id=session.id, run_id=payload.run_id)
         try:
             stream_request_context = get_request_context()
@@ -75,6 +72,20 @@ class AgentAccessLayer:
             except ConcurrencyLimitExceeded as exc:
                 raise HTTPException(status_code=429, detail=str(exc)) from exc
 
+            # The user turn is persisted only after this run owns the session
+            # lock. Saving earlier would leave an orphan user message behind
+            # whenever a concurrent run is rejected with 429.
+            try:
+                session = await self._session_store.save_run_start(
+                    session.id,
+                    messages,
+                    mcp_server_ids=mcp_ids,
+                    skill_ids=skill_ids,
+                )
+            except BaseException:
+                await stream_guard.__aexit__(None, None, None)
+                raise
+
             async def event_generator():
                 """生成对前端输出的 SSE 事件流。"""
                 stream_context_token = (
@@ -82,9 +93,22 @@ class AgentAccessLayer:
                     if stream_request_context is not None
                     else update_request_context(session_id=session.id, run_id=payload.run_id)
                 )
+                started_at = time.perf_counter()
+                request_context = get_request_context()
+                request_id = request_context.request_id if request_context else "-"
                 try:
-                    request_context = get_request_context()
-                    request_id = request_context.request_id if request_context else "-"
+                    history_count = sum(
+                        1 for message in session.messages if message.carries_context()
+                    )
+                    log_event(
+                        "access.run.accepted",
+                        requestId=request_id,
+                        threadId=session.id,
+                        runId=payload.run_id,
+                        historyCount=history_count,
+                        mcpCount=len(mcp_servers),
+                        skillCount=len(skills),
+                    )
                     backend_events = self._agent_backend_client.stream(
                         {
                             "threadId": session.id,
@@ -94,7 +118,7 @@ class AgentAccessLayer:
                             "messages": [
                                 message.model_dump(by_alias=True, mode="json")
                                 for message in session.messages
-                                if message.content.strip()
+                                if message.carries_context()
                             ],
                             "modelId": forwarded.get("modelId"),
                             # Access Layer owns selection and sends self-contained
@@ -113,6 +137,30 @@ class AgentAccessLayer:
                         # 包成 SSE，不能再按自定义 thinking/tool/message 规则重排。
                         await self._session_store.append_event(session.id, event)
                         yield self._encode_sse(event)
+                    log_event(
+                        "access.run.finished",
+                        requestId=request_id,
+                        threadId=session.id,
+                        runId=payload.run_id,
+                        elapsedMs=round(
+                            (time.perf_counter() - started_at) * 1000,
+                            3,
+                        ),
+                    )
+                except Exception as exc:
+                    log_event(
+                        "access.run.failed",
+                        level=logging.ERROR,
+                        requestId=request_id,
+                        threadId=session.id,
+                        runId=payload.run_id,
+                        errorType=type(exc).__name__,
+                        elapsedMs=round(
+                            (time.perf_counter() - started_at) * 1000,
+                            3,
+                        ),
+                    )
+                    raise
                 finally:
                     await stream_guard.__aexit__(None, None, None)
                     reset_request_context(stream_context_token)

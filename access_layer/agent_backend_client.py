@@ -71,10 +71,3 @@ class AgentBackendClient:
             )
         response.raise_for_status()
         return response.json()
-
-    async def put_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """说明 put_json 在当前模块中的具体职责。"""
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.put(f"{self._base_url}{path}", json=payload)
-        response.raise_for_status()
-        return response.json()

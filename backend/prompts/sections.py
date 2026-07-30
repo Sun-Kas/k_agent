@@ -12,7 +12,6 @@ class PromptSection:
     """描述一个可渲染的 prompt 区块。"""
     name: str
     content: str
-    cacheable: bool = True
 
 
 class PromptSectionCache:

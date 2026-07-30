@@ -46,12 +46,15 @@ def build_effective_system_prompt(
     mcp_tools: list[McpPromptTool] | None = None,
 ) -> str:
     """Apply K Agent's precedence rules for system prompts."""
+    # override 是完全替换：连 Skill 摘要和 append 都不再拼接，
+    # 用于调用方需要精确控制整段提示词的场景。
     if override_system_prompt:
         return override_system_prompt.strip()
 
     prompt = _default_system_prompt(base_prompt, mcp_tools=mcp_tools)
     if agent_system_prompt:
         agent_prompt = agent_system_prompt.strip()
+        # proactive 决定子 agent 的指令是叠加在默认提示词之上，还是整体取代它。
         if proactive:
             prompt = f"{prompt}\n\n# Custom Agent Instructions\n\n{agent_prompt}"
         else:
@@ -135,24 +138,6 @@ def append_system_context(system_prompt: str, context: dict[str, str]) -> str:
     return f"{system_prompt.rstrip()}\n\n{context_block}"
 
 
-def prepend_user_context(messages: list[dict], context: dict[str, str]) -> list[dict]:
-    """Prepend memory/date context as a user message without mutating history."""
-    if not context:
-        return messages
-    body = "\n".join(f"# {key}\n{value}" for key, value in context.items() if value)
-    if not body:
-        return messages
-    reminder = (
-        "<system-reminder>\n"
-        "As you answer the user's questions, you can use the following context:\n"
-        f"{body}\n\n"
-        "IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context "
-        "unless it is highly relevant to the user's request.\n"
-        "</system-reminder>"
-    )
-    return [{"role": "user", "content": reminder}, *messages]
-
-
 def build_nested_memory_context(cwd: Path, paths: list[Path], loaded_paths: set[str]) -> tuple[dict[str, str], list[str]]:
     """Build a one-off context block for memory discovered after tool use."""
     memory_files = []
@@ -171,6 +156,8 @@ def build_nested_memory_context(cwd: Path, paths: list[Path], loaded_paths: set[
 def extract_referenced_paths(messages: list) -> list[Path]:
     """Best-effort path extraction for loading nested memory near mentioned files."""
     paths: list[Path] = []
+    # 只看最近 3 条消息：更早提到的路径与当前任务的相关性迅速下降，
+    # 全量扫描会把大量陈旧路径的 memory 拉进上下文。
     for message in messages[-3:]:
         content = getattr(message, "content", "") or ""
         for token in content.replace("\n", " ").split():
@@ -203,16 +190,24 @@ def classify_paths_for_memory(paths: list[Path]) -> tuple[list[Path], list[Path]
 
 def _default_system_prompt(base_prompt: str, *, mcp_tools: list[McpPromptTool] | None = None) -> str:
     """生成包含默认行为和工具说明的系统提示词。"""
+    # 静态段按内容指纹缓存，动态段每次重建：MCP 工具清单会随连接状态变化，
+    # 缓存它会让模型看到已经断开的工具。指纹保证 base_prompt 改动后自动失效。
+    # 动态段排在最后，前面的稳定前缀才能被 provider 端前缀缓存命中。
     static_fingerprint = fingerprint_text(base_prompt)
     static_prompt = SECTION_CACHE.get(
         "default_system_static",
         static_fingerprint,
-        lambda: render_sections([PromptSection("base", base_prompt.strip())]),
+        lambda: render_sections([
+            PromptSection("base", base_prompt.strip()),
+            PromptSection("memory_behavior", MEMORY_BEHAVIOR_PROMPT),
+            PromptSection(
+                "style",
+                "Use concise, direct language. Prefer concrete actions and verified facts.",
+            ),
+        ]),
     )
     dynamic_prompt = render_sections([
-        PromptSection("memory_behavior", MEMORY_BEHAVIOR_PROMPT, cacheable=False),
-        PromptSection("mcp_tools", build_mcp_dynamic_prompt(mcp_tools or []), cacheable=False),
-        PromptSection("style", "Use concise, direct language. Prefer concrete actions and verified facts.", cacheable=False),
+        PromptSection("mcp_tools", build_mcp_dynamic_prompt(mcp_tools or [])),
     ])
     return "\n\n".join(section for section in (static_prompt, dynamic_prompt) if section)
 
@@ -223,6 +218,8 @@ def _append_skills(base_prompt: str, skills: list[dict | "SkillDefinition"]) -> 
     if not enabled:
         return base_prompt
     blocks = "\n".join(_skill_summary(skill) for skill in enabled)
+    # 这里只放摘要不放正文：Skill 正文可能很长，全量注入会挤占上下文预算。
+    # 模型先看摘要判断相关性，真正需要时才通过 Skill 工具取回完整指令。
     return (
         f"{base_prompt.rstrip()}\n\n"
         "# Available Skills\n\n"

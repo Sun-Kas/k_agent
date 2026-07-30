@@ -101,7 +101,9 @@ def _config_sources(cwd: Path, explicit_config_path: str | None) -> list[tuple[P
     managed = os.getenv("K_AGENT_MANAGED_MCP_CONFIG")
     if managed:
         sources.append((Path(managed).expanduser(), McpScope.MANAGED))
-    user = os.getenv("K_AGENT_USER_MCP_CONFIG") or str(Path.home() / ".k_agent" / "mcp.json")
+    from backend.home import user_mcp_config_path
+
+    user = os.getenv("K_AGENT_USER_MCP_CONFIG") or str(user_mcp_config_path())
     sources.append((Path(user).expanduser(), McpScope.USER))
     sources.append((cwd / ".mcp.json", McpScope.PROJECT))
     if explicit_config_path:

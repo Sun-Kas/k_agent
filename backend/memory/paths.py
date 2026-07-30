@@ -5,12 +5,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parents[2]
+from backend.home import memory_dir
 
 
-def auto_memory_dir(cwd: Path) -> Path:
-    """返回当前工作区个人 memory 目录。"""
+def auto_memory_dir(cwd: Path | None = None) -> Path:
+    """返回个人 memory 目录（默认 `$K_AGENT_HOME/content/memory`）。"""
+
+    del cwd  # Kept for call-site compatibility; memory is home-scoped now.
     override = os.getenv("K_AGENT_MEMORY_PATH_OVERRIDE")
     if override:
         return Path(override).expanduser().resolve()
-    return Path(os.getenv("K_AGENT_MEMORY_BASE_DIR", PROJECT_DIR / "data")).expanduser().resolve() / "memory"
+    base = os.getenv("K_AGENT_MEMORY_BASE_DIR")
+    if base:
+        return Path(base).expanduser().resolve() / "memory"
+    return memory_dir()

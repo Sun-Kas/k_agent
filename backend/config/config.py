@@ -2,11 +2,13 @@
 
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from backend.home import mcp_config_path, state_dir
 
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -17,11 +19,20 @@ When tool results are returned, base your response on those results.
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
+# Example templates remain in-repo; live MCP/models files live under $K_AGENT_HOME.
 RUNTIME_CONFIG_DIR = BACKEND_DIR / "config" / "runtime"
 
 # Load project-wide environment once. Existing process variables win, and every
 # module can use os.getenv()/os.environ without parsing .env independently.
 load_dotenv(PROJECT_DIR / ".env", override=False)
+
+
+def _default_storage_base_dir() -> str:
+    return str(state_dir())
+
+
+def _default_mcp_config_path() -> str:
+    return str(mcp_config_path())
 
 
 class Settings(BaseSettings):
@@ -50,20 +61,54 @@ class Settings(BaseSettings):
     cors_allow_credentials: bool = Field(default=True, alias="CORS_ALLOW_CREDENTIALS")
     cors_allow_methods: list[str] = Field(default_factory=lambda: ["*"], alias="CORS_ALLOW_METHODS")
     cors_allow_headers: list[str] = Field(default_factory=lambda: ["*"], alias="CORS_ALLOW_HEADERS")
-    mcp_config_path: str = Field(default=str(RUNTIME_CONFIG_DIR / "mcp.config.json"), alias="MCP_CONFIG_PATH")
+    mcp_config_path: str = Field(
+        default_factory=_default_mcp_config_path, alias="MCP_CONFIG_PATH"
+    )
     mcp_connect_timeout_seconds: float = Field(
         default=60.0,
         alias="MCP_CONNECT_TIMEOUT_SECONDS",
         ge=1.0,
         le=300.0,
     )
+    # Pooled MCP connections survive between runs so a stdio server does not pay
+    # an uvx/npx cold start every turn; idle ones are dropped after this window.
+    mcp_session_idle_ttl_seconds: float = Field(
+        default=600.0,
+        alias="MCP_SESSION_IDLE_TTL_SECONDS",
+        ge=0.0,
+        le=86_400.0,
+    )
+    mcp_call_timeout_seconds: float = Field(
+        default=180.0,
+        alias="MCP_CALL_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=3600.0,
+    )
     system_prompt: str = Field(default=DEFAULT_SYSTEM_PROMPT, alias="SYSTEM_PROMPT")
     max_model_iterations: int = Field(default=1000, alias="MAX_MODEL_ITERATIONS")
-    stream_chunk_size: int = Field(default=24, alias="STREAM_CHUNK_SIZE")
+    # Every provider call is bounded twice: once for establishing the request and
+    # once for the gap between streamed chunks. Without both, a provider that
+    # accepts the connection and then stalls holds a concurrency slot and the
+    # per-session lock in the access layer forever.
+    model_request_timeout_seconds: float = Field(
+        default=120.0,
+        alias="MODEL_REQUEST_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=3600.0,
+    )
+    model_stream_idle_timeout_seconds: float = Field(
+        default=90.0,
+        alias="MODEL_STREAM_IDLE_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=3600.0,
+    )
     default_session_title: str = Field(default="新会话", alias="DEFAULT_SESSION_TITLE")
     session_title_max_length: int = Field(default=24, alias="SESSION_TITLE_MAX_LENGTH")
     storage_backend: str = Field(default="file", alias="STORAGE_BACKEND")
-    storage_base_dir: str = Field(default=str(PROJECT_DIR / "data"), alias="STORAGE_BASE_DIR")
+    # FileStorage root: sessions land in `$K_AGENT_HOME/state/sessions/`.
+    storage_base_dir: str = Field(
+        default_factory=_default_storage_base_dir, alias="STORAGE_BASE_DIR"
+    )
     session_storage_prefix: str = Field(default="sessions", alias="SESSION_STORAGE_PREFIX")
     server_workers: int = Field(default=1, alias="SERVER_WORKERS")
     agent_backend_log_level: str = Field(default="INFO", alias="AGENT_BACKEND_LOG_LEVEL")
@@ -74,6 +119,23 @@ class Settings(BaseSettings):
     local_tool_workspace_root: str = Field(default=".", alias="LOCAL_TOOL_WORKSPACE_ROOT")
     local_tool_bash_timeout_seconds: float = Field(default=30.0, alias="LOCAL_TOOL_BASH_TIMEOUT_SECONDS")
     local_tool_max_output_chars: int = Field(default=50000, alias="LOCAL_TOOL_MAX_OUTPUT_CHARS")
+    # Bash is the one tool that cannot be confined by path checks, so it is run
+    # under an OS sandbox when the host provides one. `auto` degrades to an
+    # unsandboxed run and says so in the tool result; `required` fails instead.
+    bash_sandbox_mode: Literal["off", "auto", "required"] = Field(
+        default="auto", alias="BASH_SANDBOX_MODE"
+    )
+    bash_sandbox_command: str = Field(default="srt", alias="BASH_SANDBOX_COMMAND")
+    # Empty means no network at all: srt's network policy is allow-only.
+    bash_sandbox_allowed_domains: list[str] = Field(
+        default_factory=list, alias="BASH_SANDBOX_ALLOWED_DOMAINS"
+    )
+    bash_sandbox_write_paths: list[str] = Field(
+        default_factory=list, alias="BASH_SANDBOX_WRITE_PATHS"
+    )
+    bash_sandbox_deny_read: list[str] = Field(
+        default_factory=list, alias="BASH_SANDBOX_DENY_READ"
+    )
     status_model_started: str = Field(default="模型开始思考", alias="STATUS_MODEL_STARTED")
     tool_iteration_limit_message: str = Field(
         default="工具调用轮次达到上限，请检查工具链配置。",

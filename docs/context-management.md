@@ -5,7 +5,7 @@
 - Access Layer 只拥有公开接口、完整会话与 AG-UI Event 持久化、并发控制和流式透传。
 - Agent Backend 拥有系统提示词拼接、指令与记忆发现、Skill/MCP 管理、上下文预算与压缩、模型消息组装和旧工具结果裁剪。
 - 每次运行时 Access Layer 只传完整历史及选中的 model/MCP/Skill ID；摘要和压缩状态不跨服务持久化。
-- 完整会话历史始终保存在 `data/sessions`；压缩只影响活动模型上下文，不删除历史。
+- 完整会话历史始终保存在 `$K_AGENT_HOME/state/sessions`；压缩只影响活动模型上下文，不删除历史。
 
 ## 上下文组成
 
@@ -13,7 +13,7 @@
 
 1. 系统提示词。
 2. 项目与用户指令。
-3. 自动记忆 `data/memory/MEMORY.md`。
+3. 自动记忆 `$K_AGENT_HOME/content/memory/MEMORY.md`。
 4. 已选择 Skill 的名称与简介。
 5. 已连接 MCP 工具定义。
 6. 已压缩的早期会话摘要。
@@ -29,13 +29,13 @@
 - `.claude/CLAUDE.md`
 - `CLAUDE.local.md`
 - `.claude/rules/**/*.md` 中没有 `paths` 的规则
-- `data/memory/MEMORY.md`
+- `$K_AGENT_HOME/content/memory/MEMORY.md`
 
 支持 `@relative/path` 文件导入，最多递归五层。默认禁止导入当前指令目录以外的文件。
 
 带 `paths` frontmatter 的规则不会在启动时加载。用户消息或工具事件出现文件路径后，匹配规则与目标子目录中的指令会在后续请求中加载。
 
-自动记忆入口最多加载前 200 行或 25KB。详细主题应保存在 `data/memory` 的其他文件中，并通过记忆工具按需读取。
+自动记忆入口最多加载前 200 行或 25KB。详细主题应保存在 `$K_AGENT_HOME/content/memory` 的其他文件中，并通过记忆工具按需读取。
 
 ## Token 预算
 
@@ -47,9 +47,9 @@
 
 输入预算计算：
 
-```text
+``text
 inputBudget = contextWindow - maxOutputTokens - contextSafetyTokens
-```
+``
 
 系统按分类估算：
 
@@ -88,7 +88,7 @@ inputBudget = contextWindow - maxOutputTokens - contextSafetyTokens
 
 ## 双进程数据流
 
-```text
+``text
 Access Layer
   读取并发送完整会话 + model/MCP/Skill ID
         |
@@ -102,15 +102,15 @@ Agent Backend
         v
 Access Layer
   原样透传并持久化 Event
-```
+``
 
 ## 与 Claude Code 的对应关系
 
 | Claude Code 机制 | K Agent 对应实现 |
 |---|---|
 | CLAUDE.md | `CLAUDE.md` |
-| Auto memory | `data/memory/MEMORY.md` |
+| Auto memory | `$K_AGENT_HOME/content/memory/MEMORY.md` |
 | `.claude/rules` | `.claude/rules` |
 | Auto compact | 上下文预算超限自动压缩 |
 | Clear old tool outputs | 48KB 工具结果预算与优先裁剪 |
-| Skill descriptions | `data/skill` 中已启用 Skill 摘要 |
+| Skill descriptions | `$K_AGENT_HOME/content/skills` 中已启用 Skill 摘要 |

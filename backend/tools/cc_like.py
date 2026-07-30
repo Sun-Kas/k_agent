@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from backend.config import get_or_init_settings
+from backend.sandbox import (
+    SandboxUnavailable,
+    build_child_env,
+    enrich_bash_result,
+    install_sandbox_runtime,
+    plan_bash_invocation,
+)
 from backend.tools.local import ToolDefinition
 
 
@@ -30,6 +37,8 @@ async def _resolve_workspace_path(raw_path: str) -> Path:
     candidate = Path(raw_path or ".").expanduser()
     if not candidate.is_absolute():
         candidate = root / candidate
+    # 必须先 resolve 再比较：它会展开 `..` 和符号链接，
+    # 否则 `workspace/../../etc/passwd` 这类路径能绕过下面的包含检查。
     resolved = candidate.resolve()
     try:
         resolved.relative_to(root)
@@ -51,6 +60,8 @@ def _json(payload: dict[str, Any]) -> str:
 
 def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
     """按最大字符数截断工具输出。"""
+    # 截断标记要留在输出里：模型必须知道自己看到的是残缺内容，
+    # 否则会基于半截文件或半截命令输出下结论。
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars] + f"\n\n[truncated: kept first {max_chars} chars]", True
@@ -94,6 +105,8 @@ async def cc_edit(payload: dict[str, Any]) -> str:
     occurrences = content.count(old_string)
     if occurrences == 0:
         return _json({"ok": False, "error": "old_string not found", "path": str(path)})
+    # 匹配到多处却没显式要求全替换时拒绝执行：模型多半只想改其中一处，
+    # 默默改第一处会造成静默的错误编辑，报错让它补充上下文重试更安全。
     if occurrences > 1 and not replace_all:
         return _json({"ok": False, "error": "old_string is not unique", "occurrences": occurrences})
     updated = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
@@ -108,6 +121,8 @@ async def cc_glob(payload: dict[str, Any]) -> str:
     _, max_chars = await _tool_limits()
     matches = []
     for item in glob.iglob(str(root / pattern), recursive=True):
+        # pattern 未经工作区校验，`../` 或符号链接都可能把匹配结果指到工作区外，
+        # 所以逐条结果再确认一次包含关系。
         path = Path(item).resolve()
         try:
             path.relative_to(root)
@@ -148,33 +163,102 @@ async def cc_bash(payload: dict[str, Any]) -> str:
     """Run a time- and output-bounded shell command from the workspace root."""
 
     root = await _workspace_root()
+    settings = await get_or_init_settings()
     command = str(payload.get("command") or "").strip()
     if not command:
         return _json({"ok": False, "error": "command is required"})
     timeout, max_chars = await _tool_limits()
-    process = await asyncio.create_subprocess_shell(
-        command,
-        cwd=root,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        invocation = plan_bash_invocation(
+            command, workspace_root=root, settings=settings
+        )
+    except SandboxUnavailable as exc:
+        return _json(
+            enrich_bash_result(
+                {
+                    "ok": False,
+                    "error": f"sandbox unavailable: {exc}",
+                    "command": command,
+                    "sandboxed": False,
+                    "sandboxReason": str(exc),
+                },
+                settings=settings,
+            )
+        )
+    # Env scrubbing is independent of the OS sandbox: a Seatbelt profile cannot
+    # stop the child from reading whatever the parent put in its environ.
+    child_env = build_child_env()
+    if invocation.argv is None:
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=root,
+            env=child_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        process = await asyncio.create_subprocess_exec(
+            *invocation.argv,
+            cwd=root,
+            env=child_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(), timeout=timeout
+        )
     except TimeoutError:
+        # kill 之后必须 wait，否则子进程留成僵尸；长时间运行的服务会逐渐堆积。
         process.kill()
         await process.wait()
-        return _json({"ok": False, "error": "command timed out", "command": command, "timeoutSeconds": timeout})
-    stdout, stdout_truncated = _truncate(stdout_bytes.decode(errors="replace"), max_chars)
-    stderr, stderr_truncated = _truncate(stderr_bytes.decode(errors="replace"), max_chars)
-    return _json({
-        "ok": process.returncode == 0,
-        "command": command,
-        "display": payload.get("description") or shlex.split(command)[0],
-        "exitCode": process.returncode,
-        "stdout": stdout,
-        "stderr": stderr,
-        "truncated": stdout_truncated or stderr_truncated,
-    })
+        return _json(
+            enrich_bash_result(
+                {
+                    "ok": False,
+                    "error": "command timed out",
+                    "command": command,
+                    "timeoutSeconds": timeout,
+                    "sandboxed": invocation.sandboxed,
+                    "sandboxReason": invocation.reason,
+                },
+                settings=settings,
+            )
+        )
+    stdout, stdout_truncated = _truncate(
+        stdout_bytes.decode(errors="replace"), max_chars
+    )
+    stderr, stderr_truncated = _truncate(
+        stderr_bytes.decode(errors="replace"), max_chars
+    )
+    return _json(
+        enrich_bash_result(
+            {
+                "ok": process.returncode == 0,
+                "command": command,
+                "display": payload.get("description") or shlex.split(command)[0],
+                "exitCode": process.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "truncated": stdout_truncated or stderr_truncated,
+                "sandboxed": invocation.sandboxed,
+                "sandboxReason": invocation.reason,
+            },
+            settings=settings,
+        )
+    )
+
+
+async def cc_install_sandbox(payload: dict[str, Any]) -> str:
+    """Install srt only after the user has explicitly confirmed in chat."""
+
+    settings = await get_or_init_settings()
+    confirmed = payload.get("confirmed") is True
+    result = await install_sandbox_runtime(
+        confirmed=confirmed,
+        sandbox_command=settings.bash_sandbox_command,
+    )
+    return _json(result)
 
 
 async def cc_todo_write(payload: dict[str, Any]) -> str:
@@ -228,9 +312,36 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="Bash",
-        description="Run a shell command in the workspace with timeout and output truncation.",
+        description=(
+            "Run a shell command in the workspace with timeout and output truncation. "
+            "Commands prefer an OS sandbox (srt). If the sandbox is unavailable, the "
+            "result includes userMessage/installGuidance — relay that full message to "
+            "the user in Chinese (manual install vs confirm-then-InstallSandbox; "
+            "Windows native unsupported / WSL2). Only call InstallSandbox after they "
+            "explicitly confirm."
+        ),
         parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string"}}, "required": ["command"], "additionalProperties": False},
         execute=cc_bash,
+    ),
+    ToolDefinition(
+        name="InstallSandbox",
+        description=(
+            "Install Anthropic sandbox-runtime (srt) for Bash isolation. "
+            "Call only after the user explicitly confirms installation in chat. "
+            "Set confirmed=true; never install without confirmation."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true only after the user explicitly agrees to install.",
+                }
+            },
+            "required": ["confirmed"],
+            "additionalProperties": False,
+        },
+        execute=cc_install_sandbox,
     ),
     ToolDefinition(
         name="TodoWrite",

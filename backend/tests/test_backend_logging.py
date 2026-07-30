@@ -30,7 +30,7 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.context = AgentRunContext(run_id="internal-1")
 
-    async def test_lifecycle_logs_metadata_without_content_values(self) -> None:
+    async def test_lifecycle_logs_process_summary_without_content_values(self) -> None:
         message = ChatMessage(
             id="message-1",
             role="user",
@@ -60,15 +60,13 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         lines = self.output.getvalue().splitlines()
         serialized = "\n".join(lines)
         self.assertEqual(len(lines), 3)
-        self.assertIn(
-            "[INFO] k_agent.agent_backend "
-            "[sess=thread-1 run=run-1 trace=request-1] "
-            "[AgentRun] agent run started",
-            lines[0],
-        )
-        self.assertIn("[ModelCall] model call started", lines[1])
-        self.assertIn("[ToolCall] tool call started", lines[2])
-        self.assertIn("| argumentKeys=[token]", lines[2])
+        self.assertIn("sess=thread-1", lines[0])
+        self.assertIn("run=run-1", lines[0])
+        self.assertIn("Agent 循环开始", lines[0])
+        self.assertIn("模型#1 开始", lines[1])
+        self.assertIn("test-model", lines[1])
+        self.assertIn("工具 lookup 开始", lines[2])
+        self.assertNotIn("argumentKeys", lines[2])
         self.assertNotIn("TOP SECRET", serialized)
 
     async def test_error_logs_type_without_exception_message(self) -> None:
@@ -81,9 +79,9 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         line = self.output.getvalue()
-        self.assertIn("[ERROR]", line)
-        self.assertIn("[AgentRun] agent run failed", line)
-        self.assertIn("| errorType=RuntimeError", line)
+        self.assertIn("ERROR", line)
+        self.assertIn("Agent 失败", line)
+        self.assertIn("error=RuntimeError", line)
         self.assertNotIn("secret provider payload", line)
 
     async def test_context_logs_budget_and_pruning_without_summary_content(self) -> None:
@@ -125,11 +123,12 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         lines = self.output.getvalue().splitlines()
-        self.assertIn("[ContextManager] context plan completed", lines[0])
-        self.assertIn("| autoCompacted=true", lines[0])
-        self.assertIn("| remainingTokens=80790", lines[0])
-        self.assertIn("[ContextManager] context tool_outputs pruned", lines[1])
-        self.assertIn("| prunedOutputCount=3", lines[1])
+        self.assertIn("上下文规划", lines[0])
+        self.assertIn("剩余=80790", lines[0])
+        self.assertIn("已自动压缩", lines[0])
+        self.assertNotIn("systemTokens=", lines[0])
+        self.assertIn("裁剪旧工具输出", lines[1])
+        self.assertIn("75000→12000字", lines[1])
 
     async def test_mcp_load_logs_server_counts_without_connection_values(self) -> None:
         manager = McpClientManager(
@@ -155,11 +154,11 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         await manager.connect_all()
 
         lines = self.output.getvalue().splitlines()
-        self.assertIn("[McpRuntime] mcp load started", lines[0])
-        self.assertIn("| serverCount=1", lines[0])
-        self.assertIn("[McpRuntime] mcp server disabled", lines[1])
-        self.assertIn("| serverId=calendar", lines[1])
-        self.assertIn("[McpRuntime] mcp load completed", lines[2])
+        self.assertEqual(len(lines), 3)
+        self.assertIn("准备 MCP", lines[0])
+        self.assertIn("启用=0", lines[0])
+        self.assertIn("MCP 已禁用", lines[1])
+        self.assertIn("MCP 就绪", lines[2])
         self.assertNotIn("TOP SECRET", self.output.getvalue())
         self.assertNotIn("secret.example.test", self.output.getvalue())
 
@@ -170,7 +169,7 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         owned = [
             handler
             for handler in logger.handlers
-            if getattr(handler, "_k_agent_backend_handler", False)
+            if getattr(handler, "_k_agent_log_handler", False)
         ]
         self.assertEqual(len(owned), 1)
         self.assertEqual(logger.level, logging.INFO)

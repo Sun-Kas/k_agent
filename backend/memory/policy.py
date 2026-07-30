@@ -18,7 +18,6 @@ class MemoryPolicy:
     allow_project_memory: bool = True
     allow_local_memory: bool = True
     allow_auto_memory: bool = True
-    allow_legacy_claude_paths: bool = True
 
 
 def policy_from_env(*, include_external: bool = False) -> MemoryPolicy:
@@ -29,7 +28,6 @@ def policy_from_env(*, include_external: bool = False) -> MemoryPolicy:
         allow_project_memory=not _truthy(os.getenv("K_AGENT_DISABLE_PROJECT_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_PROJECT_MEMORY")),
         allow_local_memory=not _truthy(os.getenv("K_AGENT_DISABLE_LOCAL_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_LOCAL_MEMORY")),
         allow_auto_memory=not _truthy(os.getenv("K_AGENT_DISABLE_AUTO_MEMORY") or os.getenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY")),
-        allow_legacy_claude_paths=not _truthy(os.getenv("K_AGENT_DISABLE_LEGACY_CLAUDE_MEMORY")),
     )
 
 

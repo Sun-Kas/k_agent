@@ -21,7 +21,9 @@ from backend.agui import translate_agent_events
 from backend.api.schemas import ChatMessage
 from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
-from backend.mcp_tool import load_mcp_manager, mcp_manager_from_runtime
+from backend.home import ensure_home_layout, memory_dir
+from backend.mcp_tool import McpSessionPool, load_mcp_manager, mcp_manager_from_runtime
+from backend.sandbox import sandbox_runtime_status
 from backend.observability import AgentBackendLoggingCallback, LangfuseRuntime
 from backend.prompts import (
     build_prompt_bundle,
@@ -66,15 +68,21 @@ def create_app() -> FastAPI:
         )
         await get_or_init_settings()
         app.state.langfuse = LangfuseRuntime(settings)
+        ensure_home_layout(migrate=True)
         await app.state.langfuse.startup()
-        manager = await load_mcp_manager()
+        app.state.mcp_pool = McpSessionPool(
+            idle_ttl_seconds=settings.mcp_session_idle_ttl_seconds
+        )
+        # The startup manager shares the pool with agent runs, so servers warmed
+        # here are already connected when the first request selects them.
+        manager = await load_mcp_manager(app.state.mcp_pool)
         await manager.connect_all()
         app.state.mcp_manager = manager
         app.state.runtime_watcher = PollingChangeWatcher(
             [
                 Path.cwd() / "CLAUDE.md",
                 Path.cwd() / ".claude" / "rules",
-                Path.cwd() / "data" / "memory",
+                memory_dir(),
                 Path(settings.mcp_config_path),
             ],
             reset_prompt_caches,
@@ -96,6 +104,7 @@ def create_app() -> FastAPI:
             log_event("service.stopping")
             await app.state.runtime_watcher.stop()
             await manager.close_all()
+            await app.state.mcp_pool.close_all(force=True)
             await app.state.langfuse.shutdown()
             log_event("service.stopped")
 
@@ -107,8 +116,12 @@ def create_app() -> FastAPI:
         return {
             "ok": True,
             "service": "agent-backend",
-            "stateless": True,
+            # Agent runs carry no conversation state between requests. Integration
+            # connections and caches are pooled per process, hence the qualifier.
+            "stateless": "runs",
+            "mcpPool": await app.state.mcp_pool.stats(),
             "langfuse": app.state.langfuse.status(),
+            "bashSandbox": sandbox_runtime_status(settings),
         }
 
     @app.get("/internal/runtime/status")
@@ -140,10 +153,13 @@ def create_app() -> FastAPI:
         """代理触发 Agent Backend 重新加载 MCP 连接。"""
         log_event("mcp.reload.started")
         previous = app.state.mcp_manager
-        manager = await load_mcp_manager()
+        await previous.close_all()
+        # Reload is also the operator's "reconnect everything" button, so pooled
+        # sessions are retired first instead of being handed to the new manager.
+        await app.state.mcp_pool.close_all()
+        manager = await load_mcp_manager(app.state.mcp_pool)
         await manager.connect_all()
         app.state.mcp_manager = manager
-        await previous.close_all()
         status = await runtime_status()
         log_event(
             "mcp.reload.completed",
@@ -152,9 +168,15 @@ def create_app() -> FastAPI:
         )
         return status
 
-    @app.post("/internal/skills/reload")
-    async def reload_skills() -> dict[str, Any]:
-        """兼容旧调用：仅清理 prompt 缓存，不读取 Skill 目录。"""
+    @app.post("/internal/prompt/reset")
+    async def reset_prompt_cache() -> dict[str, Any]:
+        """Drop cached prompt sections and memory.
+
+        Skills themselves are not reloaded here: the Access Layer sends resolved
+        skill definitions with each run, so there is no backend skill registry
+        left to refresh.
+        """
+
         reset_prompt_caches("agent_backend_prompt_reset")
         return {"ok": True}
 
@@ -212,6 +234,8 @@ def create_app() -> FastAPI:
                 payload.mcp_servers,
                 log_context=log_context,
                 connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
+                call_timeout_seconds=settings.mcp_call_timeout_seconds,
+                session_pool=app.state.mcp_pool,
             )
             try:
                 await mcp_manager.connect_all()
@@ -327,7 +351,6 @@ def create_app() -> FastAPI:
             except asyncio.CancelledError:
                 log_event(
                     "agent.stream.cancelled",
-                    level=logging.WARNING,
                     requestId=request_id or "-",
                     threadId=payload.thread_id,
                     runId=payload.run_id,
@@ -372,7 +395,6 @@ def create_app() -> FastAPI:
                 internal_events(),
                 thread_id=payload.thread_id,
                 run_id=payload.run_id,
-                previous_messages=payload.messages,
             ):
                 yield json.dumps(
                     jsonable_encoder(

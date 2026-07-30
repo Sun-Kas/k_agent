@@ -2,6 +2,56 @@
 
 > 维护约定：后续涉及前后端接口、MCP/Skill/Memory 加载链路、系统提示词拼接、权限边界或缓存策略的重要修改，都需要在本文追加记录。
 
+## 2026-07-30 统一 `$K_AGENT_HOME` 数据布局
+
+- 新增 `backend/home.py`：默认根目录 `~/.k_agent`（`K_AGENT_HOME` 可覆盖；相对路径相对仓库根）。
+- 布局：`config/`（mcp、models、permissions、catalog）、`state/sessions/`、
+  `content/memory/`、`content/skills/`。
+- 首次启动在目标为空时，从旧 `data/` 与 `backend/config/runtime/` 复制迁移，不删除原文件。
+- Settings 默认 `STORAGE_BASE_DIR` / `MCP_CONFIG_PATH` 指向新布局；Skill/记忆/目录不再硬编码仓库 `data/`。
+
+## 2026-07-30 Bash 接入 Anthropic sandbox-runtime
+
+- 新增 `backend/sandbox/`：探测 `srt`、生成内容寻址的 srt settings、规划 argv；
+  `required` 模式在后端不可用时抛错，禁止静默降级。
+- `cc_bash` 改为经 `plan_bash_invocation` 启动；工具结果增加 `sandboxed` /
+  `sandboxReason`。无论沙箱是否可用，子进程环境都走白名单，不再继承
+  `OPENAI_API_KEY` 等凭据。
+- 沙箱不可用时：本轮首次发 `CUSTOM(status)` 提示；工具结果附带安装引导；
+  新增本地工具 `InstallSandbox`（必须 `confirmed=true`，仅在用户对话确认后调用）；
+  `GET /internal/health` 与 `GET /api/health` 增加 `bashSandbox`。
+- 配置项：`BASH_SANDBOX_MODE`（默认 `auto`）、`BASH_SANDBOX_COMMAND`、
+  `BASH_SANDBOX_ALLOWED_DOMAINS`、`BASH_SANDBOX_WRITE_PATHS`、
+  `BASH_SANDBOX_DENY_READ`。原生 Windows 明确不支持，需 WSL2。
+
+## 2026-07-30 架构评估后的可靠性与权限收口
+
+- **多轮工具历史**：`ChatMessage` 新增 `toolCalls`，`ChatMeta` 新增
+  `toolCallId`。Access Layer 在 `TOOL_CALL_RESULT` 到达时把缓冲的工具调用投影成
+  一对 assistant/tool 消息写入会话历史；没有结果的调用整对丢弃。后端上下文管理
+  新增 `pair_tool_messages`，压缩时不会把 assistant/tool 配对拆开。
+- **模型调用超时**：新增 `model_request_timeout_seconds` 与
+  `model_stream_idle_timeout_seconds`，前者限制请求建立，后者是流式看门狗，防止
+  服务端长时间挂在一个静默的连接上。
+- **MCP 连接复用**：新增 `backend/mcp_tool/pool.py`。会话池按连接配置指纹复用
+  stdio/HTTP 连接，配置变化即新建，空闲超过 `mcp_session_idle_ttl_seconds` 回收，
+  进程退出时强制关闭。`GET /internal/health` 增加 `mcpPool` 占用统计。
+- **权限模型**：规则按文件签名缓存；默认策略可由 `K_AGENT_PERMISSION_DEFAULT`
+  设为 `deny`；`ask` 在没有确认通道前按拒绝处理；`Bash` 按分隔符拆分多子命令取
+  最严结果；Skill 的 `allowedTools` 在激活期间强制生效。
+- **WebFetch SSRF 防护**：解析目标 IP 并拒绝回环/私网/链路本地/组播地址，重定向
+  逐跳校验，并限制下载字节数。
+- **并发与写入**：`save_run_start` 移到会话锁之后，避免并发请求写出孤立用户消息；
+  模型配置与自动记忆改用 `write_json_atomic` / `write_text_atomic` 原子写；单个
+  损坏的会话文件只记录告警并跳过，不再拖垮整个会话索引。
+- **接口重命名**：`POST /internal/skills/reload` 改为 `POST /internal/prompt/reset`，
+  因为它只清 prompt/memory 缓存，不重载 Skill。对外的
+  `POST /api/debug/prompt-cache/reset` 不变。
+- **删除的死代码**：`access_layer/session_memory.py`、
+  `access_layer/mcp_instructions.py`、`backend/prompts/memory_loader.py`、
+  `backend/memory/trace.py`，以及 `prepend_user_context`、`PromptSection.cacheable`、
+  `stream_chunk_size`、`AgentBackendClient.put_json` 等未被引用的成员。
+
 ## 2026-07-29 Agent Backend Langfuse 可观测性
 
 - Agent Backend 启动时从进程环境读取 `LANGFUSE_PUBLIC_KEY`、

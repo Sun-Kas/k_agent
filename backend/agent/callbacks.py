@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -30,6 +29,11 @@ class AgentRunContext:
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     started_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # An invoked Skill may restrict which tools stay usable. This lives on the
+    # run context rather than the agent instance because one OpenAIAgent can
+    # serve concurrent runs.
+    skill_allowlist: set[str] | None = None
+    skill_allowlist_owner: str = "skill"
 
 
 @dataclass(slots=True)
@@ -181,9 +185,6 @@ class AgentCallback(Protocol):
     ) -> None:
         """在 Agent run 结束时接收最终结果。"""
         ...
-
-
-Hook = Callable[[AgentRunContext, Any], Awaitable[None]]
 
 
 class CallbackManager:

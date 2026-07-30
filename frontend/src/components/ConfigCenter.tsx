@@ -20,9 +20,12 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
   const [mcpIsTemplate, setMcpIsTemplate] = useState(false);
   const [mcpWarnings, setMcpWarnings] = useState<string[]>([]);
   const [mcpCapabilities, setMcpCapabilities] = useState<McpCapabilities | null>(null);
+  const [mcpCatalogPath, setMcpCatalogPath] = useState("config/catalog/mcp.json");
   const [servers, setServers] = useState<McpServerConfig[]>([]);
   const [skills, setSkills] = useState<SkillConfig[]>([]);
   const [loadedSkills, setLoadedSkills] = useState<SkillConfig[]>([]);
+  const [skillCatalogPath, setSkillCatalogPath] = useState("config/catalog/skills.json");
+  const [skillDir, setSkillDir] = useState("content/skills");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
@@ -44,6 +47,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
         setMcpIsTemplate(Boolean(mcpData.isTemplate));
         setMcpWarnings([...(mcpData.warnings ?? []), ...(mcpData.blocked ?? []).map((id) => `已按策略屏蔽：${id}`)]);
         setServers(mcpData.servers.map((server) => ({ ...server, isNew: false })));
+        if (mcpData.source) setMcpCatalogPath(mcpData.source);
       })
       .catch((error: Error) => setNotice((current) => current || `MCP 配置加载失败：${error.message}`))
       .finally(complete);
@@ -51,6 +55,8 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
       .then((skillsData) => {
         setSkills(skillsData.skills.map((skill) => ({ ...skill, isNew: false })));
         setLoadedSkills(skillsData.loadedSkills ?? skillsData.skills);
+        if (skillsData.path) setSkillCatalogPath(skillsData.path);
+        if (skillsData.skillDir) setSkillDir(skillsData.skillDir);
       })
       .catch((error: Error) => setNotice((current) => current || `Skills 配置加载失败：${error.message}`))
       .finally(complete);
@@ -150,8 +156,8 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
 
               {tab === "mcp" && (
                 <section className="config-section">
-                  <ConfigHeading eyebrow="MODEL CONTEXT PROTOCOL" title="MCP 服务" copy="接入层统一管理服务摘要与连接配置；保存后通知 Agent Backend 重新载入连接。" />
-                  <div className="path-bar"><span>列表摘要</span><code>data/mcp.json</code>{mcpIsTemplate && <b>当前使用示例配置</b>}</div>
+                  <ConfigHeading eyebrow="MODEL CONTEXT PROTOCOL" title="MCP 服务" copy="接入层统一管理服务摘要与连接配置；保存后通知 Agent Backend 重新载入连接。数据位于 $K_AGENT_HOME。" />
+                  <div className="path-bar"><span>列表摘要</span><code>{mcpCatalogPath}</code>{mcpIsTemplate && <b>当前使用示例配置</b>}</div>
                   <CapabilityStrip capabilities={mcpCapabilities} warnings={mcpWarnings} onReload={async () => { await reloadMcp(); const [mcpData, capabilityData] = await Promise.all([getMcpConfig(), getMcpCapabilities()]); setServers(mcpData.servers); setMcpCapabilities(capabilityData); setNotice("MCP 已重新载入"); }} />
                   <div className="config-cards">
                     {servers.map((server, index) => (
@@ -166,8 +172,8 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
 
               {tab === "skills" && (
                 <section className="config-section">
-                  <ConfigHeading eyebrow="REUSABLE INSTRUCTIONS" title="Skills" copy="接入层从 data/skill.json 提供列表，选中后再读取对应 Skill 指令并随运行请求发送。" />
-                  <div className="path-bar"><span>列表摘要</span><code>data/skill.json</code></div>
+                  <ConfigHeading eyebrow="REUSABLE INSTRUCTIONS" title="Skills" copy="接入层从 $K_AGENT_HOME/config/catalog/skills.json 提供列表，选中后再读取对应 Skill 指令并随运行请求发送。" />
+                  <div className="path-bar"><span>列表摘要</span><code>{skillCatalogPath}</code></div>
                   <div className="config-cards">
                     {skills.map((skill, index) => (
                       <SkillCard key={index} skill={skill} onChange={(next) => setSkills(skills.map((item, i) => i === index ? next : item))} onRemove={() => setSkills(skills.filter((_, i) => i !== index))} />
@@ -176,7 +182,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
                       <span>＋</span><strong>创建 Skill</strong><small>添加一组可复用的 Agent 专业指令</small>
                     </button>
                   </div>
-                  <LoadedSkills skills={loadedSkills} onImport={async (file) => {
+                  <LoadedSkills skills={loadedSkills} skillDir={skillDir} onImport={async (file) => {
                     const result = await importSkill(file);
                     if (result.skills) {
                       setSkills(result.skills.map((skill) => ({ ...skill, isNew: false })));
@@ -421,7 +427,15 @@ function CapabilityStrip({ capabilities, warnings, onReload }: { capabilities: M
   );
 }
 
-function LoadedSkills({ skills, onImport }: { skills: SkillConfig[]; onImport: (file: File) => Promise<void> }) {
+function LoadedSkills({
+  skills,
+  skillDir,
+  onImport
+}: {
+  skills: SkillConfig[];
+  skillDir: string;
+  onImport: (file: File) => Promise<void>;
+}) {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
 
@@ -445,7 +459,7 @@ function LoadedSkills({ skills, onImport }: { skills: SkillConfig[]; onImport: (
 
   return (
     <section className="loaded-skills">
-      <header><strong>运行时载入结果</strong><small>{skills.length} 个 Skill，全部来自 data/skill</small></header>
+      <header><strong>运行时载入结果</strong><small>{skills.length} 个 Skill，来自 {skillDir}</small></header>
       <div className="skill-table">
         {skills.map((skill) => (
           <div key={`${skill.source}-${skill.id}`}>

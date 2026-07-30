@@ -64,10 +64,13 @@ async def invoke_skill(
     payload: dict[str, Any], skills: list[dict[str, Any]] | None = None
 ) -> str:
     """Execute a Skill definition supplied with the current run."""
+    # 容忍模型带上斜杠前缀（把 Skill 当斜杠命令写成 `/foo`）。
     skill_name = str(payload.get("skill", "")).strip().lstrip("/")
     args = str(payload.get("args", "")).strip()
     if not skill_name:
         return json.dumps({"success": False, "error": "skill is required"}, ensure_ascii=False)
+    # 只在本次请求传入的 skills 里查找。Agent Backend 不扫描 Skill 目录，
+    # 用户本轮没选中的 Skill 无法被模型调用起来。
     skill = next(
         (
             item
@@ -111,6 +114,8 @@ def build_skill_tool(
         """执行闭包绑定的工具逻辑。"""
         skill_name = str(payload.get("skill", "")).strip().lstrip("/")
         args = str(payload.get("args", "")).strip()
+        # MCP server 暴露的 prompt 复用同一个 Skill 入口，靠 mcp__ 前缀区分，
+        # 这样模型只需要认识一个工具，不必再学一套 prompt 调用协议。
         if skill_name.startswith("mcp__") and mcp_prompt_caller is not None:
             _, server_id, *prompt_parts = skill_name.split("__")
             prompt_name = "__".join(prompt_parts)
@@ -152,6 +157,8 @@ def _render_skill_content(content: str, args: str, argument_names: tuple[str, ..
 
 def _render_skill_hooks(hooks: dict[str, Any]) -> list[str]:
     """Expose declarative skill hooks without executing arbitrary commands."""
+    # 刻意只把 hook 渲染成文本说明返回给模型，绝不在这里执行：
+    # Skill 文件可由用户导入的 zip 提供，执行其中的命令等于任意代码执行。
     notes = []
     for name, value in hooks.items():
         notes.append(f"{name}: {value}")
@@ -187,7 +194,7 @@ LEGACY_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="read_personal_memory",
-        description="Read K Agent's project-local durable memory from data/memory/MEMORY.md.",
+        description="Read K Agent's durable memory from $K_AGENT_HOME/content/memory/MEMORY.md.",
         parameters={
             "type": "object",
             "properties": {},
@@ -197,7 +204,7 @@ LEGACY_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="append_personal_memory",
-        description="Append a concise durable memory item to this project's data/memory/MEMORY.md.",
+        description="Append a concise durable memory item to $K_AGENT_HOME/content/memory/MEMORY.md.",
         parameters={
             "type": "object",
             "properties": {
@@ -213,7 +220,7 @@ LEGACY_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="search_personal_memory",
-        description="Search this project's durable memory in data/memory/MEMORY.md.",
+        description="Search durable memory in $K_AGENT_HOME/content/memory/MEMORY.md.",
         parameters={
             "type": "object",
             "properties": {
@@ -229,7 +236,7 @@ LEGACY_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="compact_personal_memory",
-        description="Deduplicate and trim this project's durable memory in data/memory/MEMORY.md.",
+        description="Deduplicate and trim durable memory in $K_AGENT_HOME/content/memory/MEMORY.md.",
         parameters={
             "type": "object",
             "properties": {

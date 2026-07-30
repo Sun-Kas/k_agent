@@ -6,16 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from backend.home import (
+    mcp_catalog_path as default_mcp_catalog_path,
+    mcp_config_path as default_mcp_config_path,
+    skills_catalog_path as default_skills_catalog_path,
+    skills_dir as default_skills_dir,
+)
 from backend.mcp_tool.config import load_scoped_mcp_servers
 from backend.skills.frontmatter import parse_bool, parse_markdown_frontmatter, split_frontmatter_list
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-MCP_CATALOG_PATH = DATA_DIR / "mcp.json"
-SKILL_CATALOG_PATH = DATA_DIR / "skill.json"
-SKILL_DIR = DATA_DIR / "skill"
-MCP_CONFIG_PATH = PROJECT_ROOT / "backend" / "config" / "runtime" / "mcp.config.json"
+from backend.storage import write_json_atomic
 
 
 class CatalogError(ValueError):
@@ -28,15 +27,15 @@ class RuntimeCatalog:
     def __init__(
         self,
         *,
-        mcp_catalog_path: Path = MCP_CATALOG_PATH,
-        skill_catalog_path: Path = SKILL_CATALOG_PATH,
-        skill_dir: Path = SKILL_DIR,
-        mcp_config_path: Path = MCP_CONFIG_PATH,
+        mcp_catalog_path: Path | None = None,
+        skill_catalog_path: Path | None = None,
+        skill_dir: Path | None = None,
+        mcp_config_path: Path | None = None,
     ) -> None:
-        self.mcp_catalog_path = mcp_catalog_path
-        self.skill_catalog_path = skill_catalog_path
-        self.skill_dir = skill_dir
-        self.mcp_config_path = mcp_config_path
+        self.mcp_catalog_path = mcp_catalog_path or default_mcp_catalog_path()
+        self.skill_catalog_path = skill_catalog_path or default_skills_catalog_path()
+        self.skill_dir = skill_dir or default_skills_dir()
+        self.mcp_config_path = mcp_config_path or default_mcp_config_path()
 
     def ensure(self) -> None:
         """Create catalogs once from existing configuration when upgrading."""
@@ -236,10 +235,7 @@ def _read_list(path: Path, key: str) -> list[dict[str, Any]]:
 
 def _write_list(path: Path, key: str, values: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({key: values}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, {key: values})
 
 
 def _first_content_line(content: str) -> str:

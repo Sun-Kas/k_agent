@@ -37,33 +37,43 @@ from backend.api.schemas import (
     SkillsConfigUpdate,
 )
 from backend.config import Settings, get_or_init_settings
-from backend.prompts import reset_prompt_caches
+from backend.home import ensure_home_layout, skills_dir
+from backend.logging_config import configure_agent_backend_logging
+from backend.runtime_config import (
+    models_path,
+    load_models,
+    model_api_key,
+    write_models,
+)
 from backend.skills import SkillDefinition, clear_skill_caches, get_available_skills
 from backend.skills.frontmatter import parse_bool, parse_markdown_frontmatter
-from backend.storage import create_storage
+from backend.storage import create_storage, write_json_atomic
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_DIR = PROJECT_ROOT / "backend"
-RUNTIME_CONFIG_DIR = BACKEND_DIR / "config" / "runtime"
-MODELS_CONFIG_PATH = RUNTIME_CONFIG_DIR / "models.config.json"
-DATA_SKILLS_DIR = PROJECT_ROOT / "data" / "skill"
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 MAX_SKILL_ZIP_BYTES = 20 * 1024 * 1024
 MAX_SKILL_UNPACKED_BYTES = 50 * 1024 * 1024
 MAX_SKILL_ZIP_FILES = 500
 
+# Tests may patch this; production reads `$K_AGENT_HOME/content/skills`.
+DATA_SKILLS_DIR: Path | None = None
+
+
+def _skills_dir() -> Path:
+    return DATA_SKILLS_DIR if DATA_SKILLS_DIR is not None else skills_dir()
+
 
 def _all_skills() -> list[SkillDefinition]:
-    """汇总当前可编辑的 data/skill Skill 配置。"""
+    """汇总当前可编辑的 Skill 配置。"""
     return get_available_skills(Path.cwd())
 
 
 def _public_skill(skill: SkillDefinition, *, editable: bool = False) -> dict:
     """Serialize a loaded skill without hiding its source boundary.
 
-    Every editable Skill comes from data/skill. Source metadata remains visible
-    so the frontend can audit that single storage boundary.
+    Every editable Skill comes from `$K_AGENT_HOME/content/skills`. Source
+    metadata remains visible so the frontend can audit that storage boundary.
     """
     return {
         "id": skill.id,
@@ -83,8 +93,9 @@ def _public_skill(skill: SkillDefinition, *, editable: bool = False) -> dict:
 
 
 def _write_data_skills(skills: list[dict]) -> None:
-    """Persist the complete editable Skill set under data/skill/<id>/SKILL.md."""
-    DATA_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    """Persist the complete editable Skill set under content/skills/<id>/SKILL.md."""
+    root = _skills_dir()
+    root.mkdir(parents=True, exist_ok=True)
     desired_ids: set[str] = set()
     for skill in skills:
         skill_id = str(skill.get("id") or "").strip()
@@ -98,8 +109,8 @@ def _write_data_skills(skills: list[dict]) -> None:
             raise HTTPException(status_code=400, detail=f'Duplicate Skill ID: "{skill_id}"')
         desired_ids.add(skill_id)
 
-        skill_dir = (DATA_SKILLS_DIR / skill_id).resolve()
-        if not _is_relative_to(skill_dir, DATA_SKILLS_DIR.resolve()):
+        skill_dir = (root / skill_id).resolve()
+        if not _is_relative_to(skill_dir, root.resolve()):
             raise HTTPException(status_code=400, detail=f"Invalid Skill ID: {skill_id}")
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_file = skill_dir / "SKILL.md"
@@ -118,7 +129,7 @@ def _write_data_skills(skills: list[dict]) -> None:
             encoding="utf-8",
         )
 
-    for entry in DATA_SKILLS_DIR.iterdir():
+    for entry in _skills_dir().iterdir():
         if entry.is_dir() and entry.name not in desired_ids:
             shutil.rmtree(entry)
 
@@ -178,7 +189,7 @@ def _validate_and_install_skill_zip(archive: bytes, filename: str) -> tuple[str,
             skill_root = _skill_archive_root(skill_md)
             _validate_single_skill_root(entries, skill_root)
             skill_id = _normalize_imported_skill_id(skill_name)
-            destination = DATA_SKILLS_DIR / skill_id
+            destination = _skills_dir() / skill_id
             if destination.exists():
                 raise HTTPException(status_code=409, detail=f'Skill "{skill_id}" 已存在')
 
@@ -287,7 +298,7 @@ def _is_ignored_zip_entry(filename: str) -> bool:
 
 
 def _normalize_imported_skill_id(name: str) -> str:
-    """把导入的 Skill 名称规范化为 data/skill 下的目录 ID。"""
+    """把导入的 Skill 名称规范化为 content/skills 下的目录 ID。"""
     normalized = "".join(
         char.lower()
         if char.isascii() and (char.isalnum() or char == "_")
@@ -386,23 +397,7 @@ def _write_local_mcp_config(path: Path, servers: list[dict]) -> None:
             if key not in {"id", "name", "description"}
         }
         serialized[server_id] = payload
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"mcpServers": serialized}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _load_models(settings: Settings) -> list[dict]:
-    """从模型配置文件读取模型列表。"""
-    if not MODELS_CONFIG_PATH.exists():
-        return []
-    return json.loads(MODELS_CONFIG_PATH.read_text(encoding="utf-8")).get("models", [])
-
-
-def _model_api_key(model: dict, settings: Settings) -> str | None:
-    """按模型配置解析真实 API key 来源。"""
-    env_name = model.get("apiKeyEnv")
-    if env_name:
-        return os.getenv(env_name)
-    return model.get("apiKey") or settings.openai_api_key
+    write_json_atomic(path, {"mcpServers": serialized})
 
 
 def _public_models(settings: Settings) -> list[dict]:
@@ -410,36 +405,22 @@ def _public_models(settings: Settings) -> list[dict]:
     return [{
         **model,
         "apiKey": None,
-        "apiKeyConfigured": bool(_model_api_key(model, settings)),
-    } for model in _load_models(settings)]
-
-
-def _is_deepseek_model(model: dict) -> bool:
-    """判断模型配置是否属于 DeepSeek 兼容模型。"""
-    marker = " ".join(str(model.get(key, "")) for key in ("id", "name", "model", "baseUrl", "base_url")).lower()
-    return "deepseek" in marker
-
-
-def _normalize_reasoning_effort(model: dict, effort: object) -> str | None:
-    """按模型能力校验并规范化 reasoningEffort。"""
-    if not model.get("supportsReasoning", False):
-        return None
-    value = str(effort or "none").strip().lower()
-    if value == "none":
-        return None
-    # DeepSeek 的思考强度只接受 high/max；这里做服务端兜底，避免绕过前端传入 low/medium。
-    allowed = {"high", "max"} if _is_deepseek_model(model) else {"low", "medium", "high"}
-    return value if value in allowed else None
+        "apiKeyConfigured": bool(model_api_key(model, settings)),
+    } for model in load_models()]
 
 
 def create_app() -> FastAPI:
     """Construct the stateful public access-layer application."""
 
     settings = Settings()
+    # Reuse the Agent Backend logging setup so Access Layer also quiets third-party
+    # noise and filters high-frequency health/catalog access lines.
+    configure_agent_backend_logging(settings.agent_backend_log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """管理应用启动和关闭时的资源生命周期。"""
+        ensure_home_layout(migrate=True)
         app.state.settings = await get_or_init_settings()
         app.state.base_system_prompt = app.state.settings.system_prompt
         app.state.storage = create_storage(app.state.settings)
@@ -488,17 +469,22 @@ def create_app() -> FastAPI:
     async def health_check() -> HealthResponse:
         """返回 Access Layer 和 Agent Backend 的健康状态。"""
         agent_backend_ok = await app.state.agent_backend_client.health()
-        runtime = (
-            await app.state.agent_backend_client.get_json("/internal/runtime/status")
-            if agent_backend_ok
-            else {}
-        )
+        runtime: dict = {}
+        backend_health: dict = {}
+        if agent_backend_ok:
+            runtime = await app.state.agent_backend_client.get_json(
+                "/internal/runtime/status"
+            )
+            backend_health = await app.state.agent_backend_client.get_json(
+                "/internal/health"
+            )
         return HealthResponse(
             ok=agent_backend_ok,
             model=app.state.settings.openai_model,
             localToolCount=int(runtime.get("localToolCount", 0)),
             mcpToolCount=int(runtime.get("mcpToolCount", 0)),
             agentBackendOk=agent_backend_ok,
+            bashSandbox=backend_health.get("bashSandbox"),
         )
 
     @app.get("/api/health/concurrency")
@@ -517,25 +503,22 @@ def create_app() -> FastAPI:
     async def get_models_config():
         """读取模型配置并隐藏敏感密钥。"""
         return {
-            "path": str(MODELS_CONFIG_PATH),
-            "source": str(MODELS_CONFIG_PATH),
+            "path": str(models_path()),
+            "source": str(models_path()),
             "models": _public_models(app.state.settings),
         }
 
     @app.put("/api/config/models")
     async def update_models_config(payload: ModelsConfigUpdate):
         """保存配置中心提交的模型配置。"""
-        previous = {model["id"]: model for model in _load_models(app.state.settings)}
+        previous = {model["id"]: model for model in load_models()}
         models = []
         for profile in payload.models:
             model = profile.model_dump(by_alias=True)
             if not model.get("apiKey"):
                 model["apiKey"] = previous.get(profile.id, {}).get("apiKey")
             models.append(model)
-        MODELS_CONFIG_PATH.write_text(
-            json.dumps({"models": models}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        write_models(models)
         return {"ok": True, "models": _public_models(app.state.settings)}
 
     @app.get("/api/config/mcp")
@@ -646,8 +629,8 @@ def create_app() -> FastAPI:
                 {
                     **summary,
                     "instructions": skill.content if skill else "",
-                    "source": "data",
-                    "loadedFrom": "skill",
+                    "source": "home",
+                    "loadedFrom": "skills",
                     "filePath": skill.file_path if skill else None,
                     "baseDir": skill.base_dir if skill else None,
                     "paths": list(skill.paths) if skill else [],
@@ -658,7 +641,7 @@ def create_app() -> FastAPI:
             )
         return {
             "path": str(app.state.runtime_catalog.skill_catalog_path),
-            "skillDir": str(DATA_SKILLS_DIR),
+            "skillDir": str(_skills_dir()),
             "skills": skills,
             "loadedSkills": skills,
         }
@@ -719,7 +702,7 @@ def create_app() -> FastAPI:
     @app.post("/api/debug/prompt-cache/reset")
     async def reset_prompt_cache():
         """代理清理 Agent Backend 的 prompt 缓存。"""
-        await app.state.agent_backend_client.post_json("/internal/skills/reload")
+        await app.state.agent_backend_client.post_json("/internal/prompt/reset")
         return {"ok": True}
 
     @app.get("/api/debug/prompt-context")

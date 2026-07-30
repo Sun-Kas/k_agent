@@ -1,6 +1,17 @@
 """Tool and skill permission rules."""
 
-from backend.permissions.rules import PermissionDecision, check_permission, load_permission_rules
+from backend.permissions.rules import (
+    PermissionDecision,
+    check_permission,
+    check_permissions,
+    default_behavior,
+    load_permission_rules,
+)
 
-__all__ = ["PermissionDecision", "check_permission", "load_permission_rules"]
-
+__all__ = [
+    "PermissionDecision",
+    "check_permission",
+    "check_permissions",
+    "default_behavior",
+    "load_permission_rules",
+]

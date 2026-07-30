@@ -36,6 +36,8 @@ class MemoryCache:
         """写入当前对象维护的缓存条目。"""
         with self._lock:
             watched = {str(item.path): _mtime(item.path) for item in files}
+            # include 进来的文件同样要纳入失效判断：只改被引用文件时，
+            # 主文件的 mtime 不变，不记录它就会一直返回过期内容。
             for item in files:
                 for include in item.includes:
                     watched[str(include)] = _mtime(include)
@@ -48,6 +50,7 @@ class MemoryCache:
 
     def _is_fresh(self, entry: MemoryCacheEntry) -> bool:
         """判断 memory 缓存是否仍与文件 mtime 一致。"""
+        # 文件被删除时 _mtime 返回 None，与记录值不等，同样判为失效。
         return all(_mtime(Path(path)) == mtime for path, mtime in entry.mtimes)
 
 

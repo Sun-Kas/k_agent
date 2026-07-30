@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from backend.memory.paths import auto_memory_dir
+from backend.storage import write_text_atomic
+
+
+# Append and compact are read-modify-write cycles. Without this lock two tool
+# calls in the same process can interleave and drop one of the writes; the
+# atomic replace only guarantees readers never see a half-written file.
+_WRITE_LOCK = threading.Lock()
 
 
 def get_auto_memory_entrypoint(cwd: Path | None = None) -> Path:
@@ -23,10 +31,11 @@ def read_auto_memory(cwd: Path | None = None) -> tuple[Path, str]:
 def append_auto_memory(text: str, cwd: Path | None = None) -> Path:
     """向个人 memory 追加一条记录。"""
     path = get_auto_memory_entrypoint(cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else "# Personal Memory\n"
-    separator = "" if existing.endswith("\n") else "\n"
-    path.write_text(f"{existing}{separator}- {text.strip()}\n", encoding="utf-8")
+    with _WRITE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else "# Personal Memory\n"
+        separator = "" if existing.endswith("\n") else "\n"
+        write_text_atomic(path, f"{existing}{separator}- {text.strip()}\n")
     return path
 
 
@@ -46,6 +55,12 @@ def search_auto_memory(query: str, cwd: Path | None = None, *, limit: int = 20) 
 
 def compact_auto_memory(cwd: Path | None = None, *, max_items: int = 200) -> tuple[Path, int, int]:
     """压缩个人 memory 文件并保留最近条目。"""
+    with _WRITE_LOCK:
+        return _compact_auto_memory_locked(cwd, max_items)
+
+
+def _compact_auto_memory_locked(cwd: Path | None, max_items: int) -> tuple[Path, int, int]:
+    """压缩逻辑本体，调用方负责持有写锁。"""
     path, content = read_auto_memory(cwd)
     if not content:
         return path, 0, 0
@@ -68,5 +83,5 @@ def compact_auto_memory(cwd: Path | None = None, *, max_items: int = 200) -> tup
     new_content = "\n".join(header or ["# Personal Memory"])
     new_content += "\n" + "\n".join(f"- {item}" for item in compacted_items) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_content, encoding="utf-8")
+    write_text_atomic(path, new_content)
     return path, len(items), len(compacted_items)

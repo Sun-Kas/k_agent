@@ -7,7 +7,6 @@ from backend.prompts.prompting import (
     classify_paths_for_memory,
     extract_paths_from_value,
     extract_referenced_paths,
-    prepend_user_context,
 )
 from backend.prompts.lifecycle import prompt_lifecycle_state, reset_prompt_caches
 
@@ -19,6 +18,5 @@ __all__ = [
     "extract_paths_from_value",
     "extract_referenced_paths",
     "prompt_lifecycle_state",
-    "prepend_user_context",
     "reset_prompt_caches",
 ]

@@ -8,16 +8,39 @@ from pathlib import Path
 from typing import Any
 
 from backend.config import Settings
+from backend.home import models_config_path
+from backend.storage import write_json_atomic
 
 
-MODELS_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "runtime" / "models.config.json"
+def models_path() -> Path:
+    """Live models catalog under `$K_AGENT_HOME/config/models.json`."""
+
+    return models_config_path()
 
 
 def load_models() -> list[dict[str, Any]]:
     """读取运行时模型配置列表。"""
-    if not MODELS_CONFIG_PATH.exists():
+    path = models_config_path()
+    if not path.exists():
         return []
-    return json.loads(MODELS_CONFIG_PATH.read_text(encoding="utf-8")).get("models", [])
+    return json.loads(path.read_text(encoding="utf-8")).get("models", [])
+
+
+def model_api_key(model: dict[str, Any], settings: Settings) -> str | None:
+    """Resolve a model's credential from its env reference or inline value."""
+
+    env_name = model.get("apiKeyEnv")
+    if env_name:
+        return os.getenv(env_name)
+    return model.get("apiKey") or settings.openai_api_key
+
+
+def write_models(models: list[dict[str, Any]]) -> None:
+    """Persist the model catalog atomically so a crash cannot truncate it."""
+
+    path = models_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, {"models": models})
 
 
 def select_model(model_id: str | None, settings: Settings) -> dict[str, Any]:

@@ -9,7 +9,7 @@
 - 响应类型：`text/event-stream`
 - SSE 帧分隔符：`\n\n`
 - SSE 数据前缀：`data: `
-- 服务端编码器：`ag_ui.encoder.EventEncoder`
+- 服务端编码器：`ag_ui.encoder.EventEncoder`（在 Agent Backend 内使用）
 
 请求链路：
 
@@ -17,13 +17,15 @@
 frontend/src/api/agui.ts
         ↓ RunAgentInput / SSE
 access_layer/gateway.py
+        ↓ NDJSON（内部 HTTP 边界）
+backend/main.py
         ↓ 内部运行事件
-access_layer/agui.py
+backend/agui.py
         ↓ 标准 AG-UI 事件
 frontend/src/App.tsx
 ```
 
-`access_layer/agui.py` 是内部 Agent 事件到 AG-UI 事件的唯一协议适配层。前端不得读取内部 Agent 事件，也不得根据内容猜测生命周期。
+`backend/agui.py` 是内部 Agent 事件到 AG-UI 事件的唯一协议适配层。接入层只做原样透传、持久化和 SSE 编码，不重排事件。前端不得读取内部 Agent 事件，也不得根据内容猜测生命周期。
 
 ## 2. 总体运行生命周期
 
@@ -185,11 +187,20 @@ sequenceDiagram
 | 字段 | 内容 |
 | --- | --- |
 | `sessionId` | 当前会话 ID。 |
-| `messages` | 完整消息列表；assistant 正文只在对应 `TEXT_MESSAGE_END` 到达后写入。 |
-| `trace` | 执行轨迹。 |
-| `tasks` | 当前任务列表。 |
-| `thinking` | 本轮 thinking 步骤汇总，仅用于调试/详情面板。 |
+| `messages` | 下一轮要回放给模型的完整上下文：user、assistant 正文、assistant 工具调用、tool 结果。 |
+| `trace` | 预留字段，当前不写入；执行轨迹通过 `events` 中的 `CUSTOM(trace)` 保存。 |
+| `tasks` | 预留字段，当前不写入。 |
+| `thinking` | 预留字段，当前不写入；thinking 通过 `events` 中的 REASONING 事件保存。 |
 | `events` | 该会话所有运行实际发送给前端的标准 AG-UI event log，按到达顺序追加。 |
+
+工具调用同样进入 `messages`，否则下一轮模型只能看到自己的文字总结，看不到
+自己上一轮读过什么、跑过什么：
+
+1. `TOOL_CALL_START` / `TOOL_CALL_ARGS` 只写入服务端内存缓冲区。
+2. `TOOL_CALL_RESULT` 到达后，一次性写入配对的两条消息——一条声明
+   `toolCalls` 的 assistant 消息，和一条带 `meta.toolCallId` 的 tool 消息。
+3. 没有结果的工具调用（运行被中断或报错）不写入历史，避免留下 provider
+   会拒绝的孤立 `tool_calls`。
 
 请求开始时只合并本次输入中新增的真实消息，不得清空已有 `messages` 或
 `events`。每个 AG-UI event 发送前立即 append 到 `events`。
@@ -232,8 +243,8 @@ sequenceDiagram
 
 ## 10. 代码与测试位置
 
-- 协议适配与事件编码：`access_layer/agui.py`
-- SSE 输出：`access_layer/gateway.py`
+- 协议适配与事件编码：`backend/agui.py`
+- SSE 输出与会话投影：`access_layer/gateway.py`、`access_layer/sessions/store.py`
 - 前端 SSE 解析：`frontend/src/api/agui.ts`
 - 前端事件类型：`frontend/src/types.ts`
 - 前端状态机：`frontend/src/App.tsx`

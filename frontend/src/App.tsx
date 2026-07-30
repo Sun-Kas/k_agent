@@ -1364,11 +1364,34 @@ export function App() {
             </button>
           ))}
         </nav>
-        <button className="connection" type="button" onClick={() => void refreshHealth()}>
+        <button
+          className="connection"
+          type="button"
+          onClick={() => void refreshHealth()}
+          title={
+            health?.bashSandbox?.userSummary
+            || health?.bashSandbox?.reason
+            || (health?.ok ? "点击重新检查服务与沙箱状态" : "点击重新检查")
+          }
+        >
           <span className={`connection-dot ${health?.ok ? "online" : ""}`} />
           <span>
             <strong>{health?.ok ? "服务运行正常" : "后端未连接"}</strong>
-            <small>{health ? `${health.model} · ${health.localToolCount + health.mcpToolCount} 个工具` : "点击重新检查"}</small>
+            <small>
+              {health
+                ? `${health.model} · ${health.localToolCount + health.mcpToolCount} 个工具 · ${
+                    health.bashSandbox?.available
+                      ? "沙箱就绪"
+                      : health.bashSandbox?.mode === "off"
+                        ? "沙箱关闭"
+                        : health.bashSandbox?.needsInstall
+                          ? "沙箱未安装（悬停看安装说明）"
+                          : health.bashSandbox
+                            ? "沙箱不可用（悬停看说明）"
+                            : "沙箱未知"
+                  }`
+                : "点击重新检查"}
+            </small>
           </span>
           <i>↻</i>
         </button>

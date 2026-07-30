@@ -31,18 +31,16 @@
 
 ```text
 frontend/             React 前端工程
-frontend/src/         React 前端源码
 access_layer/         接入层：公开 API、完整会话持久化与 AG-UI 透传
-data/mcp.json         MCP 选择列表摘要（Access Layer 管理）
-data/skill.json       Skill 选择列表摘要（Access Layer 管理）
-data/skill/           Skill 正文与附属资源
 backend/              无状态 Agent 服务端
-backend/agent/        无状态 Agent Backend：模型循环与工具执行
-backend/config/       后端集中配置
-backend/config/runtime/ 后端运行配置文件
-backend/tools/        本地工具
-backend/mcp_tool/     MCP 客户端与配置加载
-frontend/src/config.ts 前端集中配置
+backend/home.py       $K_AGENT_HOME 路径与旧 data/ 迁移
+backend/config/runtime/  仓库内 MCP/models 示例模板（运行时写入 $K_AGENT_HOME）
+
+$K_AGENT_HOME/        默认 ~/.k_agent，可用环境变量改到项目内 .k_agent
+  config/             mcp.json、models.json、permissions.json、catalog/
+  state/sessions/     会话历史
+  content/memory/     长期记忆
+  content/skills/     Skill 包
 ```
 
 ## 服务边界
@@ -67,8 +65,11 @@ frontend/src/config.ts 前端集中配置
 - 服务端统一维护模型调用
 - 会话记忆与历史列表
 - Claude Code 风格的分层指令、自动记忆、上下文预算与持久化压缩
-- 旧工具结果优先裁剪，以及会话上下文查看和手动压缩接口
+- 旧工具结果优先裁剪，以及 `/api/debug/prompt-context` 上下文查看接口
+- 多轮 tool_calls / tool 结果持久化，跨轮保留工具执行历史
+- MCP 会话池按连接配置复用，避免每轮 stdio 冷启动
 - 本地 function tools
+- Bash 经 `srt` OS 沙箱执行（macOS/Linux；默认 `auto`，可配 `required`），子进程环境变量白名单
 - 工具参数基础校验
 - 将 MCP tools 暴露给模型
 - Agent 生命周期 callbacks：`before_model`、`after_model`、`before_tool`、`after_tool`、`on_error`
@@ -86,7 +87,7 @@ frontend/src/config.ts 前端集中配置
 - `TOOL_CALL_START` / `TOOL_CALL_ARGS` / `TOOL_CALL_END` / `TOOL_CALL_RESULT`
 - `CUSTOM`，用于状态提示和执行轨迹
 
-协议适配位于 `access_layer/agui.py`，业务 Agent 保持独立，后续可以直接接入
+协议适配位于 `backend/agui.py`，业务 Agent 保持独立，后续可以直接接入
 其他兼容 AG-UI 的 React 客户端。完整事件顺序、前端状态机和持久化约定见
 [K Agent AG-UI 协议约定](docs/ag-ui-protocol.md)。
 
@@ -120,9 +121,9 @@ agent = OpenAIAgent(LOCAL_TOOLS, mcp_manager, callbacks=[AuditCallback()])
 后端代码配置集中在 `backend/config/config.py`，运行配置文件集中在 `backend/config/runtime/`，会自动读取 `.env`。前端配置集中在 `frontend/src/config.ts`，支持 `VITE_*` 环境变量。
 
 MCP 与 Skill 的前端选择列表由 Access Layer 直接读取 `data/mcp.json` 和
-`data/skill.json`。MCP 连接参数仍保存在
-`backend/config/runtime/mcp.config.json`，Skill 完整指令保存在
-`data/skill/<skill-id>/SKILL.md`；这些完整定义只在用户发起运行并选中对应项时解析。
+`$K_AGENT_HOME/config/catalog/`。MCP 连接参数与模型配置在
+`$K_AGENT_HOME/config/`，Skill 正文在 `$K_AGENT_HOME/content/skills/`。
+首次启动若新目录为空，会从旧的 `data/` 与 `backend/config/runtime/` 复制一次。
 
 常用配置项：
 

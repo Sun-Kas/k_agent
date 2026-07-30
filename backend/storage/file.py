@@ -54,7 +54,7 @@ class FileStorage:
     async def write_text(self, key: str, content: str) -> None:
         """把文本写入指定 key。"""
         path = self.resolve(key)
-        await asyncio.to_thread(_atomic_write_text, path, content)
+        await asyncio.to_thread(write_text_atomic, path, content)
 
     async def read_json(self, key: str) -> dict[str, Any] | list[Any] | None:
         """读取并解析指定 key 的 JSON 内容。"""
@@ -89,10 +89,16 @@ class FileStorage:
         return sorted(path.resolve() for path in root.rglob(pattern) if path.is_file())
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+def write_text_atomic(path: Path, content: str) -> None:
     """通过临时文件和 replace 原子写入文本。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
         handle.write(content)
         temp_name = handle.name
     os.replace(temp_name, path)
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    """Write a config document without leaving a truncated file behind."""
+
+    write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")

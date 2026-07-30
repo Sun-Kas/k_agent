@@ -16,6 +16,20 @@ class ChatMeta(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     tool_name: str | None = Field(default=None, alias="toolName")
     run_id: str | None = Field(default=None, alias="runId")
+    tool_call_id: str | None = Field(default=None, alias="toolCallId")
+
+
+class ToolCallRecord(BaseModel):
+    """One tool invocation issued by an assistant turn.
+
+    Persisting these alongside the tool results is what lets a later turn see
+    what the agent already did instead of only its final prose summary.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+    id: str
+    name: str
+    arguments: str = ""
 
 
 class ChatMessage(BaseModel):
@@ -26,6 +40,17 @@ class ChatMessage(BaseModel):
     content: str
     created_at: datetime = Field(alias="createdAt")
     meta: ChatMeta | None = None
+    tool_calls: list[ToolCallRecord] = Field(default_factory=list, alias="toolCalls")
+
+    def carries_context(self) -> bool:
+        """Whether this message still contributes input for the next model call.
+
+        Assistant turns that only issue tool calls have empty content but must
+        survive history filtering, otherwise their paired tool results become
+        orphans that providers reject.
+        """
+
+        return bool(self.content.strip()) or bool(self.tool_calls)
 
 
 class SessionSummary(BaseModel):
@@ -54,6 +79,23 @@ class SessionState(BaseModel):
     capabilities: SessionCapabilities | None = None
 
 
+class BashSandboxHealth(BaseModel):
+    """Bash OS-sandbox readiness as reported by the Agent Backend."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    available: bool
+    mode: str
+    command: str
+    reason: str
+    needs_install: bool = Field(alias="needsInstall")
+    platform: str | None = None
+    user_summary: str | None = Field(default=None, alias="userSummary")
+    manual_install_command: str | None = Field(
+        default=None, alias="manualInstallCommand"
+    )
+    agent_install_tool: str | None = Field(default=None, alias="agentInstallTool")
+
+
 class HealthResponse(BaseModel):
     """描述 Access Layer 健康检查响应。"""
     model_config = ConfigDict(populate_by_name=True)
@@ -62,6 +104,7 @@ class HealthResponse(BaseModel):
     local_tool_count: int = Field(alias="localToolCount")
     mcp_tool_count: int = Field(alias="mcpToolCount")
     agent_backend_ok: bool = Field(alias="agentBackendOk")
+    bash_sandbox: BashSandboxHealth | None = Field(default=None, alias="bashSandbox")
 
 
 class ModelProfileInput(BaseModel):

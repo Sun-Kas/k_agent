@@ -26,6 +26,8 @@ from backend.config import Settings
 
 
 LOGGER = logging.getLogger(__name__)
+# 与本地日志不同，Langfuse 会收到 prompt、工具参数和输出的完整正文，
+# 因此需要按 key 名脱敏。命中这些名字的值一律替换为 [REDACTED]。
 _SENSITIVE_KEYS = {
     "api_key",
     "apikey",
@@ -45,6 +47,8 @@ class LangfuseAgentCallback:
     def __init__(self, root: Any, runtime: "LangfuseRuntime") -> None:
         self._root = root
         self._runtime = runtime
+        # 未收尾的子 observation 按 key 暂存，等对应的 after_* 回调来配对结束。
+        # 迭代号必须进 key：同一次 run 里同一个工具可能被多轮反复调用。
         self._generations: dict[tuple[str, int], Any] = {}
         self._tools: dict[tuple[str, int, str, str], Any] = {}
 
@@ -202,6 +206,8 @@ class LangfuseAgentCallback:
         )
 
     def _close_open_children(self, *, level: str, status_message: str) -> None:
+        # run 结束或出错时兜底收尾：模型流中断、工具抛异常都会让 after_* 回调
+        # 没机会执行，留下的 observation 在 Langfuse 上会永远显示为进行中。
         for observation in [*self._generations.values(), *self._tools.values()]:
             self._safe_update(
                 observation,
@@ -229,6 +235,8 @@ class LangfuseRuntime:
     """Own one process-level Langfuse client and request-scoped trace contexts."""
 
     def __init__(self, settings: Settings) -> None:
+        # configured 与 enabled 分开是为了让 /internal/health 能区分
+        # 「没配密钥」和「配了但被开关关掉 / 初始化失败」两种情况。
         self.configured = bool(
             settings.langfuse_public_key and settings.langfuse_secret_key
         )
@@ -256,6 +264,7 @@ class LangfuseRuntime:
         """Verify credentials without preventing Agent Backend startup."""
         if self._client is None:
             return
+        # SDK 是同步阻塞的，放到线程里做，避免启动期占住事件循环。
         try:
             self.authenticated = await asyncio.to_thread(self._client.auth_check)
             if not self.authenticated:
@@ -268,6 +277,7 @@ class LangfuseRuntime:
         """Flush buffered observations during process shutdown."""
         if self._client is None:
             return
+        # observation 是攒批上报的，不 flush 直接退出会丢掉最后一批 trace。
         try:
             await asyncio.to_thread(self._client.flush)
             await asyncio.to_thread(self._client.shutdown)
@@ -318,6 +328,7 @@ class LangfuseRuntime:
             )
             attributes_manager.__enter__()
         except Exception as exc:
+            # 建 trace 失败就退化成「无回调」运行：可观测性不可用不应影响出话。
             self.record_error(exc)
             self._exit_manager(attributes_manager)
             self._exit_manager(root_manager)
@@ -327,6 +338,8 @@ class LangfuseRuntime:
         try:
             yield [LangfuseAgentCallback(root, self)]
         except BaseException:
+            # 捕 BaseException 是为了覆盖客户端断开导致的 CancelledError：
+            # 这两个上下文管理器必须关掉，否则 trace 一直挂着且不会上报。
             error_info = sys.exc_info()
             self._exit_manager(attributes_manager, error_info)
             self._exit_manager(root_manager, error_info)
@@ -337,6 +350,7 @@ class LangfuseRuntime:
 
     def record_error(self, error: BaseException) -> None:
         """Record a sanitized SDK error and keep the request path fail-open."""
+        # 截断到 500 字符：SDK 异常里可能带上完整请求体，既冗长又可能含敏感内容。
         self.last_error = f"{type(error).__name__}: {error}"[:500]
         LOGGER.warning("Langfuse observability error: %s", self.last_error)
 
@@ -372,6 +386,7 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     if isinstance(value, BaseException):
         return f"{type(value).__name__}: {value}"
+    # 图片 data URL 是 base64 大块内容，上报既无可读性又会撑爆 trace 体积。
     if isinstance(value, str) and value.startswith("data:image/"):
         media_type = value.partition(";")[0].removeprefix("data:")
         return f"[{media_type} data omitted]"
@@ -387,6 +402,7 @@ def _mask_sensitive_data(value: Any = None, **kwargs: Any) -> Any:
 
 
 def _is_sensitive_key(key: str) -> bool:
+    # 归一化大小写和连字符，让 API-Key、api_key、apiKey 都能命中同一条规则。
     normalized = key.lower().replace("-", "_")
     return normalized in _SENSITIVE_KEYS or normalized.endswith(
         ("_api_key", "_password", "_secret", "_token")

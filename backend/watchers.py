@@ -44,13 +44,17 @@ class PollingChangeWatcher:
         self._task = None
 
     async def _run(self) -> None:
-        """启动 MCP stdio 进程并建立底层 ClientSession。"""
+        """轮询快照，发现变化就触发一次缓存失效回调。"""
+        # 先取基线快照，避免把启动时的既有状态误判成一次变更。
         self.state.mtimes = self._snapshot()
         while not self._stop.is_set():
+            # 用「等待停止信号并超时」代替 sleep：停止时能立刻退出，
+            # 不必等完整的一个轮询周期。超时才说明该做一次检查。
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
             except TimeoutError:
                 current = self._snapshot()
+                # 整体比较字典，能同时覆盖新增、删除和修改三种情况。
                 if current != self.state.mtimes:
                     self.state.mtimes = current
                     self.on_change("watched_files_changed")
@@ -62,6 +66,8 @@ class PollingChangeWatcher:
             if root.is_file():
                 watched[str(root)] = _mtime(root)
                 continue
+            # 不存在的路径也要记成 None：这样它之后被创建出来时，
+            # 快照会从 None 变成 mtime，同样能触发一次失效。
             if not root.exists():
                 watched[str(root)] = None
                 continue

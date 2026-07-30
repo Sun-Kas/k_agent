@@ -48,6 +48,9 @@ def load_memory_report(
     """读取 memory 文件并返回加载报告。"""
     cwd = (cwd or Path.cwd()).resolve()
     policy = policy_from_env(include_external=include_external)
+    # policy 必须进 cache key：同一个 cwd 在不同策略下可见的文件集合不同，
+    # 否则会把宽松策略下读到的内容泄漏给严格策略的调用方。
+    # 缓存由 watcher 在文件变更时统一清除（见 backend/watchers.py）。
     cache_key = f"eager:{cwd}:{include_external}:{additional_directories}:{policy}"
     if use_cache:
         cached = MEMORY_CACHE.get(cache_key)
@@ -67,6 +70,8 @@ def load_memory_report(
         )
 
     if policy.allow_project_memory:
+        # reversed 让遍历从最外层祖先目录走到 cwd，即由通用到具体。
+        # 加载顺序就是最终提示词里的排列顺序，越靠后越贴近当前项目。
         for directory in reversed([cwd, *cwd.parents]):
             for filename in MEMORY_FILENAMES:
                 _append_memory(
@@ -87,6 +92,8 @@ def load_memory_report(
             rules_dir = directory / ".claude" / "rules"
             for rule in _rule_files(rules_dir):
                 memory = _read_memory(rule, MemoryType.PROJECT, policy)
+                # 带 globs 的规则是文件级条件规则，只有当本轮消息引用了匹配路径时
+                # 才加载（见 get_nested_memory_files）；这里只收无条件生效的规则。
                 if memory is not None and not memory.globs:
                     _append_memory(
                         report,
@@ -108,6 +115,8 @@ def load_memory_report(
                 )
 
     if policy.allow_auto_memory:
+        # 自动记忆由 agent 自己写入，路径完全受控，因此单独放行外部路径检查，
+        # 不受上面那套针对用户手写文件的策略约束。
         _append_memory(
             report,
             auto_memory_dir(cwd) / "MEMORY.md",
@@ -192,8 +201,10 @@ def _append_memory(
     if raw is None:
         return
     resolved = path.resolve()
+    # processed 以解析后的真实路径去重，同时也是 include 成环时的终止条件。
     if resolved in processed:
         return
+    # 深度上限防止 include 链无限展开把上下文撑爆；超限记为警告而非静默丢弃。
     if depth > MAX_INCLUDE_DEPTH:
         report.warnings.append(f"include depth exceeded: {resolved}")
         return
@@ -222,6 +233,8 @@ def _append_memory(
         )
     )
 
+    # base 始终是最初那个 memory 文件的目录，不随递归下沉而改变：
+    # 否则被 include 的文件可以借助自己的目录一级级把范围引到工作区之外。
     base = include_base or resolved.parent
     for include_path in include_paths:
         _append_memory(report, include_path, memory_type, processed, policy=policy, depth=depth + 1, include_base=base)

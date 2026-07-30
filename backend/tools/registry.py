@@ -29,6 +29,7 @@ TOOL_PRESETS: dict[str, tuple[str, ...]] = {
         "LS",
         "Grep",
         "Bash",
+        "InstallSandbox",
         "WebFetch",
         "WebSearch",
         "NotebookEdit",
@@ -54,9 +55,11 @@ async def load_local_tools() -> list[ToolDefinition]:
     """按配置加载本地工具并附加 Skill 工具。"""
     settings = await get_or_init_settings()
     all_tools = {tool.name: tool for tool in get_all_base_tools()}
+    # 显式的名单配置优先级高于 preset，方便临时收窄工具面而不改预设。
     names = _configured_names(settings.local_tool_names)
     if names is None:
         names = list(TOOL_PRESETS.get(settings.local_tool_preset, TOOL_PRESETS["coding"]))
+    # 白名单语义：只有出现在名单里的工具才会暴露给模型，配置里的未知名字静默忽略。
     return [all_tools[name] for name in names if name in all_tools]
 
 
@@ -71,6 +74,9 @@ def bind_request_scoped_tools(
     skills: list[dict] | None = None,
 ) -> list[ToolDefinition]:
     """把依赖请求级 MCP manager 的工具换成闭包实例，避免跨请求复用连接状态。"""
+    # 模块级 TOOL_PRESETS 里的定义是进程共享的，直接给它们塞进本次请求的
+    # manager 会让下一个请求用到已关闭的连接。所以这里为每次 run 重建一份
+    # 绑定实例，Skill 工具同理只认本轮选中的 skills。
     bound_mcp_tools = {
         tool.name: tool
         for tool in build_mcp_resource_tools(mcp_manager.list_resources, mcp_manager.read_resource)

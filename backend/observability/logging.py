@@ -23,6 +23,10 @@ from backend.logging_config import log_event
 class AgentBackendLoggingCallback:
     """Log lifecycle metadata while excluding prompts, arguments, and outputs."""
 
+    # 本地终端日志的取舍：只记关联 ID、计数、长度和耗时，不记任何正文。
+    # 因此工具参数只记 key 名（见 before_tool），输出只记字符数（见 after_tool）。
+    # 需要看正文时用 Langfuse，那条链路有独立的脱敏处理。
+
     def __init__(self, *, request_id: str, thread_id: str, run_id: str) -> None:
         self._identity = {
             "requestId": request_id or "-",

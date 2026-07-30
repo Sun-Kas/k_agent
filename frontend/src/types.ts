@@ -34,12 +34,25 @@ export interface SessionState {
   } | null;
 }
 
+export interface BashSandboxHealth {
+  available: boolean;
+  mode: string;
+  command: string;
+  reason: string;
+  needsInstall: boolean;
+  platform?: string;
+  userSummary?: string;
+  manualInstallCommand?: string;
+  agentInstallTool?: string;
+}
+
 export interface HealthState {
   ok: boolean;
   agentBackendOk: boolean;
   model: string;
   localToolCount: number;
   mcpToolCount: number;
+  bashSandbox?: BashSandboxHealth | null;
 }
 
 export interface ModelProfile {

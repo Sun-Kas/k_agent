@@ -8,11 +8,19 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from backend.home import skills_dir
 from backend.memory.rules import matches_rule
 from backend.prompts.lifecycle import reset_prompt_caches
 from backend.skills.frontmatter import parse_bool, parse_markdown_frontmatter, split_frontmatter_list
 
-DATA_SKILLS_DIR = Path(__file__).resolve().parents[2] / "data" / "skill"
+# Tests may patch this to a temporary directory; production uses $K_AGENT_HOME.
+DATA_SKILLS_DIR: Path | None = None
+
+
+def skills_storage_dir() -> Path:
+    """Resolved Skill package root (`$K_AGENT_HOME/content/skills`)."""
+
+    return DATA_SKILLS_DIR if DATA_SKILLS_DIR is not None else skills_dir()
 
 
 @dataclass(frozen=True)
@@ -56,7 +64,11 @@ class SkillRegistry:
 
     def __init__(self) -> None:
         """初始化对象依赖和内部状态。"""
+        # 这是进程级共享状态，可能被多个并发请求同时访问，用 RLock 而非
+        # asyncio.Lock：加载过程是同步文件 IO，且 activate 内部会重入。
         self._lock = RLock()
+        # _cache 无条件 Skill；_conditional 等待路径命中；
+        # _dynamic 已被路径激活、后续一直可见。
         self._cache: dict[str, list[SkillDefinition]] = {}
         self._conditional: dict[str, SkillDefinition] = {}
         self._dynamic: dict[str, SkillDefinition] = {}
@@ -70,11 +82,13 @@ class SkillRegistry:
 
     def get(self, cwd: Path) -> list[SkillDefinition]:
         """读取或创建当前对象管理的条目。"""
-        key = str(DATA_SKILLS_DIR.resolve())
+        key = str(skills_storage_dir().resolve())
         with self._lock:
             cached = self._cache.get(key)
             if cached is not None:
                 return [*cached, *self._dynamic.values()]
+        # 刻意在锁外做文件加载：这是一段较慢的同步 IO，持锁会阻塞其他请求。
+        # 代价是并发首次访问可能重复加载一次，结果相同，可以接受。
         loaded = _load_all_skills(cwd)
         unconditional = []
         conditional = {}
@@ -89,15 +103,17 @@ class SkillRegistry:
             return [*unconditional, *self._dynamic.values()]
 
     def activate_for_paths(self, paths: list[Path], cwd: Path) -> list[SkillDefinition]:
-        """说明 activate_for_paths 在当前模块中的具体职责。"""
+        """把路径条件命中的 Skill 从待激活集合移入常驻可见集合。"""
         activated: list[SkillDefinition] = []
         with self._lock:
+            # 迭代 list() 快照而非字典本身：循环内会修改 _conditional。
             for skill in list(self._conditional.values()):
                 if any(matches_rule(path, skill.paths, Path(skill.base_dir or cwd)) for path in paths):
                     self._dynamic[skill.id] = skill
                     activated.append(skill)
             for skill in activated:
                 self._conditional.pop(skill.id, None)
+        # 可用 Skill 集合变了，缓存的系统提示词已经过时，必须清掉重建。
         if activated:
             reset_prompt_caches("skills_activated")
         return activated
@@ -130,9 +146,9 @@ def clear_skill_caches(reason: str = "skills_cache_clear") -> None:
 
 
 def _load_all_skills(cwd: Path) -> list[SkillDefinition]:
-    """从 data/skill 加载全部 Skill 并去重。"""
+    """从 `$K_AGENT_HOME/content/skills` 加载全部 Skill。"""
     del cwd
-    return _load_skills_dir(DATA_SKILLS_DIR, "data", "skill")
+    return _load_skills_dir(skills_storage_dir(), "home", "skills")
 
 
 def _load_skills_dir(base_path: Path, source: str, loaded_from: str) -> list[SkillDefinition]:
@@ -186,6 +202,8 @@ def _parse_skill_file(path: Path, default_name: str, source: str, loaded_from: s
 
 def _dedupe_skills(skills: list[SkillDefinition]) -> list[SkillDefinition]:
     """按 Skill ID 去重并保留优先项。"""
+    # 两层去重：先按真实文件路径跳过同一文件的重复来源，
+    # 再按 id 收敛，使同名 Skill 中后加载的（优先级更高的来源）覆盖先加载的。
     seen_paths: set[str] = set()
     by_name: dict[str, SkillDefinition] = {}
     for skill in skills:
@@ -208,5 +226,7 @@ def _extract_description(content: str, fallback: str) -> str:
 
 def _normalize_skill_name(name: str) -> str:
     """把 Skill 名称规整为稳定 ID。"""
+    # ID 会作为函数名候选出现在模型的工具视野里，也会拼进文件路径，
+    # 因此白名单只保留字母数字和少量安全符号，其余（含路径分隔符）一律替换。
     normalized = re.sub(r"[^a-zA-Z0-9_:-]+", "-", name.strip())
     return normalized.strip("-") or "skill"

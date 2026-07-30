@@ -12,10 +12,54 @@
 | `Glob` | 按 glob 规则查找文件。 | 找某类文件，例如 `**/*.tsx`。 |
 | `LS` | 列出工作区目录内容。 | 快速查看目录结构和文件大小。 |
 | `Grep` | 用正则搜索文件内容。 | 查函数、变量、接口路径或配置项。 |
-| `Bash` | 在工作区执行 shell 命令，并限制超时和输出长度。 | 跑测试、构建、格式化、查看 git 状态。 |
+| `Bash` | 在工作区执行 shell 命令，并限制超时和输出长度；尽量放进 OS 沙箱。 | 跑测试、构建、格式化、查看 git 状态。 |
+| `InstallSandbox` | 在用户明确确认后安装 `srt`（Anthropic sandbox-runtime）。 | 沙箱未就绪时，经用户同意后代为安装。 |
 | `NotebookEdit` | 插入、替换或删除 `.ipynb` 单元格。 | 修改 Jupyter notebook 的代码或 Markdown 单元格。 |
 
-这些工具都会把路径限制在配置的工作区内，避免模型越权读写用户其它目录。`Write` 和 `Edit` 属于高影响工具，后续如果做更细的权限 UI，应优先给它们加确认策略。
+`Read` / `Write` / `Edit` / `Glob` / `LS` / `Grep` 会把路径限制在配置的工作区内。`Bash` 额外走下面的沙箱策略，因为 shell 本身可以 `cd` 到工作区外。
+
+## Bash 沙箱
+
+`Bash` 的沙箱逻辑在 `backend/sandbox/`，通过 Anthropic 的 `srt`（`@anthropic-ai/sandbox-runtime`）做 OS 级隔离：
+
+| 平台 | 后端 | 状态 |
+| --- | --- | --- |
+| macOS | Seatbelt（`sandbox-exec`） | 支持 |
+| Linux | bubblewrap（需本机安装 `bwrap`） | 支持 |
+| Windows 原生 | — | 不支持；请在 WSL2 里跑后端 |
+
+相关环境变量：
+
+- `BASH_SANDBOX_MODE`：`off` / `auto`（默认）/ `required`。`auto` 在探测不到 `srt` 时退回裸执行，并在工具结果里写明 `sandboxed: false`；`required` 则直接失败，绝不静默降级。
+- `BASH_SANDBOX_COMMAND`：包装器命令，默认 `srt`。
+- `BASH_SANDBOX_ALLOWED_DOMAINS`：网络域名白名单；默认空，表示沙箱内禁止出站网络。
+- `BASH_SANDBOX_WRITE_PATHS` / `BASH_SANDBOX_DENY_READ`：额外可写路径和额外拒绝读取路径。
+
+默认策略：工作区和系统临时目录可写；`~/.ssh`、`~/.aws`、项目 `.env` 等凭据路径拒绝读取；子进程环境变量按白名单拷贝（`PATH`/`HOME`/`LANG` 等），模型 API key、Langfuse、AWS 密钥不会进入子进程。
+
+沙箱不可用时会这样告知用户：
+
+1. 顶部状态栏（本轮第一次）：说明未就绪 / 不可用，并提示手动安装或对话确认后安装。
+2. 对话正文：模型应转述工具结果里的 `userMessage`（含流程与平台限制）。
+3. 侧栏健康状态：显示「沙箱就绪 / 未安装 / 不可用」；鼠标悬停可看 `userSummary` 完整说明。
+
+推荐流程：助手说明原因 → 你确认是否安装 → 确认后助手调用 `InstallSandbox`，或你手动执行安装命令。未确认不会安装。
+
+平台说明会写进上述反馈：
+
+- macOS：可装 `srt`，建议再装 `ripgrep`
+- Linux：可装 `srt`，还需本机 `bubblewrap` / `socat`
+- Windows 原生：不支持；提示改用 WSL2，不会提供 `InstallSandbox`
+
+## 权限模型
+
+每次工具调用在执行前都要过一遍权限规则（`backend/permissions/`）：
+
+- 规则来自权限规则文件，按文件签名缓存，改动后自动失效重载，不会每次调用都读盘。
+- 默认策略由 `K_AGENT_PERMISSION_DEFAULT` 控制，可以设成 `deny` 让未匹配的工具默认拒绝。
+- `ask` 目前没有前端确认通道，因此按拒绝处理，而不是静默放行。
+- `Bash` 命令会按 `&&`、`||`、`;`、`|`、换行拆成多个子命令分别匹配，取最严格的结果，避免用管道拼接绕过规则。
+- Skill 声明的 `allowedTools` 在该 Skill 激活期间强制生效，Skill 之外的工具会被拒绝。
 
 ## 网络工具
 
@@ -23,6 +67,8 @@
 | --- | --- | --- |
 | `WebFetch` | 抓取 HTTP/HTTPS 页面，并把 HTML 清洗成可读文本。 | 阅读文档页面、接口说明或普通网页内容。 |
 | `WebSearch` | 搜索网页并返回候选结果。 | 查找公开资料入口。 |
+
+`WebFetch` 会先把目标主机解析成 IP，再拒绝回环、私网、链路本地和组播地址，重定向的每一跳都重新校验，防止模型被诱导去读内网服务或云元数据接口。本地开发确实需要抓 `localhost` 时，可以用环境变量显式放开。响应还有下载字节上限，避免一个大文件把上下文和内存吃满。
 
 当前 `WebSearch` 是轻量实现，适合开发期验证工具链。生产环境如果要稳定搜索结果，建议替换成正式搜索 API，并加入域名白名单、请求审计和缓存。
 
@@ -33,7 +79,7 @@
 | `TodoWrite` | 生成或更新当前任务清单。 | 让模型拆解多步骤任务，并在执行过程中同步状态。 |
 | `Skill` | 加载并执行项目或用户定义的 Skill。 | 调用可复用工作流，例如特定业务流程、报告生成、固定操作手册。 |
 
-`Skill` 不是新增一个外部服务，而是读取后端 Skill loader 已载入的能力。对于 MCP Prompt 转换出来的 Skill，执行时会绑定当前请求的 MCP manager，避免跨请求复用连接。
+`Skill` 不是新增一个外部服务，而是读取本次请求随 `AgentRunRequest` 带过来的 Skill 定义。对于 MCP Prompt 转换出来的 Skill，执行时会绑定当前请求的 MCP manager。
 
 ## MCP 资源工具
 
@@ -48,12 +94,12 @@
 
 | 工具 | 作用 | 常见用途 |
 | --- | --- | --- |
-| `read_personal_memory` | 读取项目本地持久化记忆。 | 查看 `data/memory/MEMORY.md` 里记录的长期偏好或事实。 |
-| `append_personal_memory` | 追加一条项目本地长期记忆。 | 保存用户明确要求记住的信息到 `data/memory/MEMORY.md`。 |
-| `search_personal_memory` | 搜索项目本地长期记忆。 | 在 `data/memory/MEMORY.md` 里查找相关条目。 |
-| `compact_personal_memory` | 去重并裁剪项目本地记忆。 | 控制 `data/memory/MEMORY.md` 大小，减少重复内容。 |
+| `read_personal_memory` | 读取持久化记忆。 | 查看 `$K_AGENT_HOME/content/memory/MEMORY.md`。 |
+| `append_personal_memory` | 追加一条长期记忆。 | 写入 `$K_AGENT_HOME/content/memory/MEMORY.md`。 |
+| `search_personal_memory` | 搜索长期记忆。 | 在 MEMORY.md 里查找相关条目。 |
+| `compact_personal_memory` | 去重并裁剪记忆。 | 控制 MEMORY.md 大小。 |
 
-记忆工具当前直接读写项目内 `data/memory/MEMORY.md`。对话历史由统一文件存储层保存到 `data/sessions/`。
+记忆在 `$K_AGENT_HOME/content/memory/`；会话历史在 `$K_AGENT_HOME/state/sessions/`。
 
 ## 其它辅助工具
 
