@@ -11,9 +11,14 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from backend.home import session_workspace_dir
+from backend.runners.claude_approval_bridge import (
+    APPROVAL_TOOL_NAME,
+    ClaudeApprovalBridge,
+)
 from backend.runners.base import RunnerContext
 from backend.runners.cli_process import (
     _CliStreamState,
@@ -48,7 +53,7 @@ class ClaudeCodeRunner:
             )
         command = resolved.path
 
-        workspace = session_workspace_dir(ctx.thread_id)
+        workspace = ctx.workspace_dir or session_workspace_dir(ctx.thread_id)
         workspace.mkdir(parents=True, exist_ok=True)
         skill_preamble = build_claude_skill_preamble(ctx.skills)
         prompt = build_cli_prompt(ctx)
@@ -69,45 +74,61 @@ class ClaudeCodeRunner:
             )
         mode = cli_session_mode(ctx)
         resume_id = resume_session_id(ctx) if mode == "resume" else None
-        mcp_config = write_claude_mcp_config(workspace, ctx.mcp_servers)
+        async with _approval_bridge(ctx) as approval_bridge:
+            permission_mode = _claude_permission_mode(
+                ctx, approval_available=approval_bridge is not None
+            )
+            claude_mcp_servers = list(ctx.mcp_servers)
+            if approval_bridge is not None and permission_mode != "bypassPermissions":
+                claude_mcp_servers.append(approval_bridge.mcp_server())
+            mcp_config = write_claude_mcp_config(workspace, claude_mcp_servers)
 
-        permission_mode = _claude_permission_mode(ctx)
-        argv = [
-            command,
-            "-p",
-            prompt,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            permission_mode,
-        ]
-        if mcp_config is not None:
-            # A run must see exactly the MCP servers selected in the K Agent
-            # composer, not unrelated user/project Claude configurations.
-            argv.extend(["--strict-mcp-config", "--mcp-config", str(mcp_config)])
-        if ctx.model_id:
-            argv.extend(["--model", str(ctx.model_id)])
-        effort = _claude_effort(ctx.reasoning_effort)
-        if effort is not None:
-            argv.extend(["--effort", effort])
-        if resume_id:
-            argv.extend(["--resume", resume_id])
-        elif mode == "resume":
-            argv.append("--continue")
+            argv = [
+                command,
+                "-p",
+                prompt,
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                permission_mode,
+            ]
+            if approval_bridge is not None and permission_mode != "bypassPermissions":
+                # Claude print mode delegates permission prompts to this private
+                # MCP tool; its result is normalized by ApprovalBroker exactly
+                # like K Agent and Codex app-server requests.
+                argv.extend([
+                    "--allowedTools", APPROVAL_TOOL_NAME,
+                    "--permission-prompt-tool", APPROVAL_TOOL_NAME,
+                ])
+            if mcp_config is not None:
+                # A run must see exactly the MCP servers selected in the K Agent
+                # composer, not unrelated user/project Claude configurations.
+                argv.extend(["--strict-mcp-config", "--mcp-config", str(mcp_config)])
+            if ctx.model_id:
+                argv.extend(["--model", str(ctx.model_id)])
+            effort = _claude_effort(ctx.reasoning_effort)
+            if effort is not None:
+                argv.extend(["--effort", effort])
+            if resume_id:
+                argv.extend(["--resume", resume_id])
+            elif mode == "resume":
+                argv.append("--continue")
 
-        env = os.environ.copy()
-        inject_claude_mcp_secrets(env, ctx.mcp_servers)
-        async for event in run_cli_jsonl(
-            argv=argv,
-            cwd=workspace,
-            env=env,
-            mapper=map_claude_event,
-            kind=self.kind,
-            state_factory=ClaudeCodeStreamState,
-        ):
-            yield event
+            env = os.environ.copy()
+            inject_claude_mcp_secrets(env, ctx.mcp_servers)
+            if approval_bridge is not None:
+                env.update(approval_bridge.child_env())
+            async for event in run_cli_jsonl(
+                argv=argv,
+                cwd=workspace,
+                env=env,
+                mapper=map_claude_event,
+                kind=self.kind,
+                state_factory=ClaudeCodeStreamState,
+            ):
+                yield event
 
 
 class ClaudeCodeStreamState(_CliStreamState):
@@ -360,15 +381,35 @@ def _complete_claude_thinking(
 _CLAUDE_PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions"}
 
 
-def _claude_permission_mode(ctx: RunnerContext) -> str:
+def _claude_permission_mode(
+    ctx: RunnerContext, *, approval_available: bool = False
+) -> str:
     """Resolve Claude Code --permission-mode from agentOptions.
 
-    Headless execution (stdin=/dev/null) cannot present approval prompts, so
-    ``bypassPermissions`` is the safe default — without it MCP and shell tool
-    calls are silently rejected with "user cancelled".
+    Headless execution can ask only when the private permission-prompt MCP is
+    active. Otherwise preserve the historical bypass fallback so tools are not
+    silently rejected with "user cancelled".
     """
-    raw = str(ctx.options.get("claudePermissionMode") or "bypassPermissions").strip()
-    return raw if raw in _CLAUDE_PERMISSION_MODES else "bypassPermissions"
+    configured = ctx.options.get("claudePermissionMode")
+    raw = str(configured or "").strip()
+    if raw in _CLAUDE_PERMISSION_MODES:
+        return raw
+    return "default" if approval_available else "bypassPermissions"
+
+
+@asynccontextmanager
+async def _approval_bridge(ctx: RunnerContext):
+    """Keep the per-run callback alive for exactly the Claude subprocess run."""
+
+    if ctx.approval_broker is None:
+        yield None
+        return
+    async with ClaudeApprovalBridge(
+        broker=ctx.approval_broker,
+        thread_id=ctx.thread_id,
+        run_id=ctx.run_id,
+    ) as bridge:
+        yield bridge
 
 
 _CLAUDE_EFFORT_VALUES = {"min", "low", "medium", "high", "max"}

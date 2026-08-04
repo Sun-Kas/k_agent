@@ -128,6 +128,11 @@ class Settings(BaseSettings):
     agent_backend_log_level: str = Field(default="INFO", alias="AGENT_BACKEND_LOG_LEVEL")
     max_concurrent_agent_requests: int = Field(default=5, alias="MAX_CONCURRENT_AGENT_REQUESTS")
     request_acquire_timeout_seconds: float = Field(default=1.0, alias="REQUEST_ACQUIRE_TIMEOUT_SECONDS")
+    # Team runs have their own pool because they are background work and must
+    # not hold the public conversation semaphore or same-session lock.
+    team_runtime_enabled: bool = Field(default=True, alias="TEAM_RUNTIME_ENABLED")
+    team_max_active_runs: int = Field(default=8, alias="TEAM_MAX_ACTIVE_RUNS", ge=1, le=32)
+    team_task_lease_seconds: int = Field(default=120, alias="TEAM_TASK_LEASE_SECONDS", ge=30, le=3600)
     local_tool_preset: str = Field(default="coding", alias="LOCAL_TOOL_PRESET")
     local_tool_names: str | None = Field(default=None, alias="LOCAL_TOOL_NAMES")
     local_tool_workspace_root: str = Field(default=".", alias="LOCAL_TOOL_WORKSPACE_ROOT")

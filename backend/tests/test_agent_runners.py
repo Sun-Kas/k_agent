@@ -12,6 +12,7 @@ from backend.runners.claude_code import (
     build_claude_skill_preamble,
     map_claude_event,
 )
+from backend.runners.claude_approval_mcp import server as claude_approval_mcp
 from backend.runners.claude_mcp import (
     inject_claude_mcp_secrets,
     write_claude_mcp_config,
@@ -39,6 +40,16 @@ class RunnerRegistryTests(unittest.TestCase):
         self.assertEqual(registry.get("codex").kind, "codex")
         with self.assertRaises(ValueError):
             registry.get("unknown_agent")
+
+
+class ClaudeApprovalMcpTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_prompt_tool_has_claude_contract_fields(self) -> None:
+        tools = await claude_approval_mcp.list_tools()
+        approval = next(tool for tool in tools if tool.name == "request_approval")
+        self.assertEqual(
+            set(approval.inputSchema["required"]),
+            {"tool_name", "input"},
+        )
 
 
 class CliModelsTests(unittest.TestCase):

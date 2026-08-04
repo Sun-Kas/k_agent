@@ -1,0 +1,116 @@
+import type { AgentKind } from "../types";
+
+export type TeamStatus = "draft" | "running" | "paused" | "completed" | "failed" | "cancelled";
+export type TeamTaskStatus = "pending" | "ready" | "claimed" | "running" | "completed" | "failed" | "cancelled";
+
+export interface TeamSummary {
+  id: string;
+  name: string;
+  goal: string;
+  mode: "auto" | "manual";
+  status: TeamStatus;
+  agentCount: number;
+  taskCount: number;
+  completedTaskCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TeamAgent {
+  id: string;
+  teamId: string;
+  name: string;
+  role: string;
+  agentKind: AgentKind;
+  modelId?: string | null;
+  reasoningEffort?: string | null;
+  responsibility: string;
+  status: "spawning" | "idle" | "busy" | "waiting" | "paused" | "failed" | "stopped";
+  isSupervisor: boolean;
+  creationReason: string;
+  capabilities: { mcpServerIds: string[]; skillIds: string[] };
+  workspaceDir: string;
+  updatedAt: string;
+}
+
+export interface TeamTask {
+  id: string;
+  teamId: string;
+  title: string;
+  description: string;
+  taskType: string;
+  status: TeamTaskStatus;
+  priority: number;
+  ownerAgentId?: string | null;
+  dependsOn: string[];
+  attempt: number;
+  maxAttempts: number;
+  leaseUntil?: string | null;
+  runId?: string | null;
+  error?: string | null;
+  updatedAt: string;
+}
+
+export interface TeamArtifact {
+  id: string;
+  teamId: string;
+  taskId: string;
+  agentId?: string | null;
+  kind: string;
+  title: string;
+  content: string;
+  sha256: string;
+  version: number;
+  status: string;
+  createdAt: string;
+  uri: string;
+}
+
+export interface TeamMail {
+  id: string;
+  senderId: string;
+  recipientId: string;
+  messageType: string;
+  content: string;
+  artifactIds: string[];
+  status: string;
+  createdAt: string;
+}
+
+export interface TeamSnapshot {
+  id: string;
+  name: string;
+  goal: string;
+  mode: "auto" | "manual";
+  status: TeamStatus;
+  maxParallel: number;
+  supervisorAgentId: string;
+  createdAt: string;
+  updatedAt: string;
+  lastEventSeq: number;
+  agents: TeamAgent[];
+  tasks: TeamTask[];
+  artifacts: TeamArtifact[];
+  mailbox: TeamMail[];
+}
+
+export interface TeamEvent {
+  teamId: string;
+  seq: number;
+  eventId: string;
+  type: string;
+  payload: Record<string, unknown>;
+  occurredAt: string;
+}
+
+export interface TeamAgentDraft {
+  name: string;
+  role: string;
+  agentKind: AgentKind;
+  modelId?: string;
+  reasoningEffort?: string;
+  responsibility: string;
+  isSupervisor: boolean;
+  mcpServerIds: string[];
+  skillIds: string[];
+}

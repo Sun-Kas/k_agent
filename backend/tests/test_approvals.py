@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import unittest
 
+from backend.agui import translate_agent_events
 from backend.approvals import ApprovalBroker
+from backend.runners.claude_approval_bridge import ClaudeApprovalBridge
 from backend.runners.codex_app_server import _handle_server_request
 
 
@@ -129,6 +133,90 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         await anext(stream)
         response = await anext(stream)
         self.assertEqual(response["payload"], {"decision": "acceptForSession"})
+
+    async def test_claude_permission_bridge_uses_the_same_broker_contract(self) -> None:
+        broker = ApprovalBroker(timeout_seconds=1)
+        hold_runner = asyncio.Event()
+
+        async def runner():
+            await hold_runner.wait()
+            if False:
+                yield {}
+
+        stream = broker.stream(runner(), thread_id="thread-cc", run_id="run-cc")
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        async with ClaudeApprovalBridge(
+            broker=broker, thread_id="thread-cc", run_id="run-cc"
+        ) as bridge:
+            config = bridge.child_env()
+            reader, writer = await asyncio.open_connection(
+                config["K_AGENT_APPROVAL_HOST"],
+                int(config["K_AGENT_APPROVAL_PORT"]),
+            )
+            writer.write((json.dumps({
+                "token": config["K_AGENT_APPROVAL_TOKEN"],
+                "toolName": "Bash",
+                "input": {"command": "npm test"},
+            }) + "\n").encode())
+            await writer.drain()
+
+            requested = await next_event
+            self.assertEqual(requested["type"], "approval_request")
+            self.assertEqual(requested["payload"]["agentKind"], "claude_code")
+            self.assertTrue(await broker.resolve(
+                requested["payload"]["id"],
+                thread_id="thread-cc",
+                run_id="run-cc",
+                decision={"action": "approve", "remember": True},
+            ))
+            self.assertEqual((await anext(stream))["type"], "approval_resolved")
+            decision = json.loads(await reader.readline())
+            self.assertEqual(decision["behavior"], "allow")
+            self.assertEqual(decision["updatedInput"], {"command": "npm test"})
+            writer.close()
+            await writer.wait_closed()
+        await stream.aclose()
+
+    async def test_all_builtin_agents_share_one_agui_approval_shape(self) -> None:
+        for agent_kind in ("k_agent", "claude_code", "codex"):
+            async def internal_events():
+                yield {
+                    "type": "approval_request",
+                    "payload": {
+                        "id": f"approval-{agent_kind}",
+                        "threadId": "thread-1",
+                        "runId": "run-1",
+                        "agentKind": agent_kind,
+                        "category": "tool",
+                        "title": "Allow?",
+                        "message": "Needs confirmation",
+                        "detail": {},
+                    },
+                }
+                yield {
+                    "type": "approval_resolved",
+                    "payload": {
+                        "id": f"approval-{agent_kind}",
+                        "threadId": "thread-1",
+                        "runId": "run-1",
+                        "action": "approve",
+                    },
+                }
+
+            translated = [
+                event async for event in translate_agent_events(
+                    internal_events(), thread_id="thread-1", run_id="run-1"
+                )
+            ]
+            custom = [event for event in translated if event.type == "CUSTOM"]
+            self.assertEqual(
+                [(event.name, event.value["id"]) for event in custom],
+                [
+                    ("approval_request", f"approval-{agent_kind}"),
+                    ("approval_resolved", f"approval-{agent_kind}"),
+                ],
+            )
 
 
 if __name__ == "__main__":

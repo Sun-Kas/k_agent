@@ -21,6 +21,7 @@ import {
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ConfigCenter } from "./components/ConfigCenter";
+import { TeamWorkbench } from "./components/TeamWorkbench";
 import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
 import { mergeHistoricalMessages } from "./history";
@@ -295,7 +296,7 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem("k-agent-sidebar-width")) || 252);
   const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 310);
-  const [view, setView] = useState<"chat" | "config">("chat");
+  const [view, setView] = useState<"chat" | "config" | "team">("chat");
   const [models, setModels] = useState<ModelProfile[]>([]);
   const [agents, setAgents] = useState<DetectedAgent[]>([]);
   const [agentKind, setAgentKind] = useState<AgentKind>(() => localStorage.getItem(AGENT_KIND_STORAGE_KEY) || "k_agent");
@@ -1436,6 +1437,13 @@ export function App() {
     );
   }
 
+  if (view === "team") {
+    // The floating pet overlaps the Team mailbox and task controls on common
+    // laptop widths, so the focused operations workbench intentionally owns
+    // the full viewport while chat keeps the optional companion.
+    return <TeamWorkbench onBack={() => setView("chat")} />;
+  }
+
   return (
     <>
     <div
@@ -1535,6 +1543,9 @@ export function App() {
         </button>
         <button className="settings-link" type="button" onClick={() => setView("config")}>
           <span>⚙</span><strong>配置中心</strong><small>MCP · Skills · 模型</small><i>→</i>
+        </button>
+        <button className="settings-link team-entry-link" type="button" onClick={() => setView("team")}>
+          <span>⌘</span><strong>Agent Team</strong><small>任务板 · Artifact · 协作</small><i>→</i>
         </button>
       </aside>
       <div

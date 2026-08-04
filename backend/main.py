@@ -21,7 +21,7 @@ from backend.approvals import ApprovalBroker
 from backend.api.schemas import ApprovalResolutionInput, ChatMessage
 from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
-from backend.home import ensure_home_layout, memory_dir
+from backend.home import ensure_home_layout, memory_dir, teams_dir
 from backend.mcp_tool import McpSessionPool, load_mcp_manager
 from backend.sandbox import sandbox_runtime_status
 from backend.observability import AgentBackendLoggingCallback, LangfuseRuntime
@@ -33,6 +33,7 @@ from backend.prompts import (
 from backend.runners import RunnerContext, build_default_registry
 from backend.runners.detect import detect_agents_payload
 from backend.tools import load_local_tools
+from backend.tools.workspace import reset_tool_workspace, set_tool_workspace
 from backend.watchers import PollingChangeWatcher
 
 
@@ -49,6 +50,25 @@ class AgentBackendRunInput(BaseModel):
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     agent_kind: str | None = Field(default="k_agent", alias="agentKind")
     agent_options: dict[str, Any] = Field(default_factory=dict, alias="agentOptions")
+    team_id: str | None = Field(default=None, alias="teamId")
+    task_id: str | None = Field(default=None, alias="taskId")
+    team_agent_id: str | None = Field(default=None, alias="teamAgentId")
+    attempt_id: str | None = Field(default=None, alias="attemptId")
+    workspace_dir: str | None = Field(default=None, alias="workspaceDir")
+
+
+def _team_workspace(raw_path: str | None) -> Path | None:
+    """Validate that a Team-provided cwd stays inside the Team state root."""
+
+    if not raw_path:
+        return None
+    resolved = Path(raw_path).expanduser().resolve()
+    try:
+        resolved.relative_to(teams_dir().resolve())
+    except ValueError as exc:
+        raise ValueError("workspaceDir must be inside the Team Runtime state root") from exc
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def create_app() -> FastAPI:
@@ -246,6 +266,7 @@ def create_app() -> FastAPI:
                 skills=payload.skills,
                 reasoning_effort=payload.reasoning_effort,
                 attachments=payload.attachments,
+                workspace_dir=_team_workspace(payload.workspace_dir),
                 options=dict(payload.agent_options or {}),
                 settings=settings,
                 mcp_pool=app.state.mcp_pool,
@@ -253,6 +274,7 @@ def create_app() -> FastAPI:
                 logging_callback=logging_callback,
                 approval_broker=app.state.approvals,
             )
+            workspace_token = set_tool_workspace(ctx.workspace_dir)
             try:
                 runner = app.state.runner_registry.get(agent_kind)
                 async for event in app.state.approvals.stream(
@@ -290,6 +312,7 @@ def create_app() -> FastAPI:
                 )
                 raise
             finally:
+                reset_tool_workspace(workspace_token)
                 log_event(
                     "agent.stream.closed",
                     requestId=request_id or "-",

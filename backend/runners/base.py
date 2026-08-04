@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from backend.api.schemas import ChatMessage
@@ -34,6 +35,9 @@ class RunnerContext:
     skills: list[dict[str, Any]]
     reasoning_effort: str | None
     attachments: list[dict[str, Any]]
+    # Team runs receive a per-agent workspace. Conversation runs leave this
+    # unset and preserve the existing per-session workspace behavior.
+    workspace_dir: Path | None = None
     options: dict[str, Any] = field(default_factory=dict)
     settings: Settings | None = None
     mcp_pool: McpSessionPool | None = None

@@ -29,6 +29,7 @@ from access_layer.request_context import (
     set_request_context,
 )
 from access_layer.sessions.store import SessionStore
+from access_layer.teams import TeamRuntime, TeamStore, build_team_router
 from backend.api.schemas import (
     ApprovalResolutionInput,
     HealthResponse,
@@ -39,7 +40,7 @@ from backend.api.schemas import (
     SkillsConfigUpdate,
 )
 from backend.config import Settings, get_or_init_settings
-from backend.home import ensure_home_layout, skills_dir
+from backend.home import ensure_home_layout, skills_dir, teams_dir
 from backend.logging_config import configure_agent_backend_logging
 from backend.runtime_config import (
     models_path,
@@ -442,7 +443,21 @@ def create_app() -> FastAPI:
             agent_backend_client=app.state.agent_backend_client,
             runtime_catalog=app.state.runtime_catalog,
         )
-        yield
+        app.state.team_store = TeamStore(teams_dir() / "team_runtime.db")
+        app.state.team_runtime = TeamRuntime(
+            store=app.state.team_store,
+            backend_client=app.state.agent_backend_client,
+            runtime_catalog=app.state.runtime_catalog,
+            project_root=PROJECT_ROOT,
+            max_active_runs=app.state.settings.team_max_active_runs,
+            task_lease_seconds=app.state.settings.team_task_lease_seconds,
+            enabled=app.state.settings.team_runtime_enabled,
+        )
+        await app.state.team_runtime.start()
+        try:
+            yield
+        finally:
+            await app.state.team_runtime.stop()
 
     app = FastAPI(title=settings.app_title, lifespan=lifespan)
 
@@ -466,6 +481,20 @@ def create_app() -> FastAPI:
         allow_methods=settings.cors_allow_methods,
         allow_headers=settings.cors_allow_headers,
     )
+
+    # Team routes are registered before the SPA catch-all mount. Their runtime
+    # owns durable state in the Access Layer and only delegates individual runs.
+    # Lifespan creates the initialized runtime; route closures resolve it lazily
+    # so importing/constructing the app never opens the database or starts jobs.
+    class _RuntimeProxy:
+        @property
+        def store(self):
+            return app.state.team_runtime.store
+
+    runtime_proxy = _RuntimeProxy()
+    # Route handlers only require ``store`` today. Keeping the scheduler on
+    # app.state avoids starting a duplicate runtime during app construction.
+    app.include_router(build_team_router(runtime_proxy))
 
     @app.get("/api/health", response_model=HealthResponse)
     async def health_check() -> HealthResponse:

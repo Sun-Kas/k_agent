@@ -62,6 +62,10 @@ class KAgentRunner:
                 mcp_tools=cast(list[Any], mcp_tools),
             )
             user_context = dict(prompt_bundle.user_context)
+            if ctx.workspace_dir is not None:
+                # The same boundary is enforced by request-scoped local tools;
+                # exposing the path prevents the model from guessing a cwd.
+                user_context["teamWorkspace"] = str(ctx.workspace_dir)
             if ctx.mcp_servers:
                 user_context["selectedMcpServers"] = "\n".join(
                     f"- {server.get('name') or server.get('id')}: "

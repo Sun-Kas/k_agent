@@ -20,10 +20,14 @@ from backend.sandbox import (
     plan_bash_invocation,
 )
 from backend.tools.local import ToolDefinition
+from backend.tools.workspace import current_tool_workspace
 
 
 async def _workspace_root() -> Path:
     """返回当前工作区根目录。"""
+    scoped = current_tool_workspace()
+    if scoped is not None:
+        return scoped
     settings = await get_or_init_settings()
     root = Path(settings.local_tool_workspace_root).expanduser()
     if not root.is_absolute():

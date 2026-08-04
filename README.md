@@ -57,6 +57,28 @@ $K_AGENT_HOME/        默认 ~/.k_agent，可用环境变量改到项目内 .k_a
 - Access Layer 与 Agent Backend 默认分别只监听 `127.0.0.1:3001` 和
   `127.0.0.1:3002`；内部接口会携带模型凭据，两个服务都不应暴露到公网或局域网。
 
+### Agent Team Runtime
+
+Access Layer 同时提供持久化 Agent Team Control Plane。打开侧栏中的
+“Agent Team”即可创建由 `k_agent`、`codex`、`claude_code` 任意组合的团队，
+并为每个成员独立选择模型、MCP 和 Skill。Team 的任务、Mailbox、Artifact
+和事件序列保存在 `$K_AGENT_HOME/state/teams/team_runtime.db`；单个 Worker
+Run 仍由无状态 Agent Backend 执行。
+
+Team Scheduler 使用独立并发池，不获取公开对话的 same-session lock。编码
+Agent 首次运行时会优先创建独立 detached Git worktree；如果当前目录不是 Git
+仓库，则退化为独立目录。普通工具失败只结束对应工具调用或 Task Attempt，
+不会清空 Team 的其它任务和 Artifact。
+
+```env
+TEAM_RUNTIME_ENABLED=true
+TEAM_MAX_ACTIVE_RUNS=8
+TEAM_TASK_LEASE_SECONDS=120
+```
+
+主要 API：`/api/teams`、`/api/teams/{teamId}`、
+`/api/teams/{teamId}/stream`、`/api/teams/{teamId}/commands`。
+
 ## 当前能力
 
 - 聊天消息发送与回显

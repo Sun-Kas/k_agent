@@ -90,6 +90,12 @@ def sessions_dir() -> Path:
     return state_dir() / "sessions"
 
 
+def teams_dir() -> Path:
+    """Durable Team Runtime metadata, artifacts, and isolated workspaces."""
+
+    return state_dir() / "teams"
+
+
 def session_bundle_dir(session_id: str) -> Path:
     """Directory holding one session's JSON record and workspace."""
 
@@ -104,6 +110,12 @@ def session_workspace_dir(session_id: str) -> Path:
     """Working directory for CLI agents bound to this conversation."""
 
     return session_bundle_dir(session_id) / "workspace"
+
+
+def team_workspace_dir(team_id: str, agent_id: str) -> Path:
+    """Return the workspace owned by one Agent Team member."""
+
+    return teams_dir() / team_id / "workspaces" / agent_id
 
 
 def memory_dir() -> Path:
@@ -146,6 +158,7 @@ def ensure_home_layout(*, migrate: bool = True) -> Path:
         config_dir(),
         catalog_dir(),
         sessions_dir(),
+        teams_dir(),
         memory_dir(),
         skills_dir(),
     ):

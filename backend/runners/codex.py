@@ -43,7 +43,7 @@ class CodexRunner:
             )
         command = resolved.path
 
-        workspace = session_workspace_dir(ctx.thread_id)
+        workspace = ctx.workspace_dir or session_workspace_dir(ctx.thread_id)
         workspace.mkdir(parents=True, exist_ok=True)
         skill_preamble = build_codex_skill_preamble(ctx.skills)
         prompt = build_cli_prompt(ctx)
