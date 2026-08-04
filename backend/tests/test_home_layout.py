@@ -16,6 +16,7 @@ from backend.home import (
     migrate_legacy_home,
     models_config_path,
     reset_home_cache,
+    session_workspace_dir,
     sessions_dir,
     skills_catalog_path,
     skills_dir,
@@ -35,6 +36,7 @@ class HomeLayoutTests(unittest.TestCase):
                 self.assertTrue(sessions_dir().is_dir())
                 self.assertTrue(memory_dir().is_dir())
                 self.assertTrue(skills_dir().is_dir())
+                self.assertEqual(session_workspace_dir("demo"), sessions_dir() / "demo" / "workspace")
                 self.assertEqual(mcp_catalog_path().name, "mcp.json")
                 self.assertEqual(skills_catalog_path().name, "skills.json")
                 self.assertEqual(models_config_path().name, "models.json")

@@ -10,11 +10,13 @@ import {
   useState
 } from "react";
 import {
+  getAgentsCatalog,
   getHealth,
   getModelsConfig,
   getRuntimeCatalog,
   getSession,
   listSessions,
+  resolveApproval,
   streamAgentRun
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
@@ -26,7 +28,11 @@ import { createClientId } from "./id";
 import type {
   AgUiEvent,
   AgUiRunInput,
+  AgentKind,
+  ApprovalActivity,
   ChatMessage,
+  CliSessionMode,
+  DetectedAgent,
   HealthState,
   ModelProfile,
   ReasoningEffort,
@@ -36,6 +42,28 @@ import type {
   ThinkingActivity,
   ToolActivity
 } from "./types";
+
+const AGENT_KIND_STORAGE_KEY = "k-agent-agent-kind";
+const CLI_SESSION_MODE_STORAGE_KEY = "k-agent-cli-session-mode";
+const MODEL_BY_AGENT_STORAGE_KEY = "k-agent-model-by-agent";
+
+function readModelByAgent(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(MODEL_BY_AGENT_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    );
+  } catch {
+    return {};
+  }
+}
+
+function writeModelForAgent(kind: AgentKind, modelId: string) {
+  const next = { ...readModelByAgent(), [kind]: modelId };
+  localStorage.setItem(MODEL_BY_AGENT_STORAGE_KEY, JSON.stringify(next));
+}
 
 const suggestions = [
   "帮我拆解这个需求，并给出执行计划",
@@ -62,6 +90,7 @@ type ThinkingBlock = {
 type InlineActivity =
   | { type: "thinking"; sequence: number; block: ThinkingBlock }
   | { type: "tool"; sequence: number; tool: ToolActivity }
+  | { type: "approval"; sequence: number; approval: ApprovalActivity }
   | { type: "text"; sequence: number; text: TextActivity };
 
 type CopyFeedback = {
@@ -193,11 +222,17 @@ function normalizeThinkingStep(value: unknown): ThinkingActivity | null {
   return normalizeThinking([value])[0] ?? null;
 }
 
-function inlineTimeline(texts: TextActivity[], blocks: ThinkingBlock[], tools: ToolActivity[]): InlineActivity[] {
+function inlineTimeline(
+  texts: TextActivity[],
+  blocks: ThinkingBlock[],
+  tools: ToolActivity[],
+  approvals: ApprovalActivity[]
+): InlineActivity[] {
   return [
     ...texts.map((text) => ({ type: "text" as const, sequence: text.sequence, text })),
     ...blocks.map((block) => ({ type: "thinking" as const, sequence: block.sequence, block })),
-    ...tools.map((tool, index) => ({ type: "tool" as const, sequence: tool.sequence ?? index * 2 + 1, tool }))
+    ...tools.map((tool, index) => ({ type: "tool" as const, sequence: tool.sequence ?? index * 2 + 1, tool })),
+    ...approvals.map((approval) => ({ type: "approval" as const, sequence: approval.sequence, approval }))
   ].sort((left, right) => left.sequence - right.sequence);
 }
 
@@ -246,6 +281,7 @@ export function App() {
   const [thinkingBlocks, setThinkingBlocks] = useState<ThinkingBlock[]>([]);
   const [tools, setTools] = useState<ToolActivity[]>([]);
   const [textBlocks, setTextBlocks] = useState<TextActivity[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalActivity[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
   const [status, setStatus] = useState<string>(appConfig.status.idle);
@@ -261,6 +297,12 @@ export function App() {
   const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 310);
   const [view, setView] = useState<"chat" | "config">("chat");
   const [models, setModels] = useState<ModelProfile[]>([]);
+  const [agents, setAgents] = useState<DetectedAgent[]>([]);
+  const [agentKind, setAgentKind] = useState<AgentKind>(() => localStorage.getItem(AGENT_KIND_STORAGE_KEY) || "k_agent");
+  const [cliSessionMode, setCliSessionMode] = useState<CliSessionMode>(() => {
+    const saved = localStorage.getItem(CLI_SESSION_MODE_STORAGE_KEY);
+    return saved === "resume" ? "resume" : "ephemeral";
+  });
   const [mcpServers, setMcpServers] = useState<RuntimeOption[]>([]);
   const [skills, setSkills] = useState<RuntimeOption[]>([]);
   const [modelId, setModelId] = useState("");
@@ -337,7 +379,7 @@ export function App() {
   useEffect(() => {
     if (!streamPinnedRef.current) return;
     streamEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-  }, [messages, tools, loading]);
+  }, [messages, tools, approvals, loading]);
 
   useEffect(() => {
     if (view !== "chat" || !streamPinnedRef.current) return;
@@ -377,6 +419,7 @@ export function App() {
   const activityTurnIds = new Set([
     ...thinkingBlocks.map((block) => block.turnId),
     ...tools.map((tool) => tool.turnId),
+    ...approvals.map((approval) => approval.runId),
     ...textBlocks.map((text) => text.turnId)
   ]);
   const displayMessages = groupedMessages.filter((message, index) => {
@@ -414,17 +457,27 @@ export function App() {
 
   async function refreshOptions() {
     try {
-      const [modelData, catalog] = await Promise.all([
-        getModelsConfig(), getRuntimeCatalog()
+      const [modelData, catalog, agentsCatalog] = await Promise.all([
+        getModelsConfig(), getRuntimeCatalog(), getAgentsCatalog()
       ]);
       const enabledModels = modelData.models.filter((model) => model.enabled);
       const enabledMcp = catalog.mcpServers.filter((server) => server.enabled);
       const enabledSkills = catalog.skills.filter((skill) => skill.enabled);
+      const availableAgents = agentsCatalog.agents;
       setModels(enabledModels);
+      setAgents(availableAgents.length ? availableAgents : [{ kind: "k_agent", name: "K Agent", available: true }]);
       setMcpServers(enabledMcp);
       setSkills(enabledSkills);
       catalogLoadedRef.current = true;
-      setModelId((current) => enabledModels.some((model) => model.id === current) ? current : enabledModels[0]?.id ?? "");
+      const selectable = availableAgents.filter((agent) => agent.available);
+      const nextKind = selectable.some((agent) => agent.kind === agentKind)
+        ? agentKind
+        : (agentsCatalog.defaultKind || "k_agent");
+      localStorage.setItem(AGENT_KIND_STORAGE_KEY, nextKind);
+      setAgentKind(nextKind);
+      const nextModel = resolveModelForAgent(nextKind, enabledModels, availableAgents);
+      setModelId(nextModel);
+      if (nextModel) writeModelForAgent(nextKind, nextModel);
       const remembered = capabilitySelectionRef.current;
       const nextMcp = remembered
         ? remembered.mcpServerIds.filter((id) => enabledMcp.some((server) => server.id === id))
@@ -443,6 +496,8 @@ export function App() {
     } catch {
       catalogLoadedRef.current = false;
       setModels([]);
+      setAgents([{ kind: "k_agent", name: "K Agent", available: true }]);
+      setAgentKind("k_agent");
       setMcpServers([]);
       setSkills([]);
     }
@@ -561,6 +616,7 @@ export function App() {
     setThinking([]);
     setThinkingBlocks([]);
     setTextBlocks([]);
+    setApprovals([]);
     setActiveRunId(null);
     activeRunIdRef.current = null;
     pendingAssistantIdRef.current = null;
@@ -671,9 +727,12 @@ export function App() {
     const prompt = input.trim();
     if ((!prompt && !attachments.length) || loading || sessionLoading || !modelId) return;
 
-    const selectedModel = models.find((model) => model.id === modelId);
+    const agentModels = modelsForAgent(agentKind, models, agents);
+    const selectedModel = agentModels.find((model) => model.id === modelId);
     const validReasoningOptions = reasoningOptionsForModel(selectedModel);
-    const effectiveReasoningEffort = validReasoningOptions.some((option) => option.id === reasoningEffort) ? reasoningEffort : "none";
+    const effectiveReasoningEffort = validReasoningOptions.some((option) => option.id === reasoningEffort)
+      ? reasoningEffort
+      : "none";
     const pendingAssistantId = createClientId();
     const userMessage = createMessage("user", prompt);
     const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
@@ -696,7 +755,9 @@ export function App() {
         mcpServerIds: selectedMcp,
         skillIds: selectedSkills,
         reasoningEffort: effectiveReasoningEffort,
-        attachments
+        attachments,
+        agentKind,
+        agentOptions: agentKind === "k_agent" ? undefined : { cliSessionMode }
       }
     };
 
@@ -749,7 +810,9 @@ export function App() {
       );
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      const detail = error instanceof Error ? error.message : "未知错误";
+      const detail = error instanceof Error && error.message.trim()
+        ? error.message
+        : (typeof error === "string" && error.trim() ? error : "服务未返回错误详情，请查看后端日志");
       const errorEvent: AgUiEvent = { type: "RUN_ERROR", message: detail };
       activeRun.events.push(errorEvent);
       if (activeSessionIdRef.current === targetSessionId) {
@@ -1032,6 +1095,42 @@ export function App() {
           const entry = String(event.value.entry ?? "");
           if (entry) setTrace((current) => [...current, entry]);
         }
+        if (event.name === "approval_request") {
+          const value = event.value;
+          const id = String(value.id ?? "");
+          const runId = String(value.runId ?? activeRunIdRef.current ?? "");
+          if (id && runId) {
+            const sequence = activitySequenceRef.current + 1;
+            activitySequenceRef.current = sequence;
+            setApprovals((current) => current.some((approval) => approval.id === id)
+              ? current
+              : [...current, {
+                id,
+                threadId: String(value.threadId ?? sessionId ?? ""),
+                runId,
+                agentKind: String(value.agentKind ?? "k_agent"),
+                category: String(value.category ?? "tool"),
+                title: String(value.title ?? "需要你的确认"),
+                message: String(value.message ?? "请确认是否继续。"),
+                detail: value.detail && typeof value.detail === "object"
+                  ? value.detail as Record<string, unknown>
+                  : {},
+                status: "pending",
+                sequence
+              }]);
+            setStatus("等待人工审批");
+          }
+        }
+        if (event.name === "approval_resolved") {
+          const id = String(event.value.id ?? "");
+          const action = String(event.value.action ?? "cancel");
+          setApprovals((current) => current.map((approval) => approval.id === id
+            ? {
+              ...approval,
+              status: action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled"
+            }
+            : approval));
+        }
         break;
       case "RUN_FINISHED":
         activeRunIdRef.current = null;
@@ -1042,6 +1141,7 @@ export function App() {
       case "RUN_ERROR": {
         const pendingAssistantId = pendingAssistantIdRef.current;
         const failedRunId = activeRunIdRef.current;
+        const errorText = (event.message || "").trim() || "服务未返回错误详情，请查看后端日志";
         if (failedRunId) failRunActivities(failedRunId);
         pendingAssistantIdRef.current = null;
         activeRunIdRef.current = null;
@@ -1055,13 +1155,13 @@ export function App() {
           pendingAssistantId && current.some((message) => message.id === pendingAssistantId)
             ? current.map((message) =>
               message.id === pendingAssistantId
-                ? { ...message, content: `${appConfig.text.requestErrorPrefix}${event.message}` }
+                ? { ...message, content: `${appConfig.text.requestErrorPrefix}${errorText}` }
                 : message
             )
             : [
               ...current,
               {
-                ...createMessage("assistant", `${appConfig.text.requestErrorPrefix}${event.message}`),
+                ...createMessage("assistant", `${appConfig.text.requestErrorPrefix}${errorText}`),
                 meta: failedRunId ? { runId: failedRunId } : undefined
               }
             ]
@@ -1096,6 +1196,11 @@ export function App() {
         }
         : block
     ));
+    setApprovals((current) => current.map((approval) =>
+      approval.runId === runId && (approval.status === "pending" || approval.status === "submitting")
+        ? { ...approval, status: "cancelled" }
+        : approval
+    ));
     activeThinkingBlockIdRef.current = null;
     activeThinkingStepIdRef.current = null;
     activeTextActivityIdRef.current = null;
@@ -1104,6 +1209,39 @@ export function App() {
 
   function updateTool(id: string, transform: (tool: ToolActivity) => ToolActivity) {
     setTools((current) => current.map((tool) => tool.id === id ? transform(tool) : tool));
+  }
+
+  async function submitApproval(
+    approval: ApprovalActivity,
+    action: "approve" | "deny" | "cancel",
+    remember = false
+  ) {
+    setApprovals((current) => current.map((item) => item.id === approval.id
+      ? { ...item, status: "submitting", error: undefined }
+      : item));
+    try {
+      await resolveApproval(approval.id, {
+        threadId: approval.threadId,
+        runId: approval.runId,
+        action,
+        remember
+      });
+      setApprovals((current) => current.map((item) => item.id === approval.id
+        ? {
+          ...item,
+          status: action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled"
+        }
+        : item));
+      setStatus(action === "approve" ? appConfig.status.processing : "已拒绝工具调用");
+    } catch (error) {
+      setApprovals((current) => current.map((item) => item.id === approval.id
+        ? {
+          ...item,
+          status: "error",
+          error: error instanceof Error ? error.message : "审批提交失败"
+        }
+        : item));
+    }
   }
 
   function beginThinkingBlock(blockId: string, turnId: string) {
@@ -1499,7 +1637,10 @@ export function App() {
             const messageTexts = turnId
               ? textBlocks.filter((text) => text.turnId === turnId)
               : [];
-            const timeline = inlineTimeline(messageTexts, blocks, messageTools);
+            const messageApprovals = turnId
+              ? approvals.filter((approval) => approval.runId === turnId)
+              : [];
+            const timeline = inlineTimeline(messageTexts, blocks, messageTools, messageApprovals);
             const hasTimelineText = messageTexts.length > 0;
             const isActiveAssistant = message.role === "assistant"
               && loading
@@ -1515,6 +1656,14 @@ export function App() {
                         ? <InlineThinking block={activity.block} key={`thinking-${activity.block.id}`} />
                         : activity.type === "tool"
                           ? <InlineTool tool={activity.tool} key={`tool-${activity.tool.id}`} />
+                          : activity.type === "approval"
+                            ? (
+                              <ApprovalCard
+                                approval={activity.approval}
+                                key={`approval-${activity.approval.id}`}
+                                onDecision={submitApproval}
+                              />
+                            )
                           : (
                             <div className="assistant-output" key={`text-${activity.text.id}`}>
                               <MarkdownContent content={activity.text.content} />
@@ -1586,20 +1735,42 @@ export function App() {
           />
           <div className="composer-footer">
             <div className="composer-toolbar composer-toolbar-left">
-              <label className={`attach-button ${models.find((model) => model.id === modelId)?.multimodal ? "" : "disabled"}`} title="添加图片">＋<span>图片</span><input type="file" accept="image/*" multiple onChange={(event) => { void addImages(event.target.files); event.target.value = ""; }} /></label>
+              <label className={`attach-button ${agentKind === "k_agent" && models.find((model) => model.id === modelId)?.multimodal ? "" : "disabled"}`} title="添加图片">＋<span>图片</span><input type="file" accept="image/*" multiple disabled={agentKind !== "k_agent"} onChange={(event) => { void addImages(event.target.files); event.target.value = ""; }} /></label>
               <Picker label={`MCP ${selectedMcp.length}`} items={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description }))} selected={selectedMcp} onChange={changeSelectedMcp} />
               <Picker label={`Skill ${selectedSkills.length}`} items={skills.map((skill) => ({ id: skill.id, name: skill.name, description: skill.description }))} selected={selectedSkills} onChange={changeSelectedSkills} />
             </div>
             <div className="composer-toolbar composer-toolbar-right">
+              <AgentPicker
+                agentKind={agentKind}
+                agents={agents}
+                cliSessionMode={cliSessionMode}
+                onAgentChange={(value) => {
+                  setAgentKind(value);
+                  localStorage.setItem(AGENT_KIND_STORAGE_KEY, value);
+                  if (value !== "k_agent") setAttachments([]);
+                  const nextModel = resolveModelForAgent(value, models, agents);
+                  setModelId(nextModel);
+                  if (nextModel) writeModelForAgent(value, nextModel);
+                  setReasoningEffort("none");
+                }}
+                onCliSessionModeChange={(value) => {
+                  setCliSessionMode(value);
+                  localStorage.setItem(CLI_SESSION_MODE_STORAGE_KEY, value);
+                }}
+              />
               <ModelSettingsPicker
                 modelId={modelId}
-                models={models}
+                models={modelsForAgent(agentKind, models, agents)}
                 reasoningEffort={reasoningEffort}
+                showReasoning
                 onModelChange={(value) => {
                   setModelId(value);
-                  const next = models.find((model) => model.id === value);
+                  writeModelForAgent(agentKind, value);
                   setReasoningEffort("none");
-                  if (!next?.multimodal) setAttachments([]);
+                  if (agentKind === "k_agent") {
+                    const next = models.find((model) => model.id === value);
+                    if (!next?.multimodal) setAttachments([]);
+                  }
                 }}
                 onReasoningChange={setReasoningEffort}
               />
@@ -1827,6 +1998,59 @@ function InlineTool({ tool }: { tool: ToolActivity }) {
   );
 }
 
+function ApprovalCard({
+  approval,
+  onDecision
+}: {
+  approval: ApprovalActivity;
+  onDecision: (
+    approval: ApprovalActivity,
+    action: "approve" | "deny" | "cancel",
+    remember?: boolean
+  ) => Promise<void>;
+}) {
+  const pending = approval.status === "pending" || approval.status === "error";
+  const submitting = approval.status === "submitting";
+  const argumentsValue = approval.detail.arguments;
+  const command = approval.detail.command;
+  const preview = command
+    ? String(command)
+    : argumentsValue !== undefined
+      ? safeStringify(argumentsValue)
+      : "";
+  const statusText = {
+    pending: "等待确认",
+    submitting: "正在提交",
+    approved: "已允许",
+    denied: "已拒绝",
+    cancelled: "已取消",
+    error: "提交失败"
+  }[approval.status];
+
+  return (
+    <section className={`approval-card ${approval.status}`} aria-live="polite">
+      <header>
+        <span className="approval-shield" aria-hidden="true">!</span>
+        <div>
+          <small>{approval.agentKind} · {approval.category}</small>
+          <strong>{approval.title}</strong>
+        </div>
+        <b>{statusText}</b>
+      </header>
+      <p>{approval.message}</p>
+      {preview && <code>{preview}</code>}
+      {approval.error && <p className="approval-error">{approval.error}</p>}
+      {pending && (
+        <footer>
+          <button type="button" disabled={submitting} onClick={() => void onDecision(approval, "deny")}>拒绝</button>
+          <button type="button" disabled={submitting} onClick={() => void onDecision(approval, "approve")}>允许一次</button>
+          <button className="primary" type="button" disabled={submitting} onClick={() => void onDecision(approval, "approve", true)}>本轮始终允许</button>
+        </footer>
+      )}
+    </section>
+  );
+}
+
 function InspectorSection({ title, count, children }: { title: string; count: number; children: React.ReactNode }) {
   return <section className="inspector-section"><header><h3>{title}</h3><span>{count}</span></header>{children}</section>;
 }
@@ -1920,12 +2144,15 @@ const reasoningOptions = [
   { id: "max", name: "max", hint: "" }
 ] as const;
 
-function isDeepSeekModel(model?: ModelProfile) {
+type ReasoningModel = Pick<ModelProfile, "id" | "supportsReasoning"> &
+  Partial<Pick<ModelProfile, "name" | "model" | "baseUrl">>;
+
+function isDeepSeekModel(model?: ReasoningModel) {
   const marker = `${model?.id ?? ""} ${model?.name ?? ""} ${model?.model ?? ""} ${model?.baseUrl ?? ""}`.toLowerCase();
   return marker.includes("deepseek");
 }
 
-function reasoningOptionsForModel(model?: ModelProfile) {
+function reasoningOptionsForModel(model?: ReasoningModel) {
   if (!model?.supportsReasoning) return [reasoningOptions[0]];
   // DeepSeek 只开放 high/max 两档思考强度，避免前端提交 low/medium 造成后端实际调用失败。
   if (isDeepSeekModel(model)) {
@@ -1934,16 +2161,149 @@ function reasoningOptionsForModel(model?: ModelProfile) {
   return reasoningOptions.filter((option) => option.id !== "max");
 }
 
+function modelsForAgent(
+  kind: AgentKind,
+  kAgentModels: ModelProfile[],
+  agents: DetectedAgent[]
+): Array<Pick<ModelProfile, "id" | "name" | "supportsReasoning" | "multimodal">> {
+  if (kind === "k_agent") {
+    return kAgentModels.map((model) => ({
+      id: model.id,
+      name: model.name,
+      supportsReasoning: model.supportsReasoning,
+      multimodal: model.multimodal
+    }));
+  }
+  const agent = agents.find((item) => item.kind === kind);
+  return (agent?.models || []).map((model) => ({
+    id: model.id,
+    name: model.name,
+    supportsReasoning: Boolean(model.supportsReasoning),
+    multimodal: false
+  }));
+}
+
+function resolveModelForAgent(
+  kind: AgentKind,
+  kAgentModels: ModelProfile[],
+  agents: DetectedAgent[]
+): string {
+  const options = modelsForAgent(kind, kAgentModels, agents);
+  const remembered = readModelByAgent()[kind];
+  if (remembered && options.some((model) => model.id === remembered)) return remembered;
+  if (kind === "k_agent") return options[0]?.id ?? "";
+  const agent = agents.find((item) => item.kind === kind);
+  if (agent?.defaultModelId && options.some((model) => model.id === agent.defaultModelId)) {
+    return agent.defaultModelId;
+  }
+  return options[0]?.id ?? "";
+}
+
+function AgentPicker({
+  agentKind,
+  agents,
+  cliSessionMode,
+  onAgentChange,
+  onCliSessionModeChange
+}: {
+  agentKind: AgentKind;
+  agents: DetectedAgent[];
+  cliSessionMode: CliSessionMode;
+  onAgentChange: (value: AgentKind) => void;
+  onCliSessionModeChange: (value: CliSessionMode) => void;
+}) {
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const current = agents.find((agent) => agent.kind === agentKind) ?? agents[0];
+  const supportsResume = Boolean(current?.supports_resume);
+
+  useEffect(() => {
+    const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
+      const picker = pickerRef.current;
+      if (open && picker && !picker.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointerDown);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
+  }, [open]);
+
+  return (
+    <div ref={pickerRef} className={`model-settings ${open ? "open" : ""}`}>
+      {open && (
+        <div className="model-settings-popovers">
+          <section className="agent-picker-card">
+            <div className="agent-picker-list">
+              {agents.map((agent) => (
+                <button
+                  className={agent.kind === agentKind ? "selected" : ""}
+                  disabled={!agent.available}
+                  key={agent.kind}
+                  type="button"
+                  onClick={() => {
+                    if (!agent.available) return;
+                    onAgentChange(agent.kind);
+                    if (!agent.supports_resume) setOpen(false);
+                  }}
+                >
+                  <span>
+                    <strong>{agent.name}</strong>
+                    {agent.version && <small>{agent.version}</small>}
+                    {!agent.available && <small>{agent.detail || "不可用"}</small>}
+                  </span>
+                  <i>{agent.kind === agentKind ? "✓" : ""}</i>
+                </button>
+              ))}
+            </div>
+            {supportsResume && (
+              <div className="agent-picker-sub">
+                <header>会话模式</header>
+                <div className="agent-picker-sub-options">
+                  {([
+                    { id: "ephemeral", name: "每次新建" },
+                    { id: "resume", name: "继续上次" }
+                  ] as const).map((option) => (
+                    <button
+                      className={option.id === cliSessionMode ? "selected" : ""}
+                      key={option.id}
+                      type="button"
+                      onClick={() => {
+                        onCliSessionModeChange(option.id);
+                        setOpen(false);
+                      }}
+                    >
+                      {option.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+      <button className="model-settings-bar" type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)} title="选择 Agent">
+        <span className="model-settings-current">
+          <strong>{current?.name || "K Agent"}</strong>
+          {supportsResume && <em>{cliSessionMode === "resume" ? "resume" : "new"}</em>}
+        </span>
+        <i>⌃</i>
+      </button>
+    </div>
+  );
+}
+
 function ModelSettingsPicker({
   modelId,
   models,
   reasoningEffort,
+  showReasoning = true,
   onModelChange,
   onReasoningChange
 }: {
   modelId: string;
-  models: ModelProfile[];
+  models: Array<Pick<ModelProfile, "id" | "name" | "supportsReasoning" | "multimodal">>;
   reasoningEffort: ReasoningEffort;
+  showReasoning?: boolean;
   onModelChange: (value: string) => void;
   onReasoningChange: (value: ReasoningEffort) => void;
 }) {
@@ -1951,10 +2311,12 @@ function ModelSettingsPicker({
   const [open, setOpen] = useState(false);
   const [panel, setPanel] = useState<"model" | "reasoning" | null>(null);
   const currentModel = models.find((model) => model.id === modelId);
-  const availableReasoningOptions = reasoningOptionsForModel(currentModel);
+  const availableReasoningOptions = showReasoning
+    ? reasoningOptionsForModel(currentModel)
+    : [reasoningOptions[0]];
   const normalizedReasoning = availableReasoningOptions.some((option) => option.id === reasoningEffort) ? reasoningEffort : "none";
   const currentReasoning = reasoningOptions.find((option) => option.id === normalizedReasoning);
-  const supportsReasoning = Boolean(currentModel?.supportsReasoning);
+  const supportsReasoning = Boolean(showReasoning && currentModel?.supportsReasoning);
 
   useEffect(() => {
     if (normalizedReasoning !== reasoningEffort) onReasoningChange(normalizedReasoning);
@@ -2004,14 +2366,16 @@ function ModelSettingsPicker({
             <button className={panel === "model" ? "active" : ""} type="button" onClick={() => setPanel(panel === "model" ? null : "model")}>
               <strong>模型</strong><span>{currentModel?.name ?? "未选择"}</span><i>›</i>
             </button>
-            <button
-              className={panel === "reasoning" ? "active" : ""}
-              type="button"
-              disabled={!supportsReasoning}
-              onClick={() => setPanel(panel === "reasoning" ? null : "reasoning")}
-            >
-              <strong>推理强度</strong><span>{supportsReasoning ? currentReasoning?.name : "不支持"}</span><i>›</i>
-            </button>
+            {showReasoning && (
+              <button
+                className={panel === "reasoning" ? "active" : ""}
+                type="button"
+                disabled={!supportsReasoning}
+                onClick={() => setPanel(panel === "reasoning" ? null : "reasoning")}
+              >
+                <strong>推理强度</strong><span>{supportsReasoning ? currentReasoning?.name : "不支持"}</span><i>›</i>
+              </button>
+            )}
           </section>
         </div>
       )}

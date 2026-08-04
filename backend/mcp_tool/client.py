@@ -240,6 +240,33 @@ class McpSession:
 McpStdioSession = McpSession
 
 
+_TRANSIENT_RESULT_PATTERNS: tuple[str, ...] = (
+    "user cancelled",
+    "connection reset",
+    "connection closed",
+    "stream ended unexpectedly",
+)
+
+
+def _is_transient_result(result_json: str) -> bool:
+    """Detect MCP results that indicate a transient/cancelled call worth retrying."""
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if isinstance(payload, dict) and not payload.get("ok", True):
+        error_text = str(payload.get("error", "")).lower()
+        return any(pattern in error_text for pattern in _TRANSIENT_RESULT_PATTERNS)
+    if isinstance(payload, list):
+        text = " ".join(
+            str(item.get("text", "")).lower()
+            for item in payload
+            if isinstance(item, dict)
+        )
+        return any(pattern in text for pattern in _TRANSIENT_RESULT_PATTERNS)
+    return False
+
+
 class McpClientManager:
     """Coordinate independent MCP sessions while isolating per-server failures."""
 
@@ -251,6 +278,8 @@ class McpClientManager:
         log_context: dict[str, Any] | None = None,
         connect_timeout_seconds: float = 60.0,
         call_timeout_seconds: float | None = None,
+        max_call_retries: int = 0,
+        retry_base_delay_seconds: float = 1.0,
         session_pool: "McpSessionPool | None" = None,
     ):
         """初始化对象依赖和内部状态。"""
@@ -259,6 +288,8 @@ class McpClientManager:
         self.log_context = dict(log_context or {})
         self.connect_timeout_seconds = connect_timeout_seconds
         self.call_timeout_seconds = call_timeout_seconds
+        self.max_call_retries = max_call_retries
+        self.retry_base_delay_seconds = retry_base_delay_seconds
         # With a pool, this manager borrows shared connections and returns them
         # on close_all instead of tearing down a child process per run.
         self._session_pool = session_pool
@@ -456,14 +487,66 @@ class McpClientManager:
         return instructions
 
     async def call_tool(self, server_id: str, tool_name: str, arguments: dict[str, Any]) -> str:
-        """调用指定工具并返回文本化结果。"""
+        """调用指定工具并返回文本化结果，对瞬时失败自动重试。"""
         session = self.sessions.get(server_id)
         if session is None:
             raise RuntimeError(f'MCP server "{server_id}" is not connected.')
-        # An MCP server that never answers would otherwise stall the whole run;
-        # the timeout surfaces as a recoverable tool error the model can react to.
-        async with self._call_timeout():
-            return await session.call_tool(tool_name, arguments)
+
+        last_error: Exception | None = None
+        last_result: str | None = None
+
+        for attempt in range(1 + self.max_call_retries):
+            try:
+                async with self._call_timeout():
+                    result = await session.call_tool(tool_name, arguments)
+            except asyncio.CancelledError:
+                # Run-level cancellation must propagate immediately.
+                raise
+            except Exception as exc:
+                last_error = exc
+                # Only retry transport/connection failures; business-logic
+                # errors from the server (RuntimeError, ValueError) propagate
+                # immediately so the model sees them without pointless delay.
+                retryable = isinstance(exc, (TimeoutError, OSError, ConnectionError, EOFError))
+                if retryable and attempt < self.max_call_retries:
+                    delay = self.retry_base_delay_seconds * (2 ** attempt)
+                    log_event(
+                        "mcp.call.retry",
+                        **self.log_context,
+                        serverId=server_id,
+                        tool=tool_name,
+                        attempt=attempt + 1,
+                        maxRetries=self.max_call_retries,
+                        errorType=type(exc).__name__,
+                        delay=delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            # Retry transient result-level failures (e.g. "user cancelled MCP tool call").
+            if _is_transient_result(result) and attempt < self.max_call_retries:
+                last_result = result
+                delay = self.retry_base_delay_seconds * (2 ** attempt)
+                log_event(
+                    "mcp.call.retry",
+                    **self.log_context,
+                    serverId=server_id,
+                    tool=tool_name,
+                    attempt=attempt + 1,
+                    maxRetries=self.max_call_retries,
+                    reason="transient_result",
+                    delay=delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            return result
+
+        # All retries exhausted; return the last result or raise the last error.
+        if last_result is not None:
+            return last_result
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"MCP call to {server_id}:{tool_name} failed after retries")
 
     def _call_timeout(self):
         """Bound a single MCP request, or pass through when unconfigured."""
@@ -526,6 +609,8 @@ async def load_mcp_manager(
         result,
         connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
         call_timeout_seconds=settings.mcp_call_timeout_seconds,
+        max_call_retries=settings.mcp_call_max_retries,
+        retry_base_delay_seconds=settings.mcp_call_retry_base_delay_seconds,
         session_pool=session_pool,
     )
 
@@ -536,6 +621,8 @@ def mcp_manager_from_runtime(
     log_context: dict[str, Any] | None = None,
     connect_timeout_seconds: float = 60.0,
     call_timeout_seconds: float | None = None,
+    max_call_retries: int = 0,
+    retry_base_delay_seconds: float = 1.0,
     session_pool: "McpSessionPool | None" = None,
 ) -> McpClientManager:
     """Build a manager only from access-layer supplied runtime definitions."""
@@ -583,6 +670,8 @@ def mcp_manager_from_runtime(
         log_context=log_context,
         connect_timeout_seconds=connect_timeout_seconds,
         call_timeout_seconds=call_timeout_seconds,
+        max_call_retries=max_call_retries,
+        retry_base_delay_seconds=retry_base_delay_seconds,
         session_pool=session_pool,
     )
 

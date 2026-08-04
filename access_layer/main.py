@@ -13,6 +13,7 @@ import tempfile
 import zipfile
 
 from ag_ui.core import RunAgentInput
+import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +30,7 @@ from access_layer.request_context import (
 )
 from access_layer.sessions.store import SessionStore
 from backend.api.schemas import (
+    ApprovalResolutionInput,
     HealthResponse,
     McpConfigUpdate,
     ModelsConfigUpdate,
@@ -665,6 +667,12 @@ def create_app() -> FastAPI:
         """返回工作台选择器使用的轻量 MCP/Skill 列表。"""
         return app.state.runtime_catalog.list_payload()
 
+    @app.get("/api/agents")
+    async def list_agents():
+        """Return built-in + auto-detected local CLI agents."""
+
+        return await app.state.agent_backend_client.get_json("/internal/agents")
+
     @app.post("/api/skills")
     async def import_project_skill(file: UploadFile = File(...)):
         """在接入层校验并保存上传 Skill，再通知 Agent Backend 重新加载。"""
@@ -716,6 +724,29 @@ def create_app() -> FastAPI:
     async def run_agui_agent(payload: RunAgentInput):
         """把前端 RunAgentInput 交给接入网关处理。"""
         return await app.state.access_layer.run(payload)
+
+    @app.post("/api/approvals/{request_id}")
+    async def resolve_approval(
+        request_id: str, payload: ApprovalResolutionInput
+    ) -> dict:
+        """Forward a scoped approval decision to the private Agent Backend."""
+
+        try:
+            return await app.state.agent_backend_client.post_json(
+                f"/internal/approvals/{request_id}",
+                payload.model_dump(by_alias=True),
+            )
+        except httpx.HTTPStatusError as exc:
+            # Preserve stale/mismatched approval semantics at the public edge;
+            # otherwise a backend 404 would be obscured as an Access Layer 500.
+            detail = "Approval request is no longer pending"
+            try:
+                backend_detail = exc.response.json().get("detail")
+                if isinstance(backend_detail, str) and backend_detail:
+                    detail = backend_detail
+            except (ValueError, AttributeError):
+                pass
+            raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
 
     @app.get("/api/sessions")
     async def list_sessions():

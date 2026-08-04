@@ -181,7 +181,35 @@ export interface AgUiRunInput {
     skillIds?: string[];
     reasoningEffort?: ReasoningEffort;
     attachments?: Array<{ name: string; dataUrl: string; type: string }>;
+    agentKind?: AgentKind;
+    agentOptions?: {
+      cliSessionMode?: CliSessionMode;
+      resumeSessionId?: string;
+    };
   };
+}
+
+export type AgentKind = "k_agent" | "codex" | "claude_code" | string;
+export type CliSessionMode = "ephemeral" | "resume";
+
+export interface DetectedAgent {
+  kind: AgentKind;
+  name: string;
+  available: boolean;
+  command?: string | null;
+  version?: string | null;
+  detail?: string | null;
+  requires_cli?: boolean;
+  supports_resume?: boolean;
+  default_cli_session_mode?: CliSessionMode;
+  supportsModelSwitch?: boolean;
+  defaultModelId?: string | null;
+  models?: Array<{ id: string; name: string; supportsReasoning?: boolean }>;
+}
+
+export interface AgentsCatalog {
+  defaultKind: AgentKind;
+  agents: DetectedAgent[];
 }
 
 export interface ToolActivity {
@@ -201,4 +229,18 @@ export interface TextActivity {
   content: string;
   status: "streaming" | "complete";
   sequence: number;
+}
+
+export interface ApprovalActivity {
+  id: string;
+  threadId: string;
+  runId: string;
+  agentKind: AgentKind;
+  category: string;
+  title: string;
+  message: string;
+  detail: Record<string, unknown>;
+  status: "pending" | "submitting" | "approved" | "denied" | "cancelled" | "error";
+  sequence: number;
+  error?: string;
 }

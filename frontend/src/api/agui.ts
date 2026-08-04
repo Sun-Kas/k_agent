@@ -3,6 +3,7 @@ import { nextRenderOpportunity } from "./stream-scheduler";
 import type {
   AgUiEvent,
   AgUiRunInput,
+  AgentsCatalog,
   HealthState,
   McpCapabilities,
   McpServerConfig,
@@ -51,6 +52,12 @@ export async function getRuntimeCatalog(): Promise<{
     skills: RuntimeOption[];
     sources: { mcp: string; skills: string };
   }>;
+}
+
+export async function getAgentsCatalog(): Promise<AgentsCatalog> {
+  const response = await configFetch("/api/agents");
+  if (!response.ok) throw new Error(`Unable to load agents catalog (${response.status})`);
+  return response.json() as Promise<AgentsCatalog>;
 }
 
 export async function saveModelsConfig(models: ModelProfile[]): Promise<void> {
@@ -154,6 +161,27 @@ export async function getMcpCapabilities(): Promise<McpCapabilities> {
 export async function reloadMcp(): Promise<void> {
   const response = await configFetch("/api/mcp/reload", { method: "POST" }, 120000);
   if (!response.ok) throw new Error(`Unable to reload MCP (${response.status})`);
+}
+
+export async function resolveApproval(
+  requestId: string,
+  input: {
+    threadId: string;
+    runId: string;
+    action: "approve" | "deny" | "cancel";
+    remember?: boolean;
+    answers?: Record<string, string[]>;
+    content?: Record<string, unknown>;
+  }
+): Promise<void> {
+  const response = await fetch(apiUrl(`/api/approvals/${encodeURIComponent(requestId)}`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  if (!response.ok) {
+    throw new Error(await configResponseError(response, "审批提交失败"));
+  }
 }
 
 export async function getSkillsConfig(): Promise<{ path: string; skillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }> {

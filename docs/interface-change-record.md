@@ -2,6 +2,58 @@
 
 > 维护约定：后续涉及前后端接口、MCP/Skill/Memory 加载链路、系统提示词拼接、权限边界或缓存策略的重要修改，都需要在本文追加记录。
 
+## 2026-08-04 流式消息字体稳定性
+
+- 用户与 Agent 消息正文改用本机稳定的中文字体栈，不再依赖远程
+  `Noto Sans SC` 的 `display=swap`。避免中文内容流式追加时先按 fallback 字体绘制、
+  远程字体就绪后再因字形度量变化而出现字体先大后小的跳动。
+- 消息容器固定 `text-size-adjust: 100%`，防止动态内容或窄视口触发浏览器文本自动放大；
+  Markdown 标题、代码和正文原有层级规则保持不变。
+
+## 2026-08-04 Claude Code 与 Codex Skill 路径适配
+
+- Claude Code 和 Codex 的 Skill 提示词现在同时包含 `SKILL.md` 绝对路径与
+  Skill package root；Skill 正文中的 `scripts/`、`references/`、`assets/`、
+  `templates/` 等相对路径必须以 package root 为基准解析，不能以会话工作区为基准。
+- 两套路径提示分别由 Claude Code 和 Codex runner 构造，共享 CLI 子进程层不感知
+  Skill 路径，K Agent 的原生 Skill 工具加载流程不变。
+
+## 2026-08-03 Codex 与 K Agent 人工审批通道
+
+- Codex runner 从单向 `codex exec --json` 切换为双向 `codex app-server --stdio`。
+  `commandExecution`、`fileChange`、`tool/requestUserInput`、MCP elicitation 和
+  permissions 请求会暂停当前 run，等待前端明确答复，不再被 CLI 自动取消。
+- Agent Backend 新增 run-scoped `ApprovalBroker`。它把待审批请求输出为
+  `CUSTOM(approval_request)`，完成后输出 `CUSTOM(approval_resolved)`；请求 ID 必须
+  同时匹配 thread ID 和 run ID，流关闭时未决请求会被取消，避免跨会话误批。
+- 新增 `POST /internal/approvals/{requestId}` 和 Access Layer 对外代理
+  `POST /api/approvals/{requestId}`。请求体包含 `threadId/runId/action/remember`，
+  并可为 Codex 表单请求携带 `answers/content`；过期或归属不符统一返回 404。
+- K Agent 的 `ask` 权限规则接入同一审批通道。选择“本轮始终允许”只缓存当前
+  Agent 实例内的精确工具目标，不写入持久权限配置。
+- 前端活动时间线新增审批卡片，展示 Agent、请求类型、命令或工具参数，并提供
+  “拒绝”“允许一次”“本轮始终允许”；提交中、已批准、已拒绝、已取消和失败
+  都有独立状态，切换会话后仍由已保存的原始 AG-UI 事件恢复。
+
+## 2026-08-03 Claude Code 流去重与 MCP 凭据传递
+
+- Claude Code 的 `stream_event` 增量与随后到达的完整 `assistant` 快照按内容前缀
+  对齐：已发送的文本/思考不再重复，若增量流缺失尾部则只补发快照后缀。
+- Claude runner 增加 `--strict-mcp-config`，只加载本轮在工作台选中的 MCP；提示词
+  明确禁止沿用 Codex/K Agent 的工具名，必须使用 Claude 初始化时实际暴露的名称。
+- 生成的 `.mcp.json` 会把 `bearerTokenEnv`、`envHeaders` 和 `envPassthrough`
+  转换为 `${ENV_NAME}` 引用。带动态认证头的 HTTP MCP 通过本地 stdio bridge
+  接入 Claude，再由 bridge 使用 K Agent 的 HTTP MCP 客户端访问远端，规避 Claude
+  把有效 Bearer 请求误判为 OAuth 的兼容问题。密钥仍只存在于进程环境，不会写入
+  会话工作区。
+- Claude 初始化事件中的 MCP 状态随 AG-UI `CUSTOM(status)` 发送；若仍存在
+  `needs-auth`，前端状态会明确列出服务器名称，而不是等业务工具报不存在。
+- Provider 专属逻辑不进入共享 CLI 层：Claude 的增量去重状态、`.mcp.json`
+  生成、密钥注入和 HTTP-to-stdio bridge 分别位于 `claude_code.py`、
+  `claude_mcp.py` 和 `claude_mcp_stdio_proxy.py`。`cli_process.py` 只负责通用
+  JSONL 子进程与消息生命周期；Codex app-server 和 K Agent MCP manager 不经过
+  Claude 的兼容处理。
+
 ## 2026-07-30 统一 `$K_AGENT_HOME` 数据布局
 
 - 新增 `backend/home.py`：默认根目录 `~/.k_agent`（`K_AGENT_HOME` 可覆盖；相对路径相对仓库根）。

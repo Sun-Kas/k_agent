@@ -16,26 +16,23 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend.agent import AgentRunRequest, OpenAIAgent
 from backend.agui import translate_agent_events
-from backend.api.schemas import ChatMessage
+from backend.approvals import ApprovalBroker
+from backend.api.schemas import ApprovalResolutionInput, ChatMessage
 from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
 from backend.home import ensure_home_layout, memory_dir
-from backend.mcp_tool import McpSessionPool, load_mcp_manager, mcp_manager_from_runtime
+from backend.mcp_tool import McpSessionPool, load_mcp_manager
 from backend.sandbox import sandbox_runtime_status
 from backend.observability import AgentBackendLoggingCallback, LangfuseRuntime
 from backend.prompts import (
     build_prompt_bundle,
-    extract_referenced_paths,
     prompt_lifecycle_state,
     reset_prompt_caches,
 )
-from backend.runtime_config import (
-    normalize_reasoning_effort,
-    select_model,
-)
-from backend.tools import bind_request_scoped_tools, load_local_tools
+from backend.runners import RunnerContext, build_default_registry
+from backend.runners.detect import detect_agents_payload
+from backend.tools import load_local_tools
 from backend.watchers import PollingChangeWatcher
 
 
@@ -50,12 +47,15 @@ class AgentBackendRunInput(BaseModel):
     skills: list[dict[str, Any]] = Field(default_factory=list)
     reasoning_effort: str | None = Field(default=None, alias="reasoningEffort")
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    agent_kind: str | None = Field(default="k_agent", alias="agentKind")
+    agent_options: dict[str, Any] = Field(default_factory=dict, alias="agentOptions")
 
 
 def create_app() -> FastAPI:
     """创建 FastAPI 应用并注册服务路由。"""
     settings = Settings()
     configure_agent_backend_logging(settings.agent_backend_log_level)
+    runner_registry = build_default_registry()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -78,6 +78,8 @@ def create_app() -> FastAPI:
         manager = await load_mcp_manager(app.state.mcp_pool)
         await manager.connect_all()
         app.state.mcp_manager = manager
+        app.state.runner_registry = runner_registry
+        app.state.approvals = ApprovalBroker()
         app.state.runtime_watcher = PollingChangeWatcher(
             [
                 Path.cwd() / "CLAUDE.md",
@@ -97,6 +99,7 @@ def create_app() -> FastAPI:
             ),
             failedMcpServerCount=sum(status.status == "failed" for status in statuses),
             langfuseEnabled=app.state.langfuse.enabled,
+            agentKinds=runner_registry.kinds(),
         )
         try:
             yield
@@ -123,6 +126,12 @@ def create_app() -> FastAPI:
             "langfuse": app.state.langfuse.status(),
             "bashSandbox": sandbox_runtime_status(settings),
         }
+
+    @app.get("/internal/agents")
+    async def list_agents() -> dict[str, Any]:
+        """Detect built-in and local CLI agents available on this host."""
+
+        return await detect_agents_payload()
 
     @app.get("/internal/runtime/status")
     async def runtime_status() -> dict[str, Any]:
@@ -209,151 +218,56 @@ def create_app() -> FastAPI:
             # Agent Backend 不读取列表 JSON，也不扫描 Skill 目录。
             """生成 Agent 内部事件流。"""
             request_id = request.headers.get("x-request-id", "")
-            log_context = {
-                "requestId": request_id or "-",
-                "threadId": payload.thread_id,
-                "runId": payload.run_id,
-            }
             stream_started_at = time.perf_counter()
             logging_callback = AgentBackendLoggingCallback(
                 request_id=request_id,
                 thread_id=payload.thread_id,
                 run_id=payload.run_id,
             )
+            agent_kind = (payload.agent_kind or "k_agent").strip() or "k_agent"
             log_event(
                 "agent.request.received",
                 requestId=request_id or "-",
                 threadId=payload.thread_id,
                 runId=payload.run_id,
+                agentKind=agent_kind,
                 messageCount=len(payload.messages),
                 selectedMcpServerCount=len(payload.mcp_servers),
                 selectedSkillCount=len(payload.skills),
                 attachmentCount=len(payload.attachments),
             )
-            mcp_manager = mcp_manager_from_runtime(
-                payload.mcp_servers,
-                log_context=log_context,
-                connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
-                call_timeout_seconds=settings.mcp_call_timeout_seconds,
-                session_pool=app.state.mcp_pool,
+            ctx = RunnerContext(
+                thread_id=payload.thread_id,
+                run_id=payload.run_id,
+                request_id=request_id,
+                messages=payload.messages,
+                model_id=payload.model_id,
+                mcp_servers=payload.mcp_servers,
+                skills=payload.skills,
+                reasoning_effort=payload.reasoning_effort,
+                attachments=payload.attachments,
+                options=dict(payload.agent_options or {}),
+                settings=settings,
+                mcp_pool=app.state.mcp_pool,
+                langfuse=app.state.langfuse,
+                logging_callback=logging_callback,
+                approval_broker=app.state.approvals,
             )
             try:
-                await mcp_manager.connect_all()
-                model = select_model(payload.model_id, settings)
-                if payload.attachments and not model.get("multimodal", False):
-                    raise ValueError("Selected model does not support image input")
-                skills = payload.skills
-                selected_mcp_ids = {
-                    str(server.get("id"))
-                    for server in payload.mcp_servers
-                    if server.get("id")
-                }
-                mcp_tools = await mcp_manager.list_tools()
-                referenced_paths = extract_referenced_paths(payload.messages)
-                prompt_started_at = time.perf_counter()
-                log_event(
-                    "prompt.compose.started",
-                    **log_context,
-                    basePromptChars=len(settings.system_prompt),
-                    selectedSkillCount=len(skills),
-                    mcpToolCount=len(mcp_tools),
-                    referencedPathCount=len(referenced_paths),
-                )
-                prompt_bundle = build_prompt_bundle(
-                    settings.system_prompt,
-                    skills=skills,
-                    referenced_paths=referenced_paths,
-                    mcp_tools=cast(list[Any], mcp_tools),
-                )
-                user_context = dict(prompt_bundle.user_context)
-                if payload.mcp_servers:
-                    user_context["selectedMcpServers"] = "\n".join(
-                        f"- {server.get('name') or server.get('id')}: "
-                        f"{server.get('description') or ''}".rstrip()
-                        for server in payload.mcp_servers
-                    )
-                # MCP 服务返回的动态指令属于本轮上下文，不写入会话历史；
-                # 下一轮会根据当时连接状态重新生成。
-                instructions = {
-                    server_id: value
-                    for server_id, value in mcp_manager.connected_instructions().items()
-                    if not selected_mcp_ids or server_id in selected_mcp_ids
-                }
-                if instructions:
-                    user_context["mcpInstructions"] = "\n\n".join(
-                        f"## {server_id}\n\n{value}"
-                        for server_id, value in instructions.items()
-                    )
-                log_event(
-                    "prompt.compose.completed",
-                    **log_context,
-                    elapsedMs=round(
-                        (time.perf_counter() - prompt_started_at) * 1000,
-                        3,
-                    ),
-                    systemPromptChars=len(prompt_bundle.system_prompt),
-                    systemContextKeys=sorted(prompt_bundle.system_context),
-                    userContextKeys=sorted(user_context),
-                    memoryFileCount=len(prompt_bundle.memory_paths),
-                    mcpInstructionCount=len(instructions),
-                    selectedSkillCount=len(skills),
-                )
-                tools = bind_request_scoped_tools(
-                    await load_local_tools(), mcp_manager, skills
-                )
-                log_event(
-                    "agent.context.prepared",
-                    requestId=request_id or "-",
-                    threadId=payload.thread_id,
-                    runId=payload.run_id,
-                    model=str(model.get("model") or payload.model_id or "unknown"),
-                    memoryFileCount=len(prompt_bundle.memory_paths),
-                    localAndSelectedToolCount=len(tools),
-                    mcpToolCount=len(mcp_tools),
-                )
-                run_request = AgentRunRequest(
-                    messages=payload.messages,
-                    system_prompt=prompt_bundle.system_prompt,
-                    user_context=user_context,
-                    model_config=model,
-                    attachments=payload.attachments,
-                    mcp_server_ids=selected_mcp_ids,
-                    reasoning_effort=normalize_reasoning_effort(
-                        model, payload.reasoning_effort
-                    ),
-                    loaded_memory_paths=prompt_bundle.memory_paths,
-                )
-                with app.state.langfuse.observe_agent_run(
-                    session_id=payload.thread_id,
+                runner = app.state.runner_registry.get(agent_kind)
+                async for event in app.state.approvals.stream(
+                    runner.run_stream(ctx),
+                    thread_id=payload.thread_id,
                     run_id=payload.run_id,
-                    model=str(model.get("model") or payload.model_id or "unknown"),
-                    messages=payload.messages,
-                    metadata={
-                        "mcpServerIds": sorted(selected_mcp_ids),
-                        "skillIds": [
-                            str(skill.get("id") or skill.get("name"))
-                            for skill in skills
-                            if skill.get("id") or skill.get("name")
-                        ],
-                        "reasoningEffort": run_request.reasoning_effort,
-                        "loadedMemoryPathCount": len(prompt_bundle.memory_paths),
-                        "requestId": request_id,
-                    },
-                ) as observability_callbacks:
-                    agent = OpenAIAgent(
-                        tools,
-                        mcp_manager,
-                        callbacks=[logging_callback, *observability_callbacks],
-                        skills=skills,
-                    )
-                    async for event in agent.run_stream(run_request):
-                        yield event
+                ):
+                    yield event
             except asyncio.CancelledError:
                 log_event(
                     "agent.stream.cancelled",
                     requestId=request_id or "-",
                     threadId=payload.thread_id,
                     runId=payload.run_id,
+                    agentKind=agent_kind,
                     elapsedMs=round(
                         (time.perf_counter() - stream_started_at) * 1000,
                         3,
@@ -367,6 +281,7 @@ def create_app() -> FastAPI:
                     requestId=request_id or "-",
                     threadId=payload.thread_id,
                     runId=payload.run_id,
+                    agentKind=agent_kind,
                     elapsedMs=round(
                         (time.perf_counter() - stream_started_at) * 1000,
                         3,
@@ -375,12 +290,12 @@ def create_app() -> FastAPI:
                 )
                 raise
             finally:
-                await mcp_manager.close_all()
                 log_event(
                     "agent.stream.closed",
                     requestId=request_id or "-",
                     threadId=payload.thread_id,
                     runId=payload.run_id,
+                    agentKind=agent_kind,
                     elapsedMs=round(
                         (time.perf_counter() - stream_started_at) * 1000,
                         3,
@@ -417,5 +332,23 @@ def create_app() -> FastAPI:
                 "X-Event-Protocol": "AG-UI",
             },
         )
+
+    @app.post("/internal/approvals/{request_id}")
+    async def resolve_approval(
+        request_id: str, payload: ApprovalResolutionInput
+    ) -> dict[str, Any]:
+        """Resume a suspended Agent run after validating its routing scope."""
+
+        resolved = await app.state.approvals.resolve(
+            request_id,
+            thread_id=payload.thread_id,
+            run_id=payload.run_id,
+            decision=payload.model_dump(by_alias=True),
+        )
+        if not resolved:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=404, detail="Approval request is no longer pending")
+        return {"ok": True, "requestId": request_id}
 
     return app

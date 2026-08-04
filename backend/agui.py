@@ -274,6 +274,15 @@ async def translate_agent_events(
                 yield CustomEvent(name="status", value=payload)
             elif event_type == "trace":
                 yield CustomEvent(name="trace", value=payload)
+            elif event_type == "cli_session":
+                # Persist provider-native session ids so users can opt into resume.
+                yield CustomEvent(name="cli_session", value=payload)
+            elif event_type == "approval_request":
+                # Approval remains a custom AG-UI event because the protocol has
+                # no standard bidirectional human-approval event pair.
+                yield CustomEvent(name="approval_request", value=payload)
+            elif event_type == "approval_resolved":
+                yield CustomEvent(name="approval_resolved", value=payload)
             elif event_type == "thinking":
                 for reasoning_event in reasoning_events(payload):
                     yield reasoning_event

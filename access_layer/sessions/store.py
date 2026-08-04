@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from backend.config import get_or_init_settings
@@ -30,6 +32,8 @@ class SessionRecord:
     events: list[dict] = field(default_factory=list)
     mcp_server_ids: list[str] | None = None
     skill_ids: list[str] | None = None
+    # Provider-native CLI session ids (codex / claude_code) for optional resume.
+    cli_sessions: dict[str, str] = field(default_factory=dict)
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -64,6 +68,7 @@ class SessionStore:
         session = SessionRecord(id=session_id or str(uuid.uuid4()), title=title)
         async with self._lock:
             self._sessions[session.id] = session
+            await self._ensure_workspace(session.id)
             await self._persist(session)
         return session
 
@@ -219,9 +224,28 @@ class SessionStore:
                 # them keeps history free of assistant tool_calls that no tool
                 # message answers, which providers reject on the next run.
                 self._drop_session_buffers(session_id)
+            elif event_type == "CUSTOM" and event.get("name") == "cli_session":
+                value = event.get("value")
+                if isinstance(value, dict):
+                    kind = value.get("kind")
+                    provider_session_id = value.get("sessionId")
+                    if isinstance(kind, str) and kind and isinstance(provider_session_id, str):
+                        session.cli_sessions = {
+                            **session.cli_sessions,
+                            kind: provider_session_id,
+                        }
 
             session.updated_at = datetime.now(timezone.utc)
-            await self._persist(session)
+            # Only persist on structural boundaries to avoid blocking the SSE
+            # stream with disk I/O on every incremental delta/args event.
+            if event_type in {
+                "TEXT_MESSAGE_END",
+                "TOOL_CALL_RESULT",
+                "RUN_FINISHED",
+                "RUN_ERROR",
+                "CUSTOM",
+            }:
+                await self._persist(session)
             return session
 
     async def get(self, session_id: str) -> SessionRecord | None:
@@ -294,25 +318,72 @@ class SessionStore:
                 self._loaded = True
                 return
             settings = await get_or_init_settings()
-            for path in await self._storage.list(settings.session_storage_prefix, "*.json"):
+            prefix = settings.session_storage_prefix
+            root = self._storage.resolve(prefix)
+            await self._migrate_flat_sessions(prefix, root)
+            for path in await self._storage.list(prefix, "*.json"):
+                try:
+                    relative = path.relative_to(root)
+                except ValueError:
+                    continue
+                # Only accept sessions/{id}/{id}.json — never workspace package.json etc.
+                if len(relative.parts) != 2 or relative.stem != relative.parts[0]:
+                    continue
                 try:
                     payload = await self._storage.read_json(str(path))
                     if isinstance(payload, dict):
                         session = self._record_from_payload(payload)
                         self._sessions[session.id] = session
+                        await self._ensure_workspace(session.id)
                 except Exception:
                     # One unreadable session file must not take down the whole
                     # session index and, with it, every other conversation.
                     logger.error("Skipping unreadable session file %s", path, exc_info=True)
             self._loaded = True
 
+    async def _migrate_flat_sessions(self, _prefix: str, root: Path) -> None:
+        """Move legacy sessions/{id}.json into sessions/{id}/{id}.json once."""
+
+        if self._storage is None or not root.exists():
+            return
+        await asyncio.to_thread(self._migrate_flat_sessions_sync, root)
+
+    @staticmethod
+    def _migrate_flat_sessions_sync(root: Path) -> None:
+        for path in sorted(root.glob("*.json")):
+            if not path.is_file():
+                continue
+            session_id = path.stem
+            destination = root / session_id / f"{session_id}.json"
+            if destination.exists():
+                continue
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(destination))
+                (destination.parent / "workspace").mkdir(exist_ok=True)
+                logger.info("Migrated flat session file to %s", destination)
+            except OSError:
+                logger.error("Failed to migrate session file %s", path, exc_info=True)
+
+    async def _ensure_workspace(self, session_id: str) -> None:
+        """Create the per-session workspace directory next to the JSON record."""
+
+        if self._storage is None:
+            return
+        settings = await get_or_init_settings()
+        workspace = self._storage.resolve(
+            f"{settings.session_storage_prefix}/{session_id}/workspace"
+        )
+        await asyncio.to_thread(workspace.mkdir, parents=True, exist_ok=True)
+
     async def _persist(self, session: SessionRecord) -> None:
         """把单个会话写回存储后端。"""
         if self._storage is None:
             return
         settings = await get_or_init_settings()
+        await self._ensure_workspace(session.id)
         await self._storage.write_json(
-            f"{settings.session_storage_prefix}/{session.id}.json",
+            f"{settings.session_storage_prefix}/{session.id}/{session.id}.json",
             self._record_to_payload(session),
         )
 
@@ -336,6 +407,7 @@ class SessionStore:
                 and session.skill_ids is not None
                 else None
             ),
+            "cliSessions": dict(session.cli_sessions),
             "updatedAt": session.updated_at.isoformat(),
         }
 
@@ -345,6 +417,12 @@ class SessionStore:
         updated_at = payload.get("updatedAt") or payload.get("updated_at")
         messages = [ChatMessage.model_validate(message) for message in payload.get("messages", [])]
         capabilities = payload.get("capabilities")
+        raw_cli_sessions = payload.get("cliSessions") or payload.get("cli_sessions") or {}
+        cli_sessions: dict[str, str] = {}
+        if isinstance(raw_cli_sessions, dict):
+            for key, value in raw_cli_sessions.items():
+                if isinstance(key, str) and isinstance(value, str) and key and value:
+                    cli_sessions[key] = value
         return SessionRecord(
             id=str(payload["id"]),
             title=str(payload.get("title") or ""),
@@ -363,6 +441,7 @@ class SessionStore:
                 if isinstance(capabilities, dict)
                 else None
             ),
+            cli_sessions=cli_sessions,
             updated_at=datetime.fromisoformat(updated_at) if updated_at else datetime.now(timezone.utc),
         )
 

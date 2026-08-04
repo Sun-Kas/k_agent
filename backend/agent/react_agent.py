@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from openai import AsyncOpenAI
 
@@ -51,6 +51,10 @@ class OpenAIAgent:
         callbacks: list[Any] | None = None,
         config: Settings | None = None,
         skills: list[dict[str, Any]] | None = None,
+        approval_handler: Callable[
+            [str, PermissionDecision, dict[str, Any]],
+            Awaitable[dict[str, Any]],
+        ] | None = None,
     ):
         """初始化对象依赖和内部状态。"""
         if not config:
@@ -62,6 +66,10 @@ class OpenAIAgent:
         # Only aliases selected for this request may resolve to the canonical
         # Skill tool. Arbitrary unknown function names still fail closed.
         self.skills = list(skills or [])
+        self.approval_handler = approval_handler
+        # Session approval means the rest of this Agent run. Durable permission
+        # changes still belong in the explicit permission-rules configuration.
+        self._approved_targets: set[str] = set()
 
     async def run(
         self,
@@ -578,12 +586,13 @@ class OpenAIAgent:
         if local_tool is not None:
             permission_tool_name = local_tool.name
             self._enforce_skill_allowlist(context, permission_tool_name)
-            self._enforce_permission(
+            await self._enforce_permission(
                 permission_tool_name,
                 check_permissions(
                     permission_tool_name,
                     self._permission_subjects(permission_tool_name, arguments),
                 ),
+                {"toolName": tool_name, "arguments": arguments, "source": "local"},
             )
             before_payload = ToolCallPayload(
                 iteration=iteration,
@@ -620,9 +629,15 @@ class OpenAIAgent:
 
         server_id, name = target
         self._enforce_skill_allowlist(context, tool_name)
-        self._enforce_permission(
+        await self._enforce_permission(
             f"MCP tool {server_id}:{name}",
             check_permission("mcp", f"{server_id}:{name}"),
+            {
+                "toolName": name,
+                "serverId": server_id,
+                "arguments": arguments,
+                "source": "mcp",
+            },
         )
         await callbacks.before_tool(
             context,
@@ -650,23 +665,25 @@ class OpenAIAgent:
         )
         return result
 
-    @staticmethod
-    def _enforce_permission(target: str, decision: PermissionDecision) -> None:
-        """Reject anything the rules do not explicitly allow.
+    async def _enforce_permission(
+        self,
+        target: str,
+        decision: PermissionDecision,
+        detail: dict[str, Any],
+    ) -> None:
+        """Enforce deny rules and suspend ask rules for a human decision."""
 
-        ``ask`` is fail-closed rather than silently downgraded to allow: there
-        is no interactive approval channel yet, and the wording tells the model
-        (and the user reading the transcript) that a rule change is what unblocks
-        the call, not a retry.
-        """
-
-        if decision.behavior == "allow":
+        if decision.behavior == "allow" or target in self._approved_targets:
             return
         if decision.behavior == "ask":
-            raise RuntimeError(
-                f"{target} requires manual approval, which this deployment cannot "
-                f"prompt for. {decision.reason or ''}".strip()
-            )
+            if self.approval_handler is None:
+                raise RuntimeError(f"{target} requires manual approval")
+            response = await self.approval_handler(target, decision, detail)
+            if response.get("action") == "approve":
+                if response.get("remember"):
+                    self._approved_targets.add(target)
+                return
+            raise RuntimeError(f"User denied approval for {target}")
         raise RuntimeError(decision.reason or f"Permission denied for {target}")
 
     @staticmethod

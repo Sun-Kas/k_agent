@@ -84,6 +84,20 @@ class Settings(BaseSettings):
         ge=1.0,
         le=3600.0,
     )
+    # Transient MCP failures (cancelled, timeout, connection reset) are retried
+    # up to this many times before surfacing the error to the model.
+    mcp_call_max_retries: int = Field(
+        default=2,
+        alias="MCP_CALL_MAX_RETRIES",
+        ge=0,
+        le=5,
+    )
+    mcp_call_retry_base_delay_seconds: float = Field(
+        default=1.0,
+        alias="MCP_CALL_RETRY_BASE_DELAY_SECONDS",
+        ge=0.1,
+        le=30.0,
+    )
     system_prompt: str = Field(default=DEFAULT_SYSTEM_PROMPT, alias="SYSTEM_PROMPT")
     max_model_iterations: int = Field(default=1000, alias="MAX_MODEL_ITERATIONS")
     # Every provider call is bounded twice: once for establishing the request and

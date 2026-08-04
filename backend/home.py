@@ -14,7 +14,10 @@ $K_AGENT_HOME/
       mcp.json               # frontend MCP picker summaries
       skills.json            # frontend Skill picker summaries
   state/
-    sessions/                # conversation history (FileStorage root)
+    sessions/                # FileStorage session root
+      {session_id}/
+        {session_id}.json    # conversation + AG-UI log
+        workspace/           # per-session cwd for CLI agents / tools
   content/
     memory/                  # durable MEMORY.md
     skills/                  # installed Skill packages
@@ -85,6 +88,22 @@ def content_dir() -> Path:
 
 def sessions_dir() -> Path:
     return state_dir() / "sessions"
+
+
+def session_bundle_dir(session_id: str) -> Path:
+    """Directory holding one session's JSON record and workspace."""
+
+    return sessions_dir() / session_id
+
+
+def session_json_path(session_id: str) -> Path:
+    return session_bundle_dir(session_id) / f"{session_id}.json"
+
+
+def session_workspace_dir(session_id: str) -> Path:
+    """Working directory for CLI agents bound to this conversation."""
+
+    return session_bundle_dir(session_id) / "workspace"
 
 
 def memory_dir() -> Path:

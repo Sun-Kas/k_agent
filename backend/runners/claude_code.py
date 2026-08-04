@@ -1,0 +1,385 @@
+"""Claude Code CLI runner (`claude -p --output-format stream-json`).
+
+Default permission mode is ``bypassPermissions`` so MCP and tool calls work
+in headless execution (stdin is /dev/null). Callers can restrict via
+agentOptions ``claudePermissionMode``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+from backend.home import session_workspace_dir
+from backend.runners.base import RunnerContext
+from backend.runners.cli_process import (
+    _CliStreamState,
+    append_text,
+    build_cli_prompt,
+    cli_session_mode,
+    close_text_message,
+    close_thinking,
+    emit_error,
+    emit_thinking,
+    emit_tool_call,
+    emit_tool_result,
+    resume_session_id,
+    run_cli_jsonl,
+)
+from backend.runners.claude_mcp import (
+    inject_claude_mcp_secrets,
+    write_claude_mcp_config,
+)
+from backend.runners.resolve_cli import resolve_cli
+
+
+class ClaudeCodeRunner:
+    kind = "claude_code"
+
+    async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
+        resolved = resolve_cli(self.kind)
+        if resolved is None:
+            raise RuntimeError(
+                "Claude Code CLI not found. Install `claude` / `claude-internal` "
+                "or set K_AGENT_CLAUDE_PATH"
+            )
+        command = resolved.path
+
+        workspace = session_workspace_dir(ctx.thread_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        skill_preamble = build_claude_skill_preamble(ctx.skills)
+        prompt = build_cli_prompt(ctx)
+        if skill_preamble:
+            prompt = f"{skill_preamble}\n\n---\n\n{prompt}"
+        if ctx.mcp_servers:
+            # CLI providers expose different MCP tool names and authentication
+            # states. Explicitly forbid carrying a Codex/K Agent tool spelling
+            # into Claude Code, which must use only its init-time tool catalog.
+            prompt = (
+                "[Claude Code MCP rules]\n"
+                "Use only exact MCP tool names present in this Claude Code run. "
+                "Never infer or translate tool names from earlier providers. "
+                "If a selected server exposes only authentication tools, "
+                "authenticate first and report the authentication error instead "
+                "of guessing a business tool name.\n\n"
+                f"{prompt}"
+            )
+        mode = cli_session_mode(ctx)
+        resume_id = resume_session_id(ctx) if mode == "resume" else None
+        mcp_config = write_claude_mcp_config(workspace, ctx.mcp_servers)
+
+        permission_mode = _claude_permission_mode(ctx)
+        argv = [
+            command,
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--permission-mode",
+            permission_mode,
+        ]
+        if mcp_config is not None:
+            # A run must see exactly the MCP servers selected in the K Agent
+            # composer, not unrelated user/project Claude configurations.
+            argv.extend(["--strict-mcp-config", "--mcp-config", str(mcp_config)])
+        if ctx.model_id:
+            argv.extend(["--model", str(ctx.model_id)])
+        effort = _claude_effort(ctx.reasoning_effort)
+        if effort is not None:
+            argv.extend(["--effort", effort])
+        if resume_id:
+            argv.extend(["--resume", resume_id])
+        elif mode == "resume":
+            argv.append("--continue")
+
+        env = os.environ.copy()
+        inject_claude_mcp_secrets(env, ctx.mcp_servers)
+        async for event in run_cli_jsonl(
+            argv=argv,
+            cwd=workspace,
+            env=env,
+            mapper=map_claude_event,
+            kind=self.kind,
+            state_factory=ClaudeCodeStreamState,
+        ):
+            yield event
+
+
+class ClaudeCodeStreamState(_CliStreamState):
+    """Claude-only reconciliation state for partial and snapshot messages."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.text_delta_buffer = ""
+        self.thinking_delta_buffer = ""
+        # Claude provider tool_use id → AG-UI tool call id.
+        self.tool_id_map: dict[str, str] = {}
+
+
+def build_claude_skill_preamble(skills: list[dict[str, Any]]) -> str:
+    """Expose selected Skill packages using Claude Code-specific instructions."""
+
+    parts: list[str] = []
+    for skill in skills:
+        name = str(skill.get("name") or skill.get("id") or "").strip()
+        instructions = str(skill.get("instructions") or "").strip()
+        if not instructions:
+            continue
+        file_path = _single_line(skill.get("filePath"))
+        base_dir = _single_line(skill.get("baseDir"))
+        path_lines: list[str] = []
+        if file_path:
+            path_lines.append(f"SKILL.md absolute path: {file_path}")
+        if base_dir:
+            path_lines.append(f"Skill package root: {base_dir}")
+            # Claude runs in a per-session workspace, so relative paths from a
+            # Skill must be resolved against the package root, not process cwd.
+            path_lines.append(
+                "Resolve relative paths in this Skill (including scripts/, "
+                "references/, assets/, and templates/) against the Skill "
+                "package root above."
+            )
+        header = f"[Claude Code Skill: {name}]" if name else "[Claude Code Skill]"
+        parts.append("\n".join([header, *path_lines, instructions]))
+    return "\n\n".join(parts)
+
+
+def _single_line(value: Any) -> str:
+    """Keep path metadata from altering the provider prompt structure."""
+
+    return " ".join(str(value or "").split()).strip()
+
+
+def map_claude_event(payload: dict[str, Any], state: _CliStreamState) -> list[dict[str, Any]]:
+    if not isinstance(state, ClaudeCodeStreamState):
+        raise TypeError("Claude event mapping requires ClaudeCodeStreamState")
+    event_type = str(payload.get("type") or "")
+    events: list[dict[str, Any]] = []
+
+    if event_type == "system":
+        subtype = str(payload.get("subtype") or "")
+        session_id = payload.get("session_id") or payload.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            state.provider_session_id = session_id
+        if subtype == "init":
+            mcp_servers = payload.get("mcp_servers")
+            needs_auth = [
+                str(server.get("name") or "")
+                for server in mcp_servers or []
+                if isinstance(server, dict)
+                and str(server.get("status") or "") == "needs-auth"
+                and server.get("name")
+            ]
+            message = f"Claude Code ready" + (
+                f" ({session_id})" if session_id else ""
+            )
+            if needs_auth:
+                message += " · MCP 需要认证: " + ", ".join(needs_auth)
+            events.append(
+                {
+                    "type": "status",
+                    "payload": {
+                        "message": message,
+                        "mcpServers": mcp_servers if isinstance(mcp_servers, list) else [],
+                        "mcpNeedsAuth": needs_auth,
+                    },
+                }
+            )
+        return events
+
+    # ── Streaming deltas (real-time incremental content) ──────────────
+    if event_type == "stream_event":
+        event = payload.get("event")
+        if not isinstance(event, dict):
+            return events
+        delta = event.get("delta")
+        if not isinstance(delta, dict):
+            return events
+        delta_type = str(delta.get("type") or "")
+        if delta_type == "thinking_delta":
+            thinking = delta.get("thinking") or ""
+            if isinstance(thinking, str) and thinking:
+                state.thinking_delta_buffer += thinking
+                events.extend(emit_thinking(state, thinking))
+        elif delta_type == "text_delta":
+            text = delta.get("text")
+            if isinstance(text, str) and text:
+                state.text_delta_buffer += text
+                events.extend(close_thinking(state))
+                events.extend(append_text(state, text))
+        elif delta_type == "input_json_delta":
+            # Tool argument streaming; captured by the completed assistant block.
+            pass
+        return events
+
+    # ── Complete assistant message (includes thinking, text, tool_use blocks) ─
+    if event_type == "assistant":
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return events
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            events.extend(close_thinking(state))
+            events.extend(_complete_claude_text(state, content))
+            return events
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type") or "")
+                if block_type == "thinking":
+                    thinking = block.get("thinking") or ""
+                    if isinstance(thinking, str) and thinking:
+                        events.extend(_complete_claude_thinking(state, thinking))
+                elif block_type == "text":
+                    text = block.get("text")
+                    if isinstance(text, str) and text:
+                        events.extend(close_thinking(state))
+                        events.extend(_complete_claude_text(state, text))
+                elif block_type == "tool_use":
+                    events.extend(close_thinking(state))
+                    events.extend(close_text_message(state))
+                    tool_use_id = str(block.get("id") or "")
+                    internal_id = str(uuid.uuid4())
+                    if tool_use_id:
+                        state.tool_id_map[tool_use_id] = internal_id
+                    events.extend(
+                        emit_tool_call(
+                            name=str(block.get("name") or "tool"),
+                            arguments=block.get("input") or {},
+                            tool_call_id=internal_id,
+                        )
+                    )
+        return events
+
+    # ── Tool results (user-role messages carrying tool_result blocks) ─────
+    if event_type == "user":
+        message = payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if str(block.get("type") or "") == "tool_result":
+                        tool_use_id = str(
+                            block.get("tool_use_id")
+                            or block.get("toolUseId")
+                            or ""
+                        )
+                        result = block.get("content")
+                        if isinstance(result, (dict, list)):
+                            result_text = json.dumps(result, ensure_ascii=False)
+                        else:
+                            result_text = str(result or "")
+                        paired_id = state.tool_id_map.pop(tool_use_id, None)
+                        if paired_id:
+                            events.extend(
+                                emit_tool_result(
+                                    tool_call_id=paired_id,
+                                    content=result_text,
+                                )
+                            )
+                        else:
+                            events.extend(
+                                emit_tool_call(
+                                    name="tool_result",
+                                    arguments={"toolUseId": tool_use_id},
+                                    result=result_text,
+                                )
+                            )
+        return events
+
+    # ── Final result ─────────────────────────────────────────────────
+    if event_type == "result":
+        session_id = payload.get("session_id") or payload.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            state.provider_session_id = session_id
+        events.extend(close_thinking(state))
+        result_text = payload.get("result")
+        if isinstance(result_text, str) and result_text and not state.saw_final_text:
+            events.extend(close_text_message(state))
+            events.extend(append_text(state, result_text))
+            events.extend(close_text_message(state))
+        else:
+            events.extend(close_text_message(state))
+        if payload.get("is_error"):
+            events.append(emit_error(str(payload.get("result") or "Claude Code reported an error")))
+        return events
+
+    events.append(
+        {
+            "type": "trace",
+            "payload": {"entry": f"claude_code.{event_type or 'event'}"},
+        }
+    )
+    return events
+
+
+def _complete_claude_text(
+    state: _CliStreamState, snapshot: str
+) -> list[dict[str, Any]]:
+    """Reconcile a completed Claude text block with its streamed prefix."""
+
+    if not isinstance(state, ClaudeCodeStreamState):
+        raise TypeError("Claude text reconciliation requires ClaudeCodeStreamState")
+    streamed = state.text_delta_buffer
+    state.text_delta_buffer = ""
+    if not streamed:
+        return append_text(state, snapshot)
+    if snapshot.startswith(streamed):
+        return append_text(state, snapshot[len(streamed):])
+    # A non-prefix snapshot represents a distinct provider block; retain it
+    # instead of silently dropping content on an unexpected event sequence.
+    return append_text(state, snapshot)
+
+
+def _complete_claude_thinking(
+    state: _CliStreamState, snapshot: str
+) -> list[dict[str, Any]]:
+    """Finish Claude reasoning without replaying streamed thinking deltas."""
+
+    if not isinstance(state, ClaudeCodeStreamState):
+        raise TypeError("Claude thinking reconciliation requires ClaudeCodeStreamState")
+    streamed = state.thinking_delta_buffer
+    state.thinking_delta_buffer = ""
+    if not streamed:
+        return emit_thinking(state, snapshot, finish=True)
+    if snapshot.startswith(streamed):
+        return emit_thinking(state, snapshot[len(streamed):], finish=True)
+    events = close_thinking(state)
+    events.extend(emit_thinking(state, snapshot, finish=True))
+    return events
+
+
+_CLAUDE_PERMISSION_MODES = {"default", "acceptEdits", "bypassPermissions"}
+
+
+def _claude_permission_mode(ctx: RunnerContext) -> str:
+    """Resolve Claude Code --permission-mode from agentOptions.
+
+    Headless execution (stdin=/dev/null) cannot present approval prompts, so
+    ``bypassPermissions`` is the safe default — without it MCP and shell tool
+    calls are silently rejected with "user cancelled".
+    """
+    raw = str(ctx.options.get("claudePermissionMode") or "bypassPermissions").strip()
+    return raw if raw in _CLAUDE_PERMISSION_MODES else "bypassPermissions"
+
+
+_CLAUDE_EFFORT_VALUES = {"min", "low", "medium", "high", "max"}
+
+
+def _claude_effort(effort: str | None) -> str | None:
+    """Map a reasoning effort level to a Claude Code --effort value."""
+
+    if not effort:
+        return None
+    normalized = effort.strip().lower()
+    if normalized in {"", "none"}:
+        return None
+    return normalized if normalized in _CLAUDE_EFFORT_VALUES else None

@@ -194,3 +194,15 @@ class SkillCreateInput(BaseModel):
     description: str = Field(default="", max_length=500)
     instructions: str = Field(default="", max_length=50_000)
     paths: list[str] = Field(default_factory=list)
+
+
+class ApprovalResolutionInput(BaseModel):
+    """User decision for a run-scoped approval request."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    thread_id: str = Field(alias="threadId", min_length=1)
+    run_id: str = Field(alias="runId", min_length=1)
+    action: Literal["approve", "deny", "cancel"]
+    remember: bool = False
+    answers: dict[str, list[str]] = Field(default_factory=dict)
+    content: dict[str, Any] = Field(default_factory=dict)

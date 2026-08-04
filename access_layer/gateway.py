@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -54,6 +55,14 @@ class AgentAccessLayer:
             )
         messages = submitted
         forwarded = payload.forwarded_props or {}
+        agent_kind = forwarded.get("agentKind") or "k_agent"
+        if not isinstance(agent_kind, str) or not agent_kind.strip():
+            agent_kind = "k_agent"
+        agent_kind = agent_kind.strip()
+        raw_options = forwarded.get("agentOptions") or {}
+        if not isinstance(raw_options, dict):
+            raise HTTPException(status_code=400, detail="agentOptions must be an object")
+        agent_options = dict(raw_options)
         mcp_ids = self._string_list(forwarded.get("mcpServerIds"), "mcpServerIds")
         skill_ids = self._string_list(forwarded.get("skillIds"), "skillIds")
         try:
@@ -61,8 +70,29 @@ class AgentAccessLayer:
                 mcp_ids, skill_ids
             )
         except CatalogError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if agent_kind == "k_agent":
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            # CLI runners degrade gracefully: a flaky MCP pool should not
+            # block a Codex/Claude turn entirely.
+            logging.getLogger("k_agent.access.gateway").warning(
+                "MCP/Skill resolution failed for %s, continuing without: %s",
+                agent_kind, exc,
+            )
+            mcp_servers = []
+            skills = []
         session = await self._session_store.get_or_create(payload.thread_id)
+        cli_mode = str(agent_options.get("cliSessionMode") or "ephemeral").strip().lower()
+        if cli_mode not in {"ephemeral", "resume"}:
+            cli_mode = "ephemeral"
+        agent_options["cliSessionMode"] = cli_mode
+        if (
+            agent_kind != "k_agent"
+            and cli_mode == "resume"
+            and not agent_options.get("resumeSessionId")
+        ):
+            stored = session.cli_sessions.get(agent_kind)
+            if stored:
+                agent_options["resumeSessionId"] = stored
         context_token = update_request_context(session_id=session.id, run_id=payload.run_id)
         try:
             stream_request_context = get_request_context()
@@ -105,6 +135,7 @@ class AgentAccessLayer:
                         requestId=request_id,
                         threadId=session.id,
                         runId=payload.run_id,
+                        agentKind=agent_kind,
                         historyCount=history_count,
                         mcpCount=len(mcp_servers),
                         skillCount=len(skills),
@@ -129,14 +160,39 @@ class AgentAccessLayer:
                             "attachments": self._attachments(
                                 forwarded.get("attachments", [])
                             ),
+                            "agentKind": agent_kind,
+                            "agentOptions": agent_options,
                         },
                         request_id,
                     )
-                    async for event in backend_events:
-                        # Agent Backend 已经输出标准 AG-UI event；这里原样持久化并
-                        # 包成 SSE，不能再按自定义 thinking/tool/message 规则重排。
-                        await self._session_store.append_event(session.id, event)
-                        yield self._encode_sse(event)
+                    # Persist events in a background task so the SSE stream is
+                    # never blocked by disk I/O. Events are queued and written
+                    # serially to maintain ordering, while SSE frames are yielded
+                    # to the client immediately.
+                    persist_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+                    async def _persist_worker():
+                        while True:
+                            event = await persist_queue.get()
+                            if event is None:
+                                break
+                            try:
+                                await self._session_store.append_event(session.id, event)
+                            except Exception:
+                                logging.getLogger("k_agent.access.gateway").warning(
+                                    "Failed to persist event for session %s",
+                                    session.id,
+                                    exc_info=True,
+                                )
+
+                    persist_task = asyncio.create_task(_persist_worker())
+                    try:
+                        async for event in backend_events:
+                            persist_queue.put_nowait(event)
+                            yield self._encode_sse(event)
+                    finally:
+                        await persist_queue.put(None)
+                        await persist_task
                     log_event(
                         "access.run.finished",
                         requestId=request_id,

@@ -25,6 +25,9 @@
   --control-hover: #eef4e8;
   --control-active: #e4eddb;
   --control-border: #d7dfd2;
+  /* Conversation text must not depend on a late remote-font swap. Streaming
+     CJK glyphs otherwise render with fallback metrics and visibly resize. */
+  --conversation-font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
   --content-width: 860px;
   --content-gutter: 48px;
   --conversation-bg: radial-gradient(circle at 50% 24%, rgba(var(--accent-rgb), .035), transparent 36%), var(--bg);
@@ -554,9 +557,9 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
   background: transparent !important;
   transform: none;
 }
-.bubble { border: 1px solid #262b27; border-radius: 3px 12px 12px 12px; padding: 13px 15px; color: #bdc2bc; background: #141715; font-size: 13px; line-height: 1.8; overflow-wrap: break-word; }
+.bubble { border: 1px solid #262b27; border-radius: 3px 12px 12px 12px; padding: 13px 15px; color: #bdc2bc; background: #141715; font-family: var(--conversation-font); font-size: 13px; line-height: 1.8; overflow-wrap: break-word; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .user .bubble { border: 0; border-radius: 12px 3px 12px 12px; color: #141714; background: #dfe1da; }
-.assistant-output { color: color-mix(in srgb, var(--ink) 86%, var(--muted)); font-size: 13px; line-height: 1.8; overflow-wrap: break-word; }
+.assistant-output { color: color-mix(in srgb, var(--ink) 86%, var(--muted)); font-family: var(--conversation-font); font-size: 13px; line-height: 1.8; overflow-wrap: break-word; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .bubble p, .assistant-output p { margin: 0 0 .7em; }
 .bubble p:last-child, .assistant-output p:last-child { margin-bottom: 0; }
 .bubble h1, .bubble h2, .bubble h3, .bubble h4,
@@ -596,6 +599,30 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .inline-tool-detail > code,
 .inline-tool-detail > p { display: block; max-height: 160px; margin: 0 0 7px; padding: 8px; overflow: auto; border-radius: 5px; color: var(--dim); background: color-mix(in srgb, var(--surface) 88%, transparent); font: 10px/1.6 "DM Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .inline-tool-detail > :last-child { margin-bottom: 0; }
+
+.approval-card { max-width: min(760px, 100%); margin: 8px 0 14px; padding: 15px; border: 1px solid color-mix(in srgb, #d69b3a 48%, var(--line)); border-radius: 12px; background: color-mix(in srgb, #d69b3a 8%, var(--surface)); box-shadow: 0 10px 28px rgba(0, 0, 0, .08); }
+.approval-card > header { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.approval-shield { width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; color: #fff; background: #bd7c18; font: 700 14px/1 "DM Mono", monospace; }
+.approval-card header div { min-width: 0; display: grid; gap: 2px; }
+.approval-card header small { color: var(--dim); font: 9px/1.2 "DM Mono", monospace; text-transform: uppercase; }
+.approval-card header strong { color: var(--ink); font-size: 13px; }
+.approval-card header > b { color: #a76a12; font-size: 10px; font-weight: 600; }
+.approval-card > p { margin: 12px 0 0; color: var(--ink); font-size: 12px; line-height: 1.65; }
+.approval-card > code { display: block; max-height: 180px; margin-top: 10px; padding: 9px 10px; overflow: auto; border-radius: 7px; color: var(--dim); background: color-mix(in srgb, var(--surface) 88%, transparent); font: 10px/1.6 "DM Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.approval-card > footer { margin-top: 14px; display: flex; justify-content: flex-end; gap: 7px; }
+.approval-card > footer button { min-height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--surface); font-size: 11px; }
+.approval-card > footer button.primary { border-color: color-mix(in srgb, var(--accent) 64%, var(--line)); color: var(--control-active-ink); background: var(--control-active); }
+.approval-card > footer button:not(:disabled):hover { transform: translateY(-1px); background: var(--control-hover); }
+.approval-card.approved { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
+.approval-card.approved .approval-shield { background: var(--accent); }
+.approval-card.approved header > b { color: var(--accent); }
+.approval-card.denied,
+.approval-card.cancelled,
+.approval-card.error { border-color: color-mix(in srgb, #cc625b 42%, var(--line)); }
+.approval-card.denied .approval-shield,
+.approval-card.cancelled .approval-shield,
+.approval-card.error .approval-shield { background: #b95852; }
+.approval-error { color: #b95852 !important; }
 .tool-row-icon { width: 13px; height: 13px; flex: 0 0 13px; }
 .bubble pre, .assistant-output pre { padding: 12px; border: 1px solid #303530; border-radius: 7px; overflow: auto; background: #0c0e0d; }
 .bubble pre code, .assistant-output pre code { padding: 0; background: none; }
@@ -666,6 +693,21 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .model-settings-card i { color: #9ca29d; font-style: normal; font-size: 16px; line-height: 1; text-align: right; }
 .model-options-card { width: 292px; max-height: 310px; margin-left: -1px; padding: 8px; overflow-y: auto; border-top-left-radius: 0; }
 .model-options-card > header { display: none; }
+.agent-picker-card { width: 240px; padding: 8px; border: 1px solid color-mix(in srgb, var(--line) 72%, var(--ink) 28%); border-radius: 17px; background: rgba(37,40,37,.98); box-shadow: 0 24px 60px rgba(0,0,0,.58); backdrop-filter: blur(20px); animation: picker-rise .16s ease-out both; }
+.agent-picker-list > button { width: 100%; min-height: 38px; padding: 5px 10px 6px; border: 0; border-radius: 10px; display: grid; grid-template-columns: minmax(0, 1fr) 16px; align-items: center; gap: 10px; color: var(--ink); text-align: left; background: transparent; cursor: pointer; transition: background .16s; }
+.agent-picker-list > button:hover { background: color-mix(in srgb, var(--surface-raised) 88%, var(--ink) 12%); }
+.agent-picker-list > button.selected { background: color-mix(in srgb, var(--surface-raised) 82%, var(--ink) 18%); }
+.agent-picker-list > button:disabled { opacity: .45; cursor: default; }
+.agent-picker-list button > span { min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.agent-picker-list button strong { font-size: 10px; font-weight: 500; line-height: 1.4; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+.agent-picker-list button small { margin-top: 2px; color: #858a86; font-size: 8px; line-height: 1.2; }
+.agent-picker-list button > i { color: #daddd8; text-align: center; font-style: normal; font-size: 14px; line-height: 1; }
+.agent-picker-sub { margin-top: 2px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+.agent-picker-sub > header { padding: 2px 10px 4px; color: #6b706c; font-size: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+.agent-picker-sub-options { display: flex; gap: 4px; padding: 0 6px 2px; }
+.agent-picker-sub-options > button { flex: 1; height: 26px; border: 1px solid color-mix(in srgb, var(--line) 50%, transparent); border-radius: 7px; color: #999e9a; font-size: 9px; font-weight: 500; background: transparent; cursor: pointer; transition: background .14s, border-color .14s, color .14s; }
+.agent-picker-sub-options > button:hover { border-color: var(--line); color: var(--ink); background: color-mix(in srgb, var(--surface-raised) 88%, var(--ink) 12%); }
+.agent-picker-sub-options > button.selected { border-color: color-mix(in srgb, var(--control-border) 46%, var(--lime) 54%); color: var(--ink); background: color-mix(in srgb, var(--surface-raised) 82%, var(--ink) 18%); }
 .model-options-card > div > button { width: 100%; min-height: 38px; padding: 5px 10px 6px; border: 0; border-radius: 10px; display: grid; grid-template-columns: minmax(0, 1fr) 16px; align-items: center; gap: 10px; color: var(--ink); text-align: left; background: transparent; transition: background .16s, color .16s; }
 .model-options-card > div > button:hover { background: color-mix(in srgb, var(--surface-raised) 88%, var(--ink) 12%); }
 .model-options-card > div > button.selected { background: color-mix(in srgb, var(--surface-raised) 82%, var(--ink) 18%); }
@@ -1162,7 +1204,12 @@ button:disabled, .attach-button.disabled {
 }
 :root[data-theme="snow"] .model-settings-card,
 :root[data-theme="snow"] .model-options-card,
+:root[data-theme="snow"] .agent-picker-card,
 :root[data-theme="snow"] .picker-popover { background: rgba(255,255,255,.96); box-shadow: 0 20px 45px rgba(43,55,39,.16); }
+:root[data-theme="snow"] .agent-picker-list > button { color: var(--ink); }
+:root[data-theme="snow"] .agent-picker-sub > header { color: #8a9086; }
+:root[data-theme="snow"] .agent-picker-list > button.selected,
+:root[data-theme="snow"] .agent-picker-sub-options > button.selected { background: #eef4e8 !important; }
 :root[data-theme="snow"] .model-settings-card > button.active,
 :root[data-theme="snow"] .model-options-card > div > button.selected,
 :root[data-theme="snow"] .option-picker .picker-popover label.selected {
@@ -1372,6 +1419,7 @@ button:disabled, .attach-button.disabled {
   .model-settings-popovers { position: fixed; left: 10px; right: 10px; bottom: 64px; align-items: stretch; }
   .model-settings-card { width: min(240px, calc(48vw - 10px)); }
   .model-options-card { width: min(300px, calc(52vw - 10px)); }
+  .agent-picker-card { width: min(220px, calc(50vw - 10px)); }
   .model-settings-card > button { grid-template-columns: 62px minmax(0, 1fr) 13px; padding: 0 8px; }
   .model-settings-card strong, .model-settings-card span,
   .model-options-card button > span, .model-options-card button strong { font-size: 11px; }
