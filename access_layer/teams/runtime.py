@@ -602,6 +602,9 @@ class TeamRuntime:
                 "name": agent["name"],
                 "role": agent["role"],
                 "agentKind": agent["agentKind"],
+                "modelId": agent["modelId"],
+                "reasoningEffort": agent["reasoningEffort"],
+                "networkAccess": agent["networkAccess"],
                 "responsibility": agent["responsibility"],
                 "status": agent["status"],
                 "capabilities": agent["capabilities"],
@@ -651,6 +654,7 @@ class TeamRuntime:
                 "id": team["id"],
                 "goal": team["goal"],
                 "mode": team["mode"],
+                "maxParallel": team["maxParallel"],
                 "workspaceDir": team["workspaceDir"],
             },
             "trigger": {"type": trigger_type, "payload": trigger_payload},
@@ -670,12 +674,18 @@ class TeamRuntime:
                 ),
                 (
                     "规则：task.submitted 必须对触发 taskId 执行 accept_submission 或 request_revision；"
-                    "team.started 必须为所有未分配任务执行 assign_task；后续任务使用 dependsOn 引用前置任务，"
+                    "自动模式的 team.started 如果没有任务，必须先根据团队目标和成员能力生成最小、完整的任务 DAG；"
+                    "先识别必须串行的前置输入，再识别可以独立并行的工作，并根据 role、responsibility、capabilities、"
+                    "agentKind、modelId 和 networkAccess 选择承接者。不要为了让每个成员都有工作而创建任务，允许成员暂时空闲。"
+                    "每个 create_task 必须提供唯一 taskKey，"
+                    "同一决策内的 dependsOn 使用 taskKey，引用已有任务时使用 taskId。只有真正需要上游 Artifact 的任务才设置依赖，"
+                    "没有依赖的任务会在 maxParallel 范围内并行；如果当前已有未分配任务，使用 assign_task 明确负责人；"
                     "系统会把已验收 Artifact 原样提供给下一个 Agent；只有全部任务完成后才能 finish_team。"
                 ),
                 (
                     "只输出一个 JSON 对象，不要 Markdown 代码块或额外文字。格式："
-                    '{"summary":"决策摘要","actions":[{"type":"...","taskId":"...",'
+                    '{"summary":"决策摘要","actions":[{"type":"...","taskKey":"research",'
+                    '"taskId":"...",'
                     '"artifactId":"...","assigneeAgentId":"...","reviewerAgentId":"...",'
                     '"title":"...","description":"...","dependsOn":[],"priority":50,"reason":"..."}]}'
                 ),

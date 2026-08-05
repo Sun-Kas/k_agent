@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import sqlite3
 
+import pytest
+
 from access_layer.teams.models import SupervisorDecision, TeamCreateInput
 from access_layer.teams.runtime import TeamRuntime
 from access_layer.teams.store import TeamStore
@@ -51,6 +53,29 @@ async def _approve_initial_plan(store: TeamStore, team: dict) -> dict:
     assert control is not None
     workers = [agent for agent in team["agents"] if not agent["isSupervisor"]]
     actions: list[dict] = [{"type": "approve_plan", "reason": "初始计划可执行"}]
+    if team["mode"] == "auto" and not team["tasks"]:
+        actions.extend([
+            {
+                "type": "create_task",
+                "taskKey": "research",
+                "title": "先完成调研",
+                "description": "形成后续实现所需的约束和输入。",
+                "assigneeAgentId": workers[0]["id"],
+                "dependsOn": [],
+                "priority": 100,
+                "reason": "先收敛输入",
+            },
+            {
+                "type": "create_task",
+                "taskKey": "implementation",
+                "title": "基于调研实施",
+                "description": "读取已验收调研成果并完成实现。",
+                "assigneeAgentId": workers[1]["id"],
+                "dependsOn": ["research"],
+                "priority": 80,
+                "reason": "实现依赖调研 Artifact",
+            },
+        ])
     for index, task in enumerate(team["tasks"]):
         if task["ownerAgentId"] is None:
             actions.append({
@@ -94,26 +119,149 @@ def test_supervisor_plan_gate_and_task_claim_are_atomic(tmp_path: Path) -> None:
         await store.initialize()
         team = await store.create_team(_team_payload(mode="auto"), tmp_path)
 
+        # Automatic mode starts from the goal, not one synthetic task per member.
+        assert team["tasks"] == []
         assert await store.claim_next_task(team["id"]) is None
         team = await _approve_initial_plan(store, team)
+        assert len(team["tasks"]) == 2
+        research = next(task for task in team["tasks"] if task["title"] == "先完成调研")
+        implementation = next(task for task in team["tasks"] if task["title"] == "基于调研实施")
+        assert implementation["dependsOn"] == [research["id"]]
 
         claims = await asyncio.gather(
             *(store.claim_next_task(team["id"]) for _ in range(8))
         )
         claimed = [item for item in claims if item is not None]
-        # The supervisor assigned both drafts; transactional leases still make
-        # concurrent scheduler polls claim each task exactly once.
-        assert len(claimed) == 2
-        assert len({item["task"]["id"] for item in claimed}) == 2
-        assert all(item["task"]["taskType"] == "work" for item in claimed)
+        assert len(claimed) == 1
+        assert claimed[0]["task"]["id"] == research["id"]
 
-        for item in claimed:
-            await store.submit_task(
-                team["id"], item["task"]["id"], item["agent"]["id"], "成果"
+        artifact_id = await store.submit_task(
+            team["id"], research["id"], claimed[0]["agent"]["id"], "调研成果"
+        )
+        control = await store.claim_supervisor_job(team["id"])
+        assert control is not None
+        await store.apply_supervisor_decision(
+            team["id"],
+            control["job"]["id"],
+            control["supervisor"]["id"],
+            SupervisorDecision.model_validate({
+                "summary": "调研通过，释放实现任务",
+                "actions": [{
+                    "type": "accept_submission",
+                    "taskId": research["id"],
+                    "artifactId": artifact_id,
+                    "reason": "输入完整",
+                }],
+            }),
+        )
+        next_claim = await store.claim_next_task(team["id"])
+        assert next_claim is not None
+        assert next_claim["task"]["id"] == implementation["id"]
+
+    asyncio.run(scenario())
+
+
+def test_automatic_plan_rejects_empty_or_cyclic_task_graph(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        team = await store.create_team(_team_payload(mode="auto"), tmp_path)
+        control = await store.claim_supervisor_job(team["id"])
+        assert control is not None
+        with pytest.raises(ValueError, match="must create at least one task"):
+            await store.apply_supervisor_decision(
+                team["id"],
+                control["job"]["id"],
+                control["supervisor"]["id"],
+                SupervisorDecision.model_validate({
+                    "summary": "空计划",
+                    "actions": [{"type": "approve_plan", "reason": "没有任务"}],
+                }),
             )
-        submitted = await store.get_team(team["id"])
-        assert {task["status"] for task in submitted["tasks"]} == {"submitted"}
-        assert {artifact["status"] for artifact in submitted["artifacts"]} == {"pending_review"}
+
+        workers = [agent for agent in team["agents"] if not agent["isSupervisor"]]
+        with pytest.raises(ValueError, match="dependency cycle"):
+            await store.apply_supervisor_decision(
+                team["id"],
+                control["job"]["id"],
+                control["supervisor"]["id"],
+                SupervisorDecision.model_validate({
+                    "summary": "循环计划",
+                    "actions": [
+                        {
+                            "type": "create_task",
+                            "taskKey": "a",
+                            "title": "A",
+                            "description": "A 依赖 B",
+                            "assigneeAgentId": workers[0]["id"],
+                            "dependsOn": ["b"],
+                        },
+                        {
+                            "type": "create_task",
+                            "taskKey": "b",
+                            "title": "B",
+                            "description": "B 依赖 A",
+                            "assigneeAgentId": workers[1]["id"],
+                            "dependsOn": ["a"],
+                        },
+                    ],
+                }),
+            )
+
+    asyncio.run(scenario())
+
+
+def test_automatic_plan_runs_only_independent_roots_in_parallel(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        team = await store.create_team(_team_payload(mode="auto"), tmp_path)
+        control = await store.claim_supervisor_job(team["id"])
+        assert control is not None
+        workers = [agent for agent in team["agents"] if not agent["isSupervisor"]]
+        planned = await store.apply_supervisor_decision(
+            team["id"],
+            control["job"]["id"],
+            control["supervisor"]["id"],
+            SupervisorDecision.model_validate({
+                "summary": "调研和风险检查并行，综合随后执行",
+                "actions": [
+                    {
+                        "type": "create_task",
+                        "taskKey": "research",
+                        "title": "调研",
+                        "description": "收集事实",
+                        "assigneeAgentId": workers[0]["id"],
+                        "dependsOn": [],
+                    },
+                    {
+                        "type": "create_task",
+                        "taskKey": "risk",
+                        "title": "风险检查",
+                        "description": "独立识别风险",
+                        "assigneeAgentId": workers[1]["id"],
+                        "dependsOn": [],
+                    },
+                    {
+                        "type": "create_task",
+                        "taskKey": "synthesis",
+                        "title": "综合",
+                        "description": "汇总两个已验收成果",
+                        "assigneeAgentId": workers[0]["id"],
+                        "dependsOn": ["research", "risk"],
+                    },
+                ],
+            }),
+        )
+        synthesis = next(task for task in planned["tasks"] if task["title"] == "综合")
+        assert len(synthesis["dependsOn"]) == 2
+
+        claims = await asyncio.gather(
+            *(store.claim_next_task(team["id"]) for _ in range(4))
+        )
+        claimed = [item for item in claims if item is not None]
+        assert {item["task"]["title"] for item in claimed} == {"调研", "风险检查"}
+        assert "综合" not in {item["task"]["title"] for item in claimed}
 
     asyncio.run(scenario())
 
@@ -397,6 +545,7 @@ def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: 
                         },
                         {
                             "type": "create_task",
+                            "taskKey": "downstream_check",
                             "title": "检查已发布站点",
                             "description": "读取上游已验收文件并检查。",
                             "assigneeAgentId": self.assignee_id,

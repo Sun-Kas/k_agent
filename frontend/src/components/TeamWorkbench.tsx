@@ -562,7 +562,7 @@ function TeamDashboard({
 
       <div className="team-dashboard-grid">
         <div className="team-board-panel">
-          <header className="team-section-header"><div><p className="team-kicker">SHARED TASK BOARD</p><h2>共享任务板</h2></div><span>{completed}/{team.tasks.length} 完成</span></header>
+          <header className="team-section-header"><div><p className="team-kicker">SHARED TASK BOARD</p><h2>共享任务板</h2></div><span>{team.mode === "auto" && team.tasks.length === 0 ? "主管规划中" : `${completed}/${team.tasks.length} 完成`}</span></header>
           <div className="team-board">
             {columns.map((column) => <TaskColumn key={column.key} title={column.title} tasks={column.tasks} agents={team.agents} selectedTaskId={selectedTaskId} onTaskSelect={onTaskSelect} />)}
           </div>
@@ -1035,7 +1035,7 @@ function supervisorStateLabel(state: TeamSnapshot["supervisorState"]): string {
 
 function supervisorTriggerLabel(triggerType: string): string {
   const labels: Record<string, string> = {
-    "team.started": "正在检查团队目标、成员能力与初始任务分配",
+    "team.started": "正在根据团队目标与成员能力规划首轮任务流",
     "task.submitted": "正在验收成员提交的 Artifact，并决定下一步任务",
     "task.failed": "正在处理失败任务、返工或重新分配",
     "task.created": "正在检查新任务及其承接成员",

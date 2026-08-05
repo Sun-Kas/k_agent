@@ -216,7 +216,7 @@ class TeamStore:
                     )
 
     async def create_team(self, payload: TeamCreateInput, teams_root: Path) -> dict[str, Any]:
-        """Create members and initial tasks in one transaction."""
+        """Create members and any explicit/manual task drafts in one transaction."""
 
         async with self._write_lock:
             return await asyncio.to_thread(self._create_team_sync, payload, teams_root)
@@ -365,7 +365,7 @@ class TeamStore:
                             timestamp,
                         ),
                     )
-            else:
+            elif payload.mode == "manual":
                 worker_indices = [index for index in range(len(agent_ids)) if index != supervisor_index]
                 if not worker_indices:
                     worker_indices = [supervisor_index]
@@ -386,10 +386,7 @@ class TeamStore:
                             team_id,
                             f"{agent.role}交付",
                             description,
-                            # Auto mode leaves Worker tasks unowned so the
-                            # scheduler performs a transactional capability/idle
-                            # claim instead of treating the draft as assignment.
-                            None if payload.mode == "auto" else agent_ids[index],
+                            agent_ids[index],
                             timestamp,
                             timestamp,
                         ),
@@ -1068,6 +1065,18 @@ class TeamStore:
             reviewed = reviewed_task_id is None
             finish_requested = False
 
+            # Pre-allocate IDs for every create_task action. This turns
+            # taskKey/dependsOn into a proper DAG contract and supports forward
+            # references without exposing database-generated IDs to the model.
+            created_task_ids: dict[str, str] = {}
+            for action in decision.actions:
+                if action.type != "create_task":
+                    continue
+                task_key = str(action.task_key or "").strip()
+                if task_key in created_task_ids:
+                    raise ValueError(f"Duplicate create_task taskKey: {task_key}")
+                created_task_ids[task_key] = f"task_{uuid.uuid4().hex}"
+
             def require_agent(agent_id: str | None) -> sqlite3.Row:
                 row = db.execute(
                     "SELECT * FROM team_agents WHERE id=? AND team_id=?",
@@ -1085,6 +1094,46 @@ class TeamStore:
                 if row is None:
                     raise ValueError(f"Task does not belong to this Team: {task_id}")
                 return row
+
+            def resolve_dependency(reference: str) -> str:
+                """Resolve a same-decision taskKey or an existing durable ID."""
+
+                reference = reference.strip()
+                if not reference:
+                    raise ValueError("Task dependency reference cannot be empty")
+                if reference in created_task_ids:
+                    return created_task_ids[reference]
+                return str(require_task(reference)["id"])
+
+            created_dependencies: dict[str, list[str]] = {}
+            for action in decision.actions:
+                if action.type != "create_task":
+                    continue
+                task_key = str(action.task_key).strip()
+                task_id = created_task_ids[task_key]
+                dependencies = [
+                    resolve_dependency(str(reference))
+                    for reference in action.depends_on
+                ]
+                if task_id in dependencies:
+                    raise ValueError(f"Task {task_key} cannot depend on itself")
+                created_dependencies[task_id] = list(dict.fromkeys(dependencies))
+
+            def visit_created(task_id: str, visiting: set[str], visited: set[str]) -> None:
+                if task_id in visited:
+                    return
+                if task_id in visiting:
+                    raise ValueError("Supervisor plan contains a dependency cycle")
+                visiting.add(task_id)
+                for dependency_id in created_dependencies.get(task_id, []):
+                    if dependency_id in created_dependencies:
+                        visit_created(dependency_id, visiting, visited)
+                visiting.remove(task_id)
+                visited.add(task_id)
+
+            visited_created: set[str] = set()
+            for created_task_id in created_dependencies:
+                visit_created(created_task_id, set(), visited_created)
 
             for action in decision.actions:
                 if action.type == "approve_plan":
@@ -1146,9 +1195,9 @@ class TeamStore:
 
                 if action.type == "create_task":
                     require_agent(action.assignee_agent_id)
-                    for dependency_id in action.depends_on:
-                        require_task(dependency_id)
-                    task_id = f"task_{uuid.uuid4().hex}"
+                    task_key = str(action.task_key).strip()
+                    task_id = created_task_ids[task_key]
+                    dependencies = created_dependencies[task_id]
                     db.execute(
                         """
                         INSERT INTO team_tasks VALUES
@@ -1161,15 +1210,17 @@ class TeamStore:
                             action.description,
                             action.priority,
                             action.assignee_agent_id,
-                            json.dumps(action.depends_on),
+                            json.dumps(dependencies),
                             timestamp,
                             timestamp,
                         ),
                     )
                     self._append_event_sync(db, team_id, "task.created", {
                         "taskId": task_id,
+                        "taskKey": task_key,
                         "title": action.title,
                         "createdBy": supervisor_id,
+                        "dependsOn": dependencies,
                     })
                     self._append_event_sync(db, team_id, "task.assigned", {
                         "taskId": task_id,
@@ -1255,6 +1306,14 @@ class TeamStore:
             if not reviewed:
                 raise ValueError("A task.submitted decision must accept or request revision for that task")
             if job["trigger_type"] == "team.started":
+                task_count = db.execute(
+                    "SELECT COUNT(*) count FROM team_tasks WHERE team_id=?",
+                    (team_id,),
+                ).fetchone()["count"]
+                if team["mode"] == "auto" and task_count == 0:
+                    raise ValueError(
+                        "The initial automatic plan must create at least one task"
+                    )
                 unowned = db.execute(
                     "SELECT COUNT(*) count FROM team_tasks WHERE team_id=? AND status IN ('pending','ready') AND owner_agent_id IS NULL",
                     (team_id,),

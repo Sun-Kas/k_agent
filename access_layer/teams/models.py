@@ -49,7 +49,7 @@ class TeamTaskInput(BaseModel):
 
 
 class TeamCreateInput(BaseModel):
-    """Create a durable Team and enough initial work to start execution."""
+    """Create a durable Team plus optional manual task drafts."""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -150,6 +150,9 @@ class SupervisorAction(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     type: SupervisorActionType
+    # A supervisor-generated key lets tasks in the same decision reference one
+    # another before the store assigns durable task IDs.
+    task_key: str | None = Field(default=None, alias="taskKey", max_length=80)
     task_id: str | None = Field(default=None, alias="taskId")
     artifact_id: str | None = Field(default=None, alias="artifactId")
     assignee_agent_id: str | None = Field(default=None, alias="assigneeAgentId")
@@ -173,8 +176,16 @@ class SupervisorAction(BaseModel):
         }
         if self.type in task_actions and not self.task_id:
             raise ValueError(f"{self.type} requires taskId")
-        if self.type == "create_task" and not (self.title and self.description and self.assignee_agent_id):
-            raise ValueError("create_task requires title, description and assigneeAgentId")
+        if self.type == "create_task" and not (
+            self.task_key
+            and self.task_key.strip()
+            and self.title
+            and self.description
+            and self.assignee_agent_id
+        ):
+            raise ValueError(
+                "create_task requires taskKey, title, description and assigneeAgentId"
+            )
         if self.type in {"assign_task", "reassign_task"} and not self.assignee_agent_id:
             raise ValueError(f"{self.type} requires assigneeAgentId")
         if self.type == "request_review" and not self.reviewer_agent_id:

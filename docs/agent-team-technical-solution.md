@@ -304,8 +304,11 @@ Scheduler 的主要循环：
 Supervisor 不应作为一个永久占用 HTTP 连接的长时间 Run。采用事件唤醒模型：
 
 1. 用户提交目标，Access Layer 持久化 `team.started` 主管任务。
-2. Supervisor 审查初始任务草案并明确每个 `assigneeAgentId`。
-3. Scheduler 校验并提交决策后，才允许 Worker 开始执行。
+2. 自动模式由 Supervisor 根据目标与成员能力创建最小、完整的 Task DAG，明确每个
+   `taskKey`、`assigneeAgentId` 和真实的 `dependsOn`；不要求每个成员首轮都有任务。
+   手动模式则审查用户提供的初始任务并补齐负责人。
+3. Scheduler 在事务中校验依赖引用与环路；只有没有未完成依赖的根任务可以在
+   `maxParallel` 范围内开始执行。
 4. Worker 只提交候选 Artifact，不直接把 Task 标记为完成。
 5. `task.submitted`、终态 `task.failed` 和用户补充指令会唤醒 Supervisor。
 6. Supervisor 可验收、退回、改派、创建后续 Task 或请求独立复核。
