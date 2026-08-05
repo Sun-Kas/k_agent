@@ -448,7 +448,6 @@ def create_app() -> FastAPI:
             store=app.state.team_store,
             backend_client=app.state.agent_backend_client,
             runtime_catalog=app.state.runtime_catalog,
-            project_root=PROJECT_ROOT,
             max_active_runs=app.state.settings.team_max_active_runs,
             task_lease_seconds=app.state.settings.team_task_lease_seconds,
             enabled=app.state.settings.team_runtime_enabled,

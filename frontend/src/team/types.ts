@@ -1,7 +1,7 @@
 import type { AgentKind } from "../types";
 
 export type TeamStatus = "draft" | "running" | "paused" | "completed" | "failed" | "cancelled";
-export type TeamTaskStatus = "pending" | "ready" | "claimed" | "running" | "completed" | "failed" | "cancelled";
+export type TeamTaskStatus = "pending" | "ready" | "claimed" | "running" | "submitted" | "completed" | "failed" | "cancelled";
 
 export interface TeamSummary {
   id: string;
@@ -9,6 +9,7 @@ export interface TeamSummary {
   goal: string;
   mode: "auto" | "manual";
   status: TeamStatus;
+  workspaceDir: string;
   agentCount: number;
   taskCount: number;
   completedTaskCount: number;
@@ -24,6 +25,7 @@ export interface TeamAgent {
   agentKind: AgentKind;
   modelId?: string | null;
   reasoningEffort?: string | null;
+  networkAccess?: boolean | null;
   responsibility: string;
   status: "spawning" | "idle" | "busy" | "waiting" | "paused" | "failed" | "stopped";
   isSupervisor: boolean;
@@ -39,6 +41,7 @@ export interface TeamTask {
   title: string;
   description: string;
   taskType: string;
+  reviewRequired: boolean;
   status: TeamTaskStatus;
   priority: number;
   ownerAgentId?: string | null;
@@ -62,6 +65,7 @@ export interface TeamArtifact {
   sha256: string;
   version: number;
   status: string;
+  workspacePath?: string | null;
   createdAt: string;
   uri: string;
 }
@@ -85,9 +89,20 @@ export interface TeamSnapshot {
   status: TeamStatus;
   maxParallel: number;
   supervisorAgentId: string;
+  workspaceDir: string;
   createdAt: string;
   updatedAt: string;
   lastEventSeq: number;
+  supervisorState?: {
+    id: string;
+    triggerType: string;
+    status: "pending" | "running" | "completed" | "failed" | "cancelled";
+    attempt: number;
+    maxAttempts: number;
+    runId?: string | null;
+    error?: string | null;
+    updatedAt: string;
+  } | null;
   agents: TeamAgent[];
   tasks: TeamTask[];
   artifacts: TeamArtifact[];
@@ -109,6 +124,7 @@ export interface TeamAgentDraft {
   agentKind: AgentKind;
   modelId?: string;
   reasoningEffort?: string;
+  networkAccess?: boolean;
   responsibility: string;
   isSupervisor: boolean;
   mcpServerIds: string[];

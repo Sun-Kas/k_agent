@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any
 import uuid
 
-from access_layer.teams.models import TeamCreateInput, TeamTaskCreateInput
+from access_layer.teams.models import SupervisorDecision, TeamCreateInput, TeamTaskCreateInput
 
 
 def _now() -> str:
@@ -50,6 +50,7 @@ class TeamStore:
                     status TEXT NOT NULL,
                     max_parallel INTEGER NOT NULL,
                     supervisor_agent_id TEXT,
+                    workspace_dir TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -61,6 +62,7 @@ class TeamStore:
                     agent_kind TEXT NOT NULL,
                     model_id TEXT,
                     reasoning_effort TEXT,
+                    network_access INTEGER,
                     responsibility TEXT NOT NULL,
                     status TEXT NOT NULL,
                     is_supervisor INTEGER NOT NULL,
@@ -99,6 +101,7 @@ class TeamStore:
                     sha256 TEXT NOT NULL,
                     version INTEGER NOT NULL,
                     status TEXT NOT NULL,
+                    workspace_path TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS mailbox_messages (
@@ -122,14 +125,95 @@ class TeamStore:
                     occurred_at TEXT NOT NULL,
                     UNIQUE(team_id, seq)
                 );
+                CREATE TABLE IF NOT EXISTS supervisor_jobs (
+                    id TEXT PRIMARY KEY,
+                    team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                    trigger_type TEXT NOT NULL,
+                    trigger_payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    lease_until TEXT,
+                    run_id TEXT,
+                    error TEXT,
+                    decision_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_tasks_dispatch
                     ON team_tasks(team_id, status, priority, created_at);
                 CREATE INDEX IF NOT EXISTS idx_events_replay
                     ON team_events(team_id, seq);
                 CREATE INDEX IF NOT EXISTS idx_mail_recipient
                     ON mailbox_messages(team_id, recipient_id, status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_supervisor_dispatch
+                    ON supervisor_jobs(team_id, status, created_at);
                 """
             )
+            team_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(teams)").fetchall()
+            }
+            if "workspace_dir" not in team_columns:
+                db.execute("ALTER TABLE teams ADD COLUMN workspace_dir TEXT")
+            agent_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(team_agents)").fetchall()
+            }
+            if "network_access" not in agent_columns:
+                # NULL inherits the Agent Backend default, which lets existing
+                # Teams adopt policy changes without destructive rewrites.
+                db.execute("ALTER TABLE team_agents ADD COLUMN network_access INTEGER")
+            artifact_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(artifacts)").fetchall()
+            }
+            if "workspace_path" not in artifact_columns:
+                db.execute("ALTER TABLE artifacts ADD COLUMN workspace_path TEXT")
+            for team in db.execute(
+                "SELECT id FROM teams WHERE workspace_dir IS NULL OR TRIM(workspace_dir)=''"
+            ).fetchall():
+                workspace = self.database_path.parent / team["id"] / "workspace"
+                db.execute(
+                    "UPDATE teams SET workspace_dir=? WHERE id=?",
+                    (str(workspace.resolve()), team["id"]),
+                )
+            # Existing databases predate supervisor_jobs. Backfill exactly one
+            # boundary per running Team so old pending work cannot bypass the
+            # new manager gate after an upgrade.
+            legacy_teams = db.execute(
+                """
+                SELECT t.id FROM teams t
+                WHERE t.status='running'
+                  AND NOT EXISTS (SELECT 1 FROM supervisor_jobs s WHERE s.team_id=t.id)
+                  AND EXISTS (
+                      SELECT 1 FROM team_tasks k
+                      WHERE k.team_id=t.id AND k.status IN ('pending','ready','submitted')
+                  )
+                """
+            ).fetchall()
+            for team in legacy_teams:
+                submitted = db.execute(
+                    "SELECT id, owner_agent_id FROM team_tasks WHERE team_id=? AND status='submitted' ORDER BY created_at",
+                    (team["id"],),
+                ).fetchall()
+                if submitted:
+                    for task in submitted:
+                        artifact = db.execute(
+                            "SELECT id FROM artifacts WHERE task_id=? AND status='pending_review' ORDER BY created_at DESC LIMIT 1",
+                            (task["id"],),
+                        ).fetchone()
+                        self._enqueue_supervisor_job_sync(db, team["id"], "task.submitted", {
+                            "taskId": task["id"],
+                            "agentId": task["owner_agent_id"],
+                            "artifactId": artifact["id"] if artifact else None,
+                            "source": "supervisor_loop_migration",
+                        })
+                else:
+                    self._enqueue_supervisor_job_sync(
+                        db,
+                        team["id"],
+                        "team.started",
+                        {"source": "supervisor_loop_migration"},
+                    )
 
     async def create_team(self, payload: TeamCreateInput, teams_root: Path) -> dict[str, Any]:
         """Create members and initial tasks in one transaction."""
@@ -140,6 +224,46 @@ class TeamStore:
     def _create_team_sync(self, payload: TeamCreateInput, teams_root: Path) -> dict[str, Any]:
         team_id = f"team_{uuid.uuid4().hex}"
         timestamp = _now()
+        if payload.workspace_dir and payload.workspace_dir.strip():
+            configured_workspace = Path(payload.workspace_dir).expanduser()
+            if not configured_workspace.is_absolute():
+                raise ValueError("workspaceDir must be an absolute path")
+            team_workspace = configured_workspace.resolve()
+        else:
+            team_workspace = (teams_root / team_id / "workspace").resolve()
+        if team_workspace.exists() and not team_workspace.is_dir():
+            raise ValueError("workspaceDir must point to a directory")
+        # Creating the selected directory up front turns an unwritable custom
+        # location into a create-Team error instead of a late publish failure.
+        try:
+            team_workspace.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"workspaceDir cannot be created: {exc}") from exc
+        marker_path = team_workspace / ".k_agent-team.json"
+        if marker_path.is_file():
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("workspaceDir contains an unreadable K Agent Team marker") from exc
+            if marker.get("teamId") != team_id:
+                raise ValueError("workspaceDir is already owned by another Team")
+        else:
+            try:
+                marker_path.write_text(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "teamId": team_id,
+                            "teamName": payload.name,
+                            "artifactDirectory": "artifacts",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                raise ValueError(f"workspaceDir is not writable: {exc}") from exc
         agent_ids = [f"agent_{uuid.uuid4().hex}" for _ in payload.agents]
         supervisor_index = next(
             (index for index, agent in enumerate(payload.agents) if agent.is_supervisor),
@@ -148,7 +272,12 @@ class TeamStore:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
-                "INSERT INTO teams VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)",
+                """
+                INSERT INTO teams
+                (id, name, goal, mode, status, max_parallel, supervisor_agent_id,
+                 workspace_dir, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                """,
                 (
                     team_id,
                     payload.name,
@@ -156,6 +285,7 @@ class TeamStore:
                     payload.mode,
                     payload.max_parallel,
                     agent_ids[supervisor_index],
+                    str(team_workspace),
                     timestamp,
                     timestamp,
                 ),
@@ -165,7 +295,9 @@ class TeamStore:
                     "mcpServerIds": agent.mcp_server_ids,
                     "skillIds": agent.skill_ids,
                 }
-                workspace = teams_root / team_id / "workspaces" / agent_id
+                # Agent runs remain task-isolated; this compatibility field
+                # points at the shared publication workspace, not a private cwd.
+                workspace = team_workspace
                 reason = (
                     "用户指定为团队主管"
                     if index == supervisor_index
@@ -173,8 +305,12 @@ class TeamStore:
                 )
                 db.execute(
                     """
-                    INSERT INTO team_agents VALUES
-                    (?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?)
+                    INSERT INTO team_agents
+                    (id, team_id, name, role, agent_kind, model_id,
+                     reasoning_effort, network_access, responsibility, status,
+                     is_supervisor, creation_reason, capability_json,
+                     workspace_dir, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         agent_id,
@@ -184,6 +320,11 @@ class TeamStore:
                         agent.agent_kind,
                         agent.model_id,
                         agent.reasoning_effort,
+                        (
+                            int(agent.network_access)
+                            if agent.network_access is not None
+                            else None
+                        ),
                         agent.responsibility,
                         1 if index == supervisor_index else 0,
                         reason,
@@ -254,31 +395,51 @@ class TeamStore:
                         ),
                     )
 
-                if len(payload.agents) > 1:
-                    synthesis_id = f"task_{uuid.uuid4().hex}"
-                    db.execute(
-                        """
-                        INSERT INTO team_tasks VALUES
-                        (?, ?, '主管综合与质量审查', ?, 'synthesis', 'pending', 20, ?, ?, 0, 3, NULL, NULL, NULL, ?, ?)
-                        """,
-                        (
-                            synthesis_id,
-                            team_id,
-                            "审查所有 Worker Artifact，指出冲突或遗漏，并形成面向用户的最终成果。",
-                            agent_ids[supervisor_index],
-                            json.dumps(task_ids),
-                            timestamp,
-                            timestamp,
-                        ),
-                    )
+                # Synthesis is now a supervisor control decision, not a static
+                # task that could bypass per-deliverable acceptance boundaries.
             self._append_event_sync(
                 db,
                 team_id,
                 "team.created",
                 {"name": payload.name, "mode": payload.mode, "agentCount": len(agent_ids)},
             )
+            # Initial task drafts are not dispatchable until the supervisor has
+            # inspected the goal, team capabilities, and proposed ownership.
+            self._enqueue_supervisor_job_sync(
+                db,
+                team_id,
+                "team.started",
+                {"taskIds": task_ids, "source": "team_creation"},
+            )
             db.commit()
         return self._team_snapshot_sync(team_id)
+
+    def _enqueue_supervisor_job_sync(
+        self,
+        db: sqlite3.Connection,
+        team_id: str,
+        trigger_type: str,
+        payload: dict[str, Any],
+    ) -> str:
+        """Queue one durable control decision in the caller's transaction."""
+
+        job_id = f"supervisor_{uuid.uuid4().hex}"
+        timestamp = _now()
+        db.execute(
+            """
+            INSERT INTO supervisor_jobs
+            (id, team_id, trigger_type, trigger_payload_json, status, attempt,
+             max_attempts, lease_until, run_id, error, decision_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'pending', 0, 3, NULL, NULL, NULL, NULL, ?, ?)
+            """,
+            (job_id, team_id, trigger_type, json.dumps(payload, ensure_ascii=False), timestamp, timestamp),
+        )
+        self._append_event_sync(db, team_id, "supervisor.queued", {
+            "jobId": job_id,
+            "triggerType": trigger_type,
+            **payload,
+        })
+        return job_id
 
     def _append_event_sync(
         self, db: sqlite3.Connection, team_id: str, event_type: str, payload: dict[str, Any]
@@ -391,6 +552,7 @@ class TeamStore:
                 {
                     "id": row["id"], "name": row["name"], "goal": row["goal"],
                     "mode": row["mode"], "status": row["status"],
+                    "workspaceDir": row["workspace_dir"],
                     "agentCount": row["agent_count"], "taskCount": row["task_count"],
                     "completedTaskCount": row["completed_count"],
                     "createdAt": row["created_at"], "updatedAt": row["updated_at"],
@@ -424,13 +586,19 @@ class TeamStore:
             last_seq = db.execute(
                 "SELECT COALESCE(MAX(seq), 0) value FROM team_events WHERE team_id=?", (team_id,)
             ).fetchone()["value"]
+            supervisor_job = db.execute(
+                "SELECT * FROM supervisor_jobs WHERE team_id=? ORDER BY created_at DESC LIMIT 1",
+                (team_id,),
+            ).fetchone()
             return {
                 "id": team["id"], "name": team["name"], "goal": team["goal"],
                 "mode": team["mode"], "status": team["status"],
                 "maxParallel": team["max_parallel"],
                 "supervisorAgentId": team["supervisor_agent_id"],
+                "workspaceDir": team["workspace_dir"],
                 "createdAt": team["created_at"], "updatedAt": team["updated_at"],
                 "lastEventSeq": last_seq,
+                "supervisorState": self._supervisor_job_dict(supervisor_job) if supervisor_job else None,
                 "agents": [self._agent_dict(row) for row in agents],
                 "tasks": [self._task_dict(row) for row in tasks],
                 "artifacts": [self._artifact_dict(row) for row in artifacts],
@@ -443,6 +611,11 @@ class TeamStore:
             "id": row["id"], "teamId": row["team_id"], "name": row["name"],
             "role": row["role"], "agentKind": row["agent_kind"],
             "modelId": row["model_id"], "reasoningEffort": row["reasoning_effort"],
+            "networkAccess": (
+                bool(row["network_access"])
+                if row["network_access"] is not None
+                else None
+            ),
             "responsibility": row["responsibility"], "status": row["status"],
             "isSupervisor": bool(row["is_supervisor"]),
             "creationReason": row["creation_reason"],
@@ -455,6 +628,9 @@ class TeamStore:
         return {
             "id": row["id"], "teamId": row["team_id"], "title": row["title"],
             "description": row["description"], "taskType": row["task_type"],
+            # Supervisor acceptance is a Team Runtime invariant: every worker
+            # Artifact is submitted before it can become a completed task.
+            "reviewRequired": True,
             "status": row["status"], "priority": row["priority"],
             "ownerAgentId": row["owner_agent_id"],
             "dependsOn": json.loads(row["depends_on_json"]),
@@ -470,6 +646,7 @@ class TeamStore:
             "agentId": row["agent_id"], "kind": row["kind"], "title": row["title"],
             "content": row["content"], "sha256": row["sha256"],
             "version": row["version"], "status": row["status"],
+            "workspacePath": row["workspace_path"],
             "createdAt": row["created_at"],
             "uri": f"artifact://{row['team_id']}/{row['id']}@{row['version']}",
         }
@@ -481,6 +658,19 @@ class TeamStore:
             "recipientId": row["recipient_id"], "messageType": row["message_type"],
             "content": row["content"], "artifactIds": json.loads(row["artifact_ids_json"]),
             "status": row["status"], "createdAt": row["created_at"],
+        }
+
+    @staticmethod
+    def _supervisor_job_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "triggerType": row["trigger_type"],
+            "status": row["status"],
+            "attempt": row["attempt"],
+            "maxAttempts": row["max_attempts"],
+            "runId": row["run_id"],
+            "error": row["error"],
+            "updatedAt": row["updated_at"],
         }
 
     async def events_after(self, team_id: str, seq: int, limit: int = 200) -> list[dict[str, Any]]:
@@ -515,9 +705,25 @@ class TeamStore:
                 return None
             timestamp = _now()
             db.execute("UPDATE teams SET status=?, updated_at=? WHERE id=?", (target, timestamp, team_id))
+            if command == "resume":
+                # A paused Team caused by an exhausted supervisor job needs an
+                # explicit user resume to authorize another bounded attempt set.
+                failed_job = db.execute(
+                    "SELECT id FROM supervisor_jobs WHERE team_id=? AND status='failed' ORDER BY updated_at DESC LIMIT 1",
+                    (team_id,),
+                ).fetchone()
+                if failed_job:
+                    db.execute(
+                        "UPDATE supervisor_jobs SET status='pending', attempt=0, error=NULL, updated_at=? WHERE id=?",
+                        (timestamp, failed_job["id"]),
+                    )
             if command == "cancel":
                 db.execute(
-                    "UPDATE team_tasks SET status='cancelled', updated_at=? WHERE team_id=? AND status IN ('pending','ready','claimed')",
+                    "UPDATE team_tasks SET status='cancelled', updated_at=? WHERE team_id=? AND status IN ('pending','ready','claimed','submitted')",
+                    (timestamp, team_id),
+                )
+                db.execute(
+                    "UPDATE supervisor_jobs SET status='cancelled', lease_until=NULL, updated_at=? WHERE team_id=? AND status IN ('pending','running')",
                     (timestamp, team_id),
                 )
             self._append_event_sync(db, team_id, f"team.{target}", {"previousStatus": row["status"]})
@@ -544,6 +750,10 @@ class TeamStore:
                  payload.priority, payload.owner_agent_id, json.dumps(payload.depends_on), timestamp, timestamp),
             )
             self._append_event_sync(db, team_id, "task.created", {"taskId": task_id, "title": payload.title})
+            self._enqueue_supervisor_job_sync(db, team_id, "task.created", {
+                "taskId": task_id,
+                "source": "user_api",
+            })
             db.commit()
         return self._team_snapshot_sync(team_id)
 
@@ -573,8 +783,92 @@ class TeamStore:
                 "messageId": message_id, "senderId": sender_id,
                 "recipientId": recipient_id, "messageType": message_type,
             })
+            if sender_id == "user" and message_type == "user_message":
+                self._enqueue_supervisor_job_sync(db, team_id, "user.instruction_added", {
+                    "messageId": message_id,
+                    "recipientId": recipient_id,
+                })
             db.commit()
         return self._team_snapshot_sync(team_id)
+
+    async def claim_supervisor_job(
+        self, team_id: str, lease_seconds: int = 120
+    ) -> dict[str, Any] | None:
+        """Atomically lease the oldest pending Team control decision."""
+
+        async with self._write_lock:
+            return await asyncio.to_thread(
+                self._claim_supervisor_job_sync, team_id, lease_seconds
+            )
+
+    def _claim_supervisor_job_sync(
+        self, team_id: str, lease_seconds: int
+    ) -> dict[str, Any] | None:
+        timestamp = _now()
+        lease_until = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            team = db.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
+            if team is None or team["status"] != "running":
+                return None
+            job = db.execute(
+                "SELECT * FROM supervisor_jobs WHERE team_id=? AND status='pending' ORDER BY created_at LIMIT 1",
+                (team_id,),
+            ).fetchone()
+            if job is None:
+                return None
+            supervisor = db.execute(
+                "SELECT * FROM team_agents WHERE id=? AND team_id=? AND status='idle'",
+                (team["supervisor_agent_id"], team_id),
+            ).fetchone()
+            if supervisor is None:
+                return None
+            run_id = f"supervisorrun_{uuid.uuid4().hex}"
+            attempt = int(job["attempt"]) + 1
+            db.execute(
+                "UPDATE supervisor_jobs SET status='running', attempt=?, lease_until=?, run_id=?, updated_at=? WHERE id=? AND status='pending'",
+                (attempt, lease_until, run_id, timestamp, job["id"]),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='busy', updated_at=? WHERE id=?",
+                (timestamp, supervisor["id"]),
+            )
+            self._append_event_sync(db, team_id, "supervisor.decision_started", {
+                "jobId": job["id"],
+                "triggerType": job["trigger_type"],
+                "agentId": supervisor["id"],
+                "runId": run_id,
+                "attempt": attempt,
+            })
+            db.commit()
+            current_job = db.execute(
+                "SELECT * FROM supervisor_jobs WHERE id=?", (job["id"],)
+            ).fetchone()
+            return {
+                "team": dict(team),
+                "job": self._supervisor_job_dict(current_job),
+                "triggerPayload": json.loads(job["trigger_payload_json"]),
+                "supervisor": self._agent_dict(supervisor),
+                "runId": run_id,
+            }
+
+    async def has_supervisor_work(self, team_id: str) -> bool:
+        return await asyncio.to_thread(self._has_supervisor_work_sync, team_id)
+
+    def _has_supervisor_work_sync(self, team_id: str) -> bool:
+        with self._connect() as db:
+            return db.execute(
+                "SELECT 1 FROM supervisor_jobs WHERE team_id=? AND status IN ('pending','running') LIMIT 1",
+                (team_id,),
+            ).fetchone() is not None
+
+    async def supervisor_context(self, team_id: str, job_id: str) -> dict[str, Any]:
+        """Return a bounded control-plane snapshot; raw run logs stay task-local."""
+
+        snapshot = await self.get_team(team_id)
+        if snapshot is None:
+            raise ValueError("Team not found")
+        return {"team": snapshot, "jobId": job_id}
 
     async def claim_next_task(self, team_id: str, lease_seconds: int = 120) -> dict[str, Any] | None:
         """Atomically claim one dependency-ready task whose owner is idle."""
@@ -589,6 +883,13 @@ class TeamStore:
             db.execute("BEGIN IMMEDIATE")
             team = db.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
             if team is None or team["status"] != "running":
+                return None
+            # A pending supervisor boundary is a hard gate: no newly ready work
+            # can escape before the manager has reviewed the preceding result.
+            if db.execute(
+                "SELECT 1 FROM supervisor_jobs WHERE team_id=? AND status IN ('pending','running') LIMIT 1",
+                (team_id,),
+            ).fetchone() is not None:
                 return None
             active_count = db.execute(
                 "SELECT COUNT(*) count FROM team_tasks WHERE team_id=? AND status IN ('claimed','running')",
@@ -612,15 +913,16 @@ class TeamStore:
                     if complete != len(dependencies):
                         continue
                 owner_id = row["owner_agent_id"]
-                if owner_id is None:
-                    owner = db.execute(
-                        "SELECT * FROM team_agents WHERE team_id=? AND status='idle' ORDER BY is_supervisor, created_at LIMIT 1",
-                        (team_id,),
+                # The scheduler executes assignments; it never invents one.
+                # Unowned work remains behind the supervisor boundary.
+                owner = (
+                    db.execute(
+                        "SELECT * FROM team_agents WHERE id=? AND team_id=? AND status='idle'",
+                        (owner_id, team_id),
                     ).fetchone()
-                else:
-                    owner = db.execute(
-                        "SELECT * FROM team_agents WHERE id=? AND status='idle'", (owner_id,)
-                    ).fetchone()
+                    if owner_id is not None
+                    else None
+                )
                 if owner is not None:
                     selected = (row, owner)
                     break
@@ -653,7 +955,11 @@ class TeamStore:
     def _task_context_sync(self, team_id: str, task_id: str) -> dict[str, Any]:
         with self._connect() as db:
             team = dict(db.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone())
-            task = db.execute("SELECT * FROM team_tasks WHERE id=?", (task_id,)).fetchone()
+            task = db.execute(
+                "SELECT * FROM team_tasks WHERE id=? AND team_id=?", (task_id, team_id)
+            ).fetchone()
+            if task is None:
+                raise ValueError("Task not found")
             dependencies = json.loads(task["depends_on_json"])
             artifacts: list[dict[str, Any]] = []
             if dependencies:
@@ -670,45 +976,457 @@ class TeamStore:
             return {"team": team, "task": self._task_dict(task), "artifacts": artifacts,
                     "mailbox": [self._mail_dict(row) for row in mailbox_rows]}
 
-    async def complete_task(self, team_id: str, task_id: str, agent_id: str, content: str) -> str:
-        async with self._write_lock:
-            return await asyncio.to_thread(self._complete_task_sync, team_id, task_id, agent_id, content)
+    async def submit_task(self, team_id: str, task_id: str, agent_id: str, content: str) -> str:
+        """Persist an Agent deliverable without treating it as supervisor-accepted."""
 
-    def _complete_task_sync(self, team_id: str, task_id: str, agent_id: str, content: str) -> str:
+        async with self._write_lock:
+            return await asyncio.to_thread(self._submit_task_sync, team_id, task_id, agent_id, content)
+
+    def _submit_task_sync(self, team_id: str, task_id: str, agent_id: str, content: str) -> str:
         import hashlib
         artifact_id = f"artifact_{uuid.uuid4().hex}"
         timestamp = _now()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            task = db.execute("SELECT * FROM team_tasks WHERE id=?", (task_id,)).fetchone()
+            task = db.execute(
+                "SELECT * FROM team_tasks WHERE id=? AND team_id=? AND owner_agent_id=? AND status='running'",
+                (task_id, team_id, agent_id),
+            ).fetchone()
+            if task is None:
+                raise ValueError("Task run is no longer active; refusing a stale submission")
             kind = "final_answer" if task["task_type"] == "synthesis" else "report"
             db.execute(
-                "INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'accepted', ?)",
+                """
+                INSERT INTO artifacts
+                (id, team_id, task_id, agent_id, kind, title, content, sha256,
+                 version, status, workspace_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending_review', NULL, ?)
+                """,
                 (artifact_id, team_id, task_id, agent_id, kind, task["title"], content,
                  hashlib.sha256(content.encode("utf-8")).hexdigest(), timestamp),
             )
             db.execute(
-                "UPDATE team_tasks SET status='completed', lease_until=NULL, updated_at=? WHERE id=?",
-                (timestamp, task_id),
+                "UPDATE team_tasks SET status='submitted', lease_until=NULL, updated_at=? WHERE id=? AND status='running' AND owner_agent_id=?",
+                (timestamp, task_id, agent_id),
             )
             db.execute("UPDATE team_agents SET status='idle', updated_at=? WHERE id=?", (timestamp, agent_id))
-            self._append_event_sync(db, team_id, "artifact.published", {
+            self._append_event_sync(db, team_id, "artifact.submitted", {
                 "artifactId": artifact_id, "taskId": task_id, "agentId": agent_id, "kind": kind,
             })
-            self._append_event_sync(db, team_id, "task.completed", {
+            self._append_event_sync(db, team_id, "task.submitted", {
                 "taskId": task_id, "agentId": agent_id, "artifactId": artifact_id,
             })
-            remaining = db.execute(
+            self._enqueue_supervisor_job_sync(db, team_id, "task.submitted", {
+                "taskId": task_id,
+                "agentId": agent_id,
+                "artifactId": artifact_id,
+            })
+            db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+            db.commit()
+        return artifact_id
+
+    async def apply_supervisor_decision(
+        self, team_id: str, job_id: str, supervisor_id: str, decision: SupervisorDecision
+    ) -> dict[str, Any]:
+        """Validate and commit all supervisor actions as one control-plane transaction."""
+
+        async with self._write_lock:
+            return await asyncio.to_thread(
+                self._apply_supervisor_decision_sync,
+                team_id,
+                job_id,
+                supervisor_id,
+                decision,
+            )
+
+    def _apply_supervisor_decision_sync(
+        self,
+        team_id: str,
+        job_id: str,
+        supervisor_id: str,
+        decision: SupervisorDecision,
+    ) -> dict[str, Any]:
+        timestamp = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute(
+                "SELECT * FROM supervisor_jobs WHERE id=? AND team_id=? AND status='running'",
+                (job_id, team_id),
+            ).fetchone()
+            team = db.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
+            if job is None or team is None:
+                raise ValueError("Supervisor job is no longer active")
+            if team["supervisor_agent_id"] != supervisor_id:
+                raise ValueError("Only the registered supervisor can apply this decision")
+
+            trigger_payload = json.loads(job["trigger_payload_json"])
+            reviewed_task_id = (
+                str(trigger_payload.get("taskId"))
+                if job["trigger_type"] == "task.submitted" and trigger_payload.get("taskId")
+                else None
+            )
+            reviewed = reviewed_task_id is None
+            finish_requested = False
+
+            def require_agent(agent_id: str | None) -> sqlite3.Row:
+                row = db.execute(
+                    "SELECT * FROM team_agents WHERE id=? AND team_id=?",
+                    (agent_id, team_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Agent is not registered in this Team: {agent_id}")
+                return row
+
+            def require_task(task_id: str | None) -> sqlite3.Row:
+                row = db.execute(
+                    "SELECT * FROM team_tasks WHERE id=? AND team_id=?",
+                    (task_id, team_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Task does not belong to this Team: {task_id}")
+                return row
+
+            for action in decision.actions:
+                if action.type == "approve_plan":
+                    self._append_event_sync(db, team_id, "supervisor.plan_approved", {
+                        "jobId": job_id,
+                        "reason": action.reason,
+                    })
+                    continue
+
+                if action.type == "accept_submission":
+                    task = require_task(action.task_id)
+                    if task["status"] != "submitted":
+                        raise ValueError(f"Task is not awaiting review: {task['id']}")
+                    artifact = db.execute(
+                        "SELECT * FROM artifacts WHERE id=COALESCE(?, id) AND task_id=? AND status='pending_review' ORDER BY created_at DESC LIMIT 1",
+                        (action.artifact_id, task["id"]),
+                    ).fetchone()
+                    if artifact is None:
+                        raise ValueError(f"Task has no pending Artifact: {task['id']}")
+                    db.execute("UPDATE artifacts SET status='accepted' WHERE id=?", (artifact["id"],))
+                    db.execute(
+                        "UPDATE team_tasks SET status='completed', error=NULL, updated_at=? WHERE id=?",
+                        (timestamp, task["id"]),
+                    )
+                    self._append_event_sync(db, team_id, "artifact.accepted", {
+                        "artifactId": artifact["id"],
+                        "taskId": task["id"],
+                        "supervisorAgentId": supervisor_id,
+                        "reason": action.reason,
+                    })
+                    self._append_event_sync(db, team_id, "task.completed", {
+                        "taskId": task["id"],
+                        "agentId": task["owner_agent_id"],
+                        "artifactId": artifact["id"],
+                        "acceptedBy": supervisor_id,
+                    })
+                    reviewed = reviewed or task["id"] == reviewed_task_id
+                    continue
+
+                if action.type == "request_revision":
+                    task = require_task(action.task_id)
+                    if task["status"] != "submitted":
+                        raise ValueError(f"Task is not awaiting review: {task['id']}")
+                    db.execute(
+                        "UPDATE artifacts SET status='revision_required' WHERE task_id=? AND status='pending_review'",
+                        (task["id"],),
+                    )
+                    db.execute(
+                        "UPDATE team_tasks SET status='pending', error=?, run_id=NULL, updated_at=? WHERE id=?",
+                        (action.reason, timestamp, task["id"]),
+                    )
+                    self._append_event_sync(db, team_id, "task.revision_requested", {
+                        "taskId": task["id"],
+                        "agentId": task["owner_agent_id"],
+                        "reason": action.reason,
+                    })
+                    reviewed = reviewed or task["id"] == reviewed_task_id
+                    continue
+
+                if action.type == "create_task":
+                    require_agent(action.assignee_agent_id)
+                    for dependency_id in action.depends_on:
+                        require_task(dependency_id)
+                    task_id = f"task_{uuid.uuid4().hex}"
+                    db.execute(
+                        """
+                        INSERT INTO team_tasks VALUES
+                        (?, ?, ?, ?, 'work', 'pending', ?, ?, ?, 0, 3, NULL, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            task_id,
+                            team_id,
+                            action.title,
+                            action.description,
+                            action.priority,
+                            action.assignee_agent_id,
+                            json.dumps(action.depends_on),
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    self._append_event_sync(db, team_id, "task.created", {
+                        "taskId": task_id,
+                        "title": action.title,
+                        "createdBy": supervisor_id,
+                    })
+                    self._append_event_sync(db, team_id, "task.assigned", {
+                        "taskId": task_id,
+                        "agentId": action.assignee_agent_id,
+                        "assignedBy": supervisor_id,
+                        "reason": action.reason,
+                    })
+                    continue
+
+                if action.type in {"assign_task", "reassign_task"}:
+                    task = require_task(action.task_id)
+                    require_agent(action.assignee_agent_id)
+                    if task["status"] not in {"pending", "ready", "failed"}:
+                        raise ValueError(f"Task cannot be assigned in state {task['status']}: {task['id']}")
+                    db.execute(
+                        "UPDATE team_tasks SET owner_agent_id=?, status='pending', error=NULL, updated_at=? WHERE id=?",
+                        (action.assignee_agent_id, timestamp, task["id"]),
+                    )
+                    self._append_event_sync(db, team_id, "task.assigned", {
+                        "taskId": task["id"],
+                        "agentId": action.assignee_agent_id,
+                        "assignedBy": supervisor_id,
+                        "reason": action.reason,
+                        "reassigned": action.type == "reassign_task",
+                    })
+                    continue
+
+                if action.type == "request_review":
+                    source = require_task(action.task_id)
+                    reviewer = require_agent(action.reviewer_agent_id)
+                    if source["status"] != "completed":
+                        raise ValueError("Cross-review can only reference an accepted task")
+                    review_id = f"task_{uuid.uuid4().hex}"
+                    db.execute(
+                        """
+                        INSERT INTO team_tasks VALUES
+                        (?, ?, ?, ?, 'review', 'pending', ?, ?, ?, 0, 3, NULL, NULL, NULL, ?, ?)
+                        """,
+                        (
+                            review_id,
+                            team_id,
+                            action.title or f"复核：{source['title']}",
+                            action.description or f"独立审查任务《{source['title']}》的 Artifact，指出问题并给出结论。",
+                            action.priority,
+                            reviewer["id"],
+                            json.dumps([source["id"]]),
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    self._append_event_sync(db, team_id, "task.created", {
+                        "taskId": review_id,
+                        "title": action.title or f"复核：{source['title']}",
+                        "createdBy": supervisor_id,
+                    })
+                    self._append_event_sync(db, team_id, "task.assigned", {
+                        "taskId": review_id,
+                        "agentId": reviewer["id"],
+                        "assignedBy": supervisor_id,
+                        "reason": action.reason,
+                    })
+                    continue
+
+                if action.type == "ask_human":
+                    message_id = f"mail_{uuid.uuid4().hex}"
+                    db.execute(
+                        "INSERT INTO mailbox_messages VALUES (?, ?, ?, 'user', 'supervisor_question', ?, '[]', 'sent', ?, NULL)",
+                        (message_id, team_id, supervisor_id, action.reason, timestamp),
+                    )
+                    self._append_event_sync(db, team_id, "supervisor.human_requested", {
+                        "jobId": job_id,
+                        "messageId": message_id,
+                        "reason": action.reason,
+                    })
+                    continue
+
+                if action.type == "finish_team":
+                    finish_requested = True
+                    continue
+
+                raise ValueError(f"Unsupported supervisor action: {action.type}")
+
+            if not reviewed:
+                raise ValueError("A task.submitted decision must accept or request revision for that task")
+            if job["trigger_type"] == "team.started":
+                unowned = db.execute(
+                    "SELECT COUNT(*) count FROM team_tasks WHERE team_id=? AND status IN ('pending','ready') AND owner_agent_id IS NULL",
+                    (team_id,),
+                ).fetchone()["count"]
+                if unowned:
+                    raise ValueError("The initial supervisor decision must assign every runnable task")
+
+            unfinished = db.execute(
                 "SELECT COUNT(*) count FROM team_tasks WHERE team_id=? AND status NOT IN ('completed','cancelled')",
                 (team_id,),
             ).fetchone()["count"]
-            if remaining == 0:
-                db.execute("UPDATE teams SET status='completed', updated_at=? WHERE id=?", (timestamp, team_id))
-                self._append_event_sync(db, team_id, "team.completed", {"artifactId": artifact_id})
+            if finish_requested:
+                if unfinished:
+                    raise ValueError("finish_team requires every task to be completed or cancelled")
+                db.execute(
+                    "UPDATE teams SET status='completed', updated_at=? WHERE id=?",
+                    (timestamp, team_id),
+                )
+                self._append_event_sync(db, team_id, "team.completed", {
+                    "supervisorAgentId": supervisor_id,
+                    "reason": next(
+                        action.reason for action in decision.actions if action.type == "finish_team"
+                    ),
+                })
             else:
                 db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+
+            db.execute(
+                "UPDATE supervisor_jobs SET status='completed', lease_until=NULL, decision_json=?, updated_at=? WHERE id=?",
+                (decision.model_dump_json(by_alias=True), timestamp, job_id),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='idle', updated_at=? WHERE id=?",
+                (timestamp, supervisor_id),
+            )
+            self._append_event_sync(db, team_id, "supervisor.decision_applied", {
+                "jobId": job_id,
+                "triggerType": job["trigger_type"],
+                "summary": decision.summary,
+                "actions": [
+                    action.model_dump(by_alias=True, exclude_none=True)
+                    for action in decision.actions
+                ],
+            })
             db.commit()
-        return artifact_id
+        snapshot = self._team_snapshot_sync(team_id)
+        if snapshot is None:
+            raise ValueError("Team disappeared after supervisor decision")
+        return snapshot
+
+    async def record_artifact_publication(
+        self, team_id: str, artifact_id: str, workspace_path: Path
+    ) -> None:
+        """Attach the verified filesystem publication to its accepted Artifact."""
+
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._record_artifact_publication_sync,
+                team_id,
+                artifact_id,
+                workspace_path,
+            )
+
+    def _record_artifact_publication_sync(
+        self, team_id: str, artifact_id: str, workspace_path: Path
+    ) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            artifact = db.execute(
+                "SELECT task_id, status, workspace_path FROM artifacts WHERE id=? AND team_id=?",
+                (artifact_id, team_id),
+            ).fetchone()
+            if artifact is None or artifact["status"] != "accepted":
+                raise ValueError("Only an accepted Team Artifact can be published")
+            resolved = str(workspace_path.resolve())
+            if artifact["workspace_path"] == resolved:
+                return
+            db.execute(
+                "UPDATE artifacts SET workspace_path=? WHERE id=?",
+                (resolved, artifact_id),
+            )
+            self._append_event_sync(db, team_id, "artifact.published", {
+                "artifactId": artifact_id,
+                "taskId": artifact["task_id"],
+                "workspacePath": resolved,
+            })
+            db.commit()
+
+    async def fail_supervisor_job(
+        self, team_id: str, job_id: str, supervisor_id: str, error: str
+    ) -> None:
+        """Retry invalid decisions, then pause instead of silently dropping control."""
+
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._fail_supervisor_job_sync, team_id, job_id, supervisor_id, error
+            )
+
+    def _fail_supervisor_job_sync(
+        self, team_id: str, job_id: str, supervisor_id: str, error: str
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute(
+                "SELECT attempt, max_attempts FROM supervisor_jobs WHERE id=? AND team_id=? AND status='running'",
+                (job_id, team_id),
+            ).fetchone()
+            if job is None:
+                return
+            retry = int(job["attempt"]) < int(job["max_attempts"])
+            next_status = "pending" if retry else "failed"
+            db.execute(
+                "UPDATE supervisor_jobs SET status=?, lease_until=NULL, error=?, updated_at=? WHERE id=?",
+                (next_status, error[:4000], timestamp, job_id),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='idle', updated_at=? WHERE id=?",
+                (timestamp, supervisor_id),
+            )
+            if not retry:
+                db.execute(
+                    "UPDATE teams SET status='paused', updated_at=? WHERE id=?",
+                    (timestamp, team_id),
+                )
+            self._append_event_sync(db, team_id, "supervisor.decision_failed", {
+                "jobId": job_id,
+                "error": error[:1000],
+                "willRetry": retry,
+            })
+            db.commit()
+
+    async def interrupt_supervisor_job(
+        self, team_id: str, job_id: str, supervisor_id: str, reason: str
+    ) -> None:
+        """Requeue a process-owned control run without counting a bad decision."""
+
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._interrupt_supervisor_job_sync,
+                team_id,
+                job_id,
+                supervisor_id,
+                reason,
+            )
+
+    def _interrupt_supervisor_job_sync(
+        self, team_id: str, job_id: str, supervisor_id: str, reason: str
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                UPDATE supervisor_jobs
+                SET status='pending', attempt=MAX(0, attempt - 1), lease_until=NULL,
+                    run_id=NULL, error=?, updated_at=?
+                WHERE id=? AND team_id=? AND status='running'
+                """,
+                (reason[:4000], timestamp, job_id, team_id),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='idle', updated_at=? WHERE id=? AND team_id=?",
+                (timestamp, supervisor_id, team_id),
+            )
+            self._append_event_sync(db, team_id, "supervisor.interrupted", {
+                "jobId": job_id,
+                "reason": reason[:1000],
+                "requeued": True,
+            })
+            db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+            db.commit()
 
     async def fail_task(self, team_id: str, task_id: str, agent_id: str, error: str) -> None:
         async with self._write_lock:
@@ -727,6 +1445,54 @@ class TeamStore:
             db.execute("UPDATE team_agents SET status='idle', updated_at=? WHERE id=?", (timestamp, agent_id))
             self._append_event_sync(db, team_id, "run.failed", {
                 "taskId": task_id, "agentId": agent_id, "error": error[:1000], "willRetry": next_status == "pending",
+            })
+            if next_status == "failed":
+                self._append_event_sync(db, team_id, "task.failed", {
+                    "taskId": task_id,
+                    "agentId": agent_id,
+                    "error": error[:1000],
+                })
+                self._enqueue_supervisor_job_sync(db, team_id, "task.failed", {
+                    "taskId": task_id,
+                    "agentId": agent_id,
+                })
+            db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+            db.commit()
+
+    async def interrupt_task(
+        self, team_id: str, task_id: str, agent_id: str, reason: str
+    ) -> None:
+        """Return a process-cancelled run to the queue without spending an attempt."""
+
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._interrupt_task_sync, team_id, task_id, agent_id, reason
+            )
+
+    def _interrupt_task_sync(
+        self, team_id: str, task_id: str, agent_id: str, reason: str
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                UPDATE team_tasks
+                SET status='pending', attempt=MAX(0, attempt - 1), lease_until=NULL,
+                    run_id=NULL, error=?, updated_at=?
+                WHERE id=? AND team_id=? AND owner_agent_id=? AND status='running'
+                """,
+                (reason[:4000], timestamp, task_id, team_id, agent_id),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='idle', updated_at=? WHERE id=? AND team_id=?",
+                (timestamp, agent_id, team_id),
+            )
+            self._append_event_sync(db, team_id, "run.interrupted", {
+                "taskId": task_id,
+                "agentId": agent_id,
+                "reason": reason[:1000],
+                "requeued": True,
             })
             db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
             db.commit()
@@ -759,8 +1525,28 @@ class TeamStore:
                         (timestamp, row["owner_agent_id"]),
                     )
                 self._append_event_sync(db, row["team_id"], "run.recovered", {"taskId": row["id"]})
+            supervisor_rows = db.execute(
+                "SELECT team_id, id FROM supervisor_jobs WHERE status='running' AND lease_until IS NOT NULL AND lease_until < ?",
+                (timestamp,),
+            ).fetchall()
+            for row in supervisor_rows:
+                team = db.execute(
+                    "SELECT supervisor_agent_id FROM teams WHERE id=?", (row["team_id"],)
+                ).fetchone()
+                db.execute(
+                    "UPDATE supervisor_jobs SET status='pending', lease_until=NULL, run_id=NULL, error='Previous supervisor lease expired; queued for recovery', updated_at=? WHERE id=?",
+                    (timestamp, row["id"]),
+                )
+                if team and team["supervisor_agent_id"]:
+                    db.execute(
+                        "UPDATE team_agents SET status='idle', updated_at=? WHERE id=?",
+                        (timestamp, team["supervisor_agent_id"]),
+                    )
+                self._append_event_sync(db, row["team_id"], "supervisor.recovered", {
+                    "jobId": row["id"]
+                })
             db.commit()
-            return len(rows)
+            return len(rows) + len(supervisor_rows)
 
     def _running_team_ids_sync(self) -> list[str]:
         with self._connect() as db:

@@ -138,6 +138,35 @@ class Settings(BaseSettings):
     local_tool_workspace_root: str = Field(default=".", alias="LOCAL_TOOL_WORKSPACE_ROOT")
     local_tool_bash_timeout_seconds: float = Field(default=30.0, alias="LOCAL_TOOL_BASH_TIMEOUT_SECONDS")
     local_tool_max_output_chars: int = Field(default=50000, alias="LOCAL_TOOL_MAX_OUTPUT_CHARS")
+    # One provider-neutral default controls outbound access for K Agent, Codex,
+    # and Claude Code. A run may override it with agentOptions.networkAccess;
+    # filesystem sandboxing remains enabled independently of this switch.
+    network_access_default: bool = Field(
+        default=True, alias="NETWORK_ACCESS_DEFAULT"
+    )
+    # Claude Code runs headlessly inside K Agent. Routine built-ins stay inside
+    # the configured filesystem/network sandbox and should not interrupt Team
+    # execution with approval cards; unknown/MCP tools still go through approval.
+    claude_auto_approve_tools: list[str] = Field(
+        default_factory=lambda: [
+            "Bash",
+            "Read",
+            "Edit",
+            "Write",
+            "Glob",
+            "Grep",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "TodoWrite",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
+            "Skill",
+        ],
+        alias="CLAUDE_AUTO_APPROVE_TOOLS",
+    )
     # Bash is the one tool that cannot be confined by path checks, so it is run
     # under an OS sandbox when the host provides one. `auto` degrades to an
     # unsandboxed run and says so in the tool result; `required` fails instead.
@@ -145,9 +174,11 @@ class Settings(BaseSettings):
         default="auto", alias="BASH_SANDBOX_MODE"
     )
     bash_sandbox_command: str = Field(default="srt", alias="BASH_SANDBOX_COMMAND")
-    # Empty means no network at all: srt's network policy is allow-only.
+    # `*` keeps the default network policy unrestricted while still running Bash
+    # inside the filesystem sandbox. Replace it with concrete domains to turn
+    # the K Agent Bash path into an allowlist without changing the global switch.
     bash_sandbox_allowed_domains: list[str] = Field(
-        default_factory=list, alias="BASH_SANDBOX_ALLOWED_DOMAINS"
+        default_factory=lambda: ["*"], alias="BASH_SANDBOX_ALLOWED_DOMAINS"
     )
     bash_sandbox_write_paths: list[str] = Field(
         default_factory=list, alias="BASH_SANDBOX_WRITE_PATHS"

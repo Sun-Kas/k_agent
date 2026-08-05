@@ -18,6 +18,17 @@ $K_AGENT_HOME/
       {session_id}/
         {session_id}.json    # conversation + AG-UI log
         workspace/           # per-session cwd for CLI agents / tools
+    teams/
+      team_runtime.db        # durable Team control plane
+      {team_id}/
+        workspace/           # default Team workspace; accepted deliverables only
+          artifacts/{task_id}/{artifact_id}/
+        tasks/{task_id}/
+          manifest.json      # task/run/file lineage
+          input/             # task, mailbox, dependency Artifact metadata
+          output/            # task-local Agent cwd + dependency file snapshots
+          artifacts/         # readable copies of submitted Artifact text
+          logs/              # raw provider event stream by run
   content/
     memory/                  # durable MEMORY.md
     skills/                  # installed Skill packages
@@ -113,9 +124,25 @@ def session_workspace_dir(session_id: str) -> Path:
 
 
 def team_workspace_dir(team_id: str, agent_id: str) -> Path:
-    """Return the workspace owned by one Agent Team member."""
+    """Return the legacy Agent-owned Team workspace path.
+
+    New Team runs use task-scoped directories instead. Keep this resolver for
+    old snapshots and callers that need to inspect pre-migration workspaces.
+    """
 
     return teams_dir() / team_id / "workspaces" / agent_id
+
+
+def team_task_dir(team_id: str, task_id: str) -> Path:
+    """Return the durable file bundle owned by one Team task."""
+
+    return teams_dir() / team_id / "tasks" / task_id
+
+
+def team_task_output_dir(team_id: str, task_id: str) -> Path:
+    """Return the task-local cwd exposed to its assigned Agent."""
+
+    return team_task_dir(team_id, task_id) / "output"
 
 
 def memory_dir() -> Path:

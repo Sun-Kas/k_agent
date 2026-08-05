@@ -31,9 +31,15 @@ from backend.prompts import (
     reset_prompt_caches,
 )
 from backend.runners import RunnerContext, build_default_registry
+from backend.runners.network_policy import network_access_enabled
 from backend.runners.detect import detect_agents_payload
 from backend.tools import load_local_tools
-from backend.tools.workspace import reset_tool_workspace, set_tool_workspace
+from backend.tools.workspace import (
+    reset_tool_network_access,
+    reset_tool_workspace,
+    set_tool_network_access,
+    set_tool_workspace,
+)
 from backend.watchers import PollingChangeWatcher
 
 
@@ -275,6 +281,7 @@ def create_app() -> FastAPI:
                 approval_broker=app.state.approvals,
             )
             workspace_token = set_tool_workspace(ctx.workspace_dir)
+            network_token = set_tool_network_access(network_access_enabled(ctx))
             try:
                 runner = app.state.runner_registry.get(agent_kind)
                 async for event in app.state.approvals.stream(
@@ -312,6 +319,7 @@ def create_app() -> FastAPI:
                 )
                 raise
             finally:
+                reset_tool_network_access(network_token)
                 reset_tool_workspace(workspace_token)
                 log_event(
                     "agent.stream.closed",

@@ -61,14 +61,23 @@ $K_AGENT_HOME/        默认 ~/.k_agent，可用环境变量改到项目内 .k_a
 
 Access Layer 同时提供持久化 Agent Team Control Plane。打开侧栏中的
 “Agent Team”即可创建由 `k_agent`、`codex`、`claude_code` 任意组合的团队，
-并为每个成员独立选择模型、MCP 和 Skill。Team 的任务、Mailbox、Artifact
-和事件序列保存在 `$K_AGENT_HOME/state/teams/team_runtime.db`；单个 Worker
-Run 仍由无状态 Agent Backend 执行。
+并为每个成员独立选择模型、MCP 和 Skill。创建 Team 时会明确一个团队工作空间；
+留空则使用 `$K_AGENT_HOME/state/teams/{teamId}/workspace/`。Team 的任务、
+Mailbox、Artifact 和事件序列保存在 `$K_AGENT_HOME/state/teams/team_runtime.db`；
+单个 Worker Run 仍由无状态 Agent Backend 执行。
 
-Team Scheduler 使用独立并发池，不获取公开对话的 same-session lock。编码
-Agent 首次运行时会优先创建独立 detached Git worktree；如果当前目录不是 Git
-仓库，则退化为独立目录。普通工具失败只结束对应工具调用或 Task Attempt，
-不会清空 Team 的其它任务和 Artifact。
+新 Team 采用持久化 Supervisor Loop：初始计划、成员提交、最终失败和用户补充
+指令都会进入主管队列。Worker 结束后 Task 先进入 `submitted`，Artifact 先进入
+`pending_review`；只有主管的结构化决策通过 Access Layer 校验并事务提交后，
+任务才会变成 `completed`。验收后的文本、元数据和任务输出文件会发布到
+`{workspaceDir}/artifacts/{taskId}/{artifactId}/`；后续 Agent 通过 Artifact URI
+和任务目录中的只读快照消费成果，不直接并发修改团队工作空间。
+
+Team Scheduler 使用独立并发池，不获取公开对话的 same-session lock。每次任务
+在 `$K_AGENT_HOME/state/teams/{teamId}/tasks/{taskId}/` 下创建普通任务目录，
+其中 `output/` 是该次运行唯一可写的工作目录；系统不会复制当前仓库，也不会
+自动创建 Git worktree。普通工具失败只结束对应工具调用或 Task Attempt，不会
+清空 Team 的其它任务和 Artifact。
 
 ```env
 TEAM_RUNTIME_ENABLED=true

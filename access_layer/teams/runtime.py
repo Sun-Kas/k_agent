@@ -7,12 +7,14 @@ from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
+import shutil
 import time
 from typing import Any
 import uuid
 
 from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import RuntimeCatalog
+from access_layer.teams.models import SupervisorDecision
 from access_layer.teams.store import TeamStore
 
 
@@ -28,7 +30,6 @@ class TeamRuntime:
         store: TeamStore,
         backend_client: AgentBackendClient,
         runtime_catalog: RuntimeCatalog,
-        project_root: Path,
         max_active_runs: int = 8,
         task_lease_seconds: int = 120,
         enabled: bool = True,
@@ -36,7 +37,6 @@ class TeamRuntime:
         self.store = store
         self._backend_client = backend_client
         self._runtime_catalog = runtime_catalog
-        self._project_root = project_root.resolve()
         self._semaphore = asyncio.Semaphore(max_active_runs)
         self._task_lease_seconds = task_lease_seconds
         self.enabled = enabled
@@ -49,6 +49,7 @@ class TeamRuntime:
 
         await self.store.initialize()
         await self.store.recover_expired_leases()
+        await self._reconcile_artifact_publications()
         self._stopping = False
         if not self.enabled:
             return
@@ -88,6 +89,25 @@ class TeamRuntime:
         # A Team has its own maxParallel and the global semaphore bounds total
         # provider pressure. Claiming happens before spawning so two loops can
         # never dispatch the same task.
+        supervisor_key = f"supervisor:{team_id}"
+        if supervisor_key in self._active:
+            return
+        if supervisor_key not in self._active:
+            control = await self.store.claim_supervisor_job(
+                team_id, self._task_lease_seconds
+            )
+            if control is not None:
+                control_task = asyncio.create_task(
+                    self._run_supervisor(control), name=f"team-{supervisor_key}"
+                )
+                self._active[supervisor_key] = control_task
+                control_task.add_done_callback(
+                    lambda _done, key=supervisor_key: self._active.pop(key, None)
+                )
+                return
+        if await self.store.has_supervisor_work(team_id):
+            return
+
         while not self._stopping:
             claimed = await self.store.claim_next_task(team_id, self._task_lease_seconds)
             if claimed is None:
@@ -107,11 +127,12 @@ class TeamRuntime:
         task_id = str(task["id"])
         agent_id = str(agent["id"])
         run_id = str(claimed["runId"])
+        task_dir = self.store.database_path.parent / team_id / "tasks" / task_id
         async with self._semaphore:
             try:
-                workspace = Path(agent["workspaceDir"])
-                await self._prepare_workspace(team_id, agent_id, workspace)
                 context = await self.store.task_context(team_id, task_id)
+                workspace = task_dir / "output"
+                self._prepare_task_directory(task_dir, context, agent, run_id)
                 mcp_ids = list(agent["capabilities"].get("mcpServerIds", []))
                 skill_ids = list(agent["capabilities"].get("skillIds", []))
                 mcp_servers, skills = self._runtime_catalog.selected_runtime(mcp_ids, skill_ids)
@@ -134,62 +155,397 @@ class TeamRuntime:
                     mcp_servers=mcp_servers,
                     skills=skills,
                     workspace=workspace,
+                    run_log=task_dir / "logs" / f"{run_id}.ndjson",
                 )
                 if not text.strip():
                     text = "Agent 已完成运行，但没有返回可保存的文本成果。"
-                artifact_id = await self.store.complete_task(
+                artifact_id = await self.store.submit_task(
                     team_id, task_id, agent_id, text.strip()
                 )
+                self._write_task_result(task_dir, artifact_id, text.strip())
                 await self.store.send_message(
                     team_id,
                     agent_id,
                     str(team.get("supervisor_agent_id") or "broadcast"),
                     "artifact_ready",
-                    f"任务《{task['title']}》已完成，成果见 Artifact。",
+                    f"任务《{task['title']}》已提交，成果见待验收 Artifact。",
                     [artifact_id],
                 )
             except asyncio.CancelledError:
-                await self.store.fail_task(
+                self._update_manifest(task_dir, status="pending", error="Team Runtime stopped during this run")
+                await self.store.interrupt_task(
                     team_id, task_id, agent_id, "Team Runtime stopped during this run"
                 )
                 raise
             except Exception as exc:
                 logger.exception("Team task failed: team=%s task=%s", team_id, task_id)
+                self._update_manifest(task_dir, status="failed", error=str(exc))
                 await self.store.fail_task(team_id, task_id, agent_id, str(exc))
 
-    async def _prepare_workspace(self, team_id: str, agent_id: str, workspace: Path) -> None:
-        """Create a detached worktree when possible, otherwise an isolated directory."""
+    async def _run_supervisor(self, control: dict[str, Any]) -> None:
+        """Wake the manager only at a durable scheduling boundary."""
 
-        if workspace.exists():
-            workspace.mkdir(parents=True, exist_ok=True)
-            return
-        workspace.parent.mkdir(parents=True, exist_ok=True)
-        if (self._project_root / ".git").exists():
-            process = await asyncio.create_subprocess_exec(
-                "git", "worktree", "add", "--detach", str(workspace), "HEAD",
-                cwd=str(self._project_root),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        team = control["team"]
+        job = control["job"]
+        supervisor = control["supervisor"]
+        team_id = str(team["id"])
+        job_id = str(job["id"])
+        supervisor_id = str(supervisor["id"])
+        run_id = str(control["runId"])
+        control_dir = self.store.database_path.parent / team_id / "supervisor" / job_id
+        staged_publications: list[tuple[str, Path, Path]] = []
+        async with self._semaphore:
+            try:
+                context = await self.store.supervisor_context(team_id, job_id)
+                control_dir.mkdir(parents=True, exist_ok=True)
+                prompt = self._supervisor_prompt(
+                    context,
+                    trigger_type=str(job["triggerType"]),
+                    trigger_payload=control.get("triggerPayload", {}),
+                    previous_error=job.get("error"),
+                )
+                text = await self._stream_agent(
+                    team_id=team_id,
+                    task_id=job_id,
+                    agent_id=supervisor_id,
+                    run_id=run_id,
+                    request_id=f"team-supervisor-{uuid.uuid4().hex}",
+                    prompt=prompt,
+                    agent=supervisor,
+                    # Scheduling is a control-plane operation. It must not gain
+                    # side-effecting MCP/Skill authority from a worker profile.
+                    mcp_servers=[],
+                    skills=[],
+                    workspace=control_dir,
+                    run_log=control_dir / "run.ndjson",
+                )
+                decision = self._parse_supervisor_decision(text)
+                (control_dir / "decision.json").write_text(
+                    decision.model_dump_json(by_alias=True, indent=2), encoding="utf-8"
+                )
+                staged_publications = self._stage_decision_artifacts(
+                    context["team"], decision, job_id
+                )
+                await self.store.apply_supervisor_decision(
+                    team_id, job_id, supervisor_id, decision
+                )
+                await self._finalize_artifact_publications(
+                    team_id, staged_publications
+                )
+                try:
+                    self._sync_supervisor_manifests(team_id, decision)
+                except Exception:
+                    # SQLite is authoritative. A readable task-local mirror
+                    # failing after commit must not replay control mutations.
+                    logger.exception(
+                        "Could not update task manifest after supervisor commit: team=%s job=%s",
+                        team_id,
+                        job_id,
+                    )
+            except asyncio.CancelledError:
+                await self.store.interrupt_supervisor_job(
+                    team_id, job_id, supervisor_id, "Team Runtime stopped during supervisor decision"
+                )
+                raise
+            except Exception as exc:
+                self._discard_staged_publications(staged_publications)
+                logger.exception(
+                    "Supervisor decision failed: team=%s job=%s", team_id, job_id
+                )
+                await self.store.fail_supervisor_job(
+                    team_id, job_id, supervisor_id, str(exc)
+                )
+
+    def _stage_decision_artifacts(
+        self,
+        team: dict[str, Any],
+        decision: SupervisorDecision,
+        job_id: str,
+    ) -> list[tuple[str, Path, Path]]:
+        """Copy candidate files into the Team workspace before accepting state."""
+
+        artifacts = list(team.get("artifacts") or [])
+        staged: list[tuple[str, Path, Path]] = []
+        for action in decision.actions:
+            if action.type != "accept_submission" or not action.task_id:
+                continue
+            artifact = next(
+                (
+                    item
+                    for item in artifacts
+                    if item["taskId"] == action.task_id
+                    and item["status"] == "pending_review"
+                    and (action.artifact_id is None or item["id"] == action.artifact_id)
+                ),
+                None,
             )
-            stdout, stderr = await process.communicate()
-            if process.returncode == 0:
-                await self.store.append_event(team_id, "workspace.created", {
-                    "agentId": agent_id,
-                    "mode": "worktree",
-                    "path": str(workspace),
-                })
-                return
-            logger.warning(
-                "Worktree creation failed for %s: %s",
-                agent_id,
-                stderr.decode("utf-8", errors="replace")[:1000],
+            if artifact is None:
+                raise ValueError(f"No pending Artifact to publish for task {action.task_id}")
+            staged.append(self._stage_artifact(team, artifact, job_id))
+        return staged
+
+    def _stage_artifact(
+        self, team: dict[str, Any], artifact: dict[str, Any], staging_key: str
+    ) -> tuple[str, Path, Path]:
+        """Create a complete same-filesystem staging bundle for atomic promotion."""
+
+        workspace = self._ensure_team_workspace(team)
+        artifact_id = str(artifact["id"])
+        task_id = str(artifact["taskId"])
+        staging = workspace / ".k_agent-staging" / staging_key / artifact_id
+        final_path = workspace / "artifacts" / task_id / artifact_id
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+        source_output = (
+            self.store.database_path.parent / str(team["id"]) / "tasks" / task_id / "output"
+        )
+        if source_output.is_dir():
+            shutil.copytree(
+                source_output,
+                staging / "files",
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(".team-input"),
             )
+        (staging / "result.md").write_text(
+            str(artifact.get("content") or ""), encoding="utf-8"
+        )
+        (staging / "artifact.json").write_text(
+            json.dumps(
+                {
+                    "artifactId": artifact_id,
+                    "taskId": task_id,
+                    "teamId": team["id"],
+                    "title": artifact["title"],
+                    "kind": artifact["kind"],
+                    "sha256": artifact["sha256"],
+                    "uri": artifact["uri"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return artifact_id, staging, final_path
+
+    @staticmethod
+    def _ensure_team_workspace(team: dict[str, Any]) -> Path:
+        """Create/verify the Team marker before publishing any accepted files."""
+
+        workspace = Path(str(team["workspaceDir"])).expanduser().resolve()
         workspace.mkdir(parents=True, exist_ok=True)
-        await self.store.append_event(team_id, "workspace.created", {
-            "agentId": agent_id,
-            "mode": "directory",
-            "path": str(workspace),
-        })
+        marker_path = workspace / ".k_agent-team.json"
+        if marker_path.is_file():
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if marker.get("teamId") != team["id"]:
+                raise ValueError("Team workspace marker belongs to another Team")
+        else:
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "teamId": team["id"],
+                        "teamName": team["name"],
+                        "artifactDirectory": "artifacts",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return workspace
+
+    async def _finalize_artifact_publications(
+        self, team_id: str, publications: list[tuple[str, Path, Path]]
+    ) -> None:
+        """Promote staged bundles before releasing the supervisor dispatch gate."""
+
+        for artifact_id, staging, final_path in publications:
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            else:
+                staging.replace(final_path)
+            await self.store.record_artifact_publication(
+                team_id, artifact_id, final_path
+            )
+        self._discard_staged_publications(publications)
+
+    @staticmethod
+    def _discard_staged_publications(
+        publications: list[tuple[str, Path, Path]]
+    ) -> None:
+        for _artifact_id, staging, _final_path in publications:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    async def _reconcile_artifact_publications(self) -> None:
+        """Publish accepted legacy Artifacts that predate workspace paths."""
+
+        for summary in await self.store.list_teams():
+            team = await self.store.get_team(str(summary["id"]))
+            if team is None:
+                continue
+            try:
+                self._ensure_team_workspace(team)
+            except Exception:
+                logger.exception("Could not initialize Team workspace: team=%s", team["id"])
+                continue
+            for artifact in team["artifacts"]:
+                if artifact["status"] != "accepted" or artifact.get("workspacePath"):
+                    continue
+                staged: list[tuple[str, Path, Path]] = []
+                try:
+                    staged.append(
+                        self._stage_artifact(team, artifact, f"reconcile-{artifact['id']}")
+                    )
+                    await self._finalize_artifact_publications(team["id"], staged)
+                except Exception:
+                    self._discard_staged_publications(staged)
+                    logger.exception(
+                        "Could not publish legacy Artifact: team=%s artifact=%s",
+                        team["id"],
+                        artifact["id"],
+                    )
+
+    def _sync_supervisor_manifests(
+        self, team_id: str, decision: SupervisorDecision
+    ) -> None:
+        """Mirror accepted/revision state into non-authoritative task bundles."""
+
+        tasks_root = self.store.database_path.parent / team_id / "tasks"
+        for action in decision.actions:
+            if not action.task_id:
+                continue
+            task_dir = tasks_root / action.task_id
+            if action.type == "accept_submission":
+                self._update_manifest(
+                    task_dir,
+                    status="completed",
+                    artifact_id=action.artifact_id,
+                )
+            elif action.type == "request_revision":
+                self._update_manifest(
+                    task_dir,
+                    status="revision_required",
+                    error=action.reason,
+                )
+
+    def _prepare_task_directory(
+        self,
+        task_dir: Path,
+        context: dict[str, Any],
+        agent: dict[str, Any],
+        run_id: str,
+    ) -> None:
+        """Materialize one non-code task bundle without copying the repository."""
+
+        input_dir = task_dir / "input"
+        artifact_input_dir = input_dir / "artifacts"
+        output_dir = task_dir / "output"
+        runtime_artifact_dir = output_dir / ".team-input" / "artifacts"
+        for directory in (artifact_input_dir, runtime_artifact_dir, task_dir / "artifacts", task_dir / "logs"):
+            directory.mkdir(parents=True, exist_ok=True)
+
+        task = context["task"]
+        team = context["team"]
+        (input_dir / "task.json").write_text(
+            json.dumps(
+                {
+                    "teamId": team["id"],
+                    "teamGoal": team["goal"],
+                    "teamWorkspace": team["workspace_dir"],
+                    "task": task,
+                    "agent": {
+                        "id": agent["id"],
+                        "name": agent["name"],
+                        "role": agent["role"],
+                        "responsibility": agent["responsibility"],
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        (input_dir / "mailbox.json").write_text(
+            json.dumps(context["mailbox"], ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        for artifact in context["artifacts"]:
+            artifact_id = str(artifact["id"])
+            (artifact_input_dir / f"{artifact_id}.md").write_text(
+                f"# {artifact['title']}\n\nURI: {artifact['uri']}\n\n{artifact['content']}",
+                encoding="utf-8",
+            )
+            published_path = artifact.get("workspacePath")
+            if published_path and Path(str(published_path)).is_dir():
+                shutil.copytree(
+                    Path(str(published_path)),
+                    runtime_artifact_dir / artifact_id,
+                    dirs_exist_ok=True,
+                )
+        manifest = {
+            "schemaVersion": 1,
+            "teamId": team["id"],
+            "taskId": task["id"],
+            "runId": run_id,
+            "agentId": agent["id"],
+            "status": "running",
+            "inputArtifacts": [artifact["uri"] for artifact in context["artifacts"]],
+            "inputArtifactFiles": {
+                artifact["id"]: f"output/.team-input/artifacts/{artifact['id']}"
+                for artifact in context["artifacts"]
+                if artifact.get("workspacePath")
+            },
+            "outputDirectory": "output",
+            "artifactDirectory": "artifacts",
+            "logFile": f"logs/{run_id}.ndjson",
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        (task_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _write_task_result(self, task_dir: Path, artifact_id: str, content: str) -> None:
+        """Keep a readable submitted copy beside the authoritative SQLite Artifact."""
+
+        artifact_dir = task_dir / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / f"{artifact_id}.md").write_text(content, encoding="utf-8")
+        self._update_manifest(task_dir, status="submitted", artifact_id=artifact_id)
+
+    @staticmethod
+    def _update_manifest(
+        task_dir: Path,
+        *,
+        status: str,
+        artifact_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Update recoverable task metadata without making files the state authority."""
+
+        manifest_path = task_dir / "manifest.json"
+        if not manifest_path.exists():
+            return
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = status
+        manifest["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        if artifact_id is not None:
+            manifest["artifactId"] = artifact_id
+        if error is not None:
+            manifest["error"] = error[:4000]
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _append_run_log(path: Path, event: dict[str, Any]) -> None:
+        """Append the original provider event for task-local audit and recovery."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
 
     def _task_prompt(self, context: dict[str, Any], agent: dict[str, Any]) -> str:
         team = context["team"]
@@ -198,7 +554,13 @@ class TeamRuntime:
         for artifact in context["artifacts"]:
             content = str(artifact.get("content") or "")
             artifact_parts.append(
-                f"### {artifact['uri']} — {artifact['title']}\n{content[:60_000]}"
+                f"### {artifact['uri']} — {artifact['title']}\n"
+                + (
+                    f"已验收文件快照：.team-input/artifacts/{artifact['id']}\n"
+                    if artifact.get("workspacePath")
+                    else ""
+                )
+                + content[:60_000]
             )
         mailbox_parts = [
             f"- {message['senderId']}: {message['content']}"
@@ -209,6 +571,7 @@ class TeamRuntime:
             for part in [
                 "[K Agent Team Runtime]",
                 f"团队目标：{team['goal']}",
+                f"团队工作空间：{team['workspace_dir']}（只有主管验收后的产物会发布到这里）",
                 f"你的身份：{agent['name']} / {agent['role']}",
                 f"职责边界：{agent['responsibility'] or '完成当前被分配任务'}",
                 f"当前任务：{task['title']}\n{task['description']}",
@@ -221,6 +584,121 @@ class TeamRuntime:
             ]
             if part
         )
+
+    def _supervisor_prompt(
+        self,
+        context: dict[str, Any],
+        *,
+        trigger_type: str,
+        trigger_payload: dict[str, Any],
+        previous_error: str | None,
+    ) -> str:
+        """Build a bounded scheduling prompt whose only authority is JSON actions."""
+
+        team = context["team"]
+        agents = [
+            {
+                "id": agent["id"],
+                "name": agent["name"],
+                "role": agent["role"],
+                "agentKind": agent["agentKind"],
+                "responsibility": agent["responsibility"],
+                "status": agent["status"],
+                "capabilities": agent["capabilities"],
+                "isSupervisor": agent["isSupervisor"],
+            }
+            for agent in team["agents"]
+        ]
+        tasks = [
+            {
+                "id": task["id"],
+                "title": task["title"],
+                "description": task["description"],
+                "taskType": task["taskType"],
+                "status": task["status"],
+                "ownerAgentId": task["ownerAgentId"],
+                "dependsOn": task["dependsOn"],
+                "attempt": task["attempt"],
+                "error": task["error"],
+            }
+            for task in team["tasks"]
+        ]
+        artifacts = [
+            {
+                "id": artifact["id"],
+                "taskId": artifact["taskId"],
+                "agentId": artifact["agentId"],
+                "title": artifact["title"],
+                "status": artifact["status"],
+                "uri": artifact["uri"],
+                "content": str(artifact["content"])[:60_000],
+            }
+            for artifact in team["artifacts"]
+            if artifact["status"] in {"pending_review", "accepted"}
+        ]
+        mailbox = [
+            {
+                "senderId": message["senderId"],
+                "recipientId": message["recipientId"],
+                "messageType": message["messageType"],
+                "content": message["content"],
+                "artifactIds": message["artifactIds"],
+            }
+            for message in team["mailbox"][:30]
+        ]
+        state = {
+            "team": {
+                "id": team["id"],
+                "goal": team["goal"],
+                "mode": team["mode"],
+                "workspaceDir": team["workspaceDir"],
+            },
+            "trigger": {"type": trigger_type, "payload": trigger_payload},
+            "agents": agents,
+            "tasks": tasks,
+            "artifacts": artifacts,
+            "mailbox": mailbox,
+        }
+        return "\n\n".join(
+            part
+            for part in [
+                "[K Agent Team Supervisor Control Loop]",
+                "你是团队主管。你只在任务级调度边界做决策，不复述 Artifact，也不执行成员任务。",
+                (
+                    "可用 action type：approve_plan、accept_submission、request_revision、"
+                    "create_task、assign_task、reassign_task、request_review、ask_human、finish_team。"
+                ),
+                (
+                    "规则：task.submitted 必须对触发 taskId 执行 accept_submission 或 request_revision；"
+                    "team.started 必须为所有未分配任务执行 assign_task；后续任务使用 dependsOn 引用前置任务，"
+                    "系统会把已验收 Artifact 原样提供给下一个 Agent；只有全部任务完成后才能 finish_team。"
+                ),
+                (
+                    "只输出一个 JSON 对象，不要 Markdown 代码块或额外文字。格式："
+                    '{"summary":"决策摘要","actions":[{"type":"...","taskId":"...",'
+                    '"artifactId":"...","assigneeAgentId":"...","reviewerAgentId":"...",'
+                    '"title":"...","description":"...","dependsOn":[],"priority":50,"reason":"..."}]}'
+                ),
+                f"上一次决策校验错误：{previous_error}" if previous_error else "",
+                "当前控制状态：\n" + json.dumps(state, ensure_ascii=False, default=str),
+            ]
+            if part
+        )
+
+    @staticmethod
+    def _parse_supervisor_decision(text: str) -> SupervisorDecision:
+        """Accept plain or fenced JSON while rejecting surrounding prose/actions."""
+
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            lines = candidate.splitlines()
+            if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+                candidate = "\n".join(lines[1:-1]).strip()
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Supervisor must return one valid JSON decision object") from exc
+        return SupervisorDecision.model_validate(payload)
 
     async def _stream_agent(
         self,
@@ -235,6 +713,7 @@ class TeamRuntime:
         mcp_servers: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         workspace: Path,
+        run_log: Path | None = None,
     ) -> str:
         chunks: list[str] = []
         pending_output: list[str] = []
@@ -256,7 +735,14 @@ class TeamRuntime:
             "reasoningEffort": agent.get("reasoningEffort"),
             "attachments": [],
             "agentKind": agent["agentKind"],
-            "agentOptions": {"cliSessionMode": "ephemeral"},
+            "agentOptions": {
+                "cliSessionMode": "ephemeral",
+                **(
+                    {"networkAccess": agent["networkAccess"]}
+                    if isinstance(agent.get("networkAccess"), bool)
+                    else {}
+                ),
+            },
             "teamId": team_id,
             "taskId": task_id,
             "teamAgentId": agent_id,
@@ -289,6 +775,8 @@ class TeamRuntime:
             last_activity_flush = time.monotonic()
 
         async for event in self._backend_client.stream(payload, request_id):
+            if run_log is not None:
+                self._append_run_log(run_log, event)
             event_type = str(event.get("type") or "")
             if event_type == "TEXT_MESSAGE_CONTENT":
                 delta = event.get("delta")

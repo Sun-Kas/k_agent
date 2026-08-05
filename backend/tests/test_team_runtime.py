@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 
-from access_layer.teams.models import TeamCreateInput
+from access_layer.teams.models import SupervisorDecision, TeamCreateInput
 from access_layer.teams.runtime import TeamRuntime
 from access_layer.teams.store import TeamStore
 
@@ -35,10 +36,34 @@ def _team_payload(*, mode: str = "manual") -> TeamCreateInput:
                     "name": "审查",
                     "role": "Reviewer",
                     "agentKind": "claude_code",
+                    "networkAccess": False,
                     "responsibility": "独立审查成果",
                 },
             ],
         }
+    )
+
+
+async def _approve_initial_plan(store: TeamStore, team: dict) -> dict:
+    """Drive the durable supervisor boundary without invoking a provider in store tests."""
+
+    control = await store.claim_supervisor_job(team["id"])
+    assert control is not None
+    workers = [agent for agent in team["agents"] if not agent["isSupervisor"]]
+    actions: list[dict] = [{"type": "approve_plan", "reason": "初始计划可执行"}]
+    for index, task in enumerate(team["tasks"]):
+        if task["ownerAgentId"] is None:
+            actions.append({
+                "type": "assign_task",
+                "taskId": task["id"],
+                "assigneeAgentId": workers[index % len(workers)]["id"],
+                "reason": "职责匹配",
+            })
+    return await store.apply_supervisor_decision(
+        team["id"],
+        control["job"]["id"],
+        control["supervisor"]["id"],
+        SupervisorDecision.model_validate({"summary": "批准初始计划", "actions": actions}),
     )
 
 
@@ -54,34 +79,84 @@ def test_team_store_registers_all_builtin_agent_kinds(tmp_path: Path) -> None:
             "claude_code",
         }
         assert sum(agent["isSupervisor"] for agent in team["agents"]) == 1
-        assert team["tasks"][-1]["taskType"] in {"work", "synthesis"}
+        reviewer = next(agent for agent in team["agents"] if agent["name"] == "审查")
+        assert reviewer["networkAccess"] is False
+        assert all(task["reviewRequired"] is True for task in team["tasks"])
+        assert all(task["taskType"] == "work" for task in team["tasks"])
+        assert team["supervisorState"]["triggerType"] == "team.started"
 
     asyncio.run(scenario())
 
 
-def test_task_claim_is_atomic_and_dependencies_gate_synthesis(tmp_path: Path) -> None:
+def test_supervisor_plan_gate_and_task_claim_are_atomic(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = TeamStore(tmp_path / "team_runtime.db")
         await store.initialize()
         team = await store.create_team(_team_payload(mode="auto"), tmp_path)
 
+        assert await store.claim_next_task(team["id"]) is None
+        team = await _approve_initial_plan(store, team)
+
         claims = await asyncio.gather(
             *(store.claim_next_task(team["id"]) for _ in range(8))
         )
         claimed = [item for item in claims if item is not None]
-        # Two independent Worker tasks can run, while synthesis remains blocked
-        # by its dependencies and the supervisor remains idle.
+        # The supervisor assigned both drafts; transactional leases still make
+        # concurrent scheduler polls claim each task exactly once.
         assert len(claimed) == 2
         assert len({item["task"]["id"] for item in claimed}) == 2
         assert all(item["task"]["taskType"] == "work" for item in claimed)
 
         for item in claimed:
-            await store.complete_task(
+            await store.submit_task(
                 team["id"], item["task"]["id"], item["agent"]["id"], "成果"
             )
-        synthesis = await store.claim_next_task(team["id"])
-        assert synthesis is not None
-        assert synthesis["task"]["taskType"] == "synthesis"
+        submitted = await store.get_team(team["id"])
+        assert {task["status"] for task in submitted["tasks"]} == {"submitted"}
+        assert {artifact["status"] for artifact in submitted["artifacts"]} == {"pending_review"}
+
+    asyncio.run(scenario())
+
+
+def test_submitted_artifact_requires_supervisor_acceptance(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        team = await _approve_initial_plan(
+            store, await store.create_team(_team_payload(), tmp_path)
+        )
+        claimed = await store.claim_next_task(team["id"])
+        assert claimed is not None
+        artifact_id = await store.submit_task(
+            team["id"], claimed["task"]["id"], claimed["agent"]["id"], "待验收成果"
+        )
+
+        assert await store.claim_next_task(team["id"]) is None
+        control = await store.claim_supervisor_job(team["id"])
+        assert control is not None
+        snapshot = await store.apply_supervisor_decision(
+            team["id"],
+            control["job"]["id"],
+            control["supervisor"]["id"],
+            SupervisorDecision.model_validate({
+                "summary": "成果满足任务要求",
+                "actions": [{
+                    "type": "accept_submission",
+                    "taskId": claimed["task"]["id"],
+                    "artifactId": artifact_id,
+                    "reason": "交付内容完整",
+                }],
+            }),
+        )
+
+        task = next(item for item in snapshot["tasks"] if item["id"] == claimed["task"]["id"])
+        artifact = next(item for item in snapshot["artifacts"] if item["id"] == artifact_id)
+        assert task["status"] == "completed"
+        assert artifact["status"] == "accepted"
+        event_types = [event["type"] for event in await store.events_after(team["id"], 0)]
+        assert "task.submitted" in event_types
+        assert "supervisor.decision_applied" in event_types
+        assert "task.completed" in event_types
 
     asyncio.run(scenario())
 
@@ -91,6 +166,7 @@ def test_expired_run_lease_is_recovered_after_restart(tmp_path: Path) -> None:
         store = TeamStore(tmp_path / "team_runtime.db")
         await store.initialize()
         team = await store.create_team(_team_payload(), tmp_path)
+        team = await _approve_initial_plan(store, team)
         claimed = await store.claim_next_task(team["id"])
         assert claimed is not None
 
@@ -107,6 +183,33 @@ def test_expired_run_lease_is_recovered_after_restart(tmp_path: Path) -> None:
         assert task["status"] == "pending"
         assert agent["status"] == "idle"
         assert any(event["type"] == "run.recovered" for event in await store.events_after(team["id"], 0))
+
+    asyncio.run(scenario())
+
+
+def test_runtime_stop_requeues_without_spending_attempt(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        team = await _approve_initial_plan(
+            store, await store.create_team(_team_payload(), tmp_path)
+        )
+        claimed = await store.claim_next_task(team["id"])
+        assert claimed is not None
+        assert claimed["task"]["attempt"] == 1
+
+        await store.interrupt_task(
+            team["id"], claimed["task"]["id"], claimed["agent"]["id"], "runtime stopped"
+        )
+
+        snapshot = await store.get_team(team["id"])
+        task = next(item for item in snapshot["tasks"] if item["id"] == claimed["task"]["id"])
+        assert task["status"] == "pending"
+        assert task["attempt"] == 0
+        assert any(
+            event["type"] == "run.interrupted"
+            for event in await store.events_after(team["id"], 0)
+        )
 
     asyncio.run(scenario())
 
@@ -142,6 +245,7 @@ def test_agent_stream_persists_batched_output_reasoning_and_tools(tmp_path: Path
         store = TeamStore(tmp_path / "team_runtime.db")
         await store.initialize()
         team = await store.create_team(_team_payload(), tmp_path)
+        team = await _approve_initial_plan(store, team)
         claimed = await store.claim_next_task(team["id"])
         assert claimed is not None
         task = claimed["task"]
@@ -150,7 +254,6 @@ def test_agent_stream_persists_batched_output_reasoning_and_tools(tmp_path: Path
             store=store,
             backend_client=Backend(),  # type: ignore[arg-type]
             runtime_catalog=Catalog(),  # type: ignore[arg-type]
-            project_root=tmp_path,
             enabled=False,
         )
         text = await runtime._stream_agent(
@@ -170,5 +273,191 @@ def test_agent_stream_persists_batched_output_reasoning_and_tools(tmp_path: Path
         snapshot = await store.get_team(team["id"])
         current_agent = next(item for item in snapshot["agents"] if item["id"] == agent["id"])
         assert current_agent["status"] == "busy"
+
+    asyncio.run(scenario())
+
+
+def test_task_run_uses_task_directory_without_repository_checkout(tmp_path: Path) -> None:
+    """Non-code teams must materialize only task inputs, outputs, logs, and Artifacts."""
+
+    class Backend:
+        async def stream(self, _payload, _request_id):
+            yield {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "可交付成果"}
+
+    class Catalog:
+        @staticmethod
+        def selected_runtime(_mcp_ids, _skill_ids):
+            return [], []
+
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        team = await store.create_team(_team_payload(), tmp_path)
+        team = await _approve_initial_plan(store, team)
+        claimed = await store.claim_next_task(team["id"])
+        assert claimed is not None
+        runtime = TeamRuntime(
+            store=store,
+            backend_client=Backend(),  # type: ignore[arg-type]
+            runtime_catalog=Catalog(),  # type: ignore[arg-type]
+            enabled=False,
+        )
+
+        await runtime._run_claimed(claimed)
+
+        task_id = claimed["task"]["id"]
+        task_dir = tmp_path / team["id"] / "tasks" / task_id
+        manifest = (task_dir / "manifest.json").read_text(encoding="utf-8")
+        assert '"status": "submitted"' in manifest
+        assert (task_dir / "input" / "task.json").is_file()
+        assert (task_dir / "input" / "mailbox.json").is_file()
+        assert list((task_dir / "artifacts").glob("artifact_*.md"))
+        assert list((task_dir / "logs").glob("teamrun_*.ndjson"))
+        assert not (tmp_path / team["id"] / "workspaces").exists()
+        assert not (task_dir / "output" / ".git").exists()
+
+        snapshot = await store.get_team(team["id"])
+        current_task = next(item for item in snapshot["tasks"] if item["id"] == task_id)
+        assert current_task["status"] == "submitted"
+        assert snapshot["artifacts"][0]["status"] == "pending_review"
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_runtime_applies_structured_decision(tmp_path: Path) -> None:
+    class Backend:
+        async def stream(self, _payload, _request_id):
+            yield {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "manager",
+                "delta": json.dumps({
+                    "summary": "初始任务与成员职责匹配",
+                    "actions": [{
+                        "type": "approve_plan",
+                        "reason": "允许成员开始执行",
+                    }],
+                }, ensure_ascii=False),
+            }
+
+    class Catalog:
+        pass
+
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        team = await store.create_team(_team_payload(), tmp_path)
+        control = await store.claim_supervisor_job(team["id"])
+        assert control is not None
+        runtime = TeamRuntime(
+            store=store,
+            backend_client=Backend(),  # type: ignore[arg-type]
+            runtime_catalog=Catalog(),  # type: ignore[arg-type]
+            enabled=False,
+        )
+
+        await runtime._run_supervisor(control)
+
+        snapshot = await store.get_team(team["id"])
+        assert snapshot["supervisorState"]["status"] == "completed"
+        assert await store.claim_next_task(team["id"]) is not None
+        decision_file = (
+            tmp_path / team["id"] / "supervisor" / control["job"]["id"] / "decision.json"
+        )
+        assert decision_file.is_file()
+        assert json.loads(decision_file.read_text(encoding="utf-8"))["actions"][0]["type"] == "approve_plan"
+
+    asyncio.run(scenario())
+
+
+def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: Path) -> None:
+    workspace = tmp_path / "team-deliverables"
+
+    class WorkerBackend:
+        async def stream(self, payload, _request_id):
+            output = Path(payload["workspaceDir"])
+            (output / "site.html").write_text("<main>accepted</main>", encoding="utf-8")
+            yield {"type": "TEXT_MESSAGE_CONTENT", "messageId": "worker", "delta": "站点交付"}
+
+    class SupervisorBackend:
+        def __init__(self, task_id: str, assignee_id: str) -> None:
+            self.task_id = task_id
+            self.assignee_id = assignee_id
+
+        async def stream(self, _payload, _request_id):
+            yield {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "supervisor",
+                "delta": json.dumps({
+                    "summary": "验收站点并安排下游检查",
+                    "actions": [
+                        {
+                            "type": "accept_submission",
+                            "taskId": self.task_id,
+                            "reason": "文件和说明完整",
+                        },
+                        {
+                            "type": "create_task",
+                            "title": "检查已发布站点",
+                            "description": "读取上游已验收文件并检查。",
+                            "assigneeAgentId": self.assignee_id,
+                            "dependsOn": [self.task_id],
+                            "priority": 100,
+                            "reason": "由下游成员读取正式 Artifact",
+                        },
+                    ],
+                }, ensure_ascii=False),
+            }
+
+    class Catalog:
+        @staticmethod
+        def selected_runtime(_mcp_ids, _skill_ids):
+            return [], []
+
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        payload = _team_payload().model_copy(update={"workspace_dir": str(workspace)})
+        team = await _approve_initial_plan(store, await store.create_team(payload, tmp_path))
+        claimed = await store.claim_next_task(team["id"])
+        assert claimed is not None
+        worker_runtime = TeamRuntime(
+            store=store,
+            backend_client=WorkerBackend(),  # type: ignore[arg-type]
+            runtime_catalog=Catalog(),  # type: ignore[arg-type]
+            enabled=False,
+        )
+        await worker_runtime._run_claimed(claimed)
+
+        control = await store.claim_supervisor_job(team["id"])
+        assert control is not None
+        downstream_agent = next(
+            agent for agent in team["agents"] if agent["id"] != claimed["agent"]["id"] and not agent["isSupervisor"]
+        )
+        supervisor_runtime = TeamRuntime(
+            store=store,
+            backend_client=SupervisorBackend(claimed["task"]["id"], downstream_agent["id"]),  # type: ignore[arg-type]
+            runtime_catalog=Catalog(),  # type: ignore[arg-type]
+            enabled=False,
+        )
+        await supervisor_runtime._run_supervisor(control)
+
+        snapshot = await store.get_team(team["id"])
+        artifact = next(item for item in snapshot["artifacts"] if item["taskId"] == claimed["task"]["id"])
+        published = Path(artifact["workspacePath"])
+        assert snapshot["workspaceDir"] == str(workspace.resolve())
+        assert (workspace / ".k_agent-team.json").is_file()
+        assert (published / "files" / "site.html").read_text(encoding="utf-8") == "<main>accepted</main>"
+        assert (published / "result.md").read_text(encoding="utf-8") == "站点交付"
+
+        downstream = await store.claim_next_task(team["id"])
+        assert downstream is not None
+        assert downstream["task"]["title"] == "检查已发布站点"
+        context = await store.task_context(team["id"], downstream["task"]["id"])
+        downstream_dir = tmp_path / team["id"] / "tasks" / downstream["task"]["id"]
+        supervisor_runtime._prepare_task_directory(
+            downstream_dir, context, downstream["agent"], downstream["runId"]
+        )
+        copied = downstream_dir / "output" / ".team-input" / "artifacts" / artifact["id"] / "files" / "site.html"
+        assert copied.read_text(encoding="utf-8") == "<main>accepted</main>"
 
     asyncio.run(scenario())

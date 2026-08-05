@@ -29,6 +29,7 @@ export const getTeamEvents = (teamId: string, afterSeq = 0) =>
 export function createTeam(input: {
   name: string;
   goal: string;
+  workspaceDir?: string;
   mode: "auto" | "manual";
   maxParallel: number;
   agents: TeamAgentDraft[];
@@ -43,6 +44,7 @@ export function createTeam(input: {
         agentKind: agent.agentKind,
         modelId: agent.modelId || undefined,
         reasoningEffort: agent.reasoningEffort || undefined,
+        networkAccess: agent.networkAccess ?? undefined,
         responsibility: agent.responsibility,
         isSupervisor: agent.isSupervisor,
         mcpServerIds: agent.mcpServerIds,

@@ -1441,7 +1441,29 @@ export function App() {
     // The floating pet overlaps the Team mailbox and task controls on common
     // laptop widths, so the focused operations workbench intentionally owns
     // the full viewport while chat keeps the optional companion.
-    return <TeamWorkbench onBack={() => setView("chat")} />;
+    return (
+      <TeamWorkbench
+        onBack={() => setView("chat")}
+        onOpenConfig={() => setView("config")}
+        health={health}
+        onRefreshHealth={() => void refreshHealth()}
+        sidebarWidth={sidebarWidth}
+        sidebarOpen={sidebarOpen}
+        sidebarCollapsed={sidebarCollapsed}
+        onCloseSidebar={() => setSidebarOpen(false)}
+        onToggleSidebar={() => {
+          if (window.matchMedia("(max-width: 860px)").matches) {
+            setSidebarCollapsed(false);
+            setSidebarOpen(true);
+            return;
+          }
+          setSidebarCollapsed((current) => !current);
+          setSidebarOpen(false);
+        }}
+        onBeginSidebarResize={(event) => beginResize("sidebar", event)}
+        onResizeSidebarWithKeyboard={(event) => resizeWithKeyboard("sidebar", event)}
+      />
+    );
   }
 
   return (
@@ -1465,6 +1487,14 @@ export function App() {
           <span className="brand-symbol">K</span>
           <div><strong>K Agent</strong><small>智能任务工作台</small></div>
         </div>
+        <nav className="workspace-switch" aria-label="工作模式">
+          <button className="active" type="button" aria-current="page">
+            <span>◉</span><strong>单 Agent</strong>
+          </button>
+          <button type="button" onClick={() => setView("team")}>
+            <span>⌘</span><strong>Agent Team</strong>
+          </button>
+        </nav>
         <button className="new-session" type="button" onClick={startNewSession}>
           <span>＋</span> 新建会话 <kbd>⌘ N</kbd>
         </button>
@@ -1543,9 +1573,6 @@ export function App() {
         </button>
         <button className="settings-link" type="button" onClick={() => setView("config")}>
           <span>⚙</span><strong>配置中心</strong><small>MCP · Skills · 模型</small><i>→</i>
-        </button>
-        <button className="settings-link team-entry-link" type="button" onClick={() => setView("team")}>
-          <span>⌘</span><strong>Agent Team</strong><small>任务板 · Artifact · 协作</small><i>→</i>
         </button>
       </aside>
       <div

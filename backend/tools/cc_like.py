@@ -20,7 +20,7 @@ from backend.sandbox import (
     plan_bash_invocation,
 )
 from backend.tools.local import ToolDefinition
-from backend.tools.workspace import current_tool_workspace
+from backend.tools.workspace import current_tool_network_access, current_tool_workspace
 
 
 async def _workspace_root() -> Path:
@@ -174,7 +174,10 @@ async def cc_bash(payload: dict[str, Any]) -> str:
     timeout, max_chars = await _tool_limits()
     try:
         invocation = plan_bash_invocation(
-            command, workspace_root=root, settings=settings
+            command,
+            workspace_root=root,
+            settings=settings,
+            network_access=current_tool_network_access(),
         )
     except SandboxUnavailable as exc:
         return _json(

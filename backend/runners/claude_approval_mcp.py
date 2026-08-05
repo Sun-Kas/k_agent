@@ -13,7 +13,7 @@ from mcp.server.fastmcp import FastMCP
 server = FastMCP("K Agent Human Approval", log_level="ERROR")
 
 
-@server.tool()
+@server.tool(structured_output=False)
 async def request_approval(tool_name: str, input: dict[str, Any]) -> str:
     """Suspend Claude's tool call until the Team user approves or denies it."""
 
@@ -35,8 +35,9 @@ async def request_approval(tool_name: str, input: dict[str, Any]) -> str:
             "behavior": "deny",
             "message": "Human approval bridge closed before a decision.",
         })
-    # Claude's permission-prompt MCP contract expects the decision itself as a
-    # JSON-stringified text result, not an MCP structured-content object.
+    # Claude's permission-prompt MCP contract reads exactly one text content
+    # block. FastMCP otherwise adds structuredContent for annotated returns,
+    # which Claude rejects before it can parse this JSON decision.
     return json.dumps(json.loads(raw), ensure_ascii=False)
 
 

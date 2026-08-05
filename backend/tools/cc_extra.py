@@ -18,6 +18,7 @@ from typing import Any
 from backend.config import get_or_init_settings
 from backend.tools.cc_like import _resolve_workspace_path, _tool_limits
 from backend.tools.local import ToolDefinition
+from backend.tools.workspace import current_tool_network_access
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -145,6 +146,10 @@ def _fetch_url_sync(
 
 async def cc_web_fetch(payload: dict[str, Any]) -> str:
     """抓取网页并转成文本，作为 Claude Code WebFetch 的轻量本地实现。"""
+    if current_tool_network_access() is False:
+        # Return a normal tool result so the model can revise its approach
+        # instead of turning a policy denial into a terminal Agent run.
+        return _json({"ok": False, "error": "network access is disabled for this run"})
     url = str(payload.get("url") or "").strip()
     if not url:
         return _json({"ok": False, "error": "url is required"})

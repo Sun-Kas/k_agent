@@ -9,7 +9,9 @@ from unittest.mock import patch
 from backend.runners.cli_models import list_models_for_kind
 from backend.runners.claude_code import (
     ClaudeCodeStreamState,
+    _claude_allowed_tools,
     build_claude_skill_preamble,
+    claude_sandbox_settings,
     map_claude_event,
 )
 from backend.runners.claude_approval_mcp import server as claude_approval_mcp
@@ -25,6 +27,7 @@ from backend.runners.base import RunnerContext
 from backend.approvals import ApprovalBroker
 from backend.runners.codex import CodexRunner, build_codex_skill_preamble, map_codex_event
 from backend.runners.codex_app_server import CodexStreamState
+from backend.runners.network_policy import network_access_enabled
 from backend.runners.codex_config import write_codex_mcp_config
 from backend.runners.detect import detect_agents
 from backend.runners.registry import build_default_registry
@@ -50,6 +53,7 @@ class ClaudeApprovalMcpTests(unittest.IsolatedAsyncioTestCase):
             set(approval.inputSchema["required"]),
             {"tool_name", "input"},
         )
+        self.assertIsNone(approval.outputSchema)
 
 
 class CliModelsTests(unittest.TestCase):
@@ -82,6 +86,48 @@ class CliRunnerBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(provider_marker=provider_marker):
                 self.assertNotIn(provider_marker, shared_runner)
+
+
+class NetworkPolicyTests(unittest.TestCase):
+    def _context(self, *, options=None, settings=None) -> RunnerContext:
+        return RunnerContext(
+            thread_id="thread-1",
+            run_id="run-1",
+            request_id="request-1",
+            messages=[],
+            model_id=None,
+            mcp_servers=[],
+            skills=[],
+            reasoning_effort=None,
+            attachments=[],
+            options=options or {},
+            settings=settings,
+        )
+
+    def test_network_is_allowed_by_default(self) -> None:
+        self.assertTrue(network_access_enabled(self._context()))
+        self.assertEqual(
+            claude_sandbox_settings(True)["sandbox"]["network"]["allowedDomains"],
+            ["*"],
+        )
+
+    def test_boolean_run_override_can_deny_network(self) -> None:
+        ctx = self._context(options={"networkAccess": False})
+        self.assertFalse(network_access_enabled(ctx))
+        settings = claude_sandbox_settings(False)
+        self.assertTrue(settings["sandbox"]["enabled"])
+        self.assertEqual(settings["sandbox"]["network"]["allowedDomains"], [])
+
+    def test_claude_routine_tools_are_preapproved_and_can_be_overridden(self) -> None:
+        enabled = self._context()
+        allowed = _claude_allowed_tools(enabled)
+        for tool in ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch"):
+            self.assertIn(tool, allowed)
+        restricted = self._context(options={"claudeAutoApproveTools": ["Read"]})
+        self.assertEqual(
+            _claude_allowed_tools(restricted),
+            ["Read", "mcp__k_agent_human_approval__request_approval"],
+        )
 
 
 class DetectAgentsTests(unittest.IsolatedAsyncioTestCase):
@@ -270,6 +316,7 @@ class CodexRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["command"], "/usr/local/bin/codex")
         self.assertEqual(captured["public_thread_id"], "thread-1")
         self.assertIs(captured["approval_broker"], ctx.approval_broker)
+        self.assertTrue(captured["network_access"])
 
 
 class McpConfigAndSkillTests(unittest.TestCase):

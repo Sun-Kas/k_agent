@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type KeyboardEvent,
+  type PointerEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 
 import {
   getAgentsCatalog,
@@ -19,6 +27,7 @@ import {
 import type {
   AgentKind,
   DetectedAgent,
+  HealthState,
   ModelProfile,
   RuntimeOption
 } from "../types";
@@ -47,6 +56,7 @@ const STATUS_LABEL: Record<string, string> = {
   pending: "等待",
   ready: "可认领",
   claimed: "已认领",
+  submitted: "待主管验收",
   idle: "空闲",
   busy: "工作中",
   waiting: "等待审批",
@@ -55,7 +65,33 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 
-export function TeamWorkbench({ onBack }: { onBack: () => void }) {
+interface TeamWorkbenchProps {
+  onBack: () => void;
+  onOpenConfig: () => void;
+  health: HealthState | null;
+  onRefreshHealth: () => void;
+  sidebarWidth: number;
+  sidebarOpen: boolean;
+  sidebarCollapsed: boolean;
+  onCloseSidebar: () => void;
+  onToggleSidebar: () => void;
+  onBeginSidebarResize: (event: PointerEvent<HTMLDivElement>) => void;
+  onResizeSidebarWithKeyboard: (event: KeyboardEvent<HTMLDivElement>) => void;
+}
+
+export function TeamWorkbench({
+  onBack,
+  onOpenConfig,
+  health,
+  onRefreshHealth,
+  sidebarWidth,
+  sidebarOpen,
+  sidebarCollapsed,
+  onCloseSidebar,
+  onToggleSidebar,
+  onBeginSidebarResize,
+  onResizeSidebarWithKeyboard
+}: TeamWorkbenchProps) {
   const [teams, setTeams] = useState<TeamSummary[]>([]);
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
   const [team, setTeam] = useState<TeamSnapshot | null>(null);
@@ -65,6 +101,7 @@ export function TeamWorkbench({ onBack }: { onBack: () => void }) {
   const [mcpServers, setMcpServers] = useState<RuntimeOption[]>([]);
   const [skills, setSkills] = useState<RuntimeOption[]>([]);
   const [creating, setCreating] = useState(false);
+  const [teamQuery, setTeamQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
@@ -72,6 +109,11 @@ export function TeamWorkbench({ onBack }: { onBack: () => void }) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const lastSeqRef = useRef(0);
   const refreshTimerRef = useRef<number | null>(null);
+  const filteredTeams = useMemo(() => {
+    const normalized = teamQuery.trim().toLocaleLowerCase();
+    if (!normalized) return teams;
+    return teams.filter((item) => item.name.toLocaleLowerCase().includes(normalized));
+  }, [teamQuery, teams]);
 
   useEffect(() => {
     void refreshCatalogs();
@@ -172,43 +214,86 @@ export function TeamWorkbench({ onBack }: { onBack: () => void }) {
   }
 
   return (
-    <div className="team-shell">
-      <header className="team-global-header">
-        <button className="team-back" type="button" onClick={onBack} aria-label="返回聊天">←</button>
-        <div className="team-product-mark"><span>KT</span><div><strong>Agent Team</strong><small>SUPERVISED RUNTIME</small></div></div>
-        <div className="team-header-actions">
-          <span className={`team-connection ${connected ? "online" : ""}`}><i />{connected ? "实时同步" : "等待事件"}</span>
-          <button className="team-primary-action" type="button" onClick={() => setCreating(true)}>＋ 创建团队</button>
+    <div
+      className={`team-shell team-embedded-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
+      style={{ "--sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+    >
+      <button className={`scrim ${sidebarOpen ? "visible" : ""}`} type="button" aria-label="关闭团队侧栏" onClick={onCloseSidebar} />
+      <aside className={`sidebar team-mode-sidebar ${sidebarOpen ? "open" : ""}`}>
+        <div className="brand">
+          <span className="brand-symbol">K</span>
+          <div><strong>K Agent</strong><small>智能任务工作台</small></div>
         </div>
-      </header>
-
-      <div className="team-layout">
-        <aside className="team-nav">
-          <div className="team-nav-heading"><span>团队</span><b>{teams.length}</b></div>
-          <div className="team-list">
-            {teams.map((item) => {
+        <nav className="workspace-switch" aria-label="工作模式">
+          <button type="button" onClick={onBack}><span>◉</span><strong>单 Agent</strong></button>
+          <button className="active" type="button" aria-current="page"><span>⌘</span><strong>Agent Team</strong></button>
+        </nav>
+        <button className="new-session team-new-session" type="button" onClick={() => setCreating(true)}>
+          <span>＋</span> 创建团队
+        </button>
+        <label className="session-search">
+          <span>⌕</span>
+          <input
+            value={teamQuery}
+            onChange={(event) => setTeamQuery(event.target.value)}
+            placeholder="搜索团队"
+            aria-label="搜索团队"
+          />
+        </label>
+        <div className="section-label"><span>最近团队</span><b>{teams.length}</b></div>
+        <nav className="session-list" aria-label="团队列表">
+            {filteredTeams.map((item) => {
               const progress = item.taskCount ? Math.round(item.completedTaskCount / item.taskCount * 100) : 0;
               return (
                 <button
-                  className={`team-list-item ${selectedTeamId === item.id && !creating ? "active" : ""}`}
+                  className={`session-item team-history-item ${selectedTeamId === item.id && !creating ? "active" : ""}`}
                   key={item.id}
                   type="button"
                   onClick={() => { setCreating(false); setSelectedTeamId(item.id); }}
                 >
                   <span className={`team-list-status ${item.status}`} />
-                  <span><strong>{item.name}</strong><small>{item.agentCount} Agents · {progress}%</small></span>
-                  <i>›</i>
+                  <span className="session-copy"><strong>{item.name}</strong><small>{item.agentCount} Agents · {progress}%</small></span>
                 </button>
               );
             })}
-            {!teams.length && <p className="team-empty-copy">还没有团队。创建一个团队，让多个 Agent 以明确边界协同工作。</p>}
-          </div>
-          <div className="team-nav-note">
-            <span>LOCAL FIRST</span>
-            <p>任务、Mailbox 和 Artifact 保存在本地 Team Runtime。</p>
-          </div>
-        </aside>
+            {!filteredTeams.length && (
+              <p className="team-empty-copy">
+                {teamQuery ? "没有匹配的团队。" : "还没有团队。创建一个团队，让多个 Agent 以明确边界协同工作。"}
+              </p>
+            )}
+        </nav>
+        <button className="connection" type="button" onClick={onRefreshHealth} title={health?.ok ? "点击重新检查服务与沙箱状态" : "点击重新检查"}>
+          <span className={`connection-dot ${health?.ok ? "online" : ""}`} />
+          <span>
+            <strong>{health?.ok ? "服务运行正常" : "后端未连接"}</strong>
+            <small>{health ? `${health.model} · ${health.localToolCount + health.mcpToolCount} 个工具` : "点击重新检查"}</small>
+          </span>
+          <i>↻</i>
+        </button>
+        <button className="settings-link" type="button" onClick={onOpenConfig}>
+          <span>⚙</span><strong>配置中心</strong><small>MCP · Skills · 模型</small><i>→</i>
+        </button>
+      </aside>
+      <div
+        className="resize-handle resize-handle-left"
+        role="separator"
+        tabIndex={0}
+        aria-label="调整团队侧栏宽度"
+        aria-orientation="vertical"
+        onPointerDown={onBeginSidebarResize}
+        onKeyDown={onResizeSidebarWithKeyboard}
+      />
 
+      <section className="team-workspace">
+        <header className="team-global-header">
+          <button className="topbar-icon-button sidebar-toggle-button" type="button" onClick={onToggleSidebar} aria-label={sidebarCollapsed ? "展开团队侧栏" : "折叠团队侧栏"}>
+            <span className="team-sidebar-icon" aria-hidden="true">◧</span>
+          </button>
+          <div className="team-product-mark"><span>KT</span><div><strong>Agent Team</strong><small>SUPERVISED RUNTIME</small></div></div>
+          <div className="team-header-actions">
+            <span className={`team-connection ${connected ? "online" : ""}`}><i />{connected ? "实时同步" : "等待事件"}</span>
+          </div>
+        </header>
         <main className="team-main">
           {error && <div className="team-error" role="alert"><span>!</span><p>{error}</p><button type="button" onClick={() => setError(null)}>×</button></div>}
           {creating
@@ -246,7 +331,7 @@ export function TeamWorkbench({ onBack }: { onBack: () => void }) {
               )
               : <TeamWelcome onCreate={() => setCreating(true)} />}
         </main>
-      </div>
+      </section>
     </div>
   );
 }
@@ -282,6 +367,7 @@ function TeamComposer({
 }) {
   const [name, setName] = useState("产品交付团队");
   const [goal, setGoal] = useState("");
+  const [workspaceDir, setWorkspaceDir] = useState("");
   const [maxParallel, setMaxParallel] = useState(4);
   const [mode, setMode] = useState<"auto" | "manual">("manual");
   const [submitting, setSubmitting] = useState(false);
@@ -309,6 +395,7 @@ function TeamComposer({
       const snapshot = await createTeam({
         name: name.trim() || "Agent Team",
         goal: goal.trim(),
+        workspaceDir: workspaceDir.trim() || undefined,
         mode,
         maxParallel: Math.min(maxParallel, members.length),
         agents: members.map((member, index) => ({
@@ -334,9 +421,10 @@ function TeamComposer({
       <div className="team-composer-grid">
         <div className="team-form-panel">
           <label className="team-field"><span>团队名称</span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <label className="team-field team-workspace-field"><span>团队工作空间</span><input value={workspaceDir} onChange={(event) => setWorkspaceDir(event.target.value)} placeholder="留空则创建独立的默认空间" /><small>主管验收后的 Artifact 会发布到这里；Agent 的中间文件仍留在各自任务目录。</small></label>
           <div className="team-mode-switch" role="group" aria-label="组队方式">
             <button className={mode === "manual" ? "active" : ""} type="button" onClick={() => setMode("manual")}><strong>手动组队</strong><span>明确指定每个 Agent</span></button>
-            <button className={mode === "auto" ? "active" : ""} type="button" onClick={() => setMode("auto")}><strong>自动调度</strong><span>按职责自主认领任务</span></button>
+            <button className={mode === "auto" ? "active" : ""} type="button" onClick={() => setMode("auto")}><strong>自动调度</strong><span>由主管动态拆解与指派</span></button>
           </div>
           <label className="team-field"><span>团队目标</span><textarea rows={6} value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="描述最终需要交付的结果、约束和质量要求…" /></label>
           <label className="team-field compact"><span>最大并行任务</span><input type="number" min={1} max={12} value={maxParallel} onChange={(event) => setMaxParallel(Number(event.target.value) || 1)} /></label>
@@ -363,7 +451,7 @@ function TeamComposer({
         </div>
       </div>
       {error && <p className="team-form-error">{error}</p>}
-      <footer className="team-composer-footer"><span>创建后 Scheduler 会按职责生成 Worker Task，并由主管综合 Artifact。</span><button className="team-primary-action large" type="button" disabled={submitting} onClick={() => void submit()}>{submitting ? "正在创建…" : "创建并开始运行"} <b>→</b></button></footer>
+      <footer className="team-composer-footer"><span>主管负责拆解、指派和逐项验收；通过验收的 Artifact 才会进入团队工作空间。</span><button className="team-primary-action large" type="button" disabled={submitting} onClick={() => void submit()}>{submitting ? "正在创建…" : "创建并开始运行"} <b>→</b></button></footer>
     </section>
   );
 }
@@ -429,12 +517,15 @@ function TeamDashboard({
   const progress = team.tasks.length ? Math.round(completed / team.tasks.length * 100) : 0;
   const [message, setMessage] = useState("");
   const [recipient, setRecipient] = useState(team.supervisorAgentId);
+  const [showSupervisorLog, setShowSupervisorLog] = useState(false);
   const selectedTask = team.tasks.find((task) => task.id === selectedTaskId) ?? null;
   const columns = useMemo(() => [
     { key: "queue", title: "待执行", tasks: team.tasks.filter((task) => ["pending", "ready", "claimed"].includes(task.status)) },
     { key: "running", title: "进行中", tasks: team.tasks.filter((task) => task.status === "running") },
+    { key: "review", title: "主管验收", tasks: team.tasks.filter((task) => task.status === "submitted") },
     { key: "done", title: "已交付", tasks: team.tasks.filter((task) => ["completed", "failed", "cancelled"].includes(task.status)) }
   ], [team.tasks]);
+  const supervisorStatus = supervisorStateLabel(team.supervisorState);
 
   return (
     <section className="team-dashboard">
@@ -448,12 +539,26 @@ function TeamDashboard({
         </div>
       </header>
 
+      <section className="team-workspace-strip" aria-label="团队工作空间">
+        <span>▣</span>
+        <div><small>TEAM WORKSPACE</small><strong title={team.workspaceDir}>{team.workspaceDir}</strong></div>
+        <i>已验收产物自动发布</i>
+      </section>
+
       <div className="team-metric-strip">
         <div><span>完成进度</span><strong>{progress}%</strong><i><b style={{ width: `${progress}%` }} /></i></div>
         <div><span>在线成员</span><strong>{team.agents.filter((agent) => ["idle", "busy", "waiting"].includes(agent.status)).length}<small> / {team.agents.length}</small></strong></div>
         <div><span>Artifacts</span><strong>{team.artifacts.length}</strong></div>
-        <div><span>事件序列</span><strong>#{team.lastEventSeq}</strong></div>
+        <div><span>主管控制</span><strong className={team.supervisorState?.status ?? "idle"}>{supervisorStatus}</strong></div>
       </div>
+
+      {team.supervisorState && ["pending", "running", "failed"].includes(team.supervisorState.status) && (
+        <section className={`team-supervisor-strip ${team.supervisorState.status}`}>
+          <span>✦</span>
+          <div><strong>{supervisorStatus}</strong><p>{supervisorTriggerLabel(team.supervisorState.triggerType)}</p></div>
+          <small>第 {team.supervisorState.attempt || 1}/{team.supervisorState.maxAttempts} 次决策</small>
+        </section>
+      )}
 
       <div className="team-dashboard-grid">
         <div className="team-board-panel">
@@ -468,11 +573,13 @@ function TeamDashboard({
           <div className="team-roster-list">{team.agents.map((agent) => {
             const agentTasks = team.tasks.filter((task) => task.ownerAgentId === agent.id);
             const latestTask = [...agentTasks].reverse().find((task) => task.status === "running") ?? agentTasks.at(-1);
+            const inspectable = agent.isSupervisor || Boolean(latestTask);
+            const inspectAgent = () => agent.isSupervisor ? setShowSupervisorLog(true) : latestTask && onTaskSelect(latestTask.id);
             return (
-            <article className={`team-roster-card ${latestTask ? "inspectable" : ""}`} key={agent.id} role={latestTask ? "button" : undefined} tabIndex={latestTask ? 0 : undefined} onClick={() => latestTask && onTaskSelect(latestTask.id)} onKeyDown={(event) => { if (latestTask && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); onTaskSelect(latestTask.id); } }}>
+            <article className={`team-roster-card ${inspectable ? "inspectable" : ""}`} key={agent.id} role={inspectable ? "button" : undefined} tabIndex={inspectable ? 0 : undefined} onClick={inspectAgent} onKeyDown={(event) => { if (inspectable && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); inspectAgent(); } }}>
               <span className={`team-agent-avatar kind-${agent.agentKind}`}>{agentMonogram(agent.agentKind)}</span>
               <div><strong>{agent.name}{agent.isSupervisor && <b>主管</b>}</strong><p>{agent.role} · {agent.agentKind}</p><small title={agent.creationReason}>{agent.creationReason}</small></div>
-              <i className={agent.status}>{STATUS_LABEL[agent.status] ?? agent.status}{latestTask ? " ↗" : ""}</i>
+              <i className={agent.status}>{STATUS_LABEL[agent.status] ?? agent.status}{inspectable ? " ↗" : ""}</i>
             </article>
           )})}</div>
           <form className="team-mail-composer" onSubmit={(event) => { event.preventDefault(); if (!message.trim()) return; void onMessage(recipient, message.trim()).then(() => setMessage("")); }}>
@@ -486,7 +593,7 @@ function TeamDashboard({
       <div className="team-lower-grid">
         <section className="team-artifact-panel">
           <header className="team-section-header"><div><p className="team-kicker">ARTIFACTS</p><h2>成果与引用</h2></div><span>{team.artifacts.length}</span></header>
-          <div className="team-artifact-list">{team.artifacts.length ? team.artifacts.map((artifact) => <button className={selectedArtifact?.id === artifact.id ? "active" : ""} key={artifact.id} type="button" onClick={() => onArtifactSelect(artifact)}><span>◇</span><div><strong>{artifact.title}</strong><small>{artifact.kind} · v{artifact.version}</small></div><i>›</i></button>) : <EmptyPanel text="Agent 完成任务后会在这里发布 Artifact" />}</div>
+          <div className="team-artifact-list">{team.artifacts.length ? team.artifacts.map((artifact) => <button className={`${selectedArtifact?.id === artifact.id ? "active" : ""} ${artifact.status}`} key={artifact.id} type="button" onClick={() => onArtifactSelect(artifact)}><span>◇</span><div><strong>{artifact.title}</strong><small>{artifact.workspacePath ? "已发布到工作空间" : `${artifact.kind} · v${artifact.version}`}</small></div><b>{artifactStatusLabel(artifact.status)}</b><i>›</i></button>) : <EmptyPanel text="Agent 提交成果后会在这里等待主管验收" />}</div>
         </section>
         <section className="team-flow-panel">
           <header className="team-section-header"><div><p className="team-kicker">TASK HANDOFF MAP</p><h2>成员任务流转</h2></div><span>发放 · 接取 · 汇聚</span></header>
@@ -494,8 +601,9 @@ function TeamDashboard({
         </section>
       </div>
 
-      {selectedArtifact && <div className="team-artifact-drawer" role="dialog" aria-modal="true" aria-label="Artifact 内容"><button className="team-artifact-scrim" type="button" onClick={() => onArtifactSelect(null)} aria-label="关闭" /><aside><header><div><p className="team-kicker">{selectedArtifact.uri}</p><h2>{selectedArtifact.title}</h2><span>{selectedArtifact.kind} · SHA {selectedArtifact.sha256.slice(0, 10)}</span></div><button type="button" onClick={() => onArtifactSelect(null)}>×</button></header><div className="team-artifact-content"><MarkdownContent content={selectedArtifact.content} /></div></aside></div>}
+      {selectedArtifact && <div className="team-artifact-drawer" role="dialog" aria-modal="true" aria-label="Artifact 内容"><button className="team-artifact-scrim" type="button" onClick={() => onArtifactSelect(null)} aria-label="关闭" /><aside><header><div><p className="team-kicker">{selectedArtifact.uri}</p><h2>{selectedArtifact.title}</h2><span>{selectedArtifact.kind} · SHA {selectedArtifact.sha256.slice(0, 10)} · {artifactStatusLabel(selectedArtifact.status)}</span>{selectedArtifact.workspacePath && <p className="team-artifact-workspace" title={selectedArtifact.workspacePath}>工作空间 · {selectedArtifact.workspacePath}</p>}</div><button type="button" onClick={() => onArtifactSelect(null)}>×</button></header><div className="team-artifact-content"><MarkdownContent content={selectedArtifact.content} /></div></aside></div>}
       {selectedTask && <TaskRunDrawer key={selectedTask.ownerAgentId ?? selectedTask.id} task={selectedTask} tasks={team.tasks} agents={team.agents} artifacts={team.artifacts} events={events} teamGoal={team.goal} onClose={() => onTaskSelect(null)} />}
+      {showSupervisorLog && <SupervisorRunDrawer team={team} events={events} onClose={() => setShowSupervisorLog(false)} />}
     </section>
   );
 }
@@ -503,9 +611,9 @@ function TeamDashboard({
 
 function TaskColumn({ title, tasks, agents, selectedTaskId, onTaskSelect }: { title: string; tasks: TeamTask[]; agents: TeamSnapshot["agents"]; selectedTaskId: string | null; onTaskSelect: (taskId: string) => void }) {
   return (
-    <section className="team-task-column"><header><strong>{title}</strong><span>{tasks.length}</span></header><div>{tasks.length ? tasks.map((task) => {
+    <section className="team-task-column"><header><strong>{title}</strong><span>{tasks.length}</span></header><div className="team-task-list" tabIndex={0} aria-label={`${title}任务列表`}>{tasks.length ? tasks.map((task) => {
       const owner = agents.find((agent) => agent.id === task.ownerAgentId);
-      return <article className={`team-task-card ${task.status} ${selectedTaskId === task.id ? "selected" : ""}`} key={task.id} role="button" tabIndex={0} onClick={() => onTaskSelect(task.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onTaskSelect(task.id); } }}><span className="team-task-type">{task.taskType === "synthesis" ? "SYNTHESIS" : "TASK"}</span><span className="team-task-inspect">查看工作记录 ↗</span><h3>{task.title}</h3><p>{task.description}</p>{task.error && <small className="team-task-error">{task.error}</small>}<footer><span>{owner ? <><b className={`kind-${owner.agentKind}`}>{agentMonogram(owner.agentKind)}</b>{owner.name}</> : "等待认领"}</span><i>{STATUS_LABEL[task.status] ?? task.status}{task.attempt ? ` · #${task.attempt}` : ""}</i></footer></article>;
+      return <article className={`team-task-card ${task.status} ${selectedTaskId === task.id ? "selected" : ""}`} key={task.id} role="button" tabIndex={0} onClick={() => onTaskSelect(task.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onTaskSelect(task.id); } }}><div className="team-task-card-meta"><span className="team-task-type">{task.taskType === "synthesis" ? "SYNTHESIS" : "TASK"}</span><span className={`team-task-review ${task.reviewRequired ? "required" : "optional"}`}>{task.reviewRequired ? "需主管验收" : "无需验收"}</span><span className="team-task-inspect">查看工作记录 ↗</span></div><h3>{task.title}</h3><p>{task.description}</p>{task.error && <small className="team-task-error">{task.error}</small>}<footer><span>{owner ? <><b className={`kind-${owner.agentKind}`}>{agentMonogram(owner.agentKind)}</b>{owner.name}</> : "等待认领"}</span><i>{STATUS_LABEL[task.status] ?? task.status}{task.attempt ? ` · #${task.attempt}` : ""}</i></footer></article>;
     }) : <p className="team-column-empty">暂无任务</p>}</div></section>
   );
 }
@@ -564,6 +672,53 @@ type ConversationItem =
   | { kind: "approval"; id: string; threadId: string; runId: string; agentKind: AgentKind; category: string; title: string; message: string; detail: Record<string, unknown>; status: "pending" | "approved" | "denied" | "cancelled"; action?: string; occurredAt: string }
   | { kind: "notice"; id: string; label: string; tone: "normal" | "error" | "success"; occurredAt: string };
 
+
+function SupervisorRunDrawer({ team, events, onClose }: { team: TeamSnapshot; events: TeamEvent[]; onClose: () => void }) {
+  const supervisor = team.agents.find((agent) => agent.id === team.supervisorAgentId) ?? team.agents[0];
+  const starts = events.filter((event) => event.type === "supervisor.decision_started");
+  const latestJobId = String(starts.at(-1)?.payload.jobId ?? "");
+  const [expandedJobId, setExpandedJobId] = useState(latestJobId);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (latestJobId) setExpandedJobId(latestJobId);
+  }, [latestJobId]);
+
+  return (
+    <div className="team-run-drawer" role="dialog" aria-modal="true" aria-label="主管决策记录">
+      <button className="team-artifact-scrim" type="button" onClick={onClose} aria-label="关闭" />
+      <aside>
+        <header><span className={`team-agent-avatar kind-${supervisor?.agentKind ?? "k_agent"}`}>{supervisor ? agentMonogram(supervisor.agentKind) : "KA"}</span><div><p className="team-kicker">SUPERVISOR CONTROL RECORD</p><h2>{supervisor?.name ?? "团队主管"}</h2><span>验收 · 分配 · 返工 · 结束团队</span></div><span className={`team-state-pill ${team.supervisorState?.status ?? "idle"}`}><i />{supervisorStateLabel(team.supervisorState)}</span><button type="button" onClick={onClose}>×</button></header>
+        <div className="team-run-content" ref={bodyRef}>
+          {starts.map((start, index) => {
+            const jobId = String(start.payload.jobId ?? start.eventId);
+            const open = expandedJobId === jobId;
+            const jobEvents = events.filter((event) => event.payload.taskId === jobId || event.payload.jobId === jobId);
+            const applied = jobEvents.find((event) => event.type === "supervisor.decision_applied");
+            const failed = jobEvents.find((event) => event.type === "supervisor.decision_failed");
+            const items = buildConversationItems(jobEvents);
+            const status = applied ? "completed" : failed && failed.payload.willRetry === false ? "failed" : "running";
+            return (
+              <section className={`team-task-session ${open ? "open" : "collapsed"} ${status}`} key={jobId}>
+                <button className="team-task-session-summary" type="button" aria-expanded={open} onClick={() => setExpandedJobId(open ? "" : jobId)}>
+                  <span>{open ? "⌄" : "›"}</span><div><small>主管决策 {String(index + 1).padStart(2, "0")}</small><strong>{supervisorTriggerLabel(String(start.payload.triggerType ?? "supervisor.event"))}</strong><p>{applied ? String(applied.payload.summary ?? "决策已应用") : failed ? String(failed.payload.error ?? "决策失败") : "正在读取团队状态并制定下一步"}</p></div><i className={status}><b />{STATUS_LABEL[status] ?? status}</i>
+                </button>
+                {open && <div className="team-task-conversation">
+                  <article className="team-conversation-request"><header><span>本轮调度边界</span><b>主管控制</b></header><div><strong>{String(start.payload.triggerType ?? "事件触发")}</strong><p>{supervisorTriggerLabel(String(start.payload.triggerType ?? "supervisor.event"))}</p></div></article>
+                  {items.length ? items.map((item) => <ConversationEvent key={item.id} item={item} live={!applied && !failed} />) : <EmptyPanel text="主管正在准备决策…" />}
+                  {applied && <article className="team-supervisor-decision"><small>STRUCTURED DECISION</small><strong>{String(applied.payload.summary ?? "主管决策已应用")}</strong><p>{supervisorDecisionActionSummary(applied.payload.actions)}</p></article>}
+                  {failed && <div className="team-run-error"><strong>主管决策未通过校验</strong><p>{String(failed.payload.error ?? "未知错误")}</p></div>}
+                </div>}
+              </section>
+            );
+          })}
+          {!starts.length && <EmptyPanel text="主管尚未开始第一轮调度" />}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
 function TaskRunDrawer({ task, tasks, agents, artifacts, events, teamGoal, onClose }: { task: TeamTask; tasks: TeamTask[]; agents: TeamSnapshot["agents"]; artifacts: TeamArtifact[]; events: TeamEvent[]; teamGoal: string; onClose: () => void }) {
   const owner = agents.find((agent) => agent.id === task.ownerAgentId);
   const supervisor = agents.find((agent) => agent.isSupervisor) ?? agents[0];
@@ -614,7 +769,7 @@ function TaskRunDrawer({ task, tasks, agents, artifacts, events, teamGoal, onClo
         <div className="team-run-content" ref={bodyRef}>
           {orderedTasks.map((candidate, index) => {
             const open = candidate.id === expandedTaskId;
-            const taskEvents = events.filter((event) => event.payload.taskId === candidate.id);
+            const taskEvents = events.filter((event) => eventBelongsToTask(event, candidate.id));
             const items = buildConversationItems(taskEvents);
             const toolCount = items.filter((item) => item.kind === "tool").length;
             const taskArtifacts = artifacts.filter((artifact) => artifact.taskId === candidate.id);
@@ -628,13 +783,13 @@ function TaskRunDrawer({ task, tasks, agents, artifacts, events, teamGoal, onClo
                     <article className="team-conversation-request">
                       <header><span>承接任务详情</span><b>{candidate.taskType === "synthesis" ? "综合任务" : "执行任务"}</b></header>
                       <div><strong>{candidate.title}</strong><p>{candidate.description}</p></div>
-                      <dl><div><dt>发放者</dt><dd>{supervisor?.name ?? "团队调度器"}</dd></div><div><dt>承接者</dt><dd>{owner?.name ?? "等待认领"}</dd></div><div><dt>优先级</dt><dd>P{candidate.priority}</dd></div><div><dt>执行次数</dt><dd>{candidate.attempt}/{candidate.maxAttempts}</dd></div></dl>
+                      <dl><div><dt>发放者</dt><dd>{supervisor?.name ?? "团队调度器"}</dd></div><div><dt>承接者</dt><dd>{owner?.name ?? "等待认领"}</dd></div><div><dt>交付规则</dt><dd>{candidate.reviewRequired ? "需主管验收" : "无需验收"}</dd></div><div><dt>优先级</dt><dd>P{candidate.priority}</dd></div><div><dt>执行次数</dt><dd>{candidate.attempt}/{candidate.maxAttempts}</dd></div></dl>
                       <section><small>团队目标</small><p>{teamGoal}</p></section>
                       {candidate.dependsOn.length > 0 && <section><small>前置依赖</small><p>{candidate.dependsOn.map((dependencyId) => tasks.find((item) => item.id === dependencyId)?.title ?? dependencyId).join("、")}</p></section>}
                       {owner?.responsibility && <section><small>职责边界</small><p>{owner.responsibility}</p></section>}
                     </article>
                     {items.length ? items.map((item) => <ConversationEvent key={item.id} item={item} live={candidate.status === "running"} />) : <EmptyPanel text={candidate.status === "running" ? "Agent 正在准备响应…" : "这个任务还没有运行记录"} />}
-                    {taskArtifacts.map((artifact) => <article className="team-conversation-artifact" key={artifact.id}><span>◇</span><div><small>ARTIFACT · v{artifact.version}</small><strong>{artifact.title}</strong><p>{artifact.uri}</p></div></article>)}
+                    {taskArtifacts.map((artifact) => <article className={`team-conversation-artifact ${artifact.status}`} key={artifact.id}><span>◇</span><div><small>ARTIFACT · v{artifact.version} · {artifactStatusLabel(artifact.status)}</small><strong>{artifact.title}</strong><p title={artifact.workspacePath ?? artifact.uri}>{artifact.workspacePath ?? artifact.uri}</p></div></article>)}
                     {candidate.error && <div className="team-run-error"><strong>运行错误</strong><p>{candidate.error}</p></div>}
                   </div>
                 )}
@@ -775,7 +930,13 @@ function buildConversationItems(events: TeamEvent[]): ConversationItem[] {
     }
     if (event.type === "run.started") items.push({ kind: "notice", id: event.eventId, label: "Agent 开始执行任务", tone: "normal", occurredAt: event.occurredAt });
     if (event.type === "run.failed") items.push({ kind: "notice", id: event.eventId, label: "本次运行失败，调度器将按策略处理", tone: "error", occurredAt: event.occurredAt });
-    if (event.type === "task.completed") items.push({ kind: "notice", id: event.eventId, label: "任务已完成并发布 Artifact", tone: "success", occurredAt: event.occurredAt });
+    if (event.type === "task.submitted") items.push({ kind: "notice", id: event.eventId, label: "成果已提交，等待主管验收", tone: "normal", occurredAt: event.occurredAt });
+    if (event.type === "task.revision_requested") items.push({ kind: "notice", id: event.eventId, label: `主管要求修改：${String(event.payload.reason ?? "请完善交付")}`, tone: "error", occurredAt: event.occurredAt });
+    if (event.type === "task.completed") items.push({ kind: "notice", id: event.eventId, label: "主管已验收 Artifact，任务正式完成", tone: "success", occurredAt: event.occurredAt });
+    if (event.type === "supervisor.decision_applied") {
+      const action = supervisorActionForTask(event);
+      if (action) items.push({ kind: "notice", id: event.eventId, label: `主管决策：${String(action.reason ?? event.payload.summary ?? action.type)}`, tone: action.type === "request_revision" ? "error" : "success", occurredAt: event.occurredAt });
+    }
   }
   return items;
 }
@@ -832,7 +993,20 @@ function approvalPreview(detail: Record<string, unknown>): string {
 }
 
 function firstTaskEventSeq(events: TeamEvent[], taskId: string): number {
-  return events.find((event) => event.payload.taskId === taskId)?.seq ?? Number.MAX_SAFE_INTEGER;
+  return events.find((event) => eventBelongsToTask(event, taskId))?.seq ?? Number.MAX_SAFE_INTEGER;
+}
+
+function eventBelongsToTask(event: TeamEvent, taskId: string): boolean {
+  return event.payload.taskId === taskId || Boolean(supervisorActionForTask(event, taskId));
+}
+
+function supervisorActionForTask(event: TeamEvent, taskId?: string): Record<string, unknown> | null {
+  if (event.type !== "supervisor.decision_applied" || !Array.isArray(event.payload.actions)) return null;
+  const action = event.payload.actions.find((item) => {
+    if (!item || typeof item !== "object") return false;
+    return taskId ? (item as Record<string, unknown>).taskId === taskId : Boolean((item as Record<string, unknown>).taskId);
+  });
+  return action && typeof action === "object" ? action as Record<string, unknown> : null;
 }
 
 function stringifyActivityValue(value: unknown): string {
@@ -848,6 +1022,53 @@ function toolResultIsError(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function supervisorStateLabel(state: TeamSnapshot["supervisorState"]): string {
+  if (!state) return "空闲";
+  if (state.status === "pending") return "等待主管调度";
+  if (state.status === "running") return "主管决策中";
+  if (state.status === "failed") return "主管决策失败";
+  if (state.status === "cancelled") return "已取消";
+  return "已完成本轮决策";
+}
+
+function supervisorTriggerLabel(triggerType: string): string {
+  const labels: Record<string, string> = {
+    "team.started": "正在检查团队目标、成员能力与初始任务分配",
+    "task.submitted": "正在验收成员提交的 Artifact，并决定下一步任务",
+    "task.failed": "正在处理失败任务、返工或重新分配",
+    "task.created": "正在检查新任务及其承接成员",
+    "user.instruction_added": "正在处理你补充的团队指令",
+  };
+  return labels[triggerType] ?? `正在处理 ${triggerType}`;
+}
+
+function artifactStatusLabel(status: string): string {
+  if (status === "pending_review") return "待主管验收";
+  if (status === "accepted") return "主管已验收";
+  if (status === "revision_required") return "需要修改";
+  return status;
+}
+
+function supervisorDecisionActionSummary(value: unknown): string {
+  if (!Array.isArray(value)) return "决策动作已提交到任务板。";
+  const labels: Record<string, string> = {
+    approve_plan: "批准计划",
+    accept_submission: "验收成果",
+    request_revision: "要求返工",
+    create_task: "创建任务",
+    assign_task: "分配任务",
+    reassign_task: "重新分配",
+    request_review: "发起复核",
+    ask_human: "请求用户决策",
+    finish_team: "结束团队任务",
+  };
+  return value.map((item) => {
+    const action = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const label = labels[String(action.type ?? "")] ?? String(action.type ?? "未知动作");
+    return action.reason ? `${label}：${String(action.reason)}` : label;
+  }).join("；");
 }
 
 

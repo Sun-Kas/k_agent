@@ -185,6 +185,8 @@ export interface AgUiRunInput {
     agentOptions?: {
       cliSessionMode?: CliSessionMode;
       resumeSessionId?: string;
+      networkAccess?: boolean;
+      claudeAutoApproveTools?: string[];
     };
   };
 }

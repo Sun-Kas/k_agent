@@ -35,7 +35,11 @@ class BashInvocation:
 
 
 def plan_bash_invocation(
-    command: str, *, workspace_root: Path, settings: Settings
+    command: str,
+    *,
+    workspace_root: Path,
+    settings: Settings,
+    network_access: bool | None = None,
 ) -> BashInvocation:
     """Decide how to run one Bash command under the configured sandbox mode."""
 
@@ -53,7 +57,11 @@ def plan_bash_invocation(
         logger.info("Bash sandbox unavailable, running unsandboxed: %s", support.reason)
         return BashInvocation(None, False, support.reason)
 
-    settings_path = _materialize_settings(workspace_root=workspace_root, settings=settings)
+    settings_path = _materialize_settings(
+        workspace_root=workspace_root,
+        settings=settings,
+        network_access=network_access,
+    )
     argv = [
         settings.bash_sandbox_command,
         "--settings",
@@ -65,7 +73,12 @@ def plan_bash_invocation(
     return BashInvocation(argv, True, "ok")
 
 
-def build_settings_payload(*, workspace_root: Path, settings: Settings) -> dict:
+def build_settings_payload(
+    *,
+    workspace_root: Path,
+    settings: Settings,
+    network_access: bool | None = None,
+) -> dict:
     """Translate backend settings into an srt settings document.
 
     srt denies writes and network by default and allows reads by default, so the
@@ -79,6 +92,9 @@ def build_settings_payload(*, workspace_root: Path, settings: Settings) -> dict:
     deny_read.extend(_expand_paths(settings.bash_sandbox_deny_read))
     # The project's own .env holds the model API keys that this agent runs on.
     deny_read.append(str(workspace_root / ".env"))
+    enabled = (
+        settings.network_access_default if network_access is None else network_access
+    )
     return {
         "filesystem": {
             "denyRead": _dedupe(deny_read),
@@ -87,14 +103,18 @@ def build_settings_payload(*, workspace_root: Path, settings: Settings) -> dict:
             "denyWrite": [str(workspace_root / ".env")],
         },
         "network": {
-            "allowedDomains": list(settings.bash_sandbox_allowed_domains),
+            "allowedDomains": (
+                list(settings.bash_sandbox_allowed_domains) if enabled else []
+            ),
             "deniedDomains": [],
             "allowLocalBinding": False,
         },
     }
 
 
-def _materialize_settings(*, workspace_root: Path, settings: Settings) -> Path:
+def _materialize_settings(
+    *, workspace_root: Path, settings: Settings, network_access: bool | None
+) -> Path:
     """Write the srt settings document to a stable, content-addressed path.
 
     Keying the filename by content means concurrent runs with identical settings
@@ -102,7 +122,11 @@ def _materialize_settings(*, workspace_root: Path, settings: Settings) -> Path:
     reads a file that another run is midway through rewriting.
     """
 
-    payload = build_settings_payload(workspace_root=workspace_root, settings=settings)
+    payload = build_settings_payload(
+        workspace_root=workspace_root,
+        settings=settings,
+        network_access=network_access,
+    )
     serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
     directory = Path(tempfile.gettempdir()) / "k_agent_sandbox"

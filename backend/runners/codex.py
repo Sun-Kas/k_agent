@@ -29,6 +29,7 @@ from backend.runners.cli_process import (
 )
 from backend.runners.codex_app_server import CodexStreamState, run_codex_app_server
 from backend.runners.codex_config import write_codex_mcp_config
+from backend.runners.network_policy import network_access_enabled
 from backend.runners.resolve_cli import resolve_cli
 
 
@@ -67,6 +68,7 @@ class CodexRunner:
             approval_broker=ctx.approval_broker,
             public_thread_id=ctx.thread_id,
             run_id=ctx.run_id,
+            network_access=network_access_enabled(ctx),
             mapper=map_codex_event,
         ):
             yield event

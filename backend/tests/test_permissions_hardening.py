@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import unittest
@@ -12,7 +13,8 @@ from backend.agent.react_agent import OpenAIAgent
 from backend.permissions import check_permissions, default_behavior
 from backend.permissions import rules as permission_rules
 from backend.tools import ToolDefinition
-from backend.tools.cc_extra import _html_to_text, _is_public_address
+from backend.tools.cc_extra import _html_to_text, _is_public_address, cc_web_fetch
+from backend.tools.workspace import reset_tool_network_access, set_tool_network_access
 
 
 class PermissionRuleTests(unittest.TestCase):
@@ -148,6 +150,17 @@ class SkillAllowlistTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WebFetchGuardTests(unittest.TestCase):
+    def test_run_network_policy_returns_a_recoverable_tool_error(self) -> None:
+        token = set_tool_network_access(False)
+        try:
+            payload = json.loads(
+                asyncio.run(cc_web_fetch({"url": "https://example.com"}))
+            )
+        finally:
+            reset_tool_network_access(token)
+        self.assertFalse(payload["ok"])
+        self.assertIn("disabled", payload["error"])
+
     def test_loopback_and_private_hosts_are_not_public(self) -> None:
         self.assertFalse(_is_public_address("127.0.0.1"))
         self.assertFalse(_is_public_address("localhost"))

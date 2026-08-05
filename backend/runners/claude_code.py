@@ -39,6 +39,7 @@ from backend.runners.claude_mcp import (
     write_claude_mcp_config,
 )
 from backend.runners.resolve_cli import resolve_cli
+from backend.runners.network_policy import network_access_enabled
 
 
 class ClaudeCodeRunner:
@@ -94,12 +95,22 @@ class ClaudeCodeRunner:
                 "--permission-mode",
                 permission_mode,
             ]
+            # Flag settings have run scope and do not mutate the user's Claude
+            # configuration. `*` permits outbound hosts while leaving Claude's
+            # filesystem sandbox enabled; an empty list is a fail-closed deny.
+            argv.extend([
+                "--settings",
+                json.dumps(
+                    claude_sandbox_settings(network_access_enabled(ctx)),
+                    separators=(",", ":"),
+                ),
+            ])
             if approval_bridge is not None and permission_mode != "bypassPermissions":
                 # Claude print mode delegates permission prompts to this private
                 # MCP tool; its result is normalized by ApprovalBroker exactly
                 # like K Agent and Codex app-server requests.
                 argv.extend([
-                    "--allowedTools", APPROVAL_TOOL_NAME,
+                    "--allowedTools", *_claude_allowed_tools(ctx),
                     "--permission-prompt-tool", APPROVAL_TOOL_NAME,
                 ])
             if mcp_config is not None:
@@ -140,6 +151,17 @@ class ClaudeCodeStreamState(_CliStreamState):
         self.thinking_delta_buffer = ""
         # Claude provider tool_use id → AG-UI tool call id.
         self.tool_id_map: dict[str, str] = {}
+
+
+def claude_sandbox_settings(network_access: bool) -> dict[str, Any]:
+    """Build flag-scoped Claude settings without weakening file isolation."""
+
+    return {
+        "sandbox": {
+            "enabled": True,
+            "network": {"allowedDomains": ["*"] if network_access else []},
+        }
+    }
 
 
 def build_claude_skill_preamble(skills: list[dict[str, Any]]) -> str:
@@ -395,6 +417,29 @@ def _claude_permission_mode(
     if raw in _CLAUDE_PERMISSION_MODES:
         return raw
     return "default" if approval_available else "bypassPermissions"
+
+
+def _claude_allowed_tools(ctx: RunnerContext) -> list[str]:
+    """Pre-approve routine built-ins while keeping the approval MCP callable."""
+
+    configured = ctx.options.get("claudeAutoApproveTools")
+    if isinstance(configured, list):
+        routine_tools = [
+            str(tool).strip()
+            for tool in configured
+            if isinstance(tool, str) and str(tool).strip()
+        ]
+    elif ctx.settings is not None:
+        routine_tools = list(ctx.settings.claude_auto_approve_tools)
+    else:
+        routine_tools = [
+            "Bash", "Read", "Edit", "Write", "Glob", "Grep",
+            "NotebookEdit", "WebFetch", "WebSearch", "TodoWrite",
+            "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "Skill",
+        ]
+    # Keep ordering stable for readable process diagnostics and avoid passing
+    # the private permission tool twice when a caller supplies an override.
+    return list(dict.fromkeys([*routine_tools, APPROVAL_TOOL_NAME]))
 
 
 @asynccontextmanager

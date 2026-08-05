@@ -147,24 +147,34 @@ Agent Backend 的主要改动位置：
 
 - 现有会话继续使用 JSON 存储，降低迁移风险。
 - Team 元数据使用 SQLite WAL。
-- Artifact 大文件存放在文件系统，SQLite 保存索引、哈希和血缘。
-- 默认数据库路径：`$K_AGENT_HOME/state/team_runtime.db`。
-- 默认 Artifact 路径：`$K_AGENT_HOME/state/teams/{teamId}/artifacts/`。
-- 默认 Workspace 路径：`$K_AGENT_HOME/state/teams/{teamId}/workspaces/`。
+- SQLite 是 Team 状态与文本 Artifact 的权威来源，任务目录提供可审查的文件副本。
+- 默认数据库路径：`$K_AGENT_HOME/state/teams/team_runtime.db`。
+- 每个 Team 必须记录绝对 `workspaceDir`；留空时默认使用
+  `$K_AGENT_HOME/state/teams/{teamId}/workspace/`，目录内的 `.k_agent-team.json`
+  防止多个 Team 误用同一发布空间。
+- 默认任务路径：`$K_AGENT_HOME/state/teams/{teamId}/tasks/{taskId}/`。
+- `input/` 保存任务、Mailbox 与依赖 Artifact 快照，`output/` 是 Agent 工作目录，
+  `artifacts/` 保存候选成果的文本副本，`logs/` 保存按 Run 划分的原始事件流。
+- Worker 不直接写 Team 工作空间。主管验收后，Runtime 将 `output/`（排除依赖快照）、
+  `result.md` 和 `artifact.json` 原子发布到
+  `{workspaceDir}/artifacts/{taskId}/{artifactId}/`。下游任务读取 Artifact URI，并在
+  自己的 `output/.team-input/artifacts/{artifactId}/` 获得已发布文件快照。
+- 当前非编码任务模式不会创建或复制 Git 仓库；未来编码模式需要显式选择目标项目后再按需启用 worktree。
 
 ### 4.2 核心数据表
 
 | 实体 | 关键字段 |
 |---|---|
-| `teams` | `goal`、`mode`、`status`、`budget`、`policy`、`revision` |
+| `teams` | `goal`、`mode`、`status`、`workspaceDir`、`budget`、`policy`、`revision` |
 | `team_agents` | `role`、`runnerKind`、`modelId`、`profileSnapshot`、`creationReason`、`status` |
 | `team_tasks` | `spec`、`status`、`priority`、`owner`、`leaseUntil`、`attempt`、`qualityGate` |
 | `task_dependencies` | `taskId`、`dependsOnTaskId` |
 | `agent_runs` | `agentId`、`taskId`、`attempt`、`providerSessionId`、`usage`、`error` |
 | `mailbox_messages` | `sender`、`recipient`、`type`、`correlationId`、`dedupeKey`、`ack` |
-| `artifacts` | `kind`、`path`、`sha256`、`version`、`producer`、`status`、`schema` |
+| `artifacts` | `kind`、`path`、`workspacePath`、`sha256`、`version`、`producer`、`status`、`schema` |
 | `artifact_links` | `artifactId`、`consumerTaskId`、`relation` |
 | `team_events` | `teamId`、`seq`、`type`、`actor`、`entity`、`payload` |
+| `supervisor_jobs` | `triggerType`、`triggerPayload`、`status`、`attempt`、`leaseUntil`、`decision`、`error` |
 | `team_approvals` | `action`、`scope`、`status`、`expiresAt`、`resolution` |
 | `workspace_leases` | `workspaceId`、`agentId`、`baseCommit`、`branch`、`status` |
 
@@ -181,8 +191,9 @@ draft → running → paused → running → completed
 Task 状态：
 
 ```text
-pending → ready → claimed → running → review → completed
-                    │          │          └→ revision_required → ready
+pending → assigned → running → submitted → completed
+                    │              │          ↑
+                    │              └→ revision_required → pending
                     │          └→ failed → ready/reassigned
                     └→ lease_expired → ready
 ```
@@ -205,26 +216,28 @@ queued → running → waiting_approval → succeeded
                  └→ lost
 ```
 
-### 4.4 原子任务认领
+### 4.4 主管指派与原子执行租约
 
-Agent 自主认领必须通过 SQLite 事务实现：
+当前默认模式不由 Scheduler 或 Worker 自行选择承接者。Supervisor 在结构化决策中
+明确写入 `assigneeAgentId`，Access Layer 校验成员、依赖和权限后事务提交分配；
+Scheduler 只为已经分配的任务获取执行租约：
 
 1. 执行 `BEGIN IMMEDIATE`。
 2. 检查任务依赖是否全部完成。
 3. 检查任务是否为 `ready`，且租约不存在或已经过期。
-4. 检查 Agent 能力、权限、并发和预算是否满足要求。
-5. 以 `revision` 作为乐观锁，原子更新 owner、status、lease 和 revision。
+4. 检查已指派 Agent 的状态、权限、并发和预算是否满足要求。
+5. 原子更新 status、lease、attempt 和 runId，不在此时改变 owner。
 6. 写入 `task.claimed` Team Event。
 7. 提交事务。
 
-多个 Agent 同时认领同一任务时，只允许一个成功。其他 Agent 得到结构化结果：
+多个 Scheduler 进程同时尝试启动同一任务时，只允许一个获得租约。其他进程得到结构化结果：
 
 ```json
 {
   "ok": false,
   "error": {
-    "code": "TASK_ALREADY_CLAIMED",
-    "message": "任务已被其他 Agent 认领",
+    "code": "TASK_ALREADY_LEASED",
+    "message": "任务已经由另一个执行器启动",
     "retryable": true
   }
 }
@@ -258,14 +271,14 @@ A2A_ENABLED=false
 Scheduler 的主要循环：
 
 1. 扫描状态为 `running` 的 Team。
-2. 将依赖已满足的 `pending` Task 转为 `ready`。
-3. 处理过期 Agent heartbeat 和 Task lease。
-4. 为可运行 Task 查找满足能力和预算条件的 Agent。
-5. 原子认领任务并创建 Run Attempt。
+2. 优先租用并执行最早的 `supervisor_jobs`，存在主管边界时不派发新 Worker。
+3. 校验并事务应用 Supervisor 的结构化动作，包括分配、返工、复核和结束 Team。
+4. 处理过期 Supervisor/Task lease，并恢复对应 Agent 状态。
+5. 为依赖已满足且已有 owner 的 Task 原子创建 Run Attempt。
 6. 调用 Agent Backend 执行 Worker Run。
-7. 持久化事件、指标、Artifact 和最终状态。
-8. 根据结果进入 review、retry、reassign 或 completed。
-9. 在关键事件后唤醒 Supervisor。
+7. 将 Worker 成果保存为 `pending_review` Artifact，并把 Task 标记为 `submitted`。
+8. 在同一事务中写入 `task.submitted` 并创建持久化主管任务。
+9. 主管验收后才把 Artifact 标为 `accepted`、Task 标为 `completed`，后续依赖才可执行。
 
 ### 5.3 崩溃恢复
 
@@ -290,15 +303,17 @@ Scheduler 的主要循环：
 
 Supervisor 不应作为一个永久占用 HTTP 连接的长时间 Run。采用事件唤醒模型：
 
-1. 用户提交目标。
-2. Supervisor 生成结构化 Team Proposal。
-3. 用户批准，或 Team Policy 自动批准。
-4. Scheduler 创建 Agent 和 Task，并开始调度。
-5. Task 完成、失败、Artifact 发布、审查或质疑事件唤醒 Supervisor。
-6. Supervisor 更新计划、创建修订任务或调整 Agent。
-7. 所有必要 Artifact 通过质量门禁后，Supervisor 合成最终结果。
+1. 用户提交目标，Access Layer 持久化 `team.started` 主管任务。
+2. Supervisor 审查初始任务草案并明确每个 `assigneeAgentId`。
+3. Scheduler 校验并提交决策后，才允许 Worker 开始执行。
+4. Worker 只提交候选 Artifact，不直接把 Task 标记为完成。
+5. `task.submitted`、终态 `task.failed` 和用户补充指令会唤醒 Supervisor。
+6. Supervisor 可验收、退回、改派、创建后续 Task 或请求独立复核。
+7. 所有必要 Artifact 通过质量门禁后，Supervisor 显式执行 `finish_team`。
 
-Supervisor 通过受限的 Team Control MCP 操作 Team，而不是直接访问数据库。
+当前实现要求 Supervisor 只返回 JSON 动作；Access Layer 的事务执行器是唯一可修改
+Team 数据库的组件。调度提示不会挂载 Worker 的 MCP/Skill，避免主管控制调用意外获得
+外部副作用权限。未来可把同一动作协议封装成受限 Team Control MCP，但不能绕过校验器。
 
 建议工具：
 
@@ -868,4 +883,3 @@ k_agent 的差异化不应是“同时跑多个模型”，而应是：
 - `backend/storage/file.py`：当前文件原子写入实现。
 - `frontend/src/types.ts`：当前 AG-UI Event 类型。
 - `frontend/src/App.tsx`：当前按 session 管理活动 Run 和事件处理。
-

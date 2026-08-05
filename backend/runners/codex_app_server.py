@@ -44,6 +44,7 @@ async def run_codex_app_server(
     approval_broker: ApprovalBroker,
     public_thread_id: str,
     run_id: str,
+    network_access: bool,
     mapper: CodexItemMapper,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one Codex turn and bridge JSON-RPC server requests to the UI."""
@@ -135,7 +136,9 @@ async def run_codex_app_server(
             "sandboxPolicy": {
                 "type": "workspaceWrite",
                 "writableRoots": [str(cwd)],
-                "networkAccess": False,
+                # Codex keeps workspace-write isolation even when outbound
+                # access is enabled; this flag changes only the network edge.
+                "networkAccess": network_access,
             },
         }
         if model:

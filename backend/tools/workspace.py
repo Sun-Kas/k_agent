@@ -9,6 +9,9 @@ from pathlib import Path
 _workspace_root: ContextVar[Path | None] = ContextVar(
     "k_agent_tool_workspace_root", default=None
 )
+_network_access: ContextVar[bool | None] = ContextVar(
+    "k_agent_tool_network_access", default=None
+)
 
 
 def set_tool_workspace(path: Path | None) -> Token[Path | None]:
@@ -27,3 +30,21 @@ def current_tool_workspace() -> Path | None:
     """Return the workspace inherited by tools in the current async context."""
 
     return _workspace_root.get()
+
+
+def set_tool_network_access(enabled: bool) -> Token[bool | None]:
+    """Bind the run's outbound policy for Bash without mutating Settings."""
+
+    return _network_access.set(enabled)
+
+
+def reset_tool_network_access(token: Token[bool | None]) -> None:
+    """Restore the previous async-context network policy."""
+
+    _network_access.reset(token)
+
+
+def current_tool_network_access() -> bool | None:
+    """Return the run override inherited by request-scoped local tools."""
+
+    return _network_access.get()

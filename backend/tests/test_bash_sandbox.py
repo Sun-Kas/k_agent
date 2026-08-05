@@ -148,6 +148,11 @@ class SandboxPlanningTests(unittest.TestCase):
 
 
 class SandboxSettingsTests(unittest.TestCase):
+    def test_default_settings_allow_all_network_domains(self) -> None:
+        settings = Settings(_env_file=None)
+        self.assertTrue(settings.network_access_default)
+        self.assertEqual(settings.bash_sandbox_allowed_domains, ["*"])
+
     def test_settings_deny_credential_stores_and_project_env(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -166,6 +171,15 @@ class SandboxSettingsTests(unittest.TestCase):
         self.assertIn(str(workspace / ".env"), deny_read)
         self.assertIn(str(Path("~/extra").expanduser()), allow_write)
         self.assertEqual(payload["network"]["allowedDomains"], ["example.com"])
+
+    def test_run_override_denies_network_without_disabling_filesystem_sandbox(self) -> None:
+        payload = build_settings_payload(
+            workspace_root=Path("/tmp/ws"),
+            settings=_settings(bash_sandbox_allowed_domains=["*"]),
+            network_access=False,
+        )
+        self.assertEqual(payload["network"]["allowedDomains"], [])
+        self.assertIn("/tmp/ws", payload["filesystem"]["allowWrite"])
 
 
 class ChildEnvTests(unittest.TestCase):
