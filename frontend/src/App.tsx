@@ -5,7 +5,6 @@ import {
   PointerEvent as ReactPointerEvent,
   type ReactNode,
   useEffect,
-  useMemo,
   useRef,
   useState
 } from "react";
@@ -15,12 +14,15 @@ import {
   getModelsConfig,
   getRuntimeCatalog,
   getSession,
+  getSessionWorkspace,
+  getSessionWorkspaceFile,
   listSessions,
   resolveApproval,
   streamAgentRun
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ConfigCenter } from "./components/ConfigCenter";
+import { ContentStage, type ContentStageItem } from "./components/ContentStage";
 import { TeamWorkbench } from "./components/TeamWorkbench";
 import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
@@ -294,8 +296,19 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("k-agent-sidebar-collapsed") === "true");
   const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [teamStageOpen, setTeamStageOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem("k-agent-sidebar-width")) || 252);
-  const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 310);
+  const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 360);
+  const [rightPanelMode, setRightPanelMode] = useState<"trace" | "workspace">(() => {
+    const saved = localStorage.getItem("k-agent-right-panel-mode");
+    return saved === "workspace" ? "workspace" : "trace";
+  });
+  const [workspaceItems, setWorkspaceItems] = useState<ContentStageItem[]>([]);
+  const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const workspaceCacheRef = useRef<Map<string, string>>(new Map());
+  const selectedWorkspacePathRef = useRef<string | null>(null);
   const [view, setView] = useState<"chat" | "config" | "team">("chat");
   const [models, setModels] = useState<ModelProfile[]>([]);
   const [agents, setAgents] = useState<DetectedAgent[]>([]);
@@ -411,6 +424,121 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("k-agent-desktop-pet-enabled", String(desktopPetEnabled));
   }, [desktopPetEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("k-agent-right-panel-mode", rightPanelMode);
+  }, [rightPanelMode]);
+
+  useEffect(() => {
+    workspaceCacheRef.current.clear();
+    selectedWorkspacePathRef.current = null;
+    setWorkspaceItems([]);
+    setSelectedWorkspacePath(null);
+    setWorkspaceError(null);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (rightPanelMode !== "workspace" || !sessionId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function refreshWorkspace() {
+      const activeId = sessionId;
+      if (!activeId) return;
+      setWorkspaceLoading(true);
+      setWorkspaceError(null);
+      try {
+        const listing = await getSessionWorkspace(activeId);
+        if (cancelled) return;
+
+        let nextSelected = selectedWorkspacePathRef.current;
+        if (!nextSelected || !listing.files.some((file) => file.path === nextSelected)) {
+          nextSelected = listing.files[0]?.path ?? null;
+        }
+        selectedWorkspacePathRef.current = nextSelected;
+
+        const items: ContentStageItem[] = [];
+        for (const file of listing.files) {
+          const cacheKey = `${activeId}:${file.path}`;
+          // Always refresh the selected file so Agent writes show up live.
+          const shouldFetch = file.path === nextSelected
+            || (!workspaceCacheRef.current.has(cacheKey) && listing.files.length <= 12);
+          let content = workspaceCacheRef.current.get(cacheKey);
+          if (shouldFetch) {
+            try {
+              const payload = await getSessionWorkspaceFile(activeId, file.path);
+              if (cancelled) return;
+              content = formatWorkspacePreview(payload);
+              workspaceCacheRef.current.set(cacheKey, content);
+            } catch {
+              content = "读取失败";
+              workspaceCacheRef.current.set(cacheKey, content);
+            }
+          }
+          items.push({
+            id: file.path,
+            title: file.name,
+            subtitle: file.path,
+            badge: formatBytes(file.size),
+            content: content ?? "选择后加载预览…"
+          });
+        }
+        setWorkspaceItems(items);
+        setSelectedWorkspacePath(nextSelected);
+      } catch (reason) {
+        if (!cancelled) {
+          setWorkspaceItems([]);
+          setWorkspaceError(reason instanceof Error ? reason.message : "工作区加载失败");
+        }
+      } finally {
+        if (!cancelled) setWorkspaceLoading(false);
+      }
+    }
+
+    void refreshWorkspace();
+    const timer = window.setInterval(() => {
+      void refreshWorkspace();
+    }, loading ? 2500 : 8000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [rightPanelMode, sessionId, loading]);
+
+  async function openWorkspaceFile(path: string) {
+    if (!sessionId) return;
+    selectedWorkspacePathRef.current = path;
+    setSelectedWorkspacePath(path);
+    await resolveWorkspaceAsset(path);
+  }
+
+  async function resolveWorkspaceAsset(path: string): Promise<string | null> {
+    if (!sessionId) return null;
+    const cacheKey = `${sessionId}:${path}`;
+    const cached = workspaceCacheRef.current.get(cacheKey);
+    if (cached && cached !== "选择后加载预览…" && cached !== "读取失败") {
+      return cached;
+    }
+    try {
+      const payload = await getSessionWorkspaceFile(sessionId, path);
+      const content = formatWorkspacePreview(payload);
+      workspaceCacheRef.current.set(cacheKey, content);
+      setWorkspaceItems((current) => {
+        if (!current.some((item) => item.id === path)) return current;
+        return current.map((item) => (item.id === path ? { ...item, content } : item));
+      });
+      return content;
+    } catch {
+      workspaceCacheRef.current.set(cacheKey, "读取失败");
+      setWorkspaceItems((current) => current.map((item) => (
+        item.id === path ? { ...item, content: "读取失败" } : item
+      )));
+      return null;
+    }
+  }
 
   const filteredSessions = sessions.filter((session) =>
     session.title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
@@ -683,7 +811,7 @@ export function App() {
       const delta = moveEvent.clientX - startX;
       const nextWidth = side === "sidebar"
         ? Math.min(380, Math.max(190, startWidth + delta))
-        : Math.min(460, Math.max(250, startWidth - delta));
+        : Math.min(560, Math.max(280, startWidth - delta));
       latestWidth = nextWidth;
       if (side === "sidebar") setSidebarWidth(nextWidth);
       else setInspectorWidth(nextWidth);
@@ -710,7 +838,7 @@ export function App() {
       setSidebarWidth(next);
       localStorage.setItem("k-agent-sidebar-width", String(next));
     } else {
-      const next = Math.min(460, Math.max(250, inspectorWidth - direction * 10));
+      const next = Math.min(560, Math.max(280, inspectorWidth - direction * 10));
       setInspectorWidth(next);
       localStorage.setItem("k-agent-inspector-width", String(next));
     }
@@ -1450,6 +1578,8 @@ export function App() {
         sidebarWidth={sidebarWidth}
         sidebarOpen={sidebarOpen}
         sidebarCollapsed={sidebarCollapsed}
+        stageOpen={teamStageOpen}
+        stageWidth={inspectorWidth}
         onCloseSidebar={() => setSidebarOpen(false)}
         onToggleSidebar={() => {
           if (window.matchMedia("(max-width: 860px)").matches) {
@@ -1460,8 +1590,12 @@ export function App() {
           setSidebarCollapsed((current) => !current);
           setSidebarOpen(false);
         }}
+        onToggleStage={() => setTeamStageOpen((value) => !value)}
+        onOpenStage={() => setTeamStageOpen(true)}
         onBeginSidebarResize={(event) => beginResize("sidebar", event)}
         onResizeSidebarWithKeyboard={(event) => resizeWithKeyboard("sidebar", event)}
+        onBeginStageResize={(event) => beginResize("inspector", event)}
+        onResizeStageWithKeyboard={(event) => resizeWithKeyboard("inspector", event)}
       />
     );
   }
@@ -1636,7 +1770,7 @@ export function App() {
             >
               <i />
             </button>
-            <button className="topbar-icon-button" type="button" onClick={() => setInspectorOpen((value) => !value)} aria-label="切换运行详情">
+            <button className="topbar-icon-button" type="button" onClick={() => setInspectorOpen((value) => !value)} aria-label="切换右侧面板">
               <SidebarIcon side="right" />
             </button>
           </div>
@@ -1830,55 +1964,157 @@ export function App() {
         className="resize-handle resize-handle-right"
         role="separator"
         tabIndex={0}
-        aria-label="调整运行详情宽度"
+        aria-label="调整右侧面板宽度"
         aria-orientation="vertical"
         onPointerDown={(event) => beginResize("inspector", event)}
         onKeyDown={(event) => resizeWithKeyboard("inspector", event)}
       />
-      <aside className="inspector">
-        <header className="inspector-header">
-          <div><p className="eyebrow">RUN DETAILS</p><h2>运行详情</h2></div>
+      <aside className="inspector" aria-label={rightPanelMode === "trace" ? "运行轨迹" : "工作区"}>
+        <header className="inspector-header inspector-header-switch">
+          <div>
+            <p className="eyebrow">{rightPanelMode === "trace" ? "RUN DETAILS" : "WORKSPACE"}</p>
+            <h2>{rightPanelMode === "trace" ? "运行轨迹" : "工作区"}</h2>
+          </div>
+          <div className="inspector-mode-switch" role="tablist" aria-label="右侧面板模式">
+            <button
+              className={rightPanelMode === "trace" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={rightPanelMode === "trace"}
+              onClick={() => setRightPanelMode("trace")}
+            >
+              轨迹
+            </button>
+            <button
+              className={rightPanelMode === "workspace" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={rightPanelMode === "workspace"}
+              onClick={() => setRightPanelMode("workspace")}
+            >
+              工作区
+            </button>
+          </div>
         </header>
-        <section className="run-summary">
-          <div><span className={`run-orb ${loading ? "running" : ""}`}>◆</span><strong>{loading ? "Agent 正在工作" : "等待新任务"}</strong></div>
-          <p>{status}</p>
-          <dl>
-            <div><dt>工具调用</dt><dd>{tools.length}</dd></div>
-            <div><dt>轨迹事件</dt><dd>{trace.length}</dd></div>
-            <div><dt>思考阶段</dt><dd>{thinking.length}</dd></div>
-          </dl>
-        </section>
-        <InspectorSection title="思考过程" count={thinking.length}>
-          {thinking.length ? <div className="thinking-list">{thinking.map((step) => (
-            <article className={`thinking-step ${step.status}`} key={step.id}>
-              <span className="thinking-icon">{thinkingIcon(step.phase)}</span>
-              <div><strong>{step.title}</strong><p>{step.detail}</p></div>
-              <i />
-            </article>
-          ))}</div> : <EmptyInspector text="开始任务后会显示执行思路" />}
-        </InspectorSection>
-        <InspectorSection title="任务计划" count={tasks.length}>
-          {tasks.length ? tasks.map((task, index) => (
-            <div className="task-row" key={`${task}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><p>{task}</p></div>
-          )) : <EmptyInspector text="任务开始后会生成执行步骤" />}
-        </InspectorSection>
-        <InspectorSection title="工具活动" count={tools.length}>
-          {tools.length ? tools.map((tool) => (
-            <details className="tool-row" key={tool.id}>
-              <summary><ToolIcon className="tool-row-icon" /><strong>{tool.name}</strong><i className={tool.status} /></summary>
-              {tool.arguments && <code>{tool.arguments}</code>}
-              {tool.result && <p>{tool.result}</p>}
-            </details>
-          )) : <EmptyInspector text="暂时没有工具调用" />}
-        </InspectorSection>
-        <InspectorSection title="执行轨迹" count={trace.length}>
-          {trace.length ? <ol className="timeline">{trace.map((entry, index) => <li key={`${entry}-${index}`}>{entry}</li>)}</ol> : <EmptyInspector text="运行轨迹会实时显示" />}
-        </InspectorSection>
+
+        {rightPanelMode === "trace" ? (
+          <div className="inspector-scroll">
+            <section className="run-summary">
+              <div>
+                <span className={`run-orb ${loading ? "running" : ""}`}>◆</span>
+                <strong>{loading ? "Agent 正在工作" : "等待新任务"}</strong>
+              </div>
+              <p>{status}</p>
+              <dl>
+                <div><dt>工具调用</dt><dd>{tools.length}</dd></div>
+                <div><dt>轨迹事件</dt><dd>{trace.length}</dd></div>
+                <div><dt>思考阶段</dt><dd>{thinking.length}</dd></div>
+              </dl>
+            </section>
+            <InspectorSection title="思考过程" count={thinking.length}>
+              {thinking.length ? (
+                <div className="thinking-list">
+                  {thinking.map((step) => (
+                    <article className={`thinking-step ${step.status}`} key={step.id}>
+                      <span className="thinking-icon">{thinkingIcon(step.phase)}</span>
+                      <div>
+                        <strong>{step.title}</strong>
+                        <p>{step.detail}</p>
+                      </div>
+                      <i />
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <EmptyInspector text="开始任务后会显示执行思路" />
+              )}
+            </InspectorSection>
+            <InspectorSection title="任务计划" count={tasks.length}>
+              {tasks.length ? tasks.map((task, index) => (
+                <div className="task-row" key={`${task}-${index}`}>
+                  <span>{String(index + 1).padStart(2, "0")}</span>
+                  <p>{task}</p>
+                </div>
+              )) : (
+                <EmptyInspector text="任务开始后会生成执行步骤" />
+              )}
+            </InspectorSection>
+            <InspectorSection title="工具活动" count={tools.length}>
+              {tools.length ? tools.map((tool) => (
+                <details className="tool-row" key={tool.id}>
+                  <summary>
+                    <ToolIcon className="tool-row-icon" />
+                    <strong>{tool.name}</strong>
+                    <i className={tool.status} />
+                  </summary>
+                  {tool.arguments && <code>{tool.arguments}</code>}
+                  {tool.result && <p>{tool.result}</p>}
+                </details>
+              )) : (
+                <EmptyInspector text="暂时没有工具调用" />
+              )}
+            </InspectorSection>
+            <InspectorSection title="执行轨迹" count={trace.length}>
+              {trace.length ? (
+                <ol className="timeline">
+                  {trace.map((entry, index) => (
+                    <li key={`${entry}-${index}`}>{entry}</li>
+                  ))}
+                </ol>
+              ) : (
+                <EmptyInspector text="运行轨迹会实时显示" />
+              )}
+            </InspectorSection>
+          </div>
+        ) : !sessionId ? (
+          <ContentStage
+            embedded
+            items={[]}
+            selectedId={null}
+            onSelect={() => undefined}
+            emptyTitle="先打开或创建会话"
+            emptyHint="打开会话后，Agent 写入的文件会出现在这里"
+          />
+        ) : (
+          <ContentStage
+            embedded
+            items={workspaceItems}
+            selectedId={selectedWorkspacePath}
+            onSelect={(path) => { void openWorkspaceFile(path); }}
+            resolveFile={resolveWorkspaceAsset}
+            emptyTitle={workspaceLoading ? "正在读取工作区…" : "工作区还没有可预览文件"}
+            emptyHint={
+              workspaceError
+                || "Agent 在本会话写出的文档会出现在这里"
+            }
+          />
+        )}
       </aside>
     </div>
     <DesktopPet enabled={desktopPetEnabled} onEnabledChange={setDesktopPetEnabled} />
     </>
   );
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size}B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)}KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function formatWorkspacePreview(payload: {
+  content: string;
+  truncated: boolean;
+  binary: boolean;
+  size: number;
+}): string {
+  if (payload.binary) {
+    return `（二进制文件，约 ${formatBytes(payload.size)}，暂不预览）`;
+  }
+  if (payload.truncated) {
+    return `${payload.content}\n\n…（内容已截断）`;
+  }
+  return payload.content;
 }
 
 function createStreamingMessage(id: string, runId?: string | null): ChatMessage {
@@ -2090,11 +2326,24 @@ function ApprovalCard({
 }
 
 function InspectorSection({ title, count, children }: { title: string; count: number; children: React.ReactNode }) {
-  return <section className="inspector-section"><header><h3>{title}</h3><span>{count}</span></header>{children}</section>;
+  return (
+    <section className="inspector-section">
+      <header>
+        <h3>{title}</h3>
+        <span>{count}</span>
+      </header>
+      {children}
+    </section>
+  );
 }
 
 function EmptyInspector({ text }: { text: string }) {
-  return <div className="inspector-empty"><span>—</span><p>{text}</p></div>;
+  return (
+    <div className="inspector-empty">
+      <span>—</span>
+      <p>{text}</p>
+    </div>
+  );
 }
 
 function ToolIcon({ className = "" }: { className?: string }) {

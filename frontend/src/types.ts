@@ -18,6 +18,29 @@ export interface SessionSummary {
   messageCount: number;
 }
 
+export interface SessionWorkspaceFile {
+  path: string;
+  name: string;
+  size: number;
+  modifiedAt: number;
+}
+
+export interface SessionWorkspaceListing {
+  sessionId: string;
+  root: string;
+  files: SessionWorkspaceFile[];
+}
+
+export interface SessionWorkspaceFileContent {
+  sessionId: string;
+  path: string;
+  name: string;
+  content: string;
+  truncated: boolean;
+  binary: boolean;
+  size: number;
+}
+
 export interface SessionState {
   sessionId: string;
   messages: ChatMessage[];

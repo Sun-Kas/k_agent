@@ -29,6 +29,11 @@ from access_layer.request_context import (
     set_request_context,
 )
 from access_layer.sessions.store import SessionStore
+from access_layer.sessions.workspace import (
+    list_session_workspace,
+    read_session_workspace_file,
+    resolve_session_workspace,
+)
 from access_layer.teams import TeamRuntime, TeamStore, build_team_router
 from backend.api.schemas import (
     ApprovalResolutionInput,
@@ -804,6 +809,50 @@ def create_app() -> FastAPI:
                 else None
             ),
         )
+
+    @app.get("/api/sessions/{session_id}/workspace")
+    async def get_session_workspace(session_id: str):
+        """List user-visible files in the session workspace directory."""
+
+        try:
+            resolve_session_workspace(session_id)
+            listing = list_session_workspace(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "sessionId": session_id,
+            "root": listing.root,
+            "files": [
+                {
+                    "path": item.path,
+                    "name": item.name,
+                    "size": item.size,
+                    "modifiedAt": item.modified_at,
+                }
+                for item in listing.files
+            ],
+        }
+
+    @app.get("/api/sessions/{session_id}/workspace/file")
+    async def get_session_workspace_file(session_id: str, path: str):
+        """Read one workspace file preview for the chat workbench."""
+
+        try:
+            resolve_session_workspace(session_id)
+            payload = read_session_workspace_file(session_id, path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "sessionId": session_id,
+            "path": payload.path,
+            "name": payload.name,
+            "content": payload.content,
+            "truncated": payload.truncated,
+            "binary": payload.binary,
+            "size": payload.size,
+        }
 
     # Local built deployments expose only the Access Layer. Mounting the
     # compiled client after every API route preserves /api semantics while

@@ -11,6 +11,7 @@ from typing import Any
 import uuid
 
 from access_layer.teams.models import SupervisorDecision, TeamCreateInput, TeamTaskCreateInput
+from backend.home import public_home_relative_path, resolve_managed_path, to_managed_path
 
 
 def _now() -> str:
@@ -174,7 +175,7 @@ class TeamStore:
                 workspace = self.database_path.parent / team["id"] / "workspace"
                 db.execute(
                     "UPDATE teams SET workspace_dir=? WHERE id=?",
-                    (str(workspace.resolve()), team["id"]),
+                    (to_managed_path(workspace), team["id"]),
                 )
             # Existing databases predate supervisor_jobs. Backfill exactly one
             # boundary per running Team so old pending work cannot bypass the
@@ -225,10 +226,8 @@ class TeamStore:
         team_id = f"team_{uuid.uuid4().hex}"
         timestamp = _now()
         if payload.workspace_dir and payload.workspace_dir.strip():
-            configured_workspace = Path(payload.workspace_dir).expanduser()
-            if not configured_workspace.is_absolute():
-                raise ValueError("workspaceDir must be an absolute path")
-            team_workspace = configured_workspace.resolve()
+            # Relative values resolve under $K_AGENT_HOME; absolute values stay as-is.
+            team_workspace = resolve_managed_path(payload.workspace_dir)
         else:
             team_workspace = (teams_root / team_id / "workspace").resolve()
         if team_workspace.exists() and not team_workspace.is_dir():
@@ -239,6 +238,7 @@ class TeamStore:
             team_workspace.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise ValueError(f"workspaceDir cannot be created: {exc}") from exc
+        stored_workspace = to_managed_path(team_workspace)
         marker_path = team_workspace / ".k_agent-team.json"
         if marker_path.is_file():
             try:
@@ -285,7 +285,7 @@ class TeamStore:
                     payload.mode,
                     payload.max_parallel,
                     agent_ids[supervisor_index],
-                    str(team_workspace),
+                    stored_workspace,
                     timestamp,
                     timestamp,
                 ),
@@ -329,7 +329,7 @@ class TeamStore:
                         1 if index == supervisor_index else 0,
                         reason,
                         json.dumps(capability, ensure_ascii=False),
-                        str(workspace),
+                        stored_workspace,
                         timestamp,
                         timestamp,
                     ),
@@ -366,31 +366,12 @@ class TeamStore:
                         ),
                     )
             elif payload.mode == "manual":
-                worker_indices = [index for index in range(len(agent_ids)) if index != supervisor_index]
-                if not worker_indices:
-                    worker_indices = [supervisor_index]
-                for index in worker_indices:
-                    task_id = f"task_{uuid.uuid4().hex}"
-                    task_ids.append(task_id)
-                    agent = payload.agents[index]
-                    description = agent.responsibility.strip() or (
-                        f"以 {agent.role} 身份完成团队目标中适合你的部分，并提交可验证成果。"
-                    )
-                    db.execute(
-                        """
-                        INSERT INTO team_tasks VALUES
-                        (?, ?, ?, ?, 'work', 'pending', 60, ?, '[]', 0, 3, NULL, NULL, NULL, ?, ?)
-                        """,
-                        (
-                            task_id,
-                            team_id,
-                            f"{agent.role}交付",
-                            description,
-                            agent_ids[index],
-                            timestamp,
-                            timestamp,
-                        ),
-                    )
+                # Manual mode used to invent one "{role}交付" seed task per worker.
+                # Those drafts reused responsibility text and later stacked under
+                # real supervisor create_task work, so the board looked duplicated.
+                # Both modes now wait for the supervisor team.started decision to
+                # publish the actual DAG.
+                pass
 
                 # Synthesis is now a supervisor control decision, not a static
                 # task that could bypass per-deliverable acceptance boundaries.
@@ -549,7 +530,7 @@ class TeamStore:
                 {
                     "id": row["id"], "name": row["name"], "goal": row["goal"],
                     "mode": row["mode"], "status": row["status"],
-                    "workspaceDir": row["workspace_dir"],
+                    "workspaceDir": public_home_relative_path(row["workspace_dir"]) or row["workspace_dir"],
                     "agentCount": row["agent_count"], "taskCount": row["task_count"],
                     "completedTaskCount": row["completed_count"],
                     "createdAt": row["created_at"], "updatedAt": row["updated_at"],
@@ -592,7 +573,7 @@ class TeamStore:
                 "mode": team["mode"], "status": team["status"],
                 "maxParallel": team["max_parallel"],
                 "supervisorAgentId": team["supervisor_agent_id"],
-                "workspaceDir": team["workspace_dir"],
+                "workspaceDir": public_home_relative_path(team["workspace_dir"]) or team["workspace_dir"],
                 "createdAt": team["created_at"], "updatedAt": team["updated_at"],
                 "lastEventSeq": last_seq,
                 "supervisorState": self._supervisor_job_dict(supervisor_job) if supervisor_job else None,
@@ -617,7 +598,8 @@ class TeamStore:
             "isSupervisor": bool(row["is_supervisor"]),
             "creationReason": row["creation_reason"],
             "capabilities": json.loads(row["capability_json"]),
-            "workspaceDir": row["workspace_dir"], "updatedAt": row["updated_at"],
+            "workspaceDir": public_home_relative_path(row["workspace_dir"]) or row["workspace_dir"],
+            "updatedAt": row["updated_at"],
         }
 
     @staticmethod
@@ -643,7 +625,7 @@ class TeamStore:
             "agentId": row["agent_id"], "kind": row["kind"], "title": row["title"],
             "content": row["content"], "sha256": row["sha256"],
             "version": row["version"], "status": row["status"],
-            "workspacePath": row["workspace_path"],
+            "workspacePath": public_home_relative_path(row["workspace_path"]),
             "createdAt": row["created_at"],
             "uri": f"artifact://{row['team_id']}/{row['id']}@{row['version']}",
         }
@@ -679,15 +661,54 @@ class TeamStore:
                 "SELECT * FROM team_events WHERE team_id=? AND seq>? ORDER BY seq LIMIT ?",
                 (team_id, seq, limit),
             ).fetchall()
-            return [
-                {
-                    "teamId": row["team_id"], "seq": row["seq"],
-                    "eventId": row["event_id"], "type": row["type"],
-                    "payload": json.loads(row["payload_json"]),
-                    "occurredAt": row["occurred_at"],
-                }
-                for row in rows
-            ]
+            return [self._event_dict(row) for row in rows]
+
+    async def events_tail(self, team_id: str, limit: int = 2000) -> list[dict[str, Any]]:
+        """Return the newest durable events in ascending seq order."""
+
+        return await asyncio.to_thread(self._events_tail_sync, team_id, limit)
+
+    def _events_tail_sync(self, team_id: str, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM team_events WHERE team_id=? ORDER BY seq DESC LIMIT ?
+                ) newest
+                ORDER BY seq
+                """,
+                (team_id, limit),
+            ).fetchall()
+            return [self._event_dict(row) for row in rows]
+
+    async def events_for_task(self, team_id: str, task_id: str, limit: int = 5000) -> list[dict[str, Any]]:
+        """Load the full run record for one task, independent of the live tail window."""
+
+        return await asyncio.to_thread(self._events_for_task_sync, team_id, task_id, limit)
+
+    def _events_for_task_sync(self, team_id: str, task_id: str, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM team_events
+                WHERE team_id=?
+                  AND json_extract(payload_json, '$.taskId')=?
+                ORDER BY seq
+                LIMIT ?
+                """,
+                (team_id, task_id, limit),
+            ).fetchall()
+            return [self._event_dict(row) for row in rows]
+
+    def _event_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "teamId": row["team_id"],
+            "seq": row["seq"],
+            "eventId": row["event_id"],
+            "type": row["type"],
+            "payload": json.loads(row["payload_json"]),
+            "occurredAt": row["occurred_at"],
+        }
 
     async def command(self, team_id: str, command: str) -> dict[str, Any] | None:
         async with self._write_lock:
@@ -1310,9 +1331,9 @@ class TeamStore:
                     "SELECT COUNT(*) count FROM team_tasks WHERE team_id=?",
                     (team_id,),
                 ).fetchone()["count"]
-                if team["mode"] == "auto" and task_count == 0:
+                if task_count == 0:
                     raise ValueError(
-                        "The initial automatic plan must create at least one task"
+                        "The initial supervisor plan must create at least one task"
                     )
                 unowned = db.execute(
                     "SELECT COUNT(*) count FROM team_tasks WHERE team_id=? AND status IN ('pending','ready') AND owner_agent_id IS NULL",
@@ -1388,7 +1409,7 @@ class TeamStore:
             ).fetchone()
             if artifact is None or artifact["status"] != "accepted":
                 raise ValueError("Only an accepted Team Artifact can be published")
-            resolved = str(workspace_path.resolve())
+            resolved = to_managed_path(workspace_path)
             if artifact["workspace_path"] == resolved:
                 return
             db.execute(

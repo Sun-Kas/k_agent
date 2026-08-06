@@ -11,7 +11,9 @@ import type {
   RuntimeOption,
   SkillConfig,
   SessionState,
-  SessionSummary
+  SessionSummary,
+  SessionWorkspaceFileContent,
+  SessionWorkspaceListing
 } from "../types";
 
 const apiUrl = (path: string) => `${appConfig.apiBaseUrl}${path}`;
@@ -24,6 +26,28 @@ export async function listSessions(): Promise<SessionSummary[]> {
     throw new Error(`Unable to load sessions (${response.status})`);
   }
   return response.json() as Promise<SessionSummary[]>;
+}
+
+export async function getSessionWorkspace(sessionId: string): Promise<SessionWorkspaceListing> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/workspace`));
+  if (!response.ok) {
+    throw new Error(`Unable to load session workspace (${response.status})`);
+  }
+  return response.json() as Promise<SessionWorkspaceListing>;
+}
+
+export async function getSessionWorkspaceFile(
+  sessionId: string,
+  path: string
+): Promise<SessionWorkspaceFileContent> {
+  const query = new URLSearchParams({ path });
+  const response = await fetch(
+    apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/workspace/file?${query}`)
+  );
+  if (!response.ok) {
+    throw new Error(`Unable to read workspace file (${response.status})`);
+  }
+  return response.json() as Promise<SessionWorkspaceFileContent>;
 }
 
 export async function getHealth(): Promise<HealthState> {

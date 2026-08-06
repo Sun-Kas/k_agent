@@ -13,6 +13,7 @@ import pytest
 from access_layer.teams.models import SupervisorDecision, TeamCreateInput
 from access_layer.teams.runtime import TeamRuntime
 from access_layer.teams.store import TeamStore
+from backend.home import resolve_managed_path
 
 
 def _team_payload(*, mode: str = "manual") -> TeamCreateInput:
@@ -53,7 +54,7 @@ async def _approve_initial_plan(store: TeamStore, team: dict) -> dict:
     assert control is not None
     workers = [agent for agent in team["agents"] if not agent["isSupervisor"]]
     actions: list[dict] = [{"type": "approve_plan", "reason": "初始计划可执行"}]
-    if team["mode"] == "auto" and not team["tasks"]:
+    if not team["tasks"]:
         actions.extend([
             {
                 "type": "create_task",
@@ -70,7 +71,7 @@ async def _approve_initial_plan(store: TeamStore, team: dict) -> dict:
                 "taskKey": "implementation",
                 "title": "基于调研实施",
                 "description": "读取已验收调研成果并完成实现。",
-                "assigneeAgentId": workers[1]["id"],
+                "assigneeAgentId": workers[1]["id"] if len(workers) > 1 else workers[0]["id"],
                 "dependsOn": ["research"],
                 "priority": 80,
                 "reason": "实现依赖调研 Artifact",
@@ -106,8 +107,7 @@ def test_team_store_registers_all_builtin_agent_kinds(tmp_path: Path) -> None:
         assert sum(agent["isSupervisor"] for agent in team["agents"]) == 1
         reviewer = next(agent for agent in team["agents"] if agent["name"] == "审查")
         assert reviewer["networkAccess"] is False
-        assert all(task["reviewRequired"] is True for task in team["tasks"])
-        assert all(task["taskType"] == "work" for task in team["tasks"])
+        assert team["tasks"] == []
         assert team["supervisorState"]["triggerType"] == "team.started"
 
     asyncio.run(scenario())
@@ -474,16 +474,32 @@ def test_task_run_uses_task_directory_without_repository_checkout(tmp_path: Path
 
 def test_supervisor_runtime_applies_structured_decision(tmp_path: Path) -> None:
     class Backend:
+        def __init__(self, engineer_id: str) -> None:
+            self._engineer_id = engineer_id
+
         async def stream(self, _payload, _request_id):
+            # Initial team.started plans must create runnable work; approve_plan alone is rejected.
             yield {
                 "type": "TEXT_MESSAGE_CONTENT",
                 "messageId": "manager",
                 "delta": json.dumps({
                     "summary": "初始任务与成员职责匹配",
-                    "actions": [{
-                        "type": "approve_plan",
-                        "reason": "允许成员开始执行",
-                    }],
+                    "actions": [
+                        {
+                            "type": "approve_plan",
+                            "reason": "允许成员开始执行",
+                        },
+                        {
+                            "type": "create_task",
+                            "taskKey": "implement",
+                            "title": "实现核心能力",
+                            "description": "按目标完成可审查交付。",
+                            "assigneeAgentId": self._engineer_id,
+                            "dependsOn": [],
+                            "priority": 100,
+                            "reason": "职责匹配",
+                        },
+                    ],
                 }, ensure_ascii=False),
             }
 
@@ -494,11 +510,12 @@ def test_supervisor_runtime_applies_structured_decision(tmp_path: Path) -> None:
         store = TeamStore(tmp_path / "team_runtime.db")
         await store.initialize()
         team = await store.create_team(_team_payload(), tmp_path)
+        engineer = next(agent for agent in team["agents"] if agent["role"] == "Engineer")
         control = await store.claim_supervisor_job(team["id"])
         assert control is not None
         runtime = TeamRuntime(
             store=store,
-            backend_client=Backend(),  # type: ignore[arg-type]
+            backend_client=Backend(engineer["id"]),  # type: ignore[arg-type]
             runtime_catalog=Catalog(),  # type: ignore[arg-type]
             enabled=False,
         )
@@ -592,7 +609,7 @@ def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: 
 
         snapshot = await store.get_team(team["id"])
         artifact = next(item for item in snapshot["artifacts"] if item["taskId"] == claimed["task"]["id"])
-        published = Path(artifact["workspacePath"])
+        published = resolve_managed_path(artifact["workspacePath"])
         assert snapshot["workspaceDir"] == str(workspace.resolve())
         assert (workspace / ".k_agent-team.json").is_file()
         assert (published / "files" / "site.html").read_text(encoding="utf-8") == "<main>accepted</main>"

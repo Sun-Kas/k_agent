@@ -16,6 +16,7 @@ from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import RuntimeCatalog
 from access_layer.teams.models import SupervisorDecision
 from access_layer.teams.store import TeamStore
+from backend.home import public_home_relative_path, resolve_managed_path, to_managed_path
 
 
 logger = logging.getLogger("k_agent.access.team_runtime")
@@ -332,7 +333,7 @@ class TeamRuntime:
     def _ensure_team_workspace(team: dict[str, Any]) -> Path:
         """Create/verify the Team marker before publishing any accepted files."""
 
-        workspace = Path(str(team["workspaceDir"])).expanduser().resolve()
+        workspace = resolve_managed_path(team["workspaceDir"])
         workspace.mkdir(parents=True, exist_ok=True)
         marker_path = workspace / ".k_agent-team.json"
         if marker_path.is_file():
@@ -453,7 +454,9 @@ class TeamRuntime:
                 {
                     "teamId": team["id"],
                     "teamGoal": team["goal"],
-                    "teamWorkspace": team["workspace_dir"],
+                    "teamWorkspace": to_managed_path(
+                        team.get("workspace_dir") or team.get("workspaceDir") or "."
+                    ),
                     "task": task,
                     "agent": {
                         "id": agent["id"],
@@ -479,12 +482,14 @@ class TeamRuntime:
                 encoding="utf-8",
             )
             published_path = artifact.get("workspacePath")
-            if published_path and Path(str(published_path)).is_dir():
-                shutil.copytree(
-                    Path(str(published_path)),
-                    runtime_artifact_dir / artifact_id,
-                    dirs_exist_ok=True,
-                )
+            if published_path:
+                published_dir = resolve_managed_path(str(published_path))
+                if published_dir.is_dir():
+                    shutil.copytree(
+                        published_dir,
+                        runtime_artifact_dir / artifact_id,
+                        dirs_exist_ok=True,
+                    )
         manifest = {
             "schemaVersion": 1,
             "teamId": team["id"],
@@ -571,7 +576,7 @@ class TeamRuntime:
             for part in [
                 "[K Agent Team Runtime]",
                 f"团队目标：{team['goal']}",
-                f"团队工作空间：{team['workspace_dir']}（只有主管验收后的产物会发布到这里）",
+                f"团队工作空间：{public_home_relative_path(team.get('workspace_dir') or team.get('workspaceDir')) or 'workspace'}（只有主管验收后的产物会发布到这里）",
                 f"你的身份：{agent['name']} / {agent['role']}",
                 f"职责边界：{agent['responsibility'] or '完成当前被分配任务'}",
                 f"当前任务：{task['title']}\n{task['description']}",
@@ -674,7 +679,7 @@ class TeamRuntime:
                 ),
                 (
                     "规则：task.submitted 必须对触发 taskId 执行 accept_submission 或 request_revision；"
-                    "自动模式的 team.started 如果没有任务，必须先根据团队目标和成员能力生成最小、完整的任务 DAG；"
+                    "team.started 如果还没有任务，必须先根据团队目标和成员能力生成最小、完整的任务 DAG；"
                     "先识别必须串行的前置输入，再识别可以独立并行的工作，并根据 role、responsibility、capabilities、"
                     "agentKind、modelId 和 networkAccess 选择承接者。不要为了让每个成员都有工作而创建任务，允许成员暂时空闲。"
                     "每个 create_task 必须提供唯一 taskKey，"
@@ -757,7 +762,7 @@ class TeamRuntime:
             "taskId": task_id,
             "teamAgentId": agent_id,
             "attemptId": run_id,
-            "workspaceDir": str(workspace),
+            "workspaceDir": to_managed_path(workspace),
         }
 
         async def flush_stream_activity(*, force: bool = False) -> None:

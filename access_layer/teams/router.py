@@ -15,6 +15,7 @@ from access_layer.teams.models import (
     TeamTaskCreateInput,
 )
 from access_layer.teams.runtime import TeamRuntime
+from access_layer.teams.workspace import list_team_workspace, read_team_workspace_file
 
 
 def build_team_router(runtime: TeamRuntime) -> APIRouter:
@@ -42,11 +43,66 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
             raise HTTPException(status_code=404, detail="Team not found")
         return team
 
+    @router.get("/{team_id}/workspace")
+    async def get_team_workspace(team_id: str) -> dict:
+        team = await runtime.store.get_team(team_id)
+        if team is None:
+            raise HTTPException(status_code=404, detail="Team not found")
+        try:
+            listing = list_team_workspace(team["workspaceDir"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "teamId": team_id,
+            "root": listing.root,
+            "files": [
+                {
+                    "path": item.path,
+                    "name": item.name,
+                    "size": item.size,
+                    "modifiedAt": item.modified_at,
+                }
+                for item in listing.files
+            ],
+        }
+
+    @router.get("/{team_id}/workspace/file")
+    async def get_team_workspace_file(team_id: str, path: str) -> dict:
+        team = await runtime.store.get_team(team_id)
+        if team is None:
+            raise HTTPException(status_code=404, detail="Team not found")
+        try:
+            payload = read_team_workspace_file(team["workspaceDir"], path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "teamId": team_id,
+            "path": payload.path,
+            "name": payload.name,
+            "content": payload.content,
+            "truncated": payload.truncated,
+            "binary": payload.binary,
+            "size": payload.size,
+        }
+
     @router.get("/{team_id}/events")
-    async def get_events(team_id: str, afterSeq: int = 0) -> list[dict]:
+    async def get_events(
+        team_id: str,
+        afterSeq: int = 0,
+        limit: int = 200,
+        taskId: str | None = None,
+    ) -> list[dict]:
         if await runtime.store.get_team(team_id) is None:
             raise HTTPException(status_code=404, detail="Team not found")
-        return await runtime.store.events_after(team_id, max(0, afterSeq))
+        bounded = max(1, min(limit, 5000))
+        if taskId:
+            return await runtime.store.events_for_task(team_id, taskId, limit=bounded)
+        if afterSeq <= 0:
+            # Initial hydration wants the newest window, not the oldest page.
+            return await runtime.store.events_tail(team_id, limit=bounded)
+        return await runtime.store.events_after(team_id, max(0, afterSeq), limit=min(bounded, 200))
 
     @router.get("/{team_id}/stream")
     async def stream_events(team_id: str, request: Request, afterSeq: int = 0) -> StreamingResponse:

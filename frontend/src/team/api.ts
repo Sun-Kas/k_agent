@@ -1,5 +1,33 @@
 import { appConfig } from "../config";
-import type { TeamAgentDraft, TeamEvent, TeamSnapshot, TeamSummary } from "./types";
+import type {
+  TeamAgentDraft,
+  TeamEvent,
+  TeamSnapshot,
+  TeamSummary
+} from "./types";
+
+export interface TeamWorkspaceFile {
+  path: string;
+  name: string;
+  size: number;
+  modifiedAt: number;
+}
+
+export interface TeamWorkspaceListing {
+  teamId: string;
+  root: string;
+  files: TeamWorkspaceFile[];
+}
+
+export interface TeamWorkspaceFileContent {
+  teamId: string;
+  path: string;
+  name: string;
+  content: string;
+  truncated: boolean;
+  binary: boolean;
+  size: number;
+}
 
 const teamUrl = (path: string) => `${appConfig.apiBaseUrl}/api/teams${path}`;
 
@@ -23,8 +51,25 @@ async function teamFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const listTeams = () => teamFetch<TeamSummary[]>("");
 export const getTeam = (teamId: string) => teamFetch<TeamSnapshot>(`/${encodeURIComponent(teamId)}`);
-export const getTeamEvents = (teamId: string, afterSeq = 0) =>
-  teamFetch<TeamEvent[]>(`/${encodeURIComponent(teamId)}/events?afterSeq=${afterSeq}`);
+export const getTeamEvents = (teamId: string, afterSeq = 0, limit = 2000) =>
+  teamFetch<TeamEvent[]>(
+    `/${encodeURIComponent(teamId)}/events?afterSeq=${afterSeq}&limit=${limit}`
+  );
+export const getTeamTaskEvents = (teamId: string, taskId: string, limit = 5000) =>
+  teamFetch<TeamEvent[]>(
+    `/${encodeURIComponent(teamId)}/events?${new URLSearchParams({
+      taskId,
+      limit: String(limit)
+    })}`
+  );
+
+export const getTeamWorkspace = (teamId: string) =>
+  teamFetch<TeamWorkspaceListing>(`/${encodeURIComponent(teamId)}/workspace`);
+
+export const getTeamWorkspaceFile = (teamId: string, path: string) =>
+  teamFetch<TeamWorkspaceFileContent>(
+    `/${encodeURIComponent(teamId)}/workspace/file?${new URLSearchParams({ path })}`
+  );
 
 export function createTeam(input: {
   name: string;

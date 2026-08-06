@@ -157,6 +157,7 @@ function nextPetSpot(size: number, edge: PetEdge): PetSpot {
   const selectors = [
     ".sidebar",
     ".inspector",
+    ".content-stage",
     ".composer",
     ".config-nav",
     ".config-section"

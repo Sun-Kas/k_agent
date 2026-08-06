@@ -264,3 +264,46 @@ def display_home() -> str:
         return f"~/{home.relative_to(Path.home())}"
     except ValueError:
         return str(home)
+
+
+def resolve_managed_path(value: str | Path) -> Path:
+    """Resolve a stored workspace path; relative values are under `$K_AGENT_HOME`."""
+
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = agent_home() / path
+    return path.resolve()
+
+
+def to_managed_path(value: str | Path) -> str:
+    """Prefer a `$K_AGENT_HOME`-relative path for persistence and API responses."""
+
+    resolved = resolve_managed_path(value)
+    try:
+        return resolved.relative_to(agent_home().resolve()).as_posix()
+    except ValueError:
+        # Custom workspaces outside the agent home still need an absolute path.
+        return str(resolved)
+
+
+def public_home_relative_path(value: str | Path | None) -> str | None:
+    """Return a path suitable for API/UI: relative to home, else `~/…`, else basename."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return text
+    resolved = Path(text).expanduser()
+    if not resolved.is_absolute():
+        return resolved.as_posix()
+    resolved = resolved.resolve()
+    try:
+        return resolved.relative_to(agent_home().resolve()).as_posix()
+    except ValueError:
+        pass
+    try:
+        return f"~/{resolved.relative_to(Path.home().resolve()).as_posix()}"
+    except ValueError:
+        # Custom workspaces outside both homes have no safe relative form.
+        return str(resolved)
