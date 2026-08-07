@@ -257,12 +257,17 @@ export function ContentStage({
     </div>
   );
 
-  const chrome = (
+  // Parent inspector already owns the panel title when embedded — only keep
+  // chrome for file switching in preview so the header title doesn't jump.
+  const showEmbeddedChrome = embedded && mode === "preview" && selected;
+  const chrome = showEmbeddedChrome || !embedded ? (
     <header className={`content-stage-chrome ${embedded ? "embedded-chrome" : ""}`}>
-      <div className="content-stage-brand">
-        {!embedded ? <p className="eyebrow">{eyebrow}</p> : null}
-        <h2>{title}</h2>
-      </div>
+      {!embedded ? (
+        <div className="content-stage-brand">
+          <p className="eyebrow">{eyebrow}</p>
+          <h2>{title}</h2>
+        </div>
+      ) : null}
       {mode === "preview" && selected ? (
         <div className={`content-stage-picker ${menuOpen ? "open" : ""}`}>
           <button
@@ -287,9 +292,9 @@ export function ContentStage({
           </div>
         </div>
       ) : null}
-      <span className="content-stage-count">{items.length || ""}</span>
+      {!embedded ? <span className="content-stage-count">{items.length || ""}</span> : null}
     </header>
-  );
+  ) : null;
 
   if (embedded) {
     return (

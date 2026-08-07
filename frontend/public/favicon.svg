@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="K Agent">
+  <rect width="64" height="64" rx="14" fill="#0a0a0a"/>
+  <path
+    fill="#ffffff"
+    d="M18.5 13h11.5v15.2L42.2 13H55.5L40.6 30.8 55.5 51H42L30 35.6V51H18.5V13z"
+  />
+</svg>

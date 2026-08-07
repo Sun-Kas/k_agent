@@ -82,6 +82,8 @@ interface TeamWorkbenchProps {
   sidebarCollapsed: boolean;
   stageOpen: boolean;
   stageWidth: number;
+  desktopPetEnabled: boolean;
+  onToggleDesktopPet: () => void;
   onCloseSidebar: () => void;
   onToggleSidebar: () => void;
   onToggleStage: () => void;
@@ -102,6 +104,8 @@ export function TeamWorkbench({
   sidebarCollapsed,
   stageOpen,
   stageWidth,
+  desktopPetEnabled,
+  onToggleDesktopPet,
   onCloseSidebar,
   onToggleSidebar,
   onToggleStage,
@@ -374,11 +378,11 @@ export function TeamWorkbench({
       <button className={`scrim ${sidebarOpen ? "visible" : ""}`} type="button" aria-label="关闭团队侧栏" onClick={onCloseSidebar} />
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
         <div className="brand">
-          <span className="brand-symbol">K</span>
-          <div><strong>K Agent</strong><small>智能任务工作台</small></div>
+          <img className="brand-symbol" src="/brand-k.png" alt="" width={32} height={32} />
+          <div><strong>K Agent</strong><small>本地执行台</small></div>
         </div>
         <nav className="workspace-switch" aria-label="工作模式">
-          <button type="button" onClick={onBack}><span>◉</span><strong>单 Agent</strong></button>
+          <button type="button" onClick={onBack}><span>◉</span><strong>Work</strong></button>
           <button className="active" type="button" aria-current="page"><span>⌘</span><strong>Agent Team</strong></button>
         </nav>
         <button className="new-session" type="button" onClick={() => setCreating(true)}>
@@ -449,6 +453,20 @@ export function TeamWorkbench({
             <span className={`status-pill ${connected ? "running" : ""}`}>
               <i />{connected ? "实时同步" : "等待事件"}
             </span>
+            <button
+              className={`topbar-icon-button desktop-pet-toggle ${desktopPetEnabled ? "active" : ""}`}
+              type="button"
+              aria-pressed={desktopPetEnabled}
+              aria-label={desktopPetEnabled ? "关闭桌宠" : "开启桌宠"}
+              title={desktopPetEnabled ? "桌宠已开启，点击关闭" : "桌宠已关闭，点击开启"}
+              onClick={onToggleDesktopPet}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 8.2c-4 0-7.1 2.8-7.1 6.5 0 3.1 2.5 5.2 7.1 5.2s7.1-2.1 7.1-5.2c0-3.7-3.1-6.5-7.1-6.5Z" />
+                <path d="m6.4 11.1-.8-4.2 4 2.1M17.6 11.1l.8-4.2-4 2.1M12 8V4.8M12 5c.1-1.7 1.4-2.8 3.2-2.8-.1 1.7-1.4 2.8-3.2 2.8ZM11.9 5C11.8 3.6 10.7 2.7 9.3 2.7c.1 1.4 1.2 2.3 2.6 2.3Z" />
+                <path d="M9.2 14.3h.1M14.7 14.3h.1M10.8 16.5c.8.6 1.6.6 2.4 0" />
+              </svg>
+            </button>
             <button className="topbar-icon-button" type="button" onClick={onToggleStage} aria-label="切换协作区面板">
               <TeamSidebarIcon side="right" />
             </button>
@@ -538,11 +556,11 @@ export function TeamWorkbench({
 function TeamWelcome({ onCreate }: { onCreate: () => void }) {
   return (
     <section className="team-welcome">
-      <span className="team-welcome-orbit"><i /><b>3</b></span>
-      <p className="team-kicker">AGENT TEAM RUNTIME</p>
-      <h1>把复杂目标，交给一支<br /><em>可监督的 Agent 团队。</em></h1>
-      <p>独立模型、MCP、Skill 与工作空间。协作过程随时可见、可暂停、可恢复。</p>
-      <button className="team-primary-action large" type="button" onClick={onCreate}>创建第一个团队 <span>→</span></button>
+      <div className="welcome-atmosphere" aria-hidden="true" />
+      <p className="welcome-brand">Agent Team</p>
+      <h1>组建一支可验收的执行团队。</h1>
+      <p>为每个成员指定运行时与职责。主管拆解任务，你逐项验收成果。</p>
+      <button className="team-primary-action large" type="button" onClick={onCreate}>创建团队 <span>→</span></button>
     </section>
   );
 }
@@ -731,28 +749,25 @@ function TeamDashboard({
 
   return (
     <section className="team-dashboard">
-      <header className="team-dashboard-header">
-        <div><p className="team-kicker">{team.mode.toUpperCase()} TEAM</p><h1>{team.name}</h1><span>{team.goal}</span></div>
+      <header className="team-command-mast">
+        <div className="team-command-identity">
+          <p className="team-kicker">{team.mode === "auto" ? "自动调度" : "人工确认"} · {STATUS_LABEL[team.status] ?? team.status}</p>
+          <h1>{team.name}</h1>
+          <p className="team-command-goal">{team.goal}</p>
+        </div>
+        <div className="team-command-readout" aria-label="团队读数">
+          <div><span>进度</span><strong>{progress}%</strong></div>
+          <div><span>成员</span><strong>{team.agents.filter((agent) => ["idle", "busy", "waiting"].includes(agent.status)).length}<small>/{team.agents.length}</small></strong></div>
+          <div><span>成果</span><strong>{team.artifacts.length}</strong></div>
+          <div><span>主管</span><strong title={supervisorStatus}>{supervisorReadoutLabel(team.supervisorState)}</strong></div>
+        </div>
         <div className="team-dashboard-controls">
-          <span className={`team-state-pill ${team.status}`}><i />{STATUS_LABEL[team.status] ?? team.status}</span>
-          {team.status === "running" && <button type="button" disabled={busy} onClick={() => onCommand("pause")}>Ⅱ 暂停</button>}
-          {team.status === "paused" && <button type="button" disabled={busy} onClick={() => onCommand("resume")}>▶ 恢复</button>}
+          {team.status === "running" && <button type="button" disabled={busy} onClick={() => onCommand("pause")}>暂停</button>}
+          {team.status === "paused" && <button type="button" disabled={busy} onClick={() => onCommand("resume")}>恢复</button>}
           {!['completed', 'cancelled'].includes(team.status) && <button className="danger" type="button" disabled={busy} onClick={() => onCommand("cancel")}>停止</button>}
         </div>
+        <div className="team-command-progress" aria-hidden="true"><b style={{ width: `${progress}%` }} /></div>
       </header>
-
-      <section className="team-workspace-strip" aria-label="团队工作空间">
-        <span>▣</span>
-        <div><small>TEAM WORKSPACE</small><strong>协作文件已就绪</strong></div>
-        <i>已验收产物自动发布</i>
-      </section>
-
-      <div className="team-metric-strip">
-        <div><span>完成进度</span><strong>{progress}%</strong><i><b style={{ width: `${progress}%` }} /></i></div>
-        <div><span>在线成员</span><strong>{team.agents.filter((agent) => ["idle", "busy", "waiting"].includes(agent.status)).length}<small> / {team.agents.length}</small></strong></div>
-        <div><span>Artifacts</span><strong>{team.artifacts.length}</strong></div>
-        <div><span>主管控制</span><strong className={team.supervisorState?.status ?? "idle"}>{supervisorStatus}</strong></div>
-      </div>
 
       {team.supervisorState && ["pending", "running", "failed"].includes(team.supervisorState.status) && (
         <section className={`team-supervisor-strip ${team.supervisorState.status}`}>
@@ -765,14 +780,26 @@ function TeamDashboard({
       <div className="team-dashboard-stack">
         <div className="team-dashboard-grid">
           <div className="team-board-panel">
-            <header className="team-section-header"><div><p className="team-kicker">SHARED TASK BOARD</p><h2>共享任务板</h2></div><span>{team.mode === "auto" && team.tasks.length === 0 ? "主管规划中" : `${completed}/${team.tasks.length} 完成`}</span></header>
+            <header className="team-section-header">
+              <div>
+                <h2>任务板</h2>
+                <p>按 Agent 归并 · 点击查看工作记录</p>
+              </div>
+              <span>{team.mode === "auto" && team.tasks.length === 0 ? "主管规划中" : `${completed}/${team.tasks.length} 完成`}</span>
+            </header>
             <div className="team-board">
               {columns.map((column) => <TaskColumn key={column.key} title={column.title} tasks={column.tasks} agents={team.agents} selectedTaskId={selectedTaskId} onTaskSelect={onTaskSelect} />)}
             </div>
           </div>
 
           <aside className="team-roster-panel">
-            <header className="team-section-header"><div><p className="team-kicker">TEAM ROSTER</p><h2>Agent 成员</h2></div><span>{team.agents.length}</span></header>
+            <header className="team-section-header">
+              <div>
+                <h2>成员</h2>
+                <p>点开工作记录</p>
+              </div>
+              <span>{team.agents.length}</span>
+            </header>
             <div className="team-roster-list team-scroll-pane" tabIndex={0} aria-label="Agent 成员列表">{team.agents.map((agent) => {
               const agentTasks = team.tasks.filter((task) => task.ownerAgentId === agent.id);
               const latestTask = [...agentTasks].reverse().find((task) => task.status === "running") ?? agentTasks.at(-1);
@@ -797,8 +824,8 @@ function TeamDashboard({
           <section className="team-artifact-panel">
             <header className="team-section-header">
               <div>
-                <p className="team-kicker">ARTIFACTS</p>
-                <h2>成果与引用</h2>
+                <h2>已验收成果</h2>
+                <p>通过主管验收后进入工作空间</p>
               </div>
               <span>{team.artifacts.length}</span>
             </header>
@@ -819,7 +846,7 @@ function TeamDashboard({
                   <i>›</i>
                 </button>
               )) : (
-                <EmptyPanel text="Agent 完成任务后会在这里发布 Artifact" />
+                <EmptyPanel text="验收通过后，成果会出现在这里" />
               )}
             </div>
           </section>
@@ -827,10 +854,9 @@ function TeamDashboard({
           <section className="team-flow-panel">
             <header className="team-section-header">
               <div>
-                <p className="team-kicker">TASK HANDOFF MAP</p>
-                <h2>成员任务流转</h2>
+                <h2>任务流转</h2>
+                <p>发放 · 接取 · 汇聚</p>
               </div>
-              <span>发放 · 接取 · 汇聚 · 右侧预览成果</span>
             </header>
             <TeamTaskFlowMap team={team} events={events} onTaskSelect={onTaskSelect} />
           </section>
@@ -1405,6 +1431,16 @@ function supervisorStateLabel(state: TeamSnapshot["supervisorState"]): string {
   if (state.status === "failed") return "主管决策失败";
   if (state.status === "cancelled") return "已取消";
   return "已完成本轮决策";
+}
+
+function supervisorReadoutLabel(state: TeamSnapshot["supervisorState"]): string {
+  // Compact mast cells cannot fit the full prose labels without clipping.
+  if (!state) return "空闲";
+  if (state.status === "pending") return "等待调度";
+  if (state.status === "running") return "决策中";
+  if (state.status === "failed") return "决策失败";
+  if (state.status === "cancelled") return "已取消";
+  return "本轮完成";
 }
 
 function supervisorTriggerLabel(triggerType: string): string {

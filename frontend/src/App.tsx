@@ -75,11 +75,13 @@ const suggestions = [
 ];
 
 const colorThemes = [
-  { id: "snow", name: "雪白", colors: ["#f4f6f2", "#ffffff", "#5f8f1f"] },
-  { id: "forest", name: "深林", colors: ["#0d0f0e", "#171a18", "#c8f54a"] },
-  { id: "ocean", name: "深海", colors: ["#081018", "#111f2b", "#55dff2"] },
-  { id: "sand", name: "暖砂", colors: ["#17120d", "#251c14", "#f5ba4a"] },
-  { id: "dusk", name: "暮色", colors: ["#160f16", "#251824", "#ff806e"] }
+  { id: "snow", name: "白色", colors: ["#ffffff", "#ffffff", "#111111"] },
+  { id: "ink", name: "黑色", colors: ["#000000", "#141414", "#f5f5f5"] },
+  { id: "blueprint", name: "蓝图", colors: ["#e8eef5", "#fafcff", "#2b59ff"] },
+  { id: "forest", name: "石墨", colors: ["#10141c", "#1a2230", "#5b8cff"] },
+  { id: "ocean", name: "港湾", colors: ["#07131c", "#122433", "#3ec4e0"] },
+  { id: "sand", name: "锻铜", colors: ["#17120f", "#271e17", "#e08a3c"] },
+  { id: "dusk", name: "余烬", colors: ["#141210", "#25201c", "#ff6b3d"] }
 ] as const;
 type ColorTheme = typeof colorThemes[number]["id"];
 type ThinkingBlock = {
@@ -294,8 +296,11 @@ export function App() {
   const [sessionLoading, setSessionLoading] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("k-agent-sidebar-collapsed") === "true");
-  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    const saved = localStorage.getItem("k-agent-sidebar-collapsed");
+    return saved === null ? true : saved === "true";
+  });
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [teamStageOpen, setTeamStageOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem("k-agent-sidebar-width")) || 252);
   const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 360);
@@ -1566,37 +1571,39 @@ export function App() {
   }
 
   if (view === "team") {
-    // The floating pet overlaps the Team mailbox and task controls on common
-    // laptop widths, so the focused operations workbench intentionally owns
-    // the full viewport while chat keeps the optional companion.
     return (
-      <TeamWorkbench
-        onBack={() => setView("chat")}
-        onOpenConfig={() => setView("config")}
-        health={health}
-        onRefreshHealth={() => void refreshHealth()}
-        sidebarWidth={sidebarWidth}
-        sidebarOpen={sidebarOpen}
-        sidebarCollapsed={sidebarCollapsed}
-        stageOpen={teamStageOpen}
-        stageWidth={inspectorWidth}
-        onCloseSidebar={() => setSidebarOpen(false)}
-        onToggleSidebar={() => {
-          if (window.matchMedia("(max-width: 860px)").matches) {
-            setSidebarCollapsed(false);
-            setSidebarOpen(true);
-            return;
-          }
-          setSidebarCollapsed((current) => !current);
-          setSidebarOpen(false);
-        }}
-        onToggleStage={() => setTeamStageOpen((value) => !value)}
-        onOpenStage={() => setTeamStageOpen(true)}
-        onBeginSidebarResize={(event) => beginResize("sidebar", event)}
-        onResizeSidebarWithKeyboard={(event) => resizeWithKeyboard("sidebar", event)}
-        onBeginStageResize={(event) => beginResize("inspector", event)}
-        onResizeStageWithKeyboard={(event) => resizeWithKeyboard("inspector", event)}
-      />
+      <>
+        <TeamWorkbench
+          onBack={() => setView("chat")}
+          onOpenConfig={() => setView("config")}
+          health={health}
+          onRefreshHealth={() => void refreshHealth()}
+          sidebarWidth={sidebarWidth}
+          sidebarOpen={sidebarOpen}
+          sidebarCollapsed={sidebarCollapsed}
+          stageOpen={teamStageOpen}
+          stageWidth={inspectorWidth}
+          desktopPetEnabled={desktopPetEnabled}
+          onToggleDesktopPet={() => setDesktopPetEnabled((current) => !current)}
+          onCloseSidebar={() => setSidebarOpen(false)}
+          onToggleSidebar={() => {
+            if (window.matchMedia("(max-width: 860px)").matches) {
+              setSidebarCollapsed(false);
+              setSidebarOpen(true);
+              return;
+            }
+            setSidebarCollapsed((current) => !current);
+            setSidebarOpen(false);
+          }}
+          onToggleStage={() => setTeamStageOpen((value) => !value)}
+          onOpenStage={() => setTeamStageOpen(true)}
+          onBeginSidebarResize={(event) => beginResize("sidebar", event)}
+          onResizeSidebarWithKeyboard={(event) => resizeWithKeyboard("sidebar", event)}
+          onBeginStageResize={(event) => beginResize("inspector", event)}
+          onResizeStageWithKeyboard={(event) => resizeWithKeyboard("inspector", event)}
+        />
+        <DesktopPet enabled={desktopPetEnabled} onEnabledChange={setDesktopPetEnabled} />
+      </>
     );
   }
 
@@ -1618,12 +1625,12 @@ export function App() {
 
       <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
         <div className="brand">
-          <span className="brand-symbol">K</span>
-          <div><strong>K Agent</strong><small>智能任务工作台</small></div>
+          <img className="brand-symbol" src="/brand-k.png" alt="" width={32} height={32} />
+          <div><strong>K Agent</strong><small>本地执行台</small></div>
         </div>
         <nav className="workspace-switch" aria-label="工作模式">
           <button className="active" type="button" aria-current="page">
-            <span>◉</span><strong>单 Agent</strong>
+            <span>◉</span><strong>Work</strong>
           </button>
           <button type="button" onClick={() => setView("team")}>
             <span>⌘</span><strong>Agent Team</strong>
@@ -1762,7 +1769,7 @@ export function App() {
               className="topbar-icon-button theme-button"
               type="button"
               aria-label="切换页面主题"
-              title={`当前主题：${colorThemes.find((theme) => theme.id === colorTheme)?.name ?? "雪白"}，点击切换`}
+              title={`当前主题：${colorThemes.find((theme) => theme.id === colorTheme)?.name ?? "白色"}，点击切换`}
               onClick={() => {
                 const currentIndex = colorThemes.findIndex((theme) => theme.id === colorTheme);
                 setColorTheme(colorThemes[(currentIndex + 1) % colorThemes.length].id);
@@ -1784,16 +1791,19 @@ export function App() {
         >
           {displayMessages.length === 0 && (
             <div className="welcome">
-              <div className="welcome-mark">K</div>
-              <p className="eyebrow">K AGENT / READY</p>
-              <h2>把复杂的事，<br /><em>交给 Agent。</em></h2>
-              <p className="welcome-copy">我可以理解任务、调用工具并保留工作上下文。直接描述目标，我会从这里开始。</p>
-              <div className="suggestions">
-                {suggestions.map((suggestion, index) => (
-                  <button key={suggestion} type="button" onClick={() => setInput(suggestion)}>
-                    <span>0{index + 1}</span>{suggestion}<i>↗</i>
-                  </button>
-                ))}
+              <div className="welcome-atmosphere" aria-hidden="true" />
+              <p className="welcome-brand">K Agent</p>
+              <h2>描述目标，开始执行。</h2>
+              <p className="welcome-copy">拆解任务、调用工具、保留上下文——都在这张执行台上完成。</p>
+              <div className="welcome-dispatch">
+                <span>下达一条任务</span>
+                <div className="suggestions">
+                  {suggestions.map((suggestion) => (
+                    <button key={suggestion} type="button" onClick={() => setInput(suggestion)}>
+                      {suggestion}<i>↗</i>
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
           )}
@@ -1902,7 +1912,7 @@ export function App() {
             onCompositionEnd={() => {
               isComposerComposingRef.current = false;
             }}
-            placeholder="描述任务，K Agent 会规划并执行…"
+            placeholder="写下目标或约束，开始这一轮执行…"
             rows={2}
           />
           <div className="composer-footer">
@@ -1971,7 +1981,7 @@ export function App() {
       />
       <aside className="inspector" aria-label={rightPanelMode === "trace" ? "运行轨迹" : "工作区"}>
         <header className="inspector-header inspector-header-switch">
-          <div>
+          <div className="inspector-header-title">
             <p className="eyebrow">{rightPanelMode === "trace" ? "RUN DETAILS" : "WORKSPACE"}</p>
             <h2>{rightPanelMode === "trace" ? "运行轨迹" : "工作区"}</h2>
           </div>

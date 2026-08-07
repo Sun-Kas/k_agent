@@ -153,19 +153,34 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function petXBounds(size: number): { minX: number; maxX: number } {
+  // Full viewport roam — including the left session/team queue sidebar.
+  return {
+    minX: PET_VIEWPORT_GUTTER,
+    maxX: Math.max(PET_VIEWPORT_GUTTER, window.innerWidth - size - PET_VIEWPORT_GUTTER)
+  };
+}
+
 function nextPetSpot(size: number, edge: PetEdge): PetSpot {
   const selectors = [
     ".sidebar",
+    ".session-list",
     ".inspector",
     ".content-stage",
     ".composer",
     ".config-nav",
-    ".config-section"
+    ".config-section",
+    ".team-main",
+    ".team-board-panel",
+    ".team-roster-panel",
+    ".team-composer-page",
+    ".team-welcome"
   ];
+  const { minX, maxX } = petXBounds(size);
   const rectangles = selectors
     .flatMap((selector) => Array.from(document.querySelectorAll<HTMLElement>(selector)))
     .map((element) => element.getBoundingClientRect())
-    .filter((rect) => rect.width > 80 && rect.height > 80 && rect.right > 0 && rect.left < window.innerWidth);
+    .filter((rect) => rect.width > 80 && rect.height > 80 && rect.right > minX && rect.left < window.innerWidth);
   const moods: PetMood[] = ["peek", "idle", "happy", "peek", "sleepy"];
   const mood = moods[Math.floor(Math.random() * moods.length)];
 
@@ -176,14 +191,14 @@ function nextPetSpot(size: number, edge: PetEdge): PetSpot {
       const from = rect.left > window.innerWidth / 2 ? "right" : "left";
       const x = from === "right" ? rect.left - size * 0.62 : rect.right - size * 0.38;
       return {
-        x: clamp(x, PET_VIEWPORT_GUTTER, window.innerWidth - size - PET_VIEWPORT_GUTTER),
+        x: clamp(x, minX, maxX),
         y: clamp(rect.top + rect.height * (0.2 + Math.random() * 0.55), 64, window.innerHeight - size - PET_VIEWPORT_GUTTER),
         mood: "peek",
         from
       };
     }
     return {
-      x: clamp(rect.right - size - 20, PET_VIEWPORT_GUTTER, window.innerWidth - size - PET_VIEWPORT_GUTTER),
+      x: clamp(rect.right - size - 20, minX, maxX),
       y: clamp(rect.top - size * 0.52, 64, window.innerHeight - size - PET_VIEWPORT_GUTTER),
       mood,
       from: "bottom"
@@ -192,7 +207,7 @@ function nextPetSpot(size: number, edge: PetEdge): PetSpot {
 
   const from = edge === "auto" ? (Math.random() > 0.5 ? "right" : "left") : edge;
   return {
-    x: from === "right" ? window.innerWidth - size - PET_VIEWPORT_GUTTER : PET_VIEWPORT_GUTTER,
+    x: from === "right" ? maxX : minX,
     y: clamp(window.innerHeight - size - PET_VIEWPORT_GUTTER - Math.random() * Math.min(190, window.innerHeight * 0.3), 64, window.innerHeight - size - PET_VIEWPORT_GUTTER),
     mood,
     from
@@ -237,11 +252,14 @@ export function DesktopPet({
   }, [spot]);
 
   useEffect(() => {
-    const reposition = () => setSpot((current) => ({
-      ...current,
-      x: clamp(current.x, PET_VIEWPORT_GUTTER, window.innerWidth - preferences.size - PET_VIEWPORT_GUTTER),
-      y: clamp(current.y, 64, window.innerHeight - preferences.size - PET_VIEWPORT_GUTTER)
-    }));
+    const reposition = () => setSpot((current) => {
+      const { minX, maxX } = petXBounds(preferences.size);
+      return {
+        ...current,
+        x: clamp(current.x, minX, maxX),
+        y: clamp(current.y, 64, window.innerHeight - preferences.size - PET_VIEWPORT_GUTTER)
+      };
+    });
     window.addEventListener("resize", reposition);
     return () => window.removeEventListener("resize", reposition);
   }, [preferences.size]);
@@ -424,7 +442,7 @@ export function DesktopPet({
     }
     setSpot((current) => ({
       ...current,
-      x: clamp(drag.originX + event.clientX - drag.startX, PET_VIEWPORT_GUTTER, window.innerWidth - preferences.size - PET_VIEWPORT_GUTTER),
+      x: clamp(drag.originX + event.clientX - drag.startX, petXBounds(preferences.size).minX, petXBounds(preferences.size).maxX),
       y: clamp(drag.originY + event.clientY - drag.startY, 64, window.innerHeight - preferences.size - PET_VIEWPORT_GUTTER),
       mood: "idle"
     }));
