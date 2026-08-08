@@ -35,9 +35,10 @@ class RunnerContext:
     skills: list[dict[str, Any]]
     reasoning_effort: str | None
     attachments: list[dict[str, Any]]
-    # Team runs receive a per-agent workspace. Conversation runs leave this
-    # unset and preserve the existing per-session workspace behavior.
+    # Team runs receive a per-task workspace via workspaceDir. Conversation
+    # runs leave it unset so the backend falls back to the session workspace.
     workspace_dir: Path | None = None
+    team_id: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     settings: Settings | None = None
     mcp_pool: McpSessionPool | None = None

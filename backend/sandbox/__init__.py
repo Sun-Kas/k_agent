@@ -12,6 +12,7 @@ silent degradation is the usual way a sandbox stops protecting anything.
 """
 
 from backend.sandbox.constants import (
+    DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS,
     DEFAULT_DENY_READ,
     DEFAULT_ENV_ALLOWLIST,
     SANDBOX_MODES,
@@ -42,6 +43,7 @@ from backend.sandbox.plan import (
 
 __all__ = [
     "BashInvocation",
+    "DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS",
     "DEFAULT_DENY_READ",
     "DEFAULT_ENV_ALLOWLIST",
     "SANDBOX_MODES",

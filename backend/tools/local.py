@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from backend.memory import append_auto_memory, compact_auto_memory, read_auto_memory, search_auto_memory
+from backend.tools.workspace import current_tool_workspace
 ToolExecutor = Callable[[dict[str, Any]], Awaitable[str]]
 
 
@@ -90,6 +91,8 @@ async def invoke_skill(
         str(skill.get("baseDir")) if skill.get("baseDir") else None,
     )
     hook_notes = _render_skill_hooks(skill.get("hooks", {}))
+    base_dir = str(skill.get("baseDir") or "").strip() or None
+    file_path = str(skill.get("filePath") or "").strip() or None
     return json.dumps(
         {
             "success": True,
@@ -97,6 +100,8 @@ async def invoke_skill(
             "status": skill.get("executionContext", "inline"),
             "allowedTools": list(skill.get("allowedTools", [])),
             "model": skill.get("model"),
+            "baseDir": base_dir,
+            "filePath": file_path,
             "content": content,
             "hooks": hook_notes,
         },
@@ -150,8 +155,42 @@ def _render_skill_content(content: str, args: str, argument_names: tuple[str, ..
     for index, name in enumerate(argument_names):
         value = args.split()[index] if index < len(args.split()) else ""
         rendered = rendered.replace(f"${{{name}}}", value)
+    workspace = current_tool_workspace()
+    workspace_path = str(workspace) if workspace is not None else None
     if base_dir:
-        rendered = rendered.replace("${K_AGENT_SKILL_DIR}", base_dir).replace("${CLAUDE_SKILL_DIR}", base_dir)
+        # Community skills use several spellings for the package root. Expand all
+        # of them so the model never has to `find` the skill directory.
+        for token in (
+            "${K_AGENT_SKILL_DIR}",
+            "${CLAUDE_SKILL_DIR}",
+            "${SKILL_DIR}",
+            "$SKILL_DIR",
+            "{SKILL_DIR}",
+        ):
+            rendered = rendered.replace(token, base_dir)
+        header_lines = [
+            f"Skill package root: {base_dir}",
+            f"SKILL.md directory: {base_dir}",
+            "Resolve relative paths in this Skill (scripts/, references/, "
+            "assets/, templates/) against the package root above.",
+        ]
+        if workspace_path:
+            # Community skills often hardcode /tmp; redirect artifacts into the
+            # session collaboration workspace that local tools can actually write.
+            rendered = rendered.replace("/tmp/", f"{workspace_path}/")
+            header_lines.extend(
+                [
+                    f"Session workspace (write outputs here): {workspace_path}",
+                    "Rewrite any /tmp output paths to this workspace. "
+                    "Do not write deliverables to the repository root.",
+                ]
+            )
+        rendered = "\n".join(header_lines) + "\n\n" + rendered
+    elif workspace_path:
+        rendered = (
+            f"Session workspace (write outputs here): {workspace_path}\n\n"
+            + rendered.replace("/tmp/", f"{workspace_path}/")
+        )
     return rendered
 
 

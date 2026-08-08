@@ -152,6 +152,83 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(result["success"])
             self.assertIn("Remember tea.", result["content"])
+            self.assertEqual(result["baseDir"], str(skill_dir))
+            self.assertIn("Skill package root:", result["content"])
+
+    async def test_skill_tool_expands_community_skill_dir_placeholders(self) -> None:
+        with TemporaryDirectory() as tmp:
+            skill_dir = Path(tmp) / "steam-daily-deals"
+            skill_dir.mkdir(parents=True)
+            result = json.loads(
+                await invoke_skill(
+                    {"skill": "steam-daily-deals", "args": "今天的Steam优惠"},
+                    [
+                        {
+                            "id": "steam-daily-deals",
+                            "name": "steam-daily-deals",
+                            "instructions": (
+                                "Run:\n"
+                                "python3 {SKILL_DIR}/scripts/fetch_steam_deals.py\n"
+                                "Also ${SKILL_DIR}/refs and $SKILL_DIR/assets"
+                            ),
+                            "argumentNames": [],
+                            "baseDir": str(skill_dir),
+                            "filePath": str(skill_dir / "SKILL.md"),
+                            "enabled": True,
+                        }
+                    ],
+                )
+            )
+            self.assertTrue(result["success"])
+            self.assertEqual(result["baseDir"], str(skill_dir))
+            self.assertEqual(result["filePath"], str(skill_dir / "SKILL.md"))
+            self.assertNotIn("{SKILL_DIR}", result["content"])
+            self.assertNotIn("${SKILL_DIR}", result["content"])
+            self.assertNotIn("$SKILL_DIR", result["content"])
+            self.assertIn(f"python3 {skill_dir}/scripts/fetch_steam_deals.py", result["content"])
+            self.assertIn(f"{skill_dir}/refs", result["content"])
+            self.assertIn(f"{skill_dir}/assets", result["content"])
+
+    async def test_skill_tool_rewrites_tmp_outputs_into_session_workspace(self) -> None:
+        from backend.tools.workspace import reset_tool_workspace, set_tool_workspace
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill_dir = root / "skill"
+            workspace = root / "workspace"
+            skill_dir.mkdir()
+            workspace.mkdir()
+            token = set_tool_workspace(workspace)
+            try:
+                result = json.loads(
+                    await invoke_skill(
+                        {"skill": "steam-daily-deals", "args": ""},
+                        [
+                            {
+                                "id": "steam-daily-deals",
+                                "name": "steam-daily-deals",
+                                "instructions": (
+                                    "python3 {SKILL_DIR}/scripts/fetch.py "
+                                    "--output-file /tmp/steam_deals_today.md\n"
+                                    "Read /tmp/steam_deals_today.md"
+                                ),
+                                "argumentNames": [],
+                                "baseDir": str(skill_dir),
+                                "enabled": True,
+                            }
+                        ],
+                    )
+                )
+            finally:
+                reset_tool_workspace(token)
+            self.assertTrue(result["success"])
+            self.assertNotIn("/tmp/", result["content"])
+            resolved_workspace = str(workspace.resolve())
+            self.assertIn(f"{resolved_workspace}/steam_deals_today.md", result["content"])
+            self.assertIn(
+                f"Session workspace (write outputs here): {resolved_workspace}",
+                result["content"],
+            )
 
     def test_only_data_skill_directory_is_loaded(self) -> None:
         with TemporaryDirectory() as tmp:

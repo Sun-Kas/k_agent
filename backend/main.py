@@ -27,6 +27,7 @@ from backend.home import (
     link_shared_runtime,
     memory_dir,
     resolve_managed_path,
+    session_workspace_dir,
     shared_runtime_tool_env,
     teams_dir,
 )
@@ -90,6 +91,17 @@ def _team_workspace(raw_path: str | None) -> Path | None:
         raise ValueError("workspaceDir must be inside the Team Runtime state root") from exc
     resolved.mkdir(parents=True, exist_ok=True)
     return resolved
+
+
+def _resolve_run_workspace(thread_id: str, raw_path: str | None) -> Path:
+    """Prefer Team cwd when provided; otherwise use the session collaboration dir."""
+
+    team_workspace = _team_workspace(raw_path)
+    if team_workspace is not None:
+        return team_workspace
+    workspace = session_workspace_dir(thread_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return workspace
 
 
 def create_app() -> FastAPI:
@@ -287,7 +299,10 @@ def create_app() -> FastAPI:
                 skills=payload.skills,
                 reasoning_effort=payload.reasoning_effort,
                 attachments=payload.attachments,
-                workspace_dir=_team_workspace(payload.workspace_dir),
+                workspace_dir=_resolve_run_workspace(
+                    payload.thread_id, payload.workspace_dir
+                ),
+                team_id=payload.team_id,
                 options=dict(payload.agent_options or {}),
                 settings=settings,
                 mcp_pool=app.state.mcp_pool,

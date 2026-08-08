@@ -35,6 +35,13 @@ def _default_mcp_config_path() -> str:
     return str(mcp_config_path())
 
 
+def _default_bash_sandbox_allowed_domains() -> list[str]:
+    # Import lazily: backend.sandbox.__init__ pulls guidance which imports Settings.
+    from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS
+
+    return list(DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS)
+
+
 class Settings(BaseSettings):
     """集中定义服务端端口、模型默认值、存储路径和工具限制。"""
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
@@ -174,11 +181,13 @@ class Settings(BaseSettings):
         default="auto", alias="BASH_SANDBOX_MODE"
     )
     bash_sandbox_command: str = Field(default="srt", alias="BASH_SANDBOX_COMMAND")
-    # `*` keeps the default network policy unrestricted while still running Bash
-    # inside the filesystem sandbox. Replace it with concrete domains to turn
-    # the K Agent Bash path into an allowlist without changing the global switch.
+    # srt cannot express allow-all (`*` / `*.com` are rejected). Default to a
+    # concrete host allowlist so Bash stays inside the filesystem sandbox while
+    # common package registries and skill APIs remain reachable. Override via
+    # BASH_SANDBOX_ALLOWED_DOMAINS; bare `*` entries are ignored.
     bash_sandbox_allowed_domains: list[str] = Field(
-        default_factory=lambda: ["*"], alias="BASH_SANDBOX_ALLOWED_DOMAINS"
+        default_factory=_default_bash_sandbox_allowed_domains,
+        alias="BASH_SANDBOX_ALLOWED_DOMAINS",
     )
     bash_sandbox_write_paths: list[str] = Field(
         default_factory=list, alias="BASH_SANDBOX_WRITE_PATHS"

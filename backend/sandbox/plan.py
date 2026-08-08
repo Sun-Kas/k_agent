@@ -104,12 +104,61 @@ def build_settings_payload(
         },
         "network": {
             "allowedDomains": (
-                list(settings.bash_sandbox_allowed_domains) if enabled else []
+                sanitize_srt_allowed_domains(settings.bash_sandbox_allowed_domains)
+                if enabled
+                else []
             ),
             "deniedDomains": [],
             "allowLocalBinding": False,
         },
     }
+
+
+def sanitize_srt_allowed_domains(
+    configured: list[str] | tuple[str, ...],
+) -> list[str]:
+    """Drop patterns srt rejects so Bash stays sandboxed.
+
+    Bare `*` and TLD-wide wildcards like `*.com` are invalid in srt's
+    allowedDomains. Ignoring them keeps the filesystem sandbox running instead
+    of failing config validation or skipping srt.
+    """
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in configured:
+        item = str(raw).strip()
+        if not item or item in seen:
+            continue
+        if not _is_srt_allowed_domain(item):
+            logger.warning(
+                "Ignoring invalid Bash sandbox domain %r "
+                "(srt requires concrete hosts like example.com or *.example.com)",
+                item,
+            )
+            continue
+        seen.add(item)
+        cleaned.append(item)
+    return cleaned
+
+
+def _is_srt_allowed_domain(value: str) -> bool:
+    """Mirror srt's domainPatternSchema enough to reject known-invalid entries."""
+
+    if "://" in value or "/" in value or ":" in value:
+        return False
+    if value == "localhost":
+        return True
+    if value.startswith("*."):
+        domain = value[2:]
+        if not domain or domain.startswith(".") or domain.endswith("."):
+            return False
+        parts = domain.split(".")
+        # srt rejects overly broad patterns such as *.com
+        return len(parts) >= 2 and all(parts)
+    if "*" in value:
+        return False
+    return "." in value and not value.startswith(".") and not value.endswith(".")
 
 
 def _materialize_settings(

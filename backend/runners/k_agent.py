@@ -63,9 +63,25 @@ class KAgentRunner:
             )
             user_context = dict(prompt_bundle.user_context)
             if ctx.workspace_dir is not None:
-                # The same boundary is enforced by request-scoped local tools;
-                # exposing the path prevents the model from guessing a cwd.
-                user_context["teamWorkspace"] = str(ctx.workspace_dir)
+                # Same boundary as request-scoped local tools. Tell the model
+                # explicitly so Skills that hardcode /tmp still land here.
+                workspace = str(ctx.workspace_dir)
+                if ctx.team_id:
+                    user_context["workingDirectory"] = (
+                        f"{workspace}\n"
+                        "这是当前 Team 任务工作区（不是普通对话的 session 协作区）。"
+                        "正式交付物写在此目录下的 output/；"
+                        "不要写到 /tmp、仓库根目录、其他 Team 任务目录或对话 session 目录。"
+                        "相对路径相对此任务目录解析。"
+                    )
+                else:
+                    user_context["workingDirectory"] = (
+                        f"{workspace}\n"
+                        "这是当前对话的 session 协作区（每个会话独立，不同于 Team 任务目录）。"
+                        "生成的报告、脚本 --output-file、下载文件和其他交付物都必须写在这个目录内；"
+                        "不要写到 /tmp、仓库根目录、其他会话目录或 Team 目录。"
+                        "相对路径也相对此目录解析。"
+                    )
             if ctx.mcp_servers:
                 user_context["selectedMcpServers"] = "\n".join(
                     f"- {server.get('name') or server.get('id')}: "

@@ -148,10 +148,48 @@ class SandboxPlanningTests(unittest.TestCase):
 
 
 class SandboxSettingsTests(unittest.TestCase):
-    def test_default_settings_allow_all_network_domains(self) -> None:
+    def test_default_settings_use_concrete_srt_domains(self) -> None:
+        from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS
+
         settings = Settings(_env_file=None)
         self.assertTrue(settings.network_access_default)
-        self.assertEqual(settings.bash_sandbox_allowed_domains, ["*"])
+        self.assertEqual(
+            settings.bash_sandbox_allowed_domains,
+            list(DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS),
+        )
+        self.assertNotIn("*", settings.bash_sandbox_allowed_domains)
+
+    def test_settings_payload_strips_bare_star_domain(self) -> None:
+        payload = build_settings_payload(
+            workspace_root=Path("/tmp/ws"),
+            settings=_settings(bash_sandbox_allowed_domains=["*", "example.com", "*.com"]),
+            network_access=True,
+        )
+        # Bare "*" / "*.com" are invalid for srt; keep sandbox with valid hosts.
+        self.assertEqual(payload["network"]["allowedDomains"], ["example.com"])
+
+    def test_plan_keeps_sandbox_when_star_domain_configured(self) -> None:
+        from unittest.mock import patch
+
+        from backend.sandbox.detect import SandboxSupport
+        from backend.sandbox.plan import plan_bash_invocation
+
+        with patch(
+            "backend.sandbox.plan.detect_support",
+            return_value=SandboxSupport(available=True, reason="ok"),
+        ):
+            planned = plan_bash_invocation(
+                "echo hi",
+                workspace_root=Path("/tmp/ws"),
+                settings=_settings(
+                    bash_sandbox_mode="auto",
+                    bash_sandbox_allowed_domains=["*"],
+                ),
+                network_access=True,
+            )
+        self.assertTrue(planned.sandboxed)
+        self.assertIsNotNone(planned.argv)
+        self.assertEqual(planned.argv[0], "srt")
 
     def test_settings_deny_credential_stores_and_project_env(self) -> None:
         with TemporaryDirectory() as tmp:
