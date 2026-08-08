@@ -21,7 +21,7 @@ from backend.approvals import ApprovalBroker
 from backend.api.schemas import ApprovalResolutionInput, ChatMessage
 from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
-from backend.home import ensure_home_layout, memory_dir, teams_dir
+from backend.home import ensure_home_layout, memory_dir, resolve_managed_path, teams_dir
 from backend.mcp_tool import McpSessionPool, load_mcp_manager
 from backend.sandbox import sandbox_runtime_status
 from backend.observability import AgentBackendLoggingCallback, LangfuseRuntime
@@ -68,7 +68,10 @@ def _team_workspace(raw_path: str | None) -> Path | None:
 
     if not raw_path:
         return None
-    resolved = Path(raw_path).expanduser().resolve()
+    # Access Layer sends `$K_AGENT_HOME`-relative paths via to_managed_path().
+    # Resolve against the home, not process cwd, or LAN/deploy cwd mismatches
+    # reject every Team run with "workspaceDir must be inside…".
+    resolved = resolve_managed_path(raw_path)
     try:
         resolved.relative_to(teams_dir().resolve())
     except ValueError as exc:

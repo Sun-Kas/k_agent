@@ -792,7 +792,24 @@ export function App() {
     }
 
     try {
-      await navigator.clipboard.writeText(content);
+      // Clipboard API needs a secure context (https / localhost). LAN http://IP
+      // falls back to a hidden textarea + execCommand so intranet copies still work.
+      if (window.isSecureContext && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const area = document.createElement("textarea");
+        area.value = content;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.left = "-9999px";
+        area.style.top = "0";
+        document.body.appendChild(area);
+        area.select();
+        area.setSelectionRange(0, area.value.length);
+        const ok = document.execCommand("copy");
+        document.body.removeChild(area);
+        if (!ok) throw new Error("execCommand copy failed");
+      }
       setCopyFeedback({ messageId, status: "success" });
     } catch {
       setCopyFeedback({ messageId, status: "error" });

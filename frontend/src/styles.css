@@ -1543,6 +1543,20 @@ img.brand-symbol {
 .bubble table, .assistant-output table { border-collapse: collapse; margin: .6em 0; }
 .bubble th, .bubble td, .assistant-output th, .assistant-output td { padding: 5px 8px; border: 1px solid #343934; }
 .bubble a, .assistant-output a { color: var(--lime); }
+.bubble .katex, .assistant-output .katex,
+.content-stage-markdown .katex,
+.team-conversation-message .katex { font-size: 1.05em; color: inherit; }
+.bubble .katex-display, .assistant-output .katex-display,
+.content-stage-markdown .katex-display,
+.team-conversation-message .katex-display {
+  margin: .85em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+.bubble .katex-error, .assistant-output .katex-error,
+.content-stage-markdown .katex-error,
+.team-conversation-message .katex-error { color: #d2766e; }
 .typing { display: flex; gap: 4px; padding: 5px 2px; }
 .typing i { width: 4px; height: 4px; border-radius: 50%; background: var(--lime); animation: bounce .8s infinite alternate; }
 .typing i:nth-child(2) { animation-delay: .15s; }.typing i:nth-child(3) { animation-delay: .3s; }
