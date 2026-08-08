@@ -16,10 +16,41 @@ from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import RuntimeCatalog
 from access_layer.teams.models import SupervisorDecision
 from access_layer.teams.store import TeamStore
-from backend.home import public_home_relative_path, resolve_managed_path, to_managed_path
+from backend.home import (
+    ensure_shared_runtime,
+    link_shared_runtime,
+    public_home_relative_path,
+    resolve_managed_path,
+    shared_runtime_tool_env,
+    to_managed_path,
+)
 
 
 logger = logging.getLogger("k_agent.access.team_runtime")
+
+# Deliverable trees are source snapshots. Dependency installs and tool caches
+# must not ship with Artifacts. Built output dirs like dist/ are allowed when
+# that is the intentional deliverable. Shared tooling lives under `.runtime/`
+# (sibling of output/), never inside the published tree.
+_ARTIFACT_COPY_IGNORE = shutil.ignore_patterns(
+    ".team-input",
+    ".runtime",
+    "node_modules",
+    ".pnpm-store",
+    ".yarn",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".turbo",
+    ".next",
+    ".nuxt",
+    ".cache",
+    "coverage",
+    ".git",
+)
 
 
 class TeamRuntime:
@@ -132,12 +163,17 @@ class TeamRuntime:
         async with self._semaphore:
             try:
                 context = await self.store.task_context(team_id, task_id)
-                workspace = task_dir / "output"
-                self._prepare_task_directory(task_dir, context, agent, run_id)
+                runtime = ensure_shared_runtime()
+                # cwd is the task bundle. Deliverables stay under output/; the
+                # project-wide Node tooling is linked at .runtime.
+                workspace = task_dir
+                self._prepare_task_directory(
+                    task_dir, context, agent, run_id, runtime=runtime
+                )
                 mcp_ids = list(agent["capabilities"].get("mcpServerIds", []))
                 skill_ids = list(agent["capabilities"].get("skillIds", []))
                 mcp_servers, skills = self._runtime_catalog.selected_runtime(mcp_ids, skill_ids)
-                prompt = self._task_prompt(context, agent)
+                prompt = self._task_prompt(context, agent, runtime=runtime)
                 request_id = f"team-{uuid.uuid4().hex}"
                 await self.store.append_event(team_id, "run.started", {
                     "taskId": task_id,
@@ -156,6 +192,7 @@ class TeamRuntime:
                     mcp_servers=mcp_servers,
                     skills=skills,
                     workspace=workspace,
+                    tool_env=shared_runtime_tool_env(runtime),
                     run_log=task_dir / "logs" / f"{run_id}.ndjson",
                 )
                 if not text.strip():
@@ -306,7 +343,7 @@ class TeamRuntime:
                 source_output,
                 staging / "files",
                 dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(".team-input"),
+                ignore=_ARTIFACT_COPY_IGNORE,
             )
         (staging / "result.md").write_text(
             str(artifact.get("content") or ""), encoding="utf-8"
@@ -437,6 +474,8 @@ class TeamRuntime:
         context: dict[str, Any],
         agent: dict[str, Any],
         run_id: str,
+        *,
+        runtime: Path | None = None,
     ) -> None:
         """Materialize one non-code task bundle without copying the repository."""
 
@@ -444,8 +483,15 @@ class TeamRuntime:
         artifact_input_dir = input_dir / "artifacts"
         output_dir = task_dir / "output"
         runtime_artifact_dir = output_dir / ".team-input" / "artifacts"
-        for directory in (artifact_input_dir, runtime_artifact_dir, task_dir / "artifacts", task_dir / "logs"):
+        for directory in (
+            artifact_input_dir,
+            runtime_artifact_dir,
+            task_dir / "artifacts",
+            task_dir / "logs",
+        ):
             directory.mkdir(parents=True, exist_ok=True)
+        if runtime is not None:
+            link_shared_runtime(task_dir, runtime)
 
         task = context["task"]
         team = context["team"]
@@ -552,7 +598,13 @@ class TeamRuntime:
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
 
-    def _task_prompt(self, context: dict[str, Any], agent: dict[str, Any]) -> str:
+    def _task_prompt(
+        self,
+        context: dict[str, Any],
+        agent: dict[str, Any],
+        *,
+        runtime: Path | None = None,
+    ) -> str:
         team = context["team"]
         task = context["task"]
         artifact_parts = []
@@ -561,7 +613,7 @@ class TeamRuntime:
             artifact_parts.append(
                 f"### {artifact['uri']} — {artifact['title']}\n"
                 + (
-                    f"已验收文件快照：.team-input/artifacts/{artifact['id']}\n"
+                    f"已验收文件快照：output/.team-input/artifacts/{artifact['id']}\n"
                     if artifact.get("workspacePath")
                     else ""
                 )
@@ -571,6 +623,20 @@ class TeamRuntime:
             f"- {message['senderId']}: {message['content']}"
             for message in context["mailbox"]
         ]
+        runtime_hint = ""
+        if runtime is not None:
+            runtime_rel = public_home_relative_path(runtime) or str(runtime)
+            runtime_hint = (
+                f"项目共享运行时：{runtime_rel}（任务内入口为 .runtime/；"
+                "整个 $K_AGENT_HOME 下所有会话与团队共用，禁止按任务重复安装）。\n"
+                "CLI 全局安装（全项目只需一次）："
+                "npm install -g --prefix \"$K_AGENT_SHARED_RUNTIME/node\" <pkg>\n"
+                "项目依赖装到共享目录，不要装进 output/："
+                "mkdir -p \"$K_AGENT_SHARED_RUNTIME/projects/<slug>\" && "
+                "在该目录放置 package.json/lock 后执行 npm ci；"
+                "验证构建时在该共享目录运行，或临时 ln -s 其 node_modules 到 output 下项目，"
+                "提交前必须删除该符号链接。"
+            )
         return "\n\n".join(
             part
             for part in [
@@ -584,6 +650,13 @@ class TeamRuntime:
                     "协作约束：只处理当前任务；基于给出的 Artifact，而不是猜测其他 Agent 的工作；"
                     "普通工具失败时阅读错误并自行修复；最终输出应是可以直接保存为 Artifact 的完整成果。"
                 ),
+                (
+                    "交付目录约束：正式交付物只写在 output/。"
+                    "禁止在 output/ 内执行 npm/pnpm/yarn/bun install 或 pip install -t .；"
+                    "不要留下 node_modules、.venv、__pycache__、.next 等依赖或工具缓存；"
+                    "只提交源码与 lockfile（或明确约定的构建产物本身）。"
+                ),
+                runtime_hint,
                 "依赖 Artifact：\n" + "\n\n".join(artifact_parts) if artifact_parts else "",
                 "Mailbox：\n" + "\n".join(mailbox_parts) if mailbox_parts else "",
             ]
@@ -728,6 +801,7 @@ class TeamRuntime:
         mcp_servers: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         workspace: Path,
+        tool_env: dict[str, str] | None = None,
         run_log: Path | None = None,
     ) -> str:
         chunks: list[str] = []
@@ -735,6 +809,16 @@ class TeamRuntime:
         pending_reasoning: list[str] = []
         last_activity_flush = time.monotonic()
         created_at = datetime.now(timezone.utc).isoformat()
+        agent_options: dict[str, Any] = {
+            "cliSessionMode": "ephemeral",
+            **(
+                {"networkAccess": agent["networkAccess"]}
+                if isinstance(agent.get("networkAccess"), bool)
+                else {}
+            ),
+        }
+        if tool_env:
+            agent_options["toolEnv"] = tool_env
         payload = {
             "threadId": f"{team_id}:{agent_id}",
             "runId": run_id,
@@ -750,14 +834,7 @@ class TeamRuntime:
             "reasoningEffort": agent.get("reasoningEffort"),
             "attachments": [],
             "agentKind": agent["agentKind"],
-            "agentOptions": {
-                "cliSessionMode": "ephemeral",
-                **(
-                    {"networkAccess": agent["networkAccess"]}
-                    if isinstance(agent.get("networkAccess"), bool)
-                    else {}
-                ),
-            },
+            "agentOptions": agent_options,
             "teamId": team_id,
             "taskId": task_id,
             "teamAgentId": agent_id,

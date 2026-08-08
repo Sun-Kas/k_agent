@@ -21,7 +21,12 @@ from backend.sandbox.detect import (
     detect_support,
     reset_sandbox_detection,
 )
-from backend.sandbox.env import build_child_env
+from backend.sandbox.env import (
+    build_child_env,
+    current_tool_env_overrides,
+    reset_tool_env_overrides,
+    set_tool_env_overrides,
+)
 from backend.sandbox.guidance import (
     enrich_bash_result,
     notice_from_tool_result,
@@ -44,11 +49,14 @@ __all__ = [
     "SandboxUnavailable",
     "build_child_env",
     "build_settings_payload",
+    "current_tool_env_overrides",
     "detect_support",
     "enrich_bash_result",
     "install_sandbox_runtime",
     "notice_from_tool_result",
     "plan_bash_invocation",
     "reset_sandbox_detection",
+    "reset_tool_env_overrides",
     "sandbox_runtime_status",
+    "set_tool_env_overrides",
 ]

@@ -304,19 +304,32 @@ class CodexRunnerTests(unittest.IsolatedAsyncioTestCase):
             if False:
                 yield {}
 
-        with TemporaryDirectory() as tmp, patch(
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as home, patch.dict(
+            "os.environ", {"K_AGENT_HOME": home}, clear=False
+        ), patch(
             "backend.runners.codex.resolve_cli",
             return_value=type("Resolved", (), {"path": "/usr/local/bin/codex"})(),
         ), patch(
             "backend.runners.codex.session_workspace_dir", return_value=Path(tmp)
         ), patch("backend.runners.codex.run_codex_app_server", fake_run_app_server):
-            events = [event async for event in CodexRunner().run_stream(ctx)]
+            from backend.home import reset_home_cache
+
+            reset_home_cache()
+            try:
+                events = [event async for event in CodexRunner().run_stream(ctx)]
+            finally:
+                reset_home_cache()
 
         self.assertEqual(events, [])
         self.assertEqual(captured["command"], "/usr/local/bin/codex")
         self.assertEqual(captured["public_thread_id"], "thread-1")
         self.assertIs(captured["approval_broker"], ctx.approval_broker)
         self.assertTrue(captured["network_access"])
+        env = captured["env"]
+        assert isinstance(env, dict)
+        self.assertIn("K_AGENT_SHARED_RUNTIME", env)
+        self.assertIn("npm_config_prefix", env)
+        self.assertTrue(str(env["PATH"]).startswith(str(Path(env["K_AGENT_SHARED_RUNTIME"]) / "node" / "bin")))
 
 
 class McpConfigAndSkillTests(unittest.TestCase):

@@ -535,11 +535,19 @@ def test_supervisor_runtime_applies_structured_decision(tmp_path: Path) -> None:
 
 
 def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: Path) -> None:
+    import os
+    from unittest.mock import patch
+
+    from backend.home import reset_home_cache, shared_runtime_dir
+
     workspace = tmp_path / "team-deliverables"
+    home = tmp_path / "k_agent_home"
 
     class WorkerBackend:
         async def stream(self, payload, _request_id):
-            output = Path(payload["workspaceDir"])
+            root = Path(payload["workspaceDir"])
+            output = root / "output"
+            output.mkdir(parents=True, exist_ok=True)
             (output / "site.html").write_text("<main>accepted</main>", encoding="utf-8")
             yield {"type": "TEXT_MESSAGE_CONTENT", "messageId": "worker", "delta": "站点交付"}
 
@@ -594,6 +602,12 @@ def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: 
         )
         await worker_runtime._run_claimed(claimed)
 
+        task_runtime = tmp_path / team["id"] / "tasks" / claimed["task"]["id"] / ".runtime"
+        project_runtime = shared_runtime_dir()
+        assert task_runtime.is_symlink()
+        assert task_runtime.resolve() == project_runtime.resolve()
+        assert (project_runtime / "node").is_dir()
+
         control = await store.claim_supervisor_job(team["id"])
         assert control is not None
         downstream_agent = next(
@@ -621,9 +635,21 @@ def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: 
         context = await store.task_context(team["id"], downstream["task"]["id"])
         downstream_dir = tmp_path / team["id"] / "tasks" / downstream["task"]["id"]
         supervisor_runtime._prepare_task_directory(
-            downstream_dir, context, downstream["agent"], downstream["runId"]
+            downstream_dir,
+            context,
+            downstream["agent"],
+            downstream["runId"],
+            runtime=project_runtime,
         )
         copied = downstream_dir / "output" / ".team-input" / "artifacts" / artifact["id"] / "files" / "site.html"
         assert copied.read_text(encoding="utf-8") == "<main>accepted</main>"
+        assert not (
+            downstream_dir / "output" / ".team-input" / "artifacts" / artifact["id"] / "files" / "node_modules"
+        ).exists()
 
-    asyncio.run(scenario())
+    with patch.dict(os.environ, {"K_AGENT_HOME": str(home)}, clear=False):
+        reset_home_cache()
+        try:
+            asyncio.run(scenario())
+        finally:
+            reset_home_cache()

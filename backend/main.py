@@ -21,9 +21,21 @@ from backend.approvals import ApprovalBroker
 from backend.api.schemas import ApprovalResolutionInput, ChatMessage
 from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
-from backend.home import ensure_home_layout, memory_dir, resolve_managed_path, teams_dir
+from backend.home import (
+    ensure_home_layout,
+    ensure_shared_runtime,
+    link_shared_runtime,
+    memory_dir,
+    resolve_managed_path,
+    shared_runtime_tool_env,
+    teams_dir,
+)
 from backend.mcp_tool import McpSessionPool, load_mcp_manager
-from backend.sandbox import sandbox_runtime_status
+from backend.sandbox import (
+    reset_tool_env_overrides,
+    sandbox_runtime_status,
+    set_tool_env_overrides,
+)
 from backend.observability import AgentBackendLoggingCallback, LangfuseRuntime
 from backend.prompts import (
     build_prompt_bundle,
@@ -285,6 +297,18 @@ def create_app() -> FastAPI:
             )
             workspace_token = set_tool_workspace(ctx.workspace_dir)
             network_token = set_tool_network_access(network_access_enabled(ctx))
+            # One project-wide Node/npm prefix for chat and Team runs. Explicit
+            # agentOptions.toolEnv wins on conflicting keys.
+            runtime = ensure_shared_runtime()
+            if ctx.workspace_dir is not None:
+                link_shared_runtime(ctx.workspace_dir, runtime)
+            tool_env = shared_runtime_tool_env(runtime)
+            option_env = ctx.options.get("toolEnv") if isinstance(ctx.options, dict) else None
+            if isinstance(option_env, dict):
+                tool_env.update(
+                    {str(k): str(v) for k, v in option_env.items() if v is not None}
+                )
+            env_token = set_tool_env_overrides(tool_env)
             try:
                 runner = app.state.runner_registry.get(agent_kind)
                 async for event in app.state.approvals.stream(
@@ -322,6 +346,7 @@ def create_app() -> FastAPI:
                 )
                 raise
             finally:
+                reset_tool_env_overrides(env_token)
                 reset_tool_network_access(network_token)
                 reset_tool_workspace(workspace_token)
                 log_event(

@@ -13,6 +13,7 @@ COMMON_IGNORED_NAMES = {
     ".mcp",
     ".mcp.json",
     ".cursor",
+    ".runtime",
     ".git",
     ".gitignore",
     ".gitattributes",

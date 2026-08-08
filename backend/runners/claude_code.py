@@ -8,7 +8,6 @@ agentOptions ``claudePermissionMode``.
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,6 +19,7 @@ from backend.runners.claude_approval_bridge import (
     ClaudeApprovalBridge,
 )
 from backend.runners.base import RunnerContext
+from backend.runners.cli_env import build_cli_child_env
 from backend.runners.cli_process import (
     _CliStreamState,
     append_text,
@@ -127,7 +127,7 @@ class ClaudeCodeRunner:
             elif mode == "resume":
                 argv.append("--continue")
 
-            env = os.environ.copy()
+            env = build_cli_child_env(ctx, workspace=workspace)
             inject_claude_mcp_secrets(env, ctx.mcp_servers)
             if approval_bridge is not None:
                 env.update(approval_bridge.child_env())

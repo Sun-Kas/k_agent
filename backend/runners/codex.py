@@ -14,6 +14,7 @@ import uuid
 
 from backend.home import session_workspace_dir
 from backend.runners.base import RunnerContext
+from backend.runners.cli_env import build_cli_child_env
 from backend.runners.cli_process import (
     _CliStreamState,
     append_text,
@@ -70,6 +71,8 @@ class CodexRunner:
             run_id=ctx.run_id,
             network_access=network_access_enabled(ctx),
             mapper=map_codex_event,
+            # Codex shell inherits this process env; pin shared Node/npm here.
+            env=build_cli_child_env(ctx, workspace=workspace),
         ):
             yield event
 

@@ -46,6 +46,7 @@ async def run_codex_app_server(
     run_id: str,
     network_access: bool,
     mapper: CodexItemMapper,
+    env: dict[str, str] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one Codex turn and bridge JSON-RPC server requests to the UI."""
 
@@ -54,6 +55,7 @@ async def run_codex_app_server(
         "app-server",
         "--stdio",
         cwd=str(cwd),
+        env=env,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

@@ -16,6 +16,7 @@ def test_ignores_runtime_config_names() -> None:
     assert is_ignored_workspace_name(".mcp.json")
     assert is_ignored_workspace_name(".mcp")
     assert is_ignored_workspace_name(".claude")
+    assert is_ignored_workspace_name(".runtime")
     assert not is_ignored_workspace_name("notes.md")
     assert not is_ignored_workspace_name("report.json")
 

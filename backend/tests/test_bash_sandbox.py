@@ -209,6 +209,23 @@ class ChildEnvTests(unittest.TestCase):
         )
         self.assertEqual(child["MY_TOOL_HOME"], "/opt/tool")
 
+    def test_tool_env_overrides_are_merged(self) -> None:
+        from backend.sandbox.env import reset_tool_env_overrides, set_tool_env_overrides
+
+        token = set_tool_env_overrides({
+            "K_AGENT_SHARED_RUNTIME": "/tmp/runtime",
+            "PATH": "/tmp/runtime/node/bin:/bin",
+            "NPM_CONFIG_CACHE": "/tmp/runtime/npm-cache",
+        })
+        try:
+            child = build_child_env({"PATH": "/usr/bin", "HOME": "/Users/me"})
+            self.assertEqual(child["K_AGENT_SHARED_RUNTIME"], "/tmp/runtime")
+            self.assertEqual(child["NPM_CONFIG_CACHE"], "/tmp/runtime/npm-cache")
+            self.assertEqual(child["PATH"], "/tmp/runtime/node/bin:/bin")
+            self.assertEqual(child["HOME"], "/Users/me")
+        finally:
+            reset_tool_env_overrides(token)
+
 
 class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_cc_bash_uses_scrubbed_env_and_reports_sandbox_state(self) -> None:

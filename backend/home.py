@@ -13,11 +13,17 @@ $K_AGENT_HOME/
     catalog/
       mcp.json               # frontend MCP picker summaries
       skills.json            # frontend Skill picker summaries
+  cache/
+    runtime/                 # project-wide shared Node/npm tooling (all sessions + teams)
+      node/                  # npm --prefix for global CLIs
+      npm-cache/
+      projects/              # shared package installs reused across the whole home
   state/
     sessions/                # FileStorage session root
       {session_id}/
         {session_id}.json    # conversation + AG-UI log
         workspace/           # per-session cwd for CLI agents / tools
+          .runtime -> $K_AGENT_HOME/cache/runtime
     teams/
       team_runtime.db        # durable Team control plane
       {team_id}/
@@ -26,7 +32,8 @@ $K_AGENT_HOME/
         tasks/{task_id}/
           manifest.json      # task/run/file lineage
           input/             # task, mailbox, dependency Artifact metadata
-          output/            # task-local Agent cwd + dependency file snapshots
+          output/            # deliverables only (Agent cwd is the task dir)
+          .runtime -> $K_AGENT_HOME/cache/runtime
           artifacts/         # readable copies of submitted Artifact text
           logs/              # raw provider event stream by run
   content/
@@ -105,6 +112,58 @@ def teams_dir() -> Path:
     """Durable Team Runtime metadata, artifacts, and isolated workspaces."""
 
     return state_dir() / "teams"
+
+
+def shared_runtime_dir() -> Path:
+    """Project-wide Node/npm tooling shared by every session and Team task."""
+
+    return agent_home() / "cache" / "runtime"
+
+
+def ensure_shared_runtime() -> Path:
+    """Create the shared runtime layout used for CLI prefixes and npm caches."""
+
+    runtime = shared_runtime_dir().resolve()
+    (runtime / "npm-cache").mkdir(parents=True, exist_ok=True)
+    (runtime / "node").mkdir(parents=True, exist_ok=True)
+    (runtime / "projects").mkdir(parents=True, exist_ok=True)
+    return runtime
+
+
+def link_shared_runtime(target_dir: Path, runtime: Path | None = None) -> Path:
+    """Expose the project shared runtime inside a workspace as `.runtime`."""
+
+    runtime = (runtime or ensure_shared_runtime()).resolve()
+    link = target_dir / ".runtime"
+    if link.is_symlink():
+        try:
+            if link.resolve() == runtime:
+                return link
+        except OSError:
+            pass
+        link.unlink()
+    elif link.is_dir():
+        shutil.rmtree(link)
+    elif link.exists():
+        link.unlink()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(runtime, target_is_directory=True)
+    return link
+
+
+def shared_runtime_tool_env(runtime: Path | None = None) -> dict[str, str]:
+    """Env injected into Bash/CLI children so installs reuse one project prefix."""
+
+    runtime = (runtime or ensure_shared_runtime()).resolve()
+    node_bin = str(runtime / "node" / "bin")
+    parent_path = os.environ.get("PATH", "")
+    return {
+        "K_AGENT_SHARED_RUNTIME": str(runtime),
+        "K_AGENT_TASK_OUTPUT": "output",
+        "NPM_CONFIG_CACHE": str(runtime / "npm-cache"),
+        "npm_config_prefix": str(runtime / "node"),
+        "PATH": f"{node_bin}:{parent_path}" if parent_path else node_bin,
+    }
 
 
 def session_bundle_dir(session_id: str) -> Path:
@@ -190,6 +249,7 @@ def ensure_home_layout(*, migrate: bool = True) -> Path:
         skills_dir(),
     ):
         path.mkdir(parents=True, exist_ok=True)
+    ensure_shared_runtime()
     if migrate:
         migrate_legacy_home()
     return home
