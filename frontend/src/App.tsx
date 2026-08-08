@@ -340,6 +340,11 @@ export function App() {
     const savedTheme = localStorage.getItem("k-agent-color-theme");
     return colorThemes.some((theme) => theme.id === savedTheme) ? savedTheme as ColorTheme : "snow";
   });
+  const [fontSizeDelta, setFontSizeDelta] = useState<number>(() => {
+    const saved = localStorage.getItem("k-agent-font-size-delta");
+    return saved ? Math.min(6, Math.max(-2, Number(saved))) : 0;
+  });
+  const [fontSizePopoverOpen, setFontSizePopoverOpen] = useState(false);
   const streamEndRef = useRef<HTMLDivElement>(null);
   const messageStreamRef = useRef<HTMLElement>(null);
   const streamPinnedRef = useRef(true);
@@ -421,6 +426,23 @@ export function App() {
     document.documentElement.dataset.theme = colorTheme;
     localStorage.setItem("k-agent-color-theme", colorTheme);
   }, [colorTheme]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--fs-delta", `${fontSizeDelta}px`);
+    localStorage.setItem("k-agent-font-size-delta", String(fontSizeDelta));
+  }, [fontSizeDelta]);
+
+  useEffect(() => {
+    if (!fontSizePopoverOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest(".font-size-control")) {
+        setFontSizePopoverOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [fontSizePopoverOpen]);
 
   useEffect(() => {
     localStorage.setItem("k-agent-sidebar-collapsed", String(sidebarCollapsed));
@@ -1794,6 +1816,52 @@ export function App() {
             >
               <i />
             </button>
+            <div className="font-size-control">
+              <button
+                className="topbar-icon-button font-size-button"
+                type="button"
+                aria-label="调节字体大小"
+                title={`字体偏移：${fontSizeDelta >= 0 ? "+" : ""}${fontSizeDelta}px，点击调节`}
+                onClick={() => setFontSizePopoverOpen((v) => !v)}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <text x="2" y="20" fontSize="16" fontWeight="700" fill="currentColor" stroke="none" fontFamily="sans-serif">A</text>
+                  <text x="14" y="14" fontSize="10" fontWeight="600" fill="currentColor" stroke="none" fontFamily="sans-serif">A</text>
+                </svg>
+              </button>
+              {fontSizePopoverOpen && (
+                <div className="font-size-popover">
+                  <div className="font-size-header">
+                    <span className="font-size-title">字体大小</span>
+                    <span className="font-size-value">{fontSizeDelta >= 0 ? "+" : ""}{fontSizeDelta}px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-2}
+                    max={6}
+                    step={1}
+                    value={fontSizeDelta}
+                    onChange={(e) => setFontSizeDelta(Number(e.target.value))}
+                    className="font-size-slider"
+                  />
+                  <div className="font-size-range-labels">
+                    <span>-2</span>
+                    <span>0</span>
+                    <span>+3</span>
+                    <span>+6</span>
+                  </div>
+                  {fontSizeDelta !== 0 && (
+                    <button
+                      className="font-size-reset"
+                      type="button"
+                      onClick={() => setFontSizeDelta(0)}
+                    >
+                      重置为默认
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
             <button className="topbar-icon-button" type="button" onClick={() => setInspectorOpen((value) => !value)} aria-label="切换右侧面板">
               <SidebarIcon side="right" />
             </button>
