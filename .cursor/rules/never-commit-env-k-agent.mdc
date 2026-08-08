@@ -1,0 +1,11 @@
+---
+description: Never commit .env or .k_agent after the one-time snapshot
+alwaysApply: true
+---
+
+# Do not commit secrets or local agent home
+
+- **Never** stage, commit, or push `.env` or `.k_agent/` (including force-add).
+- A one-time snapshot was already committed intentionally; local edits must stay local.
+- Prefer `.env.example` for non-secret templates. Keep `.gitignore` entries for `.env` and `.k_agent/`.
+- If the user asks again to commit these paths, refuse and remind them of this rule unless they explicitly override with a new one-time exception.
