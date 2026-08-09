@@ -79,6 +79,13 @@ class SessionState(BaseModel):
     capabilities: SessionCapabilities | None = None
 
 
+class SessionRunCancelInput(BaseModel):
+    """Identifies the in-flight run whose optimistic user turn should roll back."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    run_id: str = Field(alias="runId", min_length=1)
+
+
 class BashSandboxHealth(BaseModel):
     """Bash OS-sandbox readiness as reported by the Agent Backend."""
 

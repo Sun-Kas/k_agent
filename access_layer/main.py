@@ -40,6 +40,7 @@ from backend.api.schemas import (
     HealthResponse,
     McpConfigUpdate,
     ModelsConfigUpdate,
+    SessionRunCancelInput,
     SessionState,
     SessionCapabilities,
     SkillsConfigUpdate,
@@ -809,6 +810,18 @@ def create_app() -> FastAPI:
                 else None
             ),
         )
+
+    @app.post("/api/sessions/{session_id}/runs/cancel")
+    async def cancel_session_run(session_id: str, payload: SessionRunCancelInput):
+        """Cancel persistence for an intentionally aborted conversation turn."""
+        session = await app.state.session_store.cancel_run(session_id, payload.run_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "sessionId": session.id,
+            "runId": payload.run_id,
+            "messageCount": len(session.messages),
+        }
 
     @app.get("/api/sessions/{session_id}/workspace")
     async def get_session_workspace(session_id: str):

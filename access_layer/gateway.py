@@ -109,6 +109,7 @@ class AgentAccessLayer:
                 session = await self._session_store.save_run_start(
                     session.id,
                     messages,
+                    run_id=payload.run_id,
                     mcp_server_ids=mcp_ids,
                     skill_ids=skill_ids,
                 )

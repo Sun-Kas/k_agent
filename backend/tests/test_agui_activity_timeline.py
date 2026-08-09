@@ -142,6 +142,114 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([event["type"] for event in session.events], ["RUN_STARTED"])
 
+    async def test_cancel_run_removes_only_aborted_user_turn_and_events(self) -> None:
+        store = SessionStore()
+        await store.create_session(session_id="thread-cancel")
+        first_user = ChatMessage(
+            id="user-1",
+            role="user",
+            content="first",
+            createdAt=datetime.now(timezone.utc),
+        )
+        first_assistant = ChatMessage(
+            id="assistant-1",
+            role="assistant",
+            content="answer",
+            createdAt=datetime.now(timezone.utc),
+        )
+        await store.save_run_start(
+            "thread-cancel",
+            [first_user, first_assistant],
+            run_id="run-1",
+            mcp_server_ids=[],
+            skill_ids=[],
+        )
+        await store.append_event(
+            "thread-cancel",
+            {"type": "RUN_FINISHED", "threadId": "thread-cancel", "runId": "run-1"},
+        )
+        interrupted_user = ChatMessage(
+            id="user-2",
+            role="user",
+            content="interrupt me",
+            createdAt=datetime.now(timezone.utc),
+        )
+        await store.save_run_start(
+            "thread-cancel",
+            [interrupted_user],
+            run_id="run-2",
+            mcp_server_ids=[],
+            skill_ids=[],
+        )
+        await store.append_event(
+            "thread-cancel",
+            {"type": "RUN_STARTED", "threadId": "thread-cancel", "runId": "run-2"},
+        )
+        await store.append_event(
+            "thread-cancel",
+            {"type": "TEXT_MESSAGE_START", "messageId": "assistant-2"},
+        )
+        await store.append_event(
+            "thread-cancel",
+            {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-2",
+                "delta": "partial",
+            },
+        )
+
+        cancelled = await store.cancel_run("thread-cancel", "run-2")
+
+        assert cancelled is not None
+        self.assertEqual(
+            [message.id for message in cancelled.messages],
+            ["user-1", "assistant-1"],
+        )
+        self.assertEqual(
+            [(event["type"], event.get("runId")) for event in cancelled.events],
+            [("RUN_FINISHED", "run-1")],
+        )
+        await store.append_event(
+            "thread-cancel",
+            {"type": "TEXT_MESSAGE_END", "messageId": "assistant-2"},
+        )
+        after_late_event = await store.get("thread-cancel")
+        assert after_late_event is not None
+        self.assertEqual(
+            [message.id for message in after_late_event.messages],
+            ["user-1", "assistant-1"],
+        )
+        self.assertEqual(
+            [(event["type"], event.get("runId")) for event in after_late_event.events],
+            [("RUN_FINISHED", "run-1")],
+        )
+
+    async def test_cancel_after_finished_does_not_remove_completed_user_turn(self) -> None:
+        store = SessionStore()
+        await store.create_session(session_id="thread-finished-cancel")
+        user = ChatMessage(
+            id="user-finished",
+            role="user",
+            content="keep me",
+            createdAt=datetime.now(timezone.utc),
+        )
+        await store.save_run_start(
+            "thread-finished-cancel",
+            [user],
+            run_id="run-finished",
+            mcp_server_ids=[],
+            skill_ids=[],
+        )
+        await store.append_event(
+            "thread-finished-cancel",
+            {"type": "RUN_FINISHED", "threadId": "thread-finished-cancel", "runId": "run-finished"},
+        )
+
+        cancelled = await store.cancel_run("thread-finished-cancel", "run-finished")
+
+        assert cancelled is not None
+        self.assertEqual([message.id for message in cancelled.messages], ["user-finished"])
+
     async def test_session_capability_selection_survives_reload_and_empty_selection(self) -> None:
         with TemporaryDirectory() as tmp:
             storage = FileStorage(tmp)

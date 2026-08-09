@@ -9,6 +9,7 @@ import {
   useState
 } from "react";
 import {
+  cancelSessionRun,
   getAgentsCatalog,
   getHealth,
   getModelsConfig,
@@ -126,6 +127,8 @@ type ActiveConversationRun = {
   events: AgUiEvent[];
   initialMessages: ChatMessage[];
   pendingAssistantId: string;
+  runId: string;
+  userMessageId: string;
 };
 
 const createMessage = (role: ChatMessage["role"], content: string): ChatMessage => ({
@@ -309,6 +312,10 @@ export function App() {
   const [health, setHealth] = useState<HealthState | null>(null);
   const [status, setStatus] = useState<string>(appConfig.status.idle);
   const [input, setInput] = useState("");
+  // Voice recognition can outlive the render that started a model run. Keep
+  // the current composer value outside that stale closure so a new transcript
+  // never reuses the previous turn after submit cleared the textarea.
+  const composerInputRef = useRef("");
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
@@ -423,6 +430,11 @@ export function App() {
     skillIds: string[];
   } | null>(null);
   const catalogLoadedRef = useRef(false);
+
+  function updateComposerInput(value: string) {
+    composerInputRef.current = value;
+    setInput(value);
+  }
 
   useEffect(() => {
     void refreshSessions();
@@ -852,7 +864,26 @@ export function App() {
 
   function stopRun() {
     if (!sessionId) return;
-    activeRunsRef.current.get(sessionId)?.controller.abort();
+    const activeRun = activeRunsRef.current.get(sessionId);
+    activeRun?.controller.abort();
+    if (activeRun) {
+      // The visible transcript mirrors Access Layer rollback: an intentional
+      // stop discards the user turn that started the aborted run.
+      const removableMessageIds = new Set([
+        activeRun.userMessageId,
+        activeRun.pendingAssistantId,
+        ...activeRun.events.flatMap((event) =>
+          event.type === "TEXT_MESSAGE_START" || event.type === "TEXT_MESSAGE_CONTENT" || event.type === "TEXT_MESSAGE_END"
+            ? [event.messageId]
+            : []
+        )
+      ]);
+      setMessages((current) => current.filter((message) => !removableMessageIds.has(message.id)));
+      setTextBlocks((current) => current.filter((text) => !removableMessageIds.has(text.id)));
+      void cancelSessionRun(sessionId, activeRun.runId)
+        .then(() => refreshSessions())
+        .catch(() => refreshSessions());
+    }
     stopVoicePlayback("已停止生成和朗读");
     voiceRunFinishedRef.current = true;
     if (voiceConversationActiveRef.current) {
@@ -1257,13 +1288,14 @@ export function App() {
     const effectiveReasoningEffort = validReasoningOptions.some((option) => option.id === reasoningEffort)
       ? reasoningEffort
       : "none";
+    const runId = createClientId();
     const pendingAssistantId = createClientId();
     const userMessage = createMessage("user", prompt);
     const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
     const targetSessionId = sessionId ?? createClientId();
     const runInput: AgUiRunInput = {
       threadId: targetSessionId,
-      runId: createClientId(),
+      runId,
       state: {},
       messages: [
         {
@@ -1296,7 +1328,9 @@ export function App() {
       controller,
       events: [],
       initialMessages: nextMessages,
-      pendingAssistantId
+      pendingAssistantId,
+      runId,
+      userMessageId: userMessage.id
     };
     activeRunsRef.current.set(targetSessionId, activeRun);
     activeSessionIdRef.current = targetSessionId;
@@ -1317,7 +1351,7 @@ export function App() {
     streamPinnedRef.current = true;
     setMessages(nextMessages);
     pendingAssistantIdRef.current = pendingAssistantId;
-    setInput("");
+    updateComposerInput("");
     setAttachments([]);
     beginVoiceReply(targetSessionId, pendingAssistantId);
     activeThinkingBlockIdRef.current = null;
@@ -1935,7 +1969,7 @@ export function App() {
     recognition.lang = "zh-CN";
     recognition.interimResults = true;
     recognition.continuous = false;
-    const originalInput = input;
+    const originalInput = composerInputRef.current;
     recognition.onstart = () => setListening(true);
     recognition.onend = () => {
       setListening(false);
@@ -1951,7 +1985,7 @@ export function App() {
       for (let index = 0; index < event.results.length; index += 1) {
         transcript += event.results[index][0]?.transcript ?? "";
       }
-      setInput(`${originalInput}${originalInput && transcript ? " " : ""}${transcript}`);
+      updateComposerInput(`${originalInput}${originalInput && transcript ? " " : ""}${transcript}`);
     };
     speechRef.current = recognition;
     try {
@@ -2095,7 +2129,7 @@ export function App() {
     recognition.lang = "zh-CN";
     recognition.interimResults = true;
     recognition.continuous = false;
-    const originalInput = input;
+    const originalInput = composerInputRef.current;
     let transcript = "";
     let recognitionError: string | null = null;
     let bargeInTriggered = false;
@@ -2137,7 +2171,7 @@ export function App() {
         // requestSubmit invokes the current React handler after setInput has
         // committed, while the ref carries the exact final transcript.
         voiceAutoSubmitPromptRef.current = prompt;
-        setInput(prompt);
+        updateComposerInput(prompt);
         setVoiceConversation((current) => ({ ...current, phase: "processing", message: "已识别，正在发送" }));
         composerTextareaRef.current?.form?.requestSubmit();
         return;
@@ -2170,7 +2204,7 @@ export function App() {
         bargeInTriggered = true;
         if (voiceSpeakingRef.current) interruptActiveVoiceTurnForBargeIn(transcript);
       }
-      setInput(`${originalInput}${originalInput && transcript ? " " : ""}${transcript}`);
+      updateComposerInput(`${originalInput}${originalInput && transcript ? " " : ""}${transcript}`);
       setVoiceConversation((current) => ({ ...current, phase: "listening", message: transcript || "正在聆听" }));
     };
     speechRef.current = recognition;
@@ -2471,7 +2505,7 @@ export function App() {
                 <span>下达一条任务</span>
                 <div className="suggestions">
                   {suggestions.map((suggestion) => (
-                    <button key={suggestion} type="button" onClick={() => setInput(suggestion)}>
+                    <button key={suggestion} type="button" onClick={() => updateComposerInput(suggestion)}>
                       {suggestion}<i>↗</i>
                     </button>
                   ))}
@@ -2627,7 +2661,7 @@ export function App() {
             ref={composerTextareaRef}
             aria-label="给 Agent 发送消息"
             value={input}
-            onChange={(event) => setInput(event.target.value)}
+            onChange={(event) => updateComposerInput(event.target.value)}
             onKeyDown={handleComposerKeyDown}
             onCompositionStart={() => {
               isComposerComposingRef.current = true;

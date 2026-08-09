@@ -252,6 +252,17 @@ export async function getSession(sessionId: string): Promise<SessionState> {
   return response.json() as Promise<SessionState>;
 }
 
+export async function cancelSessionRun(sessionId: string, runId: string): Promise<void> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/runs/cancel`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ runId })
+  });
+  if (!response.ok) {
+    throw new Error(`Unable to cancel session run (${response.status})`);
+  }
+}
+
 export async function streamAgentRun(
   input: AgUiRunInput,
   onEvent: (event: AgUiEvent) => void,

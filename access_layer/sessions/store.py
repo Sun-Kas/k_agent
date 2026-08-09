@@ -50,6 +50,9 @@ class SessionStore:
         self._storage = storage
         self._sessions: dict[str, SessionRecord] = {}
         self._active_run_ids: dict[str, str] = {}
+        self._run_input_message_ids: dict[tuple[str, str], set[str]] = {}
+        self._cancelled_run_ids: set[tuple[str, str]] = set()
+        self._cancelled_active_run_ids: dict[str, str] = {}
         self._text_buffers: dict[tuple[str, str], dict[str, Any]] = {}
         # Tool calls are only complete once their result arrives, so the
         # START/ARGS fragments are buffered until TOOL_CALL_RESULT pairs them.
@@ -128,6 +131,7 @@ class SessionStore:
         session_id: str,
         messages: list[ChatMessage],
         *,
+        run_id: str | None = None,
         mcp_server_ids: list[str],
         skill_ids: list[str],
     ) -> SessionRecord:
@@ -136,13 +140,49 @@ class SessionStore:
         async with self._lock:
             session = self._sessions[session_id]
             self._active_run_ids.pop(session_id, None)
+            self._cancelled_active_run_ids.pop(session_id, None)
             self._drop_session_buffers(session_id)
+            existing_ids = {message.id for message in session.messages}
             session.messages = self._merge_messages(session.messages, messages)
+            if run_id:
+                # cancel_run() only rolls back messages first accepted for this
+                # run, so aborting a turn cannot delete earlier conversation.
+                self._run_input_message_ids[(session_id, run_id)] = {
+                    message.id
+                    for message in messages
+                    if message.role == "user" and message.id not in existing_ids
+                }
             session.mcp_server_ids = list(dict.fromkeys(mcp_server_ids))
             session.skill_ids = list(dict.fromkeys(skill_ids))
             session.updated_at = datetime.now(timezone.utc)
             if session.title == settings.default_session_title:
                 session.title = await self._derive_title(session.messages)
+            await self._persist(session)
+            return session
+
+    async def cancel_run(self, session_id: str, run_id: str) -> SessionRecord | None:
+        """Roll back the user turn and partial stream state for an aborted run."""
+        settings = await get_or_init_settings()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            self._cancelled_run_ids.add((session_id, run_id))
+            self._cancelled_active_run_ids[session_id] = run_id
+            input_ids = self._run_input_message_ids.pop((session_id, run_id), set())
+            if input_ids:
+                session.messages = [
+                    message for message in session.messages if message.id not in input_ids
+                ]
+            session.events = self._events_without_run(session.events, run_id)
+            if self._active_run_ids.get(session_id) == run_id:
+                self._active_run_ids.pop(session_id, None)
+            self._drop_run_buffers(session_id, run_id)
+            session.updated_at = datetime.now(timezone.utc)
+            if session.messages:
+                session.title = await self._derive_title(session.messages)
+            else:
+                session.title = settings.default_session_title
             await self._persist(session)
             return session
 
@@ -156,6 +196,20 @@ class SessionStore:
             session = self._sessions[session_id]
             session.events.append(event)
             event_type = str(event.get("type") or "")
+            run_id = event.get("runId")
+            if isinstance(run_id, str) and (session_id, run_id) in self._cancelled_run_ids:
+                if event_type == "RUN_STARTED":
+                    self._cancelled_active_run_ids[session_id] = run_id
+                if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
+                    self._cancelled_active_run_ids.pop(session_id, None)
+                session.events.pop()
+                return session
+            cancelled_active_run_id = self._cancelled_active_run_ids.get(session_id)
+            if cancelled_active_run_id and (not isinstance(run_id, str) or run_id == cancelled_active_run_id):
+                if event_type in {"RUN_FINISHED", "RUN_ERROR"}:
+                    self._cancelled_active_run_ids.pop(session_id, None)
+                session.events.pop()
+                return session
 
             # events 保存完整 AG-UI 流；messages 只保存可作为下一轮输入的
             # 完整对话内容。assistant 文本必须等 TEXT_MESSAGE_END 后再落盘，
@@ -220,6 +274,9 @@ class SessionStore:
                 )
             elif event_type in {"RUN_FINISHED", "RUN_ERROR"}:
                 self._active_run_ids.pop(session_id, None)
+                run_id = event.get("runId")
+                if isinstance(run_id, str):
+                    self._run_input_message_ids.pop((session_id, run_id), None)
                 # Tool calls still buffered here never produced a result. Dropping
                 # them keeps history free of assistant tool_calls that no tool
                 # message answers, which providers reject on the next run.
@@ -260,6 +317,33 @@ class SessionStore:
         for buffers in (self._text_buffers, self._tool_call_buffers):
             for key in [key for key in buffers if key[0] == session_id]:
                 buffers.pop(key, None)
+
+    def _drop_run_buffers(self, session_id: str, run_id: str) -> None:
+        """Discard partial text/tool buffers owned by one cancelled run."""
+
+        for buffers in (self._text_buffers, self._tool_call_buffers):
+            for key, value in list(buffers.items()):
+                if key[0] == session_id and value.get("runId") == run_id:
+                    buffers.pop(key, None)
+
+    @staticmethod
+    def _events_without_run(events: list[dict[str, Any]], run_id: str) -> list[dict[str, Any]]:
+        """Remove the contiguous AG-UI segment emitted by one run."""
+
+        filtered: list[dict[str, Any]] = []
+        dropping = False
+        for event in events:
+            event_type = str(event.get("type") or "")
+            event_run_id = event.get("runId")
+            starts_target_run = event_type == "RUN_STARTED" and event_run_id == run_id
+            belongs_to_target_run = event_run_id == run_id or dropping
+            if starts_target_run:
+                dropping = True
+            if not belongs_to_target_run and not starts_target_run:
+                filtered.append(event)
+            if dropping and event_type in {"RUN_FINISHED", "RUN_ERROR"}:
+                dropping = False
+        return filtered
 
     def _append_tool_turn(
         self,
