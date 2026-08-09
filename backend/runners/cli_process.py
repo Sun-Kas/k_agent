@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.api.schemas import ChatMessage
+from backend.prompts import voice_conversation_prompt
 from backend.runners.base import RunnerContext
 
 
@@ -92,9 +93,17 @@ def build_cli_prompt(ctx: "RunnerContext") -> str:
     """
 
     mode = cli_session_mode(ctx)
-    if mode == "resume":
-        return extract_latest_user_prompt(ctx.messages)
-    return build_prompt_from_messages(ctx.messages)
+    prompt = (
+        extract_latest_user_prompt(ctx.messages)
+        if mode == "resume"
+        else build_prompt_from_messages(ctx.messages)
+    )
+    voice_prompt = voice_conversation_prompt(ctx.options)
+    if voice_prompt:
+        # CLI providers have no separate per-turn system field. Prefixing the
+        # transient execution prompt preserves clean Access Layer history.
+        return f"[Voice conversation response style]\n{voice_prompt}\n\n{prompt}"
+    return prompt
 
 
 def cli_session_mode(ctx: RunnerContext) -> str:

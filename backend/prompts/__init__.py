@@ -9,6 +9,10 @@ from backend.prompts.prompting import (
     extract_referenced_paths,
 )
 from backend.prompts.lifecycle import prompt_lifecycle_state, reset_prompt_caches
+from backend.prompts.voice_prompt import (
+    VOICE_CONVERSATION_SYSTEM_PROMPT,
+    voice_conversation_prompt,
+)
 
 __all__ = [
     "build_effective_system_prompt",
@@ -17,6 +21,8 @@ __all__ = [
     "classify_paths_for_memory",
     "extract_paths_from_value",
     "extract_referenced_paths",
+    "VOICE_CONVERSATION_SYSTEM_PROMPT",
+    "voice_conversation_prompt",
     "prompt_lifecycle_state",
     "reset_prompt_caches",
 ]

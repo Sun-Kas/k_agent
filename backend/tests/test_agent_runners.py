@@ -20,6 +20,7 @@ from backend.runners.claude_mcp import (
     write_claude_mcp_config,
 )
 from backend.runners.cli_process import (
+    build_cli_prompt,
     build_prompt_from_messages,
     extract_latest_user_prompt,
 )
@@ -86,6 +87,32 @@ class CliRunnerBoundaryTests(unittest.TestCase):
         ):
             with self.subTest(provider_marker=provider_marker):
                 self.assertNotIn(provider_marker, shared_runner)
+
+    def test_voice_conversation_styles_cli_prompt_without_mutating_message(self) -> None:
+        message = ChatMessage(
+            id="message-voice",
+            role="user",
+            content="介绍一下这个功能",
+            createdAt=datetime.now(timezone.utc),
+        )
+        ctx = RunnerContext(
+            thread_id="thread-voice",
+            run_id="run-voice",
+            request_id="request-voice",
+            messages=[message],
+            model_id=None,
+            mcp_servers=[],
+            skills=[],
+            reasoning_effort=None,
+            attachments=[],
+            options={"voiceConversation": True},
+        )
+
+        prompt = build_cli_prompt(ctx)
+
+        self.assertIn("Voice conversation response style", prompt)
+        self.assertIn("介绍一下这个功能", prompt)
+        self.assertEqual(message.content, "介绍一下这个功能")
 
 
 class NetworkPolicyTests(unittest.TestCase):

@@ -9,7 +9,11 @@ from typing import Any, cast
 
 from backend.agent import AgentRunRequest, OpenAIAgent
 from backend.mcp_tool import mcp_manager_from_runtime
-from backend.prompts import build_prompt_bundle, extract_referenced_paths
+from backend.prompts import (
+    build_prompt_bundle,
+    extract_referenced_paths,
+    voice_conversation_prompt,
+)
 from backend.runners.base import RunnerContext
 from backend.runtime_config import normalize_reasoning_effort, select_model
 from backend.tools import bind_request_scoped_tools, load_local_tools
@@ -58,6 +62,9 @@ class KAgentRunner:
             prompt_bundle = build_prompt_bundle(
                 settings.system_prompt,
                 skills=skills,
+                # Voice guidance is rebuilt per run and never becomes a
+                # persisted chat message or process-global prompt mutation.
+                append_system_prompt=voice_conversation_prompt(ctx.options),
                 referenced_paths=referenced_paths,
                 mcp_tools=cast(list[Any], mcp_tools),
             )

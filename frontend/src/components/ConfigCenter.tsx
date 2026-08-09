@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   getMcpCapabilities,
   getMcpConfig,
@@ -11,8 +11,14 @@ import {
   saveSkillsConfig
 } from "../api/agui";
 import type { McpCapabilities, McpServerConfig, ModelProfile, SkillConfig } from "../types";
+import {
+  readVoiceConfig,
+  VOICE_STYLES,
+  writeVoiceConfig,
+  type VoiceConfig
+} from "../voice-config";
 
-type ConfigTab = "model" | "mcp" | "skills";
+type ConfigTab = "model" | "mcp" | "skills" | "voice";
 
 export function ConfigCenter({ onBack }: { onBack: () => void }) {
   const [tab, setTab] = useState<ConfigTab>("model");
@@ -29,6 +35,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
+  const [voiceConfig, setVoiceConfig] = useState<VoiceConfig>(readVoiceConfig);
 
   useEffect(() => {
     let pending = 3;
@@ -92,13 +99,17 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
         setMcpCapabilities(capabilityData);
         setMcpWarnings([...(mcpData.warnings ?? []), ...(mcpData.blocked ?? []).map((id) => `已按策略屏蔽：${id}`)]);
         setNotice(mcpConnectionNotice(mcpData.servers));
-      } else {
+      } else if (tab === "skills") {
         assertUniqueIds(skills, "Skill");
         await saveSkillsConfig(skills);
         const skillsData = await getSkillsConfig();
         setSkills(skillsData.skills.map((skill) => ({ ...skill, isNew: false })));
         setLoadedSkills(skillsData.loadedSkills ?? skillsData.skills);
         setNotice("Skills 已保存，并已即时应用到 Agent");
+      } else {
+        const saved = writeVoiceConfig(voiceConfig);
+        setVoiceConfig(saved);
+        setNotice("语音配置已保存，将用于下一次朗读");
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "未知错误";
@@ -132,6 +143,9 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
           </button>
           <button className={tab === "skills" ? "active" : ""} type="button" onClick={() => { setTab("skills"); setNotice(""); }}>
             <i>✦</i><span><strong>Skills</strong><small>可复用的专业指令</small></span><b>{skills.length}</b>
+          </button>
+          <button className={tab === "voice" ? "active" : ""} type="button" onClick={() => { setTab("voice"); setNotice(""); }}>
+            <i>声</i><span><strong>语音</strong><small>音色、风格与语速</small></span>
           </button>
           <div className="config-note"><strong>安全提示</strong><p>密钥不会回传到浏览器。MCP 环境变量只显示遮蔽值。</p></div>
         </nav>
@@ -196,8 +210,15 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
                   }} />
                 </section>
               )}
+              {tab === "voice" && (
+                <VoiceConfigSection
+                  value={voiceConfig}
+                  onChange={setVoiceConfig}
+                  onNotice={setNotice}
+                />
+              )}
               <footer className="config-footer">
-                <p className={notice.startsWith("保存失败") || notice.startsWith("加载失败") || notice.startsWith("连接失败") ? "error" : ""}>{notice}</p>
+                <p className={notice.includes("失败") ? "error" : ""}>{notice}</p>
                 <button type="submit" disabled={saving}>{saving ? "保存中…" : "保存更改"}</button>
               </footer>
             </>
@@ -214,6 +235,255 @@ function ConfigHeading({ eyebrow, title, copy }: { eyebrow: string; title: strin
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return <label className="config-field"><span><strong>{label}</strong>{hint && <small>{hint}</small>}</span>{children}</label>;
+}
+
+function VoiceConfigSection({
+  value,
+  onChange,
+  onNotice
+}: {
+  value: VoiceConfig;
+  onChange: (value: VoiceConfig) => void;
+  onNotice: (notice: string) => void;
+}) {
+  const supported = "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [previewing, setPreviewing] = useState(false);
+  const [voicePickerOpen, setVoicePickerOpen] = useState(false);
+  const [voiceSearch, setVoiceSearch] = useState("");
+  const [voiceScope, setVoiceScope] = useState<"chinese" | "all">("chinese");
+  const previewActiveRef = useRef(false);
+  const voicePickerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!supported) return;
+    const refreshVoices = () => {
+      // Chromium and Safari often expose an empty catalog initially, then notify
+      // voiceschanged after native voice services finish loading.
+      const available = [...window.speechSynthesis.getVoices()].sort((left, right) => {
+        const leftChinese = /^zh(?:-|_)/i.test(left.lang) ? 0 : 1;
+        const rightChinese = /^zh(?:-|_)/i.test(right.lang) ? 0 : 1;
+        return leftChinese - rightChinese
+          || Number(right.localService) - Number(left.localService)
+          || left.name.localeCompare(right.name);
+      });
+      setVoices(available);
+    };
+    refreshVoices();
+    window.speechSynthesis.addEventListener("voiceschanged", refreshVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener("voiceschanged", refreshVoices);
+      // Preview shares the browser synthesis singleton, so only cancel speech
+      // started by this panel when leaving it.
+      if (previewActiveRef.current) window.speechSynthesis.cancel();
+    };
+  }, [supported]);
+
+  useEffect(() => {
+    if (!voicePickerOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (!voicePickerRef.current?.contains(event.target as Node)) setVoicePickerOpen(false);
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") setVoicePickerOpen(false);
+    };
+    // The picker is rendered inside the scrolling config page, so document-level
+    // listeners close it consistently when the user clicks another setting.
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [voicePickerOpen]);
+
+  const selectedVoiceAvailable = !value.voiceURI || voices.some((voice) => voice.voiceURI === value.voiceURI);
+  const selectedVoice = voices.find((voice) => voice.voiceURI === value.voiceURI);
+  const normalizedVoiceSearch = voiceSearch.trim().toLocaleLowerCase();
+  const chineseVoiceCount = voices.filter((voice) => isChineseVoice(voice)).length;
+  const visibleVoices = voices.filter((voice) => {
+    if (voiceScope === "chinese" && !isChineseVoice(voice)) return false;
+    if (!normalizedVoiceSearch) return true;
+    return `${voice.name} ${voice.lang}`.toLocaleLowerCase().includes(normalizedVoiceSearch);
+  });
+
+  function previewVoice() {
+    if (!supported) {
+      onNotice("试听失败：当前浏览器不支持语音输出");
+      return;
+    }
+    const style = VOICE_STYLES.find((item) => item.id === value.style) ?? VOICE_STYLES[0];
+    const utterance = new SpeechSynthesisUtterance(style.preview);
+    const selectedVoice = voices.find((voice) => voice.voiceURI === value.voiceURI);
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+      utterance.lang = selectedVoice.lang;
+    } else {
+      utterance.lang = "zh-CN";
+    }
+    utterance.rate = value.rate;
+    utterance.pitch = value.pitch;
+    utterance.volume = value.volume;
+    window.speechSynthesis.cancel();
+    previewActiveRef.current = true;
+    utterance.onstart = () => {
+      setPreviewing(true);
+      onNotice("正在试听当前语音配置");
+    };
+    utterance.onend = () => {
+      previewActiveRef.current = false;
+      setPreviewing(false);
+      onNotice("试听完成，保存后用于对话朗读");
+    };
+    utterance.onerror = (event) => {
+      previewActiveRef.current = false;
+      setPreviewing(false);
+      // "canceled" is expected when the user starts another preview quickly.
+      if (event.error !== "canceled" && event.error !== "interrupted") {
+        onNotice(`试听失败：${event.error || "系统语音服务不可用"}`);
+      }
+    };
+    window.speechSynthesis.speak(utterance);
+  }
+
+  return (
+    <section className="config-section voice-config-section">
+      <ConfigHeading eyebrow="VOICE CONVERSATION" title="语音配置" copy="选择当前设备的朗读音色，并调整语音对话的表达风格与播放参数。" />
+      <div className="voice-config-block">
+        <div className="config-field voice-picker-field">
+          <span><strong>朗读音色</strong><small>{supported ? `${voices.length} 个系统音色可用` : "当前浏览器不支持语音输出"}</small></span>
+          <div className={`voice-picker ${voicePickerOpen ? "open" : ""}`} ref={voicePickerRef}>
+            <button
+              className="voice-picker-trigger"
+              type="button"
+              disabled={!supported}
+              aria-haspopup="listbox"
+              aria-expanded={voicePickerOpen}
+              onClick={() => setVoicePickerOpen((open) => {
+                if (!open) setVoiceSearch("");
+                return !open;
+              })}
+            >
+              <span>
+                <strong>{selectedVoice?.name ?? (value.voiceURI ? "原音色当前不可用" : "系统自动选择")}</strong>
+                <small>{selectedVoice ? `${selectedVoice.lang} · ${selectedVoice.localService ? "本地" : "网络"}` : "根据文本语言自动匹配"}</small>
+              </span>
+              <i aria-hidden="true">⌄</i>
+            </button>
+            {voicePickerOpen && (
+              <div className="voice-picker-popover">
+                <header>
+                  <input
+                    autoFocus
+                    value={voiceSearch}
+                    onChange={(event) => setVoiceSearch(event.target.value)}
+                    placeholder="搜索音色名称或语言"
+                    aria-label="搜索音色"
+                  />
+                  <div className="voice-scope-switch" role="group" aria-label="音色语言范围">
+                    <button type="button" className={voiceScope === "chinese" ? "active" : ""} onClick={() => setVoiceScope("chinese")}>中文 {chineseVoiceCount}</button>
+                    <button type="button" className={voiceScope === "all" ? "active" : ""} onClick={() => setVoiceScope("all")}>全部 {voices.length}</button>
+                  </div>
+                </header>
+                <div className="voice-picker-options" role="listbox" aria-label="朗读音色">
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={!value.voiceURI}
+                    className={!value.voiceURI ? "selected" : ""}
+                    onClick={() => { onChange({ ...value, voiceURI: "" }); setVoiceSearch(""); setVoicePickerOpen(false); }}
+                  >
+                    <span className="voice-option-mark">{!value.voiceURI ? "✓" : "A"}</span>
+                    <span><strong>系统自动选择</strong><small>根据文本语言自动匹配</small></span>
+                  </button>
+                  {!selectedVoiceAvailable && (
+                    <button type="button" role="option" aria-selected className="selected unavailable" onClick={() => setVoicePickerOpen(false)}>
+                      <span className="voice-option-mark">!</span><span><strong>原音色当前不可用</strong><small>保留设置，等待系统重新载入</small></span>
+                    </button>
+                  )}
+                  {visibleVoices.map((voice) => (
+                    <button
+                      key={`${voice.voiceURI}-${voice.lang}`}
+                      type="button"
+                      role="option"
+                      aria-selected={value.voiceURI === voice.voiceURI}
+                      className={value.voiceURI === voice.voiceURI ? "selected" : ""}
+                      onClick={() => { onChange({ ...value, voiceURI: voice.voiceURI }); setVoiceSearch(""); setVoicePickerOpen(false); }}
+                    >
+                      <span className="voice-option-mark">{value.voiceURI === voice.voiceURI ? "✓" : voice.name.slice(0, 1).toLocaleUpperCase()}</span>
+                      <span><strong>{voice.name}</strong><small>{voice.lang} · {voice.localService ? "本地音色" : "网络音色"}</small></span>
+                    </button>
+                  ))}
+                  {visibleVoices.length === 0 && <p>没有匹配的音色</p>}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="voice-config-block">
+        <header className="voice-config-label"><strong>对话风格</strong><small>同时控制回复措辞和试听内容</small></header>
+        <div className="voice-style-grid" role="radiogroup" aria-label="语音对话风格">
+          {VOICE_STYLES.map((style) => (
+            <button
+              key={style.id}
+              className={value.style === style.id ? "active" : ""}
+              type="button"
+              role="radio"
+              aria-checked={value.style === style.id}
+              onClick={() => onChange({ ...value, style: style.id })}
+            >
+              <strong>{style.name}</strong>
+              <small>{style.description}</small>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="voice-config-block voice-range-list">
+        <VoiceRange label="语速" value={value.rate} minimum={0.7} maximum={1.4} step={0.05} suffix="×" onChange={(rate) => onChange({ ...value, rate })} />
+        <VoiceRange label="音调" value={value.pitch} minimum={0.7} maximum={1.3} step={0.05} suffix="×" onChange={(pitch) => onChange({ ...value, pitch })} />
+        <VoiceRange label="音量" value={value.volume} minimum={0.2} maximum={1} step={0.05} suffix="%" displayValue={Math.round(value.volume * 100)} onChange={(volume) => onChange({ ...value, volume })} />
+      </div>
+
+      <div className="voice-preview-row">
+        <span>{value.voiceURI ? voices.find((voice) => voice.voiceURI === value.voiceURI)?.name ?? "原音色当前不可用" : "系统自动选择"}</span>
+        <button type="button" disabled={!supported} onClick={previewVoice}>{previewing ? "正在试听" : "试听当前设置"}</button>
+      </div>
+    </section>
+  );
+}
+
+function isChineseVoice(voice: SpeechSynthesisVoice) {
+  return /^(?:zh|yue)(?:-|_)/i.test(voice.lang);
+}
+
+function VoiceRange({
+  label,
+  value,
+  minimum,
+  maximum,
+  step,
+  suffix,
+  displayValue = value,
+  onChange
+}: {
+  label: string;
+  value: number;
+  minimum: number;
+  maximum: number;
+  step: number;
+  suffix: string;
+  displayValue?: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label>
+      <span><strong>{label}</strong><output>{displayValue.toFixed(displayValue < 10 ? 2 : 0)}{suffix}</output></span>
+      <input type="range" min={minimum} max={maximum} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+    </label>
+  );
 }
 
 function ModelCard({ model, onChange, onRemove }: { model: ModelProfile; onChange: (model: ModelProfile) => void; onRemove: () => void }) {

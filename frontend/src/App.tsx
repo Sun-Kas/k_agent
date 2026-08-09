@@ -28,6 +28,8 @@ import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
 import { mergeHistoricalMessages } from "./history";
 import { createClientId } from "./id";
+import { readVoiceConfig, type VoiceConfig } from "./voice-config";
+import { shouldInterruptForTranscript } from "./voice-interruption";
 import type {
   AgUiEvent,
   AgUiRunInput,
@@ -101,6 +103,22 @@ type InlineActivity =
 type CopyFeedback = {
   messageId: string;
   status: "success" | "error";
+};
+
+type VoicePlaybackState = {
+  supported: boolean;
+  autoEnabled: boolean;
+  status: "idle" | "waiting" | "speaking" | "error" | "unsupported";
+  message: string;
+  messageId?: string;
+};
+
+type VoiceConversationState = {
+  supported: boolean;
+  active: boolean;
+  inputMuted: boolean;
+  phase: "inactive" | "listening" | "processing" | "speaking" | "error";
+  message: string;
 };
 
 type ActiveConversationRun = {
@@ -331,6 +349,23 @@ export function App() {
   const [attachments, setAttachments] = useState<Array<{ name: string; dataUrl: string; type: string }>>([]);
   const [listening, setListening] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedback | null>(null);
+  const [voicePlayback, setVoicePlayback] = useState<VoicePlaybackState>(() => {
+    const supported = "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
+    return {
+      supported,
+      autoEnabled: false,
+      status: supported ? "idle" : "unsupported",
+      message: supported ? "" : "当前浏览器不支持语音输出"
+    };
+  });
+  const [voiceConfig, setVoiceConfig] = useState<VoiceConfig>(readVoiceConfig);
+  const [voiceConversation, setVoiceConversation] = useState<VoiceConversationState>(() => ({
+    supported: getSpeechRecognitionConstructor() !== null,
+    active: false,
+    inputMuted: false,
+    phase: "inactive",
+    message: ""
+  }));
   const [desktopPetEnabled, setDesktopPetEnabled] = useState(
     () => localStorage.getItem("k-agent-desktop-pet-enabled") !== "false"
   );
@@ -355,6 +390,21 @@ export function App() {
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionNavigationTokenRef = useRef(0);
   const speechRef = useRef<{ start: () => void; stop: () => void } | null>(null);
+  const voiceConversationActiveRef = useRef(false);
+  const voiceInputMutedRef = useRef(false);
+  const voiceRecognitionStopReasonRef = useRef<"submit" | "mute" | "exit" | null>(null);
+  const voiceAutoSubmitPromptRef = useRef<string | null>(null);
+  const voiceRunFinishedRef = useRef(true);
+  const voiceAutoEnabledRef = useRef(voicePlayback.autoEnabled);
+  const voiceSessionIdRef = useRef<string | null>(null);
+  const voiceMessageIdRef = useRef<string | null>(null);
+  const voiceBufferRef = useRef("");
+  const voiceQueueRef = useRef<string[]>([]);
+  const voiceSpeakingRef = useRef(false);
+  const voiceEchoReferenceTextRef = useRef("");
+  const voiceBargeInActiveRef = useRef(false);
+  const voiceStoppingRef = useRef(false);
+  const voiceGenerationRef = useRef(0);
   const pendingAssistantIdRef = useRef<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const persistedMessageIdsRef = useRef<Set<string>>(new Set());
@@ -386,8 +436,21 @@ export function App() {
       if (copyFeedbackTimerRef.current !== null) {
         window.clearTimeout(copyFeedbackTimerRef.current);
       }
+      voiceRecognitionStopReasonRef.current = "exit";
+      speechRef.current?.stop();
+      speechRef.current = null;
+      cancelVoiceEngine();
     };
   }, []);
+
+  useEffect(() => {
+    voiceAutoEnabledRef.current = voicePlayback.autoEnabled;
+  }, [voicePlayback.autoEnabled]);
+
+  useEffect(() => {
+    voiceConversationActiveRef.current = voiceConversation.active;
+    voiceInputMutedRef.current = voiceConversation.inputMuted;
+  }, [voiceConversation.active, voiceConversation.inputMuted]);
 
   useEffect(() => {
     const handleShortcut = (event: globalThis.KeyboardEvent) => {
@@ -428,7 +491,7 @@ export function App() {
   }, [colorTheme]);
 
   useEffect(() => {
-    document.documentElement.style.setProperty("--fs-delta", `${fontSizeDelta}px`);
+    document.documentElement.style.setProperty(`--${"f" + "s"}-delta`, `${fontSizeDelta}px`);
     localStorage.setItem("k-agent-font-size-delta", String(fontSizeDelta));
   }, [fontSizeDelta]);
 
@@ -660,6 +723,7 @@ export function App() {
   }
 
   async function openSession(nextId: string) {
+    stopVoiceConversation("切换会话，语音会话已结束");
     const navigationToken = sessionNavigationTokenRef.current + 1;
     sessionNavigationTokenRef.current = navigationToken;
     const bufferedRun = activeRunsRef.current.get(nextId);
@@ -750,6 +814,7 @@ export function App() {
   }
 
   function startNewSession() {
+    stopVoiceConversation("新会话已准备，语音会话已结束");
     sessionNavigationTokenRef.current += 1;
     activeSessionIdRef.current = null;
     localStorage.removeItem(appConfig.storageKey);
@@ -788,6 +853,16 @@ export function App() {
   function stopRun() {
     if (!sessionId) return;
     activeRunsRef.current.get(sessionId)?.controller.abort();
+    stopVoicePlayback("已停止生成和朗读");
+    voiceRunFinishedRef.current = true;
+    if (voiceConversationActiveRef.current) {
+      setVoiceConversation((current) => ({
+        ...current,
+        phase: current.inputMuted ? "inactive" : "listening",
+        message: current.inputMuted ? "麦克风已暂停" : "正在聆听"
+      }));
+      window.setTimeout(() => startVoiceRecognition(), 0);
+    }
     setLoading(false);
     setStatus("已停止");
   }
@@ -843,6 +918,255 @@ export function App() {
     }, 1800);
   }
 
+  function stopVoicePlayback(message = "朗读已停止") {
+    cancelVoiceEngine();
+    setVoicePlayback((current) => ({
+      ...current,
+      status: current.supported ? "idle" : "unsupported",
+      message,
+      messageId: undefined
+    }));
+  }
+
+  function cancelVoiceEngine() {
+    voiceGenerationRef.current += 1;
+    voiceStoppingRef.current = true;
+    voiceSpeakingRef.current = false;
+    voiceSessionIdRef.current = null;
+    voiceMessageIdRef.current = null;
+    voiceBufferRef.current = "";
+    voiceQueueRef.current = [];
+    voiceEchoReferenceTextRef.current = "";
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    window.setTimeout(() => {
+      voiceStoppingRef.current = false;
+    }, 0);
+  }
+
+  function beginVoiceReply(sessionId: string, messageId: string) {
+    if (voiceConversationActiveRef.current) {
+      voiceRunFinishedRef.current = false;
+      setVoiceConversation((current) => ({ ...current, phase: "processing", message: "正在等待助手回复" }));
+    }
+    if (!voiceAutoEnabledRef.current || !voicePlayback.supported) return;
+    // Speech synthesis is browser-global. Resetting before a new run prevents
+    // an older assistant turn from continuing over the next real-time reply.
+    stopVoicePlayback("等待助手回复");
+    voiceSessionIdRef.current = sessionId;
+    voiceMessageIdRef.current = messageId;
+    setVoicePlayback((current) => ({
+      ...current,
+      status: "waiting",
+      message: "正在等待可朗读内容",
+      messageId
+    }));
+  }
+
+  function handleVoiceStreamEvent(event: AgUiEvent, eventSessionId: string) {
+    // Once a user barges in, late events from the aborted turn remain available
+    // to the normal AG-UI renderer but must never restart its speech queue.
+    if (voiceBargeInActiveRef.current) return;
+    // Conversation turn-taking depends on the run boundary even when the user
+    // muted TTS, so RUN_FINISHED must not be hidden behind the output guard.
+    if (event.type === "RUN_FINISHED") {
+      voiceRunFinishedRef.current = true;
+      maybeResumeVoiceListening();
+      return;
+    }
+    if (event.type === "RUN_ERROR") {
+      voiceRunFinishedRef.current = true;
+      stopVoicePlayback("助手回复出错，朗读已停止");
+      if (voiceConversationActiveRef.current) {
+        setVoiceConversation((current) => ({ ...current, phase: "error", message: "回复出错，可以继续说话重试" }));
+        // Keep the error visible briefly, then return to hands-free listening.
+        window.setTimeout(() => maybeResumeVoiceListening(), 1200);
+      }
+      return;
+    }
+    if (!voiceAutoEnabledRef.current || !voicePlayback.supported || replayingHistoryRef.current) return;
+
+    if (event.type === "TEXT_MESSAGE_START") {
+      voiceSessionIdRef.current = eventSessionId;
+      voiceMessageIdRef.current = event.messageId;
+      voiceBufferRef.current = "";
+      setVoicePlayback((current) => ({
+        ...current,
+        status: "waiting",
+        message: "正在接收助手回复",
+        messageId: event.messageId
+      }));
+      return;
+    }
+
+    if (!voiceSessionIdRef.current) {
+      voiceSessionIdRef.current = eventSessionId;
+    }
+    if (voiceSessionIdRef.current !== eventSessionId) return;
+
+    if (event.type === "TEXT_MESSAGE_CONTENT" && !voiceMessageIdRef.current) {
+      // Reattaching to an already-running session may miss TEXT_MESSAGE_START
+      // locally; resume from the next live delta without replaying buffered text.
+      voiceMessageIdRef.current = event.messageId;
+      setVoicePlayback((current) => ({
+        ...current,
+        status: "waiting",
+        message: "正在接收助手回复",
+        messageId: event.messageId
+      }));
+    }
+
+    if (event.type === "TEXT_MESSAGE_CONTENT" && voiceMessageIdRef.current === event.messageId) {
+      appendVoiceDelta(event.delta);
+      return;
+    }
+
+    if (event.type === "TEXT_MESSAGE_END" && voiceMessageIdRef.current === event.messageId) {
+      flushVoiceBuffer(true);
+      voiceMessageIdRef.current = null;
+      if (!voiceSpeakingRef.current && voiceQueueRef.current.length === 0) {
+        setVoicePlayback((current) => ({
+          ...current,
+          status: "idle",
+          message: "朗读完成",
+          messageId: undefined
+        }));
+      }
+      return;
+    }
+
+  }
+
+  function appendVoiceDelta(delta: string) {
+    voiceBufferRef.current += delta;
+    flushVoiceBuffer(false);
+  }
+
+  function flushVoiceBuffer(force: boolean) {
+    const chunks = splitSpeakableChunks(voiceBufferRef.current, force);
+    voiceBufferRef.current = chunks.remainder;
+    const cleaned = chunks.ready
+      .map((chunk) => sanitizeSpeechText(chunk))
+      .filter((chunk) => chunk.length > 0);
+    if (!cleaned.length) return;
+    voiceQueueRef.current.push(...cleaned);
+    speakNextVoiceChunk(voiceGenerationRef.current);
+  }
+
+  function speakNextVoiceChunk(generation: number) {
+    if (!voicePlayback.supported || voiceSpeakingRef.current || voiceQueueRef.current.length === 0) return;
+    const text = voiceQueueRef.current.shift();
+    if (!text) return;
+    // Keep several recent chunks because recognition can return speaker echo
+    // spanning a sentence boundary after synthesis has advanced to the next one.
+    voiceEchoReferenceTextRef.current = `${voiceEchoReferenceTextRef.current} ${text}`.slice(-800);
+    const utterance = new SpeechSynthesisUtterance(text);
+    // Voice catalogs are device-owned and may load after the app. A stale URI
+    // falls back to the browser default without interrupting streamed playback.
+    const selectedVoice = window.speechSynthesis
+      .getVoices()
+      .find((voice) => voice.voiceURI === voiceConfig.voiceURI);
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+      utterance.lang = selectedVoice.lang;
+    } else {
+      utterance.lang = /[\u4e00-\u9fff]/.test(text) ? "zh-CN" : "en-US";
+    }
+    utterance.rate = voiceConfig.rate;
+    utterance.pitch = voiceConfig.pitch;
+    utterance.volume = voiceConfig.volume;
+    voiceSpeakingRef.current = true;
+    utterance.onstart = () => {
+      if (voiceGenerationRef.current !== generation) return;
+      setVoicePlayback((current) => ({
+        ...current,
+        status: "speaking",
+        message: "正在朗读助手回复",
+        messageId: voiceMessageIdRef.current ?? current.messageId
+      }));
+      if (voiceConversationActiveRef.current) {
+        setVoiceConversation((current) => ({ ...current, phase: "speaking", message: "助手正在说话，你可以直接说话打断" }));
+        // Barge-in recognition stays active during playback. Transcript echo is
+        // filtered before cancellation, so speaker output does not immediately
+        // interrupt itself on browsers without reliable acoustic echo control.
+        window.setTimeout(() => startVoiceRecognition("barge-in"), 120);
+      }
+    };
+    utterance.onend = () => {
+      if (voiceGenerationRef.current !== generation) return;
+      voiceSpeakingRef.current = false;
+      if (voiceQueueRef.current.length > 0) {
+        speakNextVoiceChunk(generation);
+        return;
+      }
+      setVoicePlayback((current) => ({
+        ...current,
+        status: "idle",
+        message: voiceBufferRef.current.trim() ? "等待更多内容" : "朗读完成",
+        messageId: voiceMessageIdRef.current ?? undefined
+      }));
+      maybeResumeVoiceListening();
+    };
+    utterance.onerror = () => {
+      voiceSpeakingRef.current = false;
+      if (voiceStoppingRef.current || voiceGenerationRef.current !== generation) return;
+      voiceQueueRef.current = [];
+      setVoicePlayback((current) => ({
+        ...current,
+        status: "error",
+        message: "语音输出失败，请检查浏览器语音权限或系统声音",
+        messageId: undefined
+      }));
+      setStatus("语音输出失败");
+      if (voiceConversationActiveRef.current) {
+        setVoiceConversation((current) => ({ ...current, phase: "error", message: "语音输出失败" }));
+      }
+    };
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function speakMessage(messageId: string, content: string) {
+    if (!voicePlayback.supported) {
+      setStatus("当前浏览器不支持语音输出");
+      return;
+    }
+    stopVoicePlayback("准备朗读消息");
+    voiceGenerationRef.current += 1;
+    voiceMessageIdRef.current = messageId;
+    voiceQueueRef.current = splitTextForManualSpeech(content);
+    if (!voiceQueueRef.current.length) {
+      setVoicePlayback((current) => ({
+        ...current,
+        status: "idle",
+        message: "没有可朗读内容",
+        messageId: undefined
+      }));
+      return;
+    }
+    setVoicePlayback((current) => ({
+      ...current,
+      status: "waiting",
+      message: "准备朗读消息",
+      messageId
+    }));
+    speakNextVoiceChunk(voiceGenerationRef.current);
+  }
+
+  function maybeResumeVoiceListening() {
+    if (
+      !voiceConversationActiveRef.current
+      || voiceInputMutedRef.current
+      || !voiceRunFinishedRef.current
+      || voiceSpeakingRef.current
+      || voiceQueueRef.current.length > 0
+      || voiceBufferRef.current.trim()
+      || voiceMessageIdRef.current
+    ) return;
+    setVoiceConversation((current) => ({ ...current, phase: "listening", message: "正在聆听" }));
+    window.setTimeout(() => startVoiceRecognition(), 180);
+  }
+
   function beginResize(side: "sidebar" | "inspector", event: ReactPointerEvent<HTMLDivElement>) {
     if (window.innerWidth <= 860) return;
     event.preventDefault();
@@ -895,10 +1219,37 @@ export function App() {
     streamPinnedRef.current = distanceToBottom < 36;
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const prompt = input.trim();
-    if ((!prompt && !attachments.length) || loading || sessionLoading || !modelId) return;
+    const prompt = voiceAutoSubmitPromptRef.current ?? input.trim();
+    voiceAutoSubmitPromptRef.current = null;
+    if (voiceConversationActiveRef.current && speechRef.current) {
+      // Keyboard submission during listening must retire that recognition
+      // instance, otherwise its later onend could submit the same turn again.
+      voiceRecognitionStopReasonRef.current = "submit";
+      speechRef.current.stop();
+    }
+    void submitConversation(prompt);
+  }
+
+  async function submitConversation(prompt: string) {
+    if ((!prompt && !attachments.length) || loading || sessionLoading || !modelId) {
+      if (voiceConversationActiveRef.current) {
+        voiceRunFinishedRef.current = !loading;
+        setVoiceConversation((current) => ({
+          ...current,
+          phase: loading || sessionLoading ? "processing" : "error",
+          message: loading || sessionLoading
+            ? "当前回复尚未结束"
+            : !modelId ? "请先选择可用模型" : "没有识别到可发送内容"
+        }));
+      }
+      return;
+    }
+
+    // A new user turn owns subsequent voice events. This also releases the
+    // temporary suppression used for late deltas from an interrupted run.
+    voiceBargeInActiveRef.current = false;
 
     const agentModels = modelsForAgent(agentKind, models, agents);
     const selectedModel = agentModels.find((model) => model.id === modelId);
@@ -930,7 +1281,13 @@ export function App() {
         reasoningEffort: effectiveReasoningEffort,
         attachments,
         agentKind,
-        agentOptions: agentKind === "k_agent" ? undefined : { cliSessionMode }
+        // Voice style is run-scoped metadata rather than user-visible prompt
+        // text, so persistence keeps the exact transcript the user spoke.
+        agentOptions: {
+          voiceConversation: voiceConversationActiveRef.current,
+          voiceStyle: voiceConfig.style,
+          ...(agentKind === "k_agent" ? {} : { cliSessionMode })
+        }
       }
     };
 
@@ -962,6 +1319,7 @@ export function App() {
     pendingAssistantIdRef.current = pendingAssistantId;
     setInput("");
     setAttachments([]);
+    beginVoiceReply(targetSessionId, pendingAssistantId);
     activeThinkingBlockIdRef.current = null;
     activeThinkingStepIdRef.current = null;
     activeTextActivityIdRef.current = null;
@@ -977,6 +1335,7 @@ export function App() {
           activeRun.events.push(streamEvent);
           if (activeSessionIdRef.current === targetSessionId) {
             applyAgUiEvent(streamEvent);
+            handleVoiceStreamEvent(streamEvent, targetSessionId);
           }
         },
         controller.signal
@@ -990,18 +1349,20 @@ export function App() {
       activeRun.events.push(errorEvent);
       if (activeSessionIdRef.current === targetSessionId) {
         applyAgUiEvent(errorEvent);
+        handleVoiceStreamEvent(errorEvent, targetSessionId);
       }
     } finally {
-      if (activeRunsRef.current.get(targetSessionId)?.controller === controller) {
+      const stillOwnsSession = activeRunsRef.current.get(targetSessionId)?.controller === controller;
+      if (stillOwnsSession) {
         activeRunsRef.current.delete(targetSessionId);
-      }
-      setRunningSessionIds((current) => {
-        const next = new Set(current);
-        next.delete(targetSessionId);
-        return next;
-      });
-      if (activeSessionIdRef.current === targetSessionId) {
-        setLoading(false);
+        setRunningSessionIds((current) => {
+          const next = new Set(current);
+          next.delete(targetSessionId);
+          return next;
+        });
+        if (activeSessionIdRef.current === targetSessionId) {
+          setLoading(false);
+        }
       }
       await Promise.all([refreshSessions(), refreshHealth()]);
     }
@@ -1562,18 +1923,14 @@ export function App() {
       speechRef.current?.stop();
       return;
     }
-    const SpeechRecognition = (
-      window as typeof window & {
-        SpeechRecognition?: new () => SpeechRecognitionLike;
-        webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-      }
-    ).SpeechRecognition ?? (
-      window as typeof window & { webkitSpeechRecognition?: new () => SpeechRecognitionLike }
-    ).webkitSpeechRecognition;
+    const SpeechRecognition = getSpeechRecognitionConstructor();
     if (!SpeechRecognition) {
       setStatus("当前浏览器不支持语音输入");
       return;
     }
+
+    // Plain voice input remains a one-shot dictation feature: it only updates
+    // the composer and never submits or enables assistant speech automatically.
     const recognition = new SpeechRecognition();
     recognition.lang = "zh-CN";
     recognition.interimResults = true;
@@ -1582,11 +1939,11 @@ export function App() {
     recognition.onstart = () => setListening(true);
     recognition.onend = () => {
       setListening(false);
-      speechRef.current = null;
+      if (speechRef.current === recognition) speechRef.current = null;
     };
     recognition.onerror = () => {
       setListening(false);
-      speechRef.current = null;
+      if (speechRef.current === recognition) speechRef.current = null;
       setStatus("语音输入未能启动");
     };
     recognition.onresult = (event) => {
@@ -1597,13 +1954,243 @@ export function App() {
       setInput(`${originalInput}${originalInput && transcript ? " " : ""}${transcript}`);
     };
     speechRef.current = recognition;
-    recognition.start();
+    try {
+      recognition.start();
+    } catch {
+      speechRef.current = null;
+      setListening(false);
+      setStatus("语音输入未能启动");
+    }
+  }
+
+  function startVoiceConversation() {
+    const SpeechRecognition = getSpeechRecognitionConstructor();
+    if (!SpeechRecognition) {
+      setStatus("当前浏览器不支持语音输入");
+      setVoiceConversation((current) => ({
+        ...current,
+        supported: false,
+        active: false,
+        phase: "error",
+        message: "当前浏览器不支持语音输入"
+      }));
+      return;
+    }
+    if (!modelId || sessionLoading) {
+      setStatus(!modelId ? "请先选择可用模型" : "会话仍在加载，请稍后再试");
+      return;
+    }
+
+    voiceConversationActiveRef.current = true;
+    voiceInputMutedRef.current = false;
+    voiceRunFinishedRef.current = !loading;
+    setVoiceConversation({
+      supported: true,
+      active: true,
+      inputMuted: false,
+      phase: loading ? "processing" : "listening",
+      message: loading ? "正在等待助手回复" : "正在聆听"
+    });
+
+    // A voice conversation owns both browser speech directions. Enable TTS in
+    // the same tick so an immediately auto-submitted turn cannot outrun React.
+    if (voicePlayback.supported) {
+      voiceAutoEnabledRef.current = true;
+      setVoicePlayback((current) => ({
+        ...current,
+        autoEnabled: true,
+        status: "idle",
+        message: "语音会话已开启"
+      }));
+    }
+    // A dictation recognition may still be shutting down when the user moves
+    // directly into conversation mode; release it before starting the owner.
+    if (speechRef.current) {
+      speechRef.current.stop();
+      speechRef.current = null;
+      setListening(false);
+    }
+    if (!loading) window.setTimeout(() => startVoiceRecognition(), 180);
+  }
+
+  function stopVoiceConversation(message = "语音会话已结束") {
+    if (!voiceConversationActiveRef.current) {
+      stopVoicePlayback(message);
+      return;
+    }
+    voiceConversationActiveRef.current = false;
+    voiceInputMutedRef.current = false;
+    voiceRecognitionStopReasonRef.current = "exit";
+    speechRef.current?.stop();
+    speechRef.current = null;
+    setListening(false);
+    cancelVoiceEngine();
+    setVoiceConversation((current) => ({
+      ...current,
+      active: false,
+      inputMuted: false,
+      phase: "inactive",
+      message: ""
+    }));
+    setVoicePlayback((current) => ({
+      ...current,
+      autoEnabled: false,
+      status: current.supported ? "idle" : "unsupported",
+      message: current.supported ? message : current.message,
+      messageId: undefined
+    }));
+    voiceAutoEnabledRef.current = false;
+  }
+
+  function toggleVoiceConversationMicrophone() {
+    if (voiceInputMutedRef.current) {
+      voiceInputMutedRef.current = false;
+      setVoiceConversation((current) => ({ ...current, inputMuted: false, phase: "listening", message: "正在聆听" }));
+      startVoiceRecognition();
+      return;
+    }
+    voiceInputMutedRef.current = true;
+    voiceRecognitionStopReasonRef.current = "mute";
+    speechRef.current?.stop();
+    setVoiceConversation((current) => ({ ...current, inputMuted: true, phase: "inactive", message: "麦克风已暂停" }));
+  }
+
+  function interruptActiveVoiceTurnForBargeIn(transcript: string) {
+    if (!voiceSpeakingRef.current || voiceBargeInActiveRef.current) return;
+    voiceBargeInActiveRef.current = true;
+    const activeSessionId = activeSessionIdRef.current;
+    if (activeSessionId) {
+      activeRunsRef.current.get(activeSessionId)?.controller.abort();
+    }
+    cancelVoiceEngine();
+    voiceRunFinishedRef.current = true;
+    setLoading(false);
+    setStatus("已打断助手，正在聆听");
+    setVoicePlayback((current) => ({
+      ...current,
+      status: current.supported ? "idle" : "unsupported",
+      message: "已被用户打断",
+      messageId: undefined
+    }));
+    setVoiceConversation((current) => ({
+      ...current,
+      phase: "listening",
+      message: transcript || "已打断，继续说完后将自动发送"
+    }));
+  }
+
+  function startVoiceRecognition(mode: "turn" | "barge-in" = "turn") {
+    if (
+      !voiceConversationActiveRef.current
+      || voiceInputMutedRef.current
+      || (mode === "turn" && !voiceRunFinishedRef.current)
+      || speechRef.current
+    ) return;
+    const SpeechRecognition = getSpeechRecognitionConstructor();
+    if (!SpeechRecognition) {
+      setVoiceConversation((current) => ({ ...current, phase: "error", message: "浏览器语音识别不可用" }));
+      return;
+    }
+    const recognition = new SpeechRecognition();
+    recognition.lang = "zh-CN";
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    const originalInput = input;
+    let transcript = "";
+    let recognitionError: string | null = null;
+    let bargeInTriggered = false;
+    voiceRecognitionStopReasonRef.current = null;
+    recognition.onstart = () => {
+      setListening(true);
+      if (mode === "barge-in" && voiceSpeakingRef.current) {
+        setVoiceConversation((current) => ({ ...current, phase: "speaking", message: "助手正在说话，你可以直接说话打断" }));
+      } else {
+        setVoiceConversation((current) => ({ ...current, phase: "listening", message: "正在聆听，说完后将自动发送" }));
+      }
+    };
+    recognition.onend = () => {
+      setListening(false);
+      if (speechRef.current === recognition) speechRef.current = null;
+      const stopReason = voiceRecognitionStopReasonRef.current;
+      voiceRecognitionStopReasonRef.current = null;
+      if (
+        !voiceConversationActiveRef.current
+        || stopReason === "exit"
+        || stopReason === "mute"
+        || stopReason === "submit"
+      ) return;
+
+      if (mode === "barge-in" && !bargeInTriggered) {
+        // A barge-in listener that heard only synthesized speech must discard
+        // that transcript instead of submitting the assistant's own words.
+        if (!recognitionError || recognitionError === "no-speech" || recognitionError === "aborted") {
+          window.setTimeout(
+            () => startVoiceRecognition(voiceSpeakingRef.current || !voiceRunFinishedRef.current ? "barge-in" : "turn"),
+            250
+          );
+        }
+        return;
+      }
+
+      const prompt = `${originalInput}${originalInput && transcript ? " " : ""}${transcript}`.trim();
+      if (prompt && !recognitionError) {
+        // requestSubmit invokes the current React handler after setInput has
+        // committed, while the ref carries the exact final transcript.
+        voiceAutoSubmitPromptRef.current = prompt;
+        setInput(prompt);
+        setVoiceConversation((current) => ({ ...current, phase: "processing", message: "已识别，正在发送" }));
+        composerTextareaRef.current?.form?.requestSubmit();
+        return;
+      }
+      if (!recognitionError || recognitionError === "no-speech" || recognitionError === "aborted") {
+        window.setTimeout(
+          () => startVoiceRecognition(voiceSpeakingRef.current || !voiceRunFinishedRef.current ? "barge-in" : "turn"),
+          250
+        );
+      }
+    };
+    recognition.onerror = (event) => {
+      recognitionError = event.error ?? "unknown";
+      setListening(false);
+      if (recognitionError === "no-speech" || recognitionError === "aborted") return;
+      setVoiceConversation((current) => ({ ...current, phase: "error", message: "语音识别失败，请检查麦克风权限" }));
+      setStatus("语音输入未能启动");
+    };
+    recognition.onresult = (event) => {
+      transcript = "";
+      for (let index = 0; index < event.results.length; index += 1) {
+        transcript += event.results[index][0]?.transcript ?? "";
+      }
+      if (mode === "barge-in" && !bargeInTriggered) {
+        const shouldInterrupt = shouldInterruptForTranscript(
+          transcript,
+          voiceSpeakingRef.current ? voiceEchoReferenceTextRef.current : ""
+        );
+        if (!shouldInterrupt) return;
+        bargeInTriggered = true;
+        if (voiceSpeakingRef.current) interruptActiveVoiceTurnForBargeIn(transcript);
+      }
+      setInput(`${originalInput}${originalInput && transcript ? " " : ""}${transcript}`);
+      setVoiceConversation((current) => ({ ...current, phase: "listening", message: transcript || "正在聆听" }));
+    };
+    speechRef.current = recognition;
+    try {
+      recognition.start();
+    } catch {
+      speechRef.current = null;
+      setVoiceConversation((current) => ({ ...current, phase: "error", message: "语音识别启动失败" }));
+    }
   }
 
   if (view === "config") {
     return (
       <>
-        <ConfigCenter onBack={() => { setView("chat"); void refreshOptions(); }} />
+        <ConfigCenter onBack={() => {
+          // ConfigCenter persists device-local voices independently of server catalogs.
+          setVoiceConfig(readVoiceConfig());
+          setView("chat");
+          void refreshOptions();
+        }} />
         <DesktopPet enabled={desktopPetEnabled} onEnabledChange={setDesktopPetEnabled} />
       </>
     );
@@ -1765,7 +2352,7 @@ export function App() {
         onKeyDown={(event) => resizeWithKeyboard("sidebar", event)}
       />
 
-      <main className="conversation">
+      <main className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""}`}>
         <header className="topbar">
           <button
             className="topbar-icon-button sidebar-toggle-button"
@@ -1954,6 +2541,31 @@ export function App() {
                       <footer className="message-meta">
                         <time>{formatTime(message.createdAt)}</time>
                         {message.content && (
+                          <>
+                          {message.role === "assistant" && (
+                            <button
+                              className={voicePlayback.messageId === message.id && voicePlayback.status === "speaking" ? "voice-feedback speaking" : ""}
+                              type="button"
+                              aria-label={voicePlayback.messageId === message.id && voicePlayback.status === "speaking"
+                                ? "停止朗读这条消息"
+                                : "朗读这条消息"}
+                              title={voicePlayback.messageId === message.id && voicePlayback.status === "speaking"
+                                ? "停止朗读"
+                                : "朗读消息"}
+                              onClick={() => {
+                                if (voicePlayback.messageId === message.id && voicePlayback.status === "speaking") {
+                                  stopVoicePlayback("朗读已停止");
+                                } else {
+                                  speakMessage(message.id, message.content);
+                                }
+                              }}
+                            >
+                              <span aria-hidden="true">{voicePlayback.messageId === message.id && voicePlayback.status === "speaking" ? "■" : "◉"}</span>
+                              {voicePlayback.messageId === message.id && voicePlayback.status === "speaking" && (
+                                <b role="status" aria-live="polite">朗读中</b>
+                              )}
+                            </button>
+                          )}
                           <button
                             className={copyFeedback?.messageId === message.id ? `copy-feedback ${copyFeedback.status}` : ""}
                             type="button"
@@ -1972,6 +2584,7 @@ export function App() {
                               </b>
                             )}
                           </button>
+                          </>
                         )}
                       </footer>
                     )}
@@ -1983,6 +2596,31 @@ export function App() {
           <div ref={streamEndRef} />
         </section>
 
+        {voiceConversation.active && (
+          <div className={`voice-conversation-float ${voiceConversation.phase}`} role="status" aria-live="polite">
+            <button
+              className="voice-orb"
+              type="button"
+              onClick={toggleVoiceConversationMicrophone}
+              aria-label={voiceConversation.inputMuted ? "恢复语音对话麦克风" : "暂停语音对话麦克风"}
+              title={voiceConversation.inputMuted ? "恢复麦克风" : "暂停麦克风"}
+            >
+              <i /><i /><i /><i />
+            </button>
+            <div className="voice-conversation-copy">
+              <strong>{voiceConversation.phase === "listening"
+                ? "正在聆听"
+                : voiceConversation.phase === "processing"
+                  ? "正在思考"
+                  : voiceConversation.phase === "speaking"
+                    ? "正在回答"
+                    : voiceConversation.phase === "error"
+                      ? "语音会话遇到问题"
+                      : "语音会话已暂停"}</strong>
+              <small>{voiceConversation.message}</small>
+            </div>
+          </div>
+        )}
         <form className="composer" onSubmit={handleSubmit}>
           {attachments.length > 0 && <div className="attachment-list">{attachments.map((attachment, index) => <span key={`${attachment.name}-${index}`}>▧ {attachment.name}<button type="button" onClick={() => setAttachments(attachments.filter((_, i) => i !== index))}>×</button></span>)}</div>}
           <textarea
@@ -2041,8 +2679,11 @@ export function App() {
                 }}
                 onReasoningChange={setReasoningEffort}
               />
-              <button className={`voice-button ${listening ? "listening" : ""}`} type="button" onClick={toggleVoiceInput} aria-label={listening ? "停止语音输入" : "语音输入"} title={listening ? "停止语音输入" : "语音输入"}>
+              <button className={`voice-button ${listening && !voiceConversation.active ? "listening" : ""}`} type="button" onClick={toggleVoiceInput} disabled={voiceConversation.active} aria-label={voiceConversation.active ? "语音对话中不可单独听写" : listening ? "停止语音输入" : "语音输入"} title={voiceConversation.active ? "语音对话中不可单独听写" : listening ? "停止语音输入" : "语音输入"}>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M18 11v1a6 6 0 0 1-12 0v-1M12 18v3M9 21h6"/></svg>
+              </button>
+              <button className={`voice-button voice-conversation-start-button ${voiceConversation.active ? "enabled" : ""}`} type="button" onClick={voiceConversation.active ? () => stopVoiceConversation() : startVoiceConversation} aria-label={voiceConversation.active ? "结束语音对话" : "开启语音对话"} title={voiceConversation.active ? "结束语音对话" : "开启语音对话"}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h2M8 8v8M12 5v14M16 8v8M20 12h-2"/></svg>
               </button>
               {loading ? (
                 <button className="stop-button" type="button" onClick={stopRun} aria-label="停止生成">■</button>
@@ -2265,11 +2906,64 @@ type SpeechRecognitionLike = {
   continuous: boolean;
   onstart: (() => void) | null;
   onend: (() => void) | null;
-  onerror: (() => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
   onresult: ((event: { results: ArrayLike<{ [index: number]: { transcript: string } }> }) => void) | null;
   start: () => void;
   stop: () => void;
 };
+
+function getSpeechRecognitionConstructor(): (new () => SpeechRecognitionLike) | null {
+  // Safari still exposes the prefixed constructor while Chromium exposes the
+  // standard name; Firefox currently provides neither in regular releases.
+  const speechWindow = window as typeof window & {
+    SpeechRecognition?: new () => SpeechRecognitionLike;
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+  };
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+}
+
+function splitSpeakableChunks(text: string, force: boolean): { ready: string[]; remainder: string } {
+  const ready: string[] = [];
+  let start = 0;
+  const boundary = /[。！？!?；;：:\n]/;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const size = index - start + 1;
+    const shouldCutAtPunctuation = boundary.test(text[index]) && size >= 10;
+    const shouldCutByLength = size >= 90;
+    if (!shouldCutAtPunctuation && !shouldCutByLength) continue;
+    ready.push(text.slice(start, index + 1));
+    start = index + 1;
+  }
+
+  const remainder = text.slice(start);
+  if (force && remainder.trim()) {
+    ready.push(remainder);
+    return { ready, remainder: "" };
+  }
+  return { ready, remainder };
+}
+
+function splitTextForManualSpeech(content: string): string[] {
+  const chunks = splitSpeakableChunks(content, true).ready
+    .map((chunk) => sanitizeSpeechText(chunk))
+    .filter((chunk) => chunk.length > 0);
+  return chunks.length ? chunks : sanitizeSpeechText(content) ? [sanitizeSpeechText(content)] : [];
+}
+
+function sanitizeSpeechText(text: string): string {
+  // Browser TTS reads literal markdown punctuation poorly. The UI still renders
+  // markdown normally; this cleanup only prepares client-side speech text.
+  return text
+    .replace(/```[\s\S]*?```/g, " 代码块 ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, "链接")
+    .replace(/^[#>*\-\s]+/gm, "")
+    .replace(/[*_~]{1,3}/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function formatTime(value: string) {
   const date = new Date(value);

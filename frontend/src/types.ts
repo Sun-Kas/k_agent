@@ -206,6 +206,8 @@ export interface AgUiRunInput {
     attachments?: Array<{ name: string; dataUrl: string; type: string }>;
     agentKind?: AgentKind;
     agentOptions?: {
+      voiceConversation?: boolean;
+      voiceStyle?: VoiceStyleId;
       cliSessionMode?: CliSessionMode;
       resumeSessionId?: string;
       networkAccess?: boolean;
@@ -216,6 +218,7 @@ export interface AgUiRunInput {
 
 export type AgentKind = "k_agent" | "codex" | "claude_code" | string;
 export type CliSessionMode = "ephemeral" | "resume";
+export type VoiceStyleId = "natural" | "warm" | "lively" | "professional" | "storytelling";
 
 export interface DetectedAgent {
   kind: AgentKind;
