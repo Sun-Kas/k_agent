@@ -32,6 +32,13 @@ def main() -> None:
         host=settings.host,
         port=settings.port,
         reload=args.reload,
+        # Watching the repository root made CSS, README and generated workspace
+        # writes restart the stateful Access Layer and cancel active automations.
+        # Only Python packages imported by this process should trigger reload.
+        reload_dirs=(
+            [str(PROJECT_ROOT / "access_layer"), str(PROJECT_ROOT / "backend")]
+            if args.reload else None
+        ),
         workers=args.workers,
         factory=True,
     )

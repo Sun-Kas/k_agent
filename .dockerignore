@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.DS_Store
+frontend/node_modules
+frontend/dist
+
+# Intentionally NOT ignored for Dockerfile.snapshot:
+#   .env
+#   .k_agent/config
+#   .k_agent/content
+#   .k_agent/state

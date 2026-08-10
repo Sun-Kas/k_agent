@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
 import uvicorn
 
 from backend.config import get_or_init_settings
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def main() -> None:
@@ -22,6 +25,8 @@ def main() -> None:
         host=settings.agent_backend_host,
         port=settings.agent_backend_port,
         reload=args.reload,
+        # Frontend/docs changes must not bounce the private inference service.
+        reload_dirs=[str(PROJECT_ROOT / "backend")] if args.reload else None,
         workers=args.workers,
         factory=True,
     )

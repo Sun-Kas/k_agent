@@ -173,6 +173,8 @@ npm run deploy:local
 
 部署模式下 Access Layer 会在 `http://127.0.0.1:3001` 同源托管 `frontend/dist`，Agent Backend 继续运行在 `127.0.0.1:3002`。
 
+需要把当前 `.env`、Sessions、Skills、Team 和定时任务完整封装为仅供本机使用的容器镜像时，请参阅[私有快照镜像](docs/snapshot-image.md)。该镜像包含明文凭据和私人数据，禁止推送到公共 Registry。
+
 ## 运行时数据
 
 持久化内容默认写入 `~/.k_agent`，可通过 `K_AGENT_HOME` 修改：
