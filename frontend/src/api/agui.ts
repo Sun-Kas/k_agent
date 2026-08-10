@@ -1,3 +1,7 @@
+/**
+ * Access Layer HTTP 客户端：会话 CRUD、配置、审批，以及 AG-UI SSE 流式 run。
+ * streamAgentRun 是聊天主路径的网络入口；事件由调用方（App.applyAgUiEvent）投影到 UI。
+ */
 import { appConfig } from "../config";
 import { nextRenderOpportunity } from "./stream-scheduler";
 import type {
@@ -125,6 +129,7 @@ export async function saveMcpConfig(servers: McpServerConfig[]): Promise<{
   }>;
 }
 
+/** 按 transport 裁剪字段，避免把 stdio/http 互斥配置一并写回。 */
 function sanitizeMcpServerForSave(server: McpServerConfig): McpServerConfig {
   const type = server.type ?? "stdio";
   const optional = (value?: string) => value?.trim() || undefined;
@@ -263,6 +268,10 @@ export async function cancelSessionRun(sessionId: string, runId: string): Promis
   }
 }
 
+/**
+ * POST AgUiRunInput，按 SSE 帧解析为 AgUiEvent 并回调。
+ * TEXT_MESSAGE_CONTENT 后 await nextRenderOpportunity，给 React 绘制喘息，避免读流饿死主线程。
+ */
 export async function streamAgentRun(
   input: AgUiRunInput,
   onEvent: (event: AgUiEvent) => void,
@@ -293,6 +302,7 @@ export async function streamAgentRun(
   while (true) {
     const { done, value } = await reader.read();
     buffer += decoder.decode(value, { stream: !done });
+    // 不完整帧留在 buffer；完整帧以空行分隔。
     const frames = buffer.split(appConfig.sseMessageDelimiter);
     buffer = frames.pop() ?? "";
 
@@ -316,6 +326,7 @@ export async function streamAgentRun(
   }
 }
 
+/** 提取 `data: ` 行并 JSON.parse 为 AgUiEvent；无 data 行则忽略（注释/心跳）。 */
 function parseSseFrame(frame: string): AgUiEvent | null {
   const data = frame
     .split(/\r?\n/)

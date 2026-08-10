@@ -1,4 +1,14 @@
-"""Access-layer owned MCP and Skill catalogs plus runtime payload assembly."""
+"""Access Layer 拥有的 MCP/Skill 目录与运行时载荷装配。
+
+在请求链路中的角色：维护前端选择器用的轻量摘要（catalog JSON），并在
+`gateway.run` / Team Runtime 发起执行前，把所选 ID 解析成自包含的
+MCP 连接配置 + Skill 正文，随请求发给 Agent Backend。
+
+服务边界：
+- 列表数据与正文归属本层（`$K_AGENT_HOME` 下 catalog / skills / mcp 配置）
+- 后端从不读 catalog 文件；只消费请求体内的完整 entries
+- `selected_runtime` 在接入边界校验「未知/已禁用」ID，失败则抛 CatalogError
+"""
 
 from __future__ import annotations
 
@@ -18,11 +28,11 @@ from backend.storage import write_json_atomic
 
 
 class CatalogError(ValueError):
-    """Raised when a requested catalog entry is missing or disabled."""
+    """请求的目录项缺失、禁用或配置不完整时抛出。"""
 
 
 class RuntimeCatalog:
-    """Own lightweight list data and resolve selected runtime definitions."""
+    """持有轻量列表数据，并将用户选择的 ID 解析为后端可直接消费的运行时条目。"""
 
     def __init__(
         self,
@@ -32,13 +42,14 @@ class RuntimeCatalog:
         skill_dir: Path | None = None,
         mcp_config_path: Path | None = None,
     ) -> None:
+        """绑定 catalog / skills 目录 / MCP 配置路径（测试可注入覆盖）。"""
         self.mcp_catalog_path = mcp_catalog_path or default_mcp_catalog_path()
         self.skill_catalog_path = skill_catalog_path or default_skills_catalog_path()
         self.skill_dir = skill_dir or default_skills_dir()
         self.mcp_config_path = mcp_config_path or default_mcp_config_path()
 
     def ensure(self) -> None:
-        """Create catalogs once from existing configuration when upgrading."""
+        """升级场景：若 catalog 尚不存在，从现有配置/Skill 目录一次性生成。"""
         if not self.mcp_catalog_path.exists():
             servers, _ = read_mcp_config(self.mcp_config_path)
             self.write_mcp_summaries(
@@ -80,7 +91,7 @@ class RuntimeCatalog:
             self.write_skill_summaries(summaries)
 
     def list_payload(self) -> dict[str, Any]:
-        """Return the fast frontend selection payload without backend calls."""
+        """返回工作台选择器的轻量列表，不调用 Agent Backend。"""
         return {
             "mcpServers": self.mcp_summaries(),
             "skills": self.skill_summaries(),
@@ -91,21 +102,29 @@ class RuntimeCatalog:
         }
 
     def mcp_summaries(self) -> list[dict[str, Any]]:
+        """读取 MCP 目录摘要（id/name/description/enabled）。"""
         return _read_list(self.mcp_catalog_path, "servers")
 
     def skill_summaries(self) -> list[dict[str, Any]]:
+        """读取 Skill 目录摘要（id/name/description/enabled）。"""
         return _read_list(self.skill_catalog_path, "skills")
 
     def write_mcp_summaries(self, servers: list[dict[str, Any]]) -> None:
+        """原子写入 MCP 摘要列表（配置中心保存后调用）。"""
         _write_list(self.mcp_catalog_path, "servers", [_summary(item) for item in servers])
 
     def write_skill_summaries(self, skills: list[dict[str, Any]]) -> None:
+        """原子写入 Skill 摘要列表。"""
         _write_list(self.skill_catalog_path, "skills", [_summary(item) for item in skills])
 
     def selected_runtime(
         self, mcp_ids: list[str], skill_ids: list[str]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Resolve IDs at the access boundary and return self-contained entries."""
+        """在接入边界解析 ID，返回自包含的 MCP 配置与 Skill 运行时条目。
+
+        摘要只负责选择与启用态；真实连接参数来自 mcp 配置文件，Skill 正文
+        来自 content/skills/<id>/SKILL.md。后端不再二次读盘。
+        """
         mcp_summaries = self._select(self.mcp_summaries(), mcp_ids, "MCP")
         skill_summaries = self._select(self.skill_summaries(), skill_ids, "Skill")
 
@@ -151,6 +170,7 @@ class RuntimeCatalog:
     def _select(
         entries: list[dict[str, Any]], ids: list[str], label: str
     ) -> list[dict[str, Any]]:
+        """按请求 ID 顺序选取已启用条目；未知或禁用则 CatalogError。"""
         if not ids:
             return []
         enabled = {
@@ -166,6 +186,7 @@ class RuntimeCatalog:
         return [enabled[item_id] for item_id in dict.fromkeys(ids)]
 
     def _skill_runtime(self, summary: dict[str, Any]) -> dict[str, Any]:
+        """把摘要扩展为含 instructions / 工具约束等的后端 Skill 载荷。"""
         skill_id = str(summary["id"])
         skill_file = self.skill_dir / skill_id / "SKILL.md"
         if not skill_file.is_file():
@@ -199,7 +220,7 @@ class RuntimeCatalog:
 
 
 def read_mcp_config(path: Path) -> tuple[list[dict[str, Any]], str | None]:
-    """Read Claude-style mcpServers or the legacy servers array."""
+    """读取 Claude 风格 mcpServers 或旧版 servers 数组，返回 (列表, 格式名)。"""
     if not path.exists():
         return [], None
     payload = json.loads(path.read_text(encoding="utf-8"))

@@ -1,4 +1,15 @@
-"""Thin public AG-UI ingress for the independently running Agent Backend."""
+"""AG-UI 公开入口网关：承接前端单轮用户消息，装配历史后转发至 Agent Backend。
+
+在请求链路中的角色：
+- 校验前端 RunAgentInput（每轮恰好一条新 user 消息）
+- 解析 MCP/Skill 选择，组装自包含运行时载荷
+- 在会话锁保护下落盘本轮用户消息，再流式中继后端 AG-UI 事件
+- 将事件异步持久化到 SessionStore，同时立即 SSE 推给浏览器
+
+服务边界：
+- 本层拥有会话状态与目录选择；不拼系统提示词、不执行模型/工具
+- Agent Backend 为无状态执行端，只消费本层组装好的完整 messages + runtime
+"""
 
 from __future__ import annotations
 
@@ -27,7 +38,7 @@ from backend.logging_config import log_event
 
 
 class AgentAccessLayer:
-    """Persist conversations and transparently relay Agent Backend AG-UI events."""
+    """单会话 AG-UI 运行编排：持久化对话并透明中继 Agent Backend 事件流。"""
 
     def __init__(
         self,
@@ -37,16 +48,18 @@ class AgentAccessLayer:
         agent_backend_client: AgentBackendClient,
         runtime_catalog: RuntimeCatalog,
     ) -> None:
-        """初始化对象依赖和内部状态。"""
+        """注入会话存储、并发守卫、后端客户端与运行时目录。"""
         self._session_store = session_store
         self._request_limiter = request_limiter
         self._agent_backend_client = agent_backend_client
         self._runtime_catalog = runtime_catalog
 
     async def run(self, payload: RunAgentInput) -> StreamingResponse:
-        # 前端每次运行只提交本轮新增的用户消息。历史消息由接入层从
-        # SessionStore 读取并补齐，避免浏览器把旧历史重新上报造成重复或丢失。
-        """说明 run 在当前模块中的具体职责。"""
+        """处理一次公开 Agent 运行：校验、加锁、落盘用户轮次并返回 SSE 流。
+
+        前端每轮只提交新增的用户消息；完整历史由本层从 SessionStore 补齐后
+        发给后端，避免浏览器重报导致重复或丢失。
+        """
         submitted = to_chat_messages(payload.messages)
         if len(submitted) != 1 or submitted[0].role != "user":
             raise HTTPException(
@@ -102,9 +115,8 @@ class AgentAccessLayer:
             except ConcurrencyLimitExceeded as exc:
                 raise HTTPException(status_code=429, detail=str(exc)) from exc
 
-            # The user turn is persisted only after this run owns the session
-            # lock. Saving earlier would leave an orphan user message behind
-            # whenever a concurrent run is rejected with 429.
+            # 用户轮次必须在拿到会话锁之后才持久化：若并发 run 被 429 拒绝，
+            # 提前落盘会留下孤立的 user 消息。
             try:
                 session = await self._session_store.save_run_start(
                     session.id,
@@ -118,7 +130,8 @@ class AgentAccessLayer:
                 raise
 
             async def event_generator():
-                """生成对前端输出的 SSE 事件流。"""
+                """生成对前端输出的 SSE 事件流；落盘在后台串行，不阻塞推送。"""
+                # StreamingResponse 在独立任务中消费生成器，需把请求上下文复制进该协程。
                 stream_context_token = (
                     set_request_context(stream_request_context)
                     if stream_request_context is not None
@@ -145,8 +158,7 @@ class AgentAccessLayer:
                         {
                             "threadId": session.id,
                             "runId": payload.run_id,
-                            # 发送给 Agent Backend 的 messages 是完整会话历史。
-                            # 接入层只负责装配传输载荷，不拼系统提示词、不压缩上下文。
+                            # 发给后端的是完整会话历史；本层只装配载荷，不拼系统提示。
                             "messages": [
                                 message.model_dump(by_alias=True, mode="json")
                                 for message in session.messages
@@ -166,10 +178,8 @@ class AgentAccessLayer:
                         },
                         request_id,
                     )
-                    # Persist events in a background task so the SSE stream is
-                    # never blocked by disk I/O. Events are queued and written
-                    # serially to maintain ordering, while SSE frames are yielded
-                    # to the client immediately.
+                    # 落盘走后台队列，SSE 帧立刻 yield，避免磁盘 I/O 卡住流式体验。
+                    # 单 worker 串行写盘以保持事件顺序。
                     persist_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
                     async def _persist_worker():
@@ -236,7 +246,7 @@ class AgentAccessLayer:
 
     @staticmethod
     def _string_list(value: Any, name: str) -> list[str]:
-        """说明 _string_list 在当前模块中的具体职责。"""
+        """校验 forwarded_props 中的字符串 ID 列表；非法则 400。"""
         if value is None:
             return []
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
@@ -245,14 +255,14 @@ class AgentAccessLayer:
 
     @staticmethod
     def _attachments(value: Any) -> list[dict[str, Any]]:
-        """说明 _attachments 在当前模块中的具体职责。"""
+        """过滤附件列表，只保留 dict 项后原样转发给后端。"""
         if not isinstance(value, list):
             raise HTTPException(status_code=400, detail="attachments must be a list")
         return [item for item in value if isinstance(item, dict)]
 
     @staticmethod
     def _encode_sse(event: dict[str, Any]) -> str:
-        """说明 _encode_sse 在当前模块中的具体职责。"""
+        """将单个 AG-UI 事件编码为 SSE data 帧。"""
         return "data: " + json.dumps(
             event, ensure_ascii=False, separators=(",", ":")
         ) + "\n\n"

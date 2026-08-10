@@ -1,6 +1,10 @@
+/**
+ * 多 Agent 团队领域类型：快照、任务状态机、有序事件（seq）与创建草稿。
+ */
 import type { AgentKind } from "../types";
 
 export type TeamStatus = "draft" | "running" | "paused" | "completed" | "failed" | "cancelled";
+/** 任务生命周期：pending → ready → claimed → running → submitted → completed（或 failed/cancelled）。 */
 export type TeamTaskStatus = "pending" | "ready" | "claimed" | "running" | "submitted" | "completed" | "failed" | "cancelled";
 
 export interface TeamSummary {
@@ -81,6 +85,7 @@ export interface TeamMail {
   createdAt: string;
 }
 
+/** 团队当前全量视图；lastEventSeq 用于 EventSource afterSeq 续传。 */
 export interface TeamSnapshot {
   id: string;
   name: string;
@@ -109,6 +114,7 @@ export interface TeamSnapshot {
   mailbox: TeamMail[];
 }
 
+/** 有序团队事件；UI 按 seq 去重合并后驱动任务/对话面板。 */
 export interface TeamEvent {
   teamId: string;
   seq: number;

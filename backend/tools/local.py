@@ -1,4 +1,4 @@
-"""Built-in local tools for memory operations, utility calls, and Skill invocation."""
+"""内置本地工具：记忆读写、探针工具、以及按本轮定义执行的 Skill。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class ToolDefinition:
 
 
 async def get_current_time(_: dict[str, Any]) -> str:
-    """返回当前 ISO 时间。"""
+    """返回 UTC ISO 时间，供模型校准「现在」。"""
     return json.dumps({"now": datetime.now(timezone.utc).isoformat()})
 
 
@@ -33,13 +33,13 @@ async def echo_text(payload: dict[str, Any]) -> str:
 
 
 async def read_personal_memory(_: dict[str, Any]) -> str:
-    """读取个人 memory 工具实现。"""
+    """读取 `$K_AGENT_HOME/content/memory/MEMORY.md`。"""
     path, content = read_auto_memory()
     return json.dumps({"path": str(path), "content": content}, ensure_ascii=False)
 
 
 async def append_personal_memory(payload: dict[str, Any]) -> str:
-    """追加个人 memory 工具实现。"""
+    """向 MEMORY.md 追加一条精简的持久记忆。"""
     text = str(payload.get("text", "")).strip()
     if not text:
         return json.dumps({"ok": False, "error": "text is required"}, ensure_ascii=False)
@@ -48,14 +48,14 @@ async def append_personal_memory(payload: dict[str, Any]) -> str:
 
 
 async def search_personal_memory(payload: dict[str, Any]) -> str:
-    """搜索个人 memory 工具实现。"""
+    """在 MEMORY.md 中按子串搜索匹配行。"""
     query = str(payload.get("query", "")).strip().lower()
     path, matches = search_auto_memory(query)
     return json.dumps({"path": str(path), "matches": matches}, ensure_ascii=False)
 
 
 async def compact_personal_memory(payload: dict[str, Any]) -> str:
-    """压缩个人 memory 工具实现。"""
+    """去重并裁剪 MEMORY.md，控制持久记忆体积。"""
     max_items = int(payload.get("maxItems", 200))
     path, before, after = compact_auto_memory(max_items=max_items)
     return json.dumps({"ok": True, "path": str(path), "itemsBefore": before, "itemsAfter": after}, ensure_ascii=False)
@@ -64,7 +64,7 @@ async def compact_personal_memory(payload: dict[str, Any]) -> str:
 async def invoke_skill(
     payload: dict[str, Any], skills: list[dict[str, Any]] | None = None
 ) -> str:
-    """Execute a Skill definition supplied with the current run."""
+    """执行本轮请求随带的 Skill 定义（不扫描磁盘目录）。"""
     # 容忍模型带上斜杠前缀（把 Skill 当斜杠命令写成 `/foo`）。
     skill_name = str(payload.get("skill", "")).strip().lstrip("/")
     args = str(payload.get("args", "")).strip()
@@ -113,10 +113,10 @@ def build_skill_tool(
     mcp_prompt_caller: Callable[[str, str, dict[str, Any]], Awaitable[str]] | None = None,
     skills: list[dict[str, Any]] | None = None,
 ) -> ToolDefinition:
-    """Build Skill as a closure so MCP prompt skills can call the active manager."""
+    """以闭包绑定本轮 MCP prompt 调用与 skills，避免跨请求复用连接。"""
 
     async def execute(payload: dict[str, Any]) -> str:
-        """执行闭包绑定的工具逻辑。"""
+        """Skill 入口：`mcp__` 前缀走 MCP prompt，否则走本地 Skill 定义。"""
         skill_name = str(payload.get("skill", "")).strip().lstrip("/")
         args = str(payload.get("args", "")).strip()
         # MCP server 暴露的 prompt 复用同一个 Skill 入口，靠 mcp__ 前缀区分，
@@ -195,7 +195,7 @@ def _render_skill_content(content: str, args: str, argument_names: tuple[str, ..
 
 
 def _render_skill_hooks(hooks: dict[str, Any]) -> list[str]:
-    """Expose declarative skill hooks without executing arbitrary commands."""
+    """仅把声明式 hooks 渲染成文本说明，绝不执行（防任意代码执行）。"""
     # 刻意只把 hook 渲染成文本说明返回给模型，绝不在这里执行：
     # Skill 文件可由用户导入的 zip 提供，执行其中的命令等于任意代码执行。
     notes = []

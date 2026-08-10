@@ -1,4 +1,4 @@
-"""Internal request contract shared by the stateless Agent Backend components."""
+"""无状态 Agent Backend 组件共用的一次 run 入参契约。"""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from backend.api.schemas import ChatMessage
 
 @dataclass(frozen=True, slots=True)
 class AgentRunRequest:
-    """Complete, validated input for one stateless agent execution.
+    """一次无状态执行的完整、已校验输入。
 
-    All prompt/context preparation has already happened inside Agent Backend.
+    prompt/上下文已在 Agent Backend 内拼装完毕；本结构只携带执行所需字段。
     """
 
     messages: list[ChatMessage]

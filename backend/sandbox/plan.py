@@ -1,4 +1,8 @@
-"""Turn Bash tool calls into sandboxed `srt` invocations when possible."""
+"""把 Bash 工具调用规划成可沙箱的 `srt` 启动参数（若主机可用）。
+
+pipeline：`cc_like.Bash` → `plan_bash_invocation`；`required` 模式无后端则失败，
+`auto` 降级为非沙箱但必须把原因写回调用方，避免误判已隔离。
+"""
 
 from __future__ import annotations
 
@@ -20,15 +24,15 @@ logger = logging.getLogger(__name__)
 
 
 class SandboxUnavailable(RuntimeError):
-    """Raised when a sandbox is required but no usable backend exists."""
+    """沙箱为 required 但本机没有可用后端时抛出。"""
 
 
 @dataclass(frozen=True, slots=True)
 class BashInvocation:
-    """How the Bash tool should actually spawn a command."""
+    """Bash 工具实际应如何起进程。"""
 
     argv: list[str] | None
-    """Explicit argv for a sandboxed spawn, or None to fall back to the shell."""
+    """显式 argv（经 srt）；None 表示回落普通 shell。"""
 
     sandboxed: bool
     reason: str
@@ -41,7 +45,7 @@ def plan_bash_invocation(
     settings: Settings,
     network_access: bool | None = None,
 ) -> BashInvocation:
-    """Decide how to run one Bash command under the configured sandbox mode."""
+    """按 `bash_sandbox_mode` 决定本条命令走 srt 还是裸 shell。"""
 
     mode = settings.bash_sandbox_mode
     if mode == "off":
@@ -79,11 +83,9 @@ def build_settings_payload(
     settings: Settings,
     network_access: bool | None = None,
 ) -> dict:
-    """Translate backend settings into an srt settings document.
+    """把后端 Settings 译成 srt settings 文档。
 
-    srt denies writes and network by default and allows reads by default, so the
-    workspace is opened for writing while credential stores are closed for
-    reading.
+    srt 默认禁写/禁网、默认可读；因此开放工作区写入，并关掉凭证目录与 `.env` 读取。
     """
 
     allow_write = [str(workspace_root), tempfile.gettempdir()]
@@ -117,11 +119,9 @@ def build_settings_payload(
 def sanitize_srt_allowed_domains(
     configured: list[str] | tuple[str, ...],
 ) -> list[str]:
-    """Drop patterns srt rejects so Bash stays sandboxed.
+    """丢掉 srt 会拒的域名模式，避免校验失败导致整段沙箱被跳过。
 
-    Bare `*` and TLD-wide wildcards like `*.com` are invalid in srt's
-    allowedDomains. Ignoring them keeps the filesystem sandbox running instead
-    of failing config validation or skipping srt.
+    裸 `*`、`*.com` 这类过宽模式非法；忽略它们才能保住文件系统隔离。
     """
 
     cleaned: list[str] = []
@@ -143,7 +143,7 @@ def sanitize_srt_allowed_domains(
 
 
 def _is_srt_allowed_domain(value: str) -> bool:
-    """Mirror srt's domainPatternSchema enough to reject known-invalid entries."""
+    """对齐 srt domainPatternSchema，拒绝已知非法条目。"""
 
     if "://" in value or "/" in value or ":" in value:
         return False
@@ -164,11 +164,9 @@ def _is_srt_allowed_domain(value: str) -> bool:
 def _materialize_settings(
     *, workspace_root: Path, settings: Settings, network_access: bool | None
 ) -> Path:
-    """Write the srt settings document to a stable, content-addressed path.
+    """把 srt settings 写到内容寻址的稳定路径。
 
-    Keying the filename by content means concurrent runs with identical settings
-    share one file and a settings change produces a new one, so a command never
-    reads a file that another run is midway through rewriting.
+    同内容并发 run 共享同一文件；内容变更换新文件，避免读到半写状态。
     """
 
     payload = build_settings_payload(
@@ -187,7 +185,7 @@ def _materialize_settings(
 
 
 def _shell_path() -> str:
-    """Pick the shell used to interpret the model's command string."""
+    """选择解释模型命令字符串的 shell。"""
 
     for candidate in ("/bin/bash", "/bin/sh"):
         if Path(candidate).exists():

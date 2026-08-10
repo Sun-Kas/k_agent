@@ -1,4 +1,11 @@
-"""FastAPI routes for supervising durable Agent Teams from the workbench."""
+"""Agent Teams 公开 HTTP 路由：工作台监督持久化团队（状态在 Access Layer）。
+
+在请求链路中的角色：CRUD / 命令 / 任务 / 邮箱 / 事件查询与 SSE 订阅；
+调度与后端调用由 TeamRuntime 完成，本模块只绑定 FastAPI 与 TeamStore。
+
+服务边界：事件流通过轮询 SQLite 事件日志实现，以便 Access Layer 重启后
+仍可按 seq 续订，而不依赖进程内订阅者。
+"""
 
 from __future__ import annotations
 
@@ -19,7 +26,7 @@ from access_layer.teams.workspace import list_team_workspace, read_team_workspac
 
 
 def build_team_router(runtime: TeamRuntime) -> APIRouter:
-    """Bind API handlers to one application-owned Team Runtime instance."""
+    """把 `/api/teams*` 处理器绑定到应用拥有的 TeamRuntime（实际多用其 store）。"""
 
     router = APIRouter(prefix="/api/teams", tags=["agent-teams"])
 
@@ -110,8 +117,7 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
             raise HTTPException(status_code=404, detail="Team not found")
 
         async def event_stream():
-            # Polling the durable event log keeps reconnect semantics correct
-            # across Access Layer restarts and avoids process-local subscribers.
+            # 轮询持久事件日志：重启后续订语义正确，且不依赖进程内订阅者。
             cursor = max(0, afterSeq)
             idle_ticks = 0
             while not await request.is_disconnected():

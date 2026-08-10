@@ -1,4 +1,8 @@
-"""Run-scoped human approval coordination for every Agent runner."""
+"""按 run 挂起人类审批：把 approval 事件并入 live 流，决策后再唤醒工具调用。
+
+所有 Runner（k_agent / Codex / Claude Code）共用本经纪。`stream` 用独立 producer
+泵事件，使 HTTP 流能先下发审批卡片，而请求方仍阻塞在 Future 上。
+"""
 
 from __future__ import annotations
 
@@ -11,7 +15,7 @@ from typing import Any
 
 @dataclass(slots=True)
 class _PendingApproval:
-    """Internal waiter plus immutable routing metadata."""
+    """待决审批：Future + 不可变 threadId/runId，resolve 时必须三者齐全。"""
 
     request_id: str
     thread_id: str
@@ -20,15 +24,15 @@ class _PendingApproval:
 
 
 class ApprovalBroker:
-    """Multiplex approval requests into a live run and resume it after a decision.
+    """把审批请求复用进正在进行的 run，并在决策后恢复被挂起的工具调用。
 
-    The runner that requests approval is intentionally suspended on a Future.
-    A separate producer task pumps its event iterator, allowing the HTTP stream
-    to deliver the approval card while the tool call remains paused.
+    请求审批的 Runner 刻意阻塞在 Future 上；独立 producer 继续泵事件，
+    这样 HTTP 流能先把审批卡交给前端，工具调用本身仍保持暂停。
     """
 
     def __init__(self, *, timeout_seconds: float = 600.0) -> None:
         self._timeout_seconds = timeout_seconds
+        # (thread_id, run_id) → 合流队列；同 run 重复注册会拒绝，防止串流。
         self._queues: dict[tuple[str, str], asyncio.Queue[tuple[str, Any]]] = {}
         self._pending: dict[str, _PendingApproval] = {}
         self._lock = asyncio.Lock()
@@ -40,7 +44,7 @@ class ApprovalBroker:
         thread_id: str,
         run_id: str,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Merge runner events and approval lifecycle events in arrival order."""
+        """按到达顺序合并 Runner 事件与审批生命周期事件；流结束取消未决审批。"""
 
         key = (thread_id, run_id)
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -90,7 +94,7 @@ class ApprovalBroker:
         message: str,
         detail: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Publish one request and wait for the matching public API decision."""
+        """向当前 run 流发布 `approval_request`，阻塞直到公开 API resolve 或超时。"""
 
         request_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
@@ -134,7 +138,7 @@ class ApprovalBroker:
         run_id: str,
         decision: dict[str, Any],
     ) -> bool:
-        """Resolve a pending request only when all routing identifiers match."""
+        """仅当 requestId + threadId + runId 全匹配时完成 Future，防止跨 run 误唤醒。"""
 
         async with self._lock:
             pending = self._pending.get(request_id)
@@ -162,7 +166,7 @@ class ApprovalBroker:
             return True
 
     async def cancel_run(self, *, thread_id: str, run_id: str) -> None:
-        """Cancel unanswered approvals when their HTTP run stream closes."""
+        """HTTP 流关闭时取消该 run 上仍在等待的审批，避免 Future 泄漏。"""
 
         async with self._lock:
             for pending in tuple(self._pending.values()):

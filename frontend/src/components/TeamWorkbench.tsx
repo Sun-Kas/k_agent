@@ -1,3 +1,7 @@
+/**
+ * 多 Agent 团队工作台：拉快照 + 历史事件，再经 EventSource 按 seq 增量刷新。
+ * 主路径：选团队 → getTeam/getTeamEvents → subscribeTeamEvents → scheduleTeamRefresh。
+ */
 import {
   type CSSProperties,
   type KeyboardEvent,
@@ -162,8 +166,7 @@ export function TeamWorkbench({
     setSelectedWorkspacePath(null);
     lastSeqRef.current = 0;
     void getTeam(selectedTeamId).then(async (snapshot) => {
-      // Hydrate the newest durable window. Using afterSeq=last-N previously
-      // skipped the live tip because the API page size was smaller than N.
+      // 先拉持久化事件窗口再开流；from afterSeq=0 避免页大小小于 N 时漏掉 tip。
       const history = await getTeamEvents(selectedTeamId, 0, 2000);
       if (cancelled) return;
       setTeam(snapshot);
@@ -248,6 +251,7 @@ export function TeamWorkbench({
 
   useEffect(() => {
     if (!selectedTeamId || !team) return;
+    // 从 lastSeq 续订；新事件先入本地列表，再 debounce 拉最新 snapshot。
     return subscribeTeamEvents(
       selectedTeamId,
       lastSeqRef.current,

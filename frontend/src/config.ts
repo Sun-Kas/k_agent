@@ -1,11 +1,14 @@
+/**
+ * 前端运行时常量：API 基址、AG-UI 路径、SSE 帧约定、以及 UI 文案/状态文案。
+ */
 const configuredApiBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim();
 
 export const appConfig = {
-  // Development keeps Vite and Access Layer on separate loopback ports. A
-  // built client is served by Access Layer itself and therefore stays same-origin.
+  // 开发时 Vite 与 Access Layer 分端口；生产由 Access Layer 同源托管，基址留空。
   apiBaseUrl: configuredApiBaseUrl ?? (import.meta.env.DEV ? "http://localhost:3001" : ""),
   storageKey: import.meta.env.VITE_SESSION_STORAGE_KEY ?? "k-agent-session-id",
   agUiEndpoint: "/api/agent",
+  // SSE：帧以空行分隔，有效载荷在 `data: ` 前缀行（见 streamAgentRun / parseSseFrame）。
   sseMessageDelimiter: "\n\n",
   sseDataPrefix: "data: ",
   status: {

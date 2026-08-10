@@ -1,4 +1,8 @@
-"""Discover, parse, deduplicate, cache, and activate project and user Skills."""
+"""发现、解析、去重、缓存并按路径条件激活项目/用户 Skill。
+
+pipeline：拼 prompt / 绑定工具前经 `get_available_skills` 取常驻 Skill；
+模型触达匹配路径后 `activate_skills_for_paths` 激活条件 Skill 并重置 prompt 缓存。
+"""
 
 from __future__ import annotations
 
@@ -18,14 +22,14 @@ DATA_SKILLS_DIR: Path | None = None
 
 
 def skills_storage_dir() -> Path:
-    """Resolved Skill package root (`$K_AGENT_HOME/content/skills`)."""
+    """返回 Skill 包根目录（`$K_AGENT_HOME/content/skills`，测试可 patch）。"""
 
     return DATA_SKILLS_DIR if DATA_SKILLS_DIR is not None else skills_dir()
 
 
 @dataclass(frozen=True)
 class SkillDefinition:
-    """Parsed Skill metadata, instructions, and optional activation conditions."""
+    """单个 Skill 的元数据、正文指令与可选路径激活条件。"""
 
     id: str
     name: str
@@ -50,20 +54,15 @@ class SkillDefinition:
 
     @property
     def is_conditional(self) -> bool:
-        """判断 Skill 是否需要按路径条件触发。"""
+        """是否需路径命中后才进入模型可见集合。"""
         return bool(self.paths)
 
 
 class SkillRegistry:
-    """Caches always-visible skills and stores conditional skills separately.
-
-    This mirrors Claude Code's behavior: path-filtered skills do not pollute the
-    initial tool prompt. They become available only after the model/user touches
-    a matching file path, at which point prompt caches are cleared.
-    """
+    """区分常驻与条件 Skill：条件项不进初始工具 prompt，路径命中后再激活并清 prompt 缓存。"""
 
     def __init__(self) -> None:
-        """初始化对象依赖和内部状态。"""
+        """初始化无条件/条件/已激活三类表与可重入锁。"""
         # 这是进程级共享状态，可能被多个并发请求同时访问，用 RLock 而非
         # asyncio.Lock：加载过程是同步文件 IO，且 activate 内部会重入。
         self._lock = RLock()
@@ -74,14 +73,14 @@ class SkillRegistry:
         self._dynamic: dict[str, SkillDefinition] = {}
 
     def clear(self) -> None:
-        """清空当前对象维护的缓存或会话状态。"""
+        """清空无条件缓存、待激活与已激活 Skill 集合。"""
         with self._lock:
             self._cache.clear()
             self._conditional.clear()
             self._dynamic.clear()
 
     def get(self, cwd: Path) -> list[SkillDefinition]:
-        """读取或创建当前对象管理的条目。"""
+        """返回常驻可见 Skill（缓存命中则复用，否则从磁盘加载并分类）。"""
         key = str(skills_storage_dir().resolve())
         with self._lock:
             cached = self._cache.get(key)
@@ -123,7 +122,7 @@ SKILL_REGISTRY = SkillRegistry()
 
 
 def load_skill_registry(cwd: Path | None = None) -> list[SkillDefinition]:
-    """Return all unconditional and previously activated Skills."""
+    """返回无条件 Skill 与此前已激活的条件 Skill。"""
 
     return SKILL_REGISTRY.get((cwd or Path.cwd()).resolve())
 
@@ -134,13 +133,13 @@ def get_available_skills(cwd: Path | None = None) -> list[SkillDefinition]:
 
 
 def activate_skills_for_paths(paths: list[Path], cwd: Path | None = None) -> list[SkillDefinition]:
-    """Activate conditional Skills whose path rules match referenced files."""
+    """按触达路径激活条件 Skill，并在有变更时重置 prompt 缓存。"""
 
     return SKILL_REGISTRY.activate_for_paths(paths, (cwd or Path.cwd()).resolve())
 
 
 def clear_skill_caches(reason: str = "skills_cache_clear") -> None:
-    """清空全局 Skill 加载缓存。"""
+    """清空全局 Skill 注册表缓存，并同步重置 prompt 缓存。"""
     SKILL_REGISTRY.clear()
     reset_prompt_caches(reason)
 
@@ -152,7 +151,7 @@ def _load_all_skills(cwd: Path) -> list[SkillDefinition]:
 
 
 def _load_skills_dir(base_path: Path, source: str, loaded_from: str) -> list[SkillDefinition]:
-    """Load directory-format skills: skills/name/SKILL.md only."""
+    """扫描目录格式 Skill：仅识别 `skills/<name>/SKILL.md`。"""
     if not base_path.exists() or not base_path.is_dir():
         return []
     skills = []

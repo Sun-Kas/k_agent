@@ -1,4 +1,17 @@
-"""Persistent conversation session store and AG-UI event projection logic."""
+"""会话持久化与 AG-UI 事件投影：Access Layer 拥有对话真相源。
+
+在请求链路中的角色：
+- `save_run_start`：在会话锁保护下写入本轮 user 消息
+- `append_event`：消费后端 AG-UI 流，投影为可再输入的 messages，并按边界落盘
+- `cancel_run`：回滚本轮用户消息与半截流状态
+
+服务边界：
+- 存储布局 `sessions/{id}/{id}.json` + 同级 `workspace/`；本层拥有，后端无状态
+- 本类的 asyncio.Lock 只保护内存索引与落盘，不是 agent-run 互斥
+  （互斥在 RequestConcurrencyLimiter）
+- events 保留完整流；messages 只在 TEXT_MESSAGE_END / TOOL_CALL_RESULT 等
+  结构边界写入完整内容，避免半截 delta 进入下一轮上下文
+"""
 
 from __future__ import annotations
 
@@ -21,7 +34,7 @@ logger = logging.getLogger("k_agent.access_layer.sessions")
 
 @dataclass(slots=True)
 class SessionRecord:
-    """Persisted conversation state reconstructed from accepted AG-UI events."""
+    """由已接受 AG-UI 事件重建的持久化会话状态（messages / events / 能力选择等）。"""
 
     id: str
     title: str
@@ -38,15 +51,14 @@ class SessionRecord:
 
 
 class SessionStore:
-    """Session cache backed by the configured StorageBackend.
+    """基于 StorageBackend 的会话缓存与 AG-UI→messages 投影器。
 
-    This lock protects the in-memory index and persistence calls on the ASGI
-    event loop. It is not the agent-run session lock; request serialization by
-    session_id happens in RequestConcurrencyLimiter before execution starts.
+    `_lock` 保护 ASGI 事件循环上的内存索引与持久化调用。它不是 agent-run
+    会话锁；按 session_id 的请求串行化在 RequestConcurrencyLimiter 中完成。
     """
 
     def __init__(self, storage: StorageBackend | None = None) -> None:
-        """初始化对象依赖和内部状态。"""
+        """绑定存储后端，并初始化内存索引、缓冲与取消标记表。"""
         self._storage = storage
         self._sessions: dict[str, SessionRecord] = {}
         self._active_run_ids: dict[str, str] = {}
@@ -54,8 +66,7 @@ class SessionStore:
         self._cancelled_run_ids: set[tuple[str, str]] = set()
         self._cancelled_active_run_ids: dict[str, str] = {}
         self._text_buffers: dict[tuple[str, str], dict[str, Any]] = {}
-        # Tool calls are only complete once their result arrives, so the
-        # START/ARGS fragments are buffered until TOOL_CALL_RESULT pairs them.
+        # 工具调用须等 RESULT 才完整；START/ARGS 片段先缓冲，再成对写入。
         self._tool_call_buffers: dict[tuple[str, str], dict[str, Any]] = {}
         self._loaded = False
         self._lock = asyncio.Lock()
@@ -135,7 +146,7 @@ class SessionStore:
         mcp_server_ids: list[str],
         skill_ids: list[str],
     ) -> SessionRecord:
-        """保存本轮用户消息并清理该会话的旧文本缓冲。"""
+        """在拿到会话锁之后调用：合并本轮 user 消息、记录可回滚 ID、清旧缓冲。"""
         settings = await get_or_init_settings()
         async with self._lock:
             session = self._sessions[session_id]
@@ -161,7 +172,7 @@ class SessionStore:
             return session
 
     async def cancel_run(self, session_id: str, run_id: str) -> SessionRecord | None:
-        """Roll back the user turn and partial stream state for an aborted run."""
+        """中止一轮运行：回滚本轮首次接受的 user 消息，并丢弃该 run 的半截缓冲/事件。"""
         settings = await get_or_init_settings()
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -306,7 +317,7 @@ class SessionStore:
             return session
 
     async def get(self, session_id: str) -> SessionRecord | None:
-        """读取或创建当前对象管理的条目。"""
+        """按 id 读取已加载会话；不存在返回 None（不隐式创建）。"""
         await self._ensure_loaded()
         async with self._lock:
             return self._sessions.get(session_id)

@@ -1,4 +1,12 @@
-"""HTTP client for streaming requests from the access layer to the Agent Backend."""
+"""Access Layer → Agent Backend 的私有 HTTP 客户端。
+
+在请求链路中的角色：把公开网关 / Team Runtime 组装好的载荷 POST 到
+`/internal/agent/run`，以 NDJSON 流式回传 AG-UI 事件；配置/健康类接口
+走短超时的 JSON GET/POST。
+
+服务边界：仅访问 Agent Backend 的 `/internal/*`，不直接触达模型或工具；
+流式读超时关闭（read=None），避免长 agent run 被客户端提前掐断。
+"""
 
 from __future__ import annotations
 
@@ -10,15 +18,17 @@ import httpx
 
 
 class AgentBackendClient:
-    """Streaming client for the separate, stateless Agent Backend service."""
+    """面向独立、无状态 Agent Backend 的流式 HTTP 客户端。"""
 
     def __init__(self, base_url: str) -> None:
-        """初始化对象依赖和内部状态。"""
+        """记录后端基址；每次调用新建 AsyncClient，避免跨请求共享连接状态。"""
         self._base_url = base_url.rstrip("/")
 
     async def stream(self, payload: dict[str, Any], request_id: str) -> AsyncIterator[dict[str, Any]]:
-        """Yield decoded backend events without buffering the complete agent run."""
+        """流式读取 `/internal/agent/run` 的 NDJSON 事件，不缓冲整次运行结果。
 
+        `X-Request-Id` 透传以便两端日志关联；read 超时关闭以支持长时间工具调用。
+        """
         timeout = httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream(
@@ -41,8 +51,7 @@ class AgentBackendClient:
                         yield json.loads(line)
 
     async def health(self) -> bool:
-        """Return whether the private Agent Backend answers its health endpoint."""
-
+        """探测私有 `/internal/health`；网络/非 200 均视为不可用。"""
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
                 response = await client.get(f"{self._base_url}/internal/health")
@@ -51,7 +60,7 @@ class AgentBackendClient:
             return False
 
     async def get_json(self, path: str) -> dict[str, Any]:
-        """说明 get_json 在当前模块中的具体职责。"""
+        """GET 私有控制面 JSON（如 runtime status / MCP capabilities）。"""
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(f"{self._base_url}{path}")
         response.raise_for_status()
@@ -60,11 +69,11 @@ class AgentBackendClient:
     async def post_json(
         self, path: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """POST private control-plane operations such as MCP reloads."""
+        """POST 私有控制面操作（如 MCP reload、approval、prompt reset）。
 
-        # A cold STDIO MCP start can include an uvx/npx package download. Keep
-        # this above the backend's per-server timeout so reload is not cancelled
-        # at the access-layer boundary after the configuration was already saved.
+        超时刻意高于后端单 server 启动时间：冷启动 STDIO MCP 可能含 uvx/npx
+        下载；配置已在接入层落盘后，不应因本客户端过早取消而留下不一致状态。
+        """
         async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(
                 f"{self._base_url}{path}", json=payload or {}

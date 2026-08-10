@@ -1,10 +1,7 @@
-"""Process-wide reuse of MCP connections across stateless agent runs.
+"""跨无状态 Agent run 复用 MCP 连接，避免每轮冷启动 uvx/npx。
 
-Each run receives a self-contained server list from the Access Layer, so a
-naive implementation spawns and tears down a stdio child process (often an
-uvx/npx cold start) on every turn. The pool keys live sessions by their
-connection settings: identical settings reuse one connection, changed settings
-produce a new one, and nothing conversational is shared between runs.
+Access Layer 每轮下发自包含 server 列表；朴素实现会每轮起停 stdio 子进程。
+池按连接设置指纹键控：相同设置复用，变更则新建；对话内容绝不跨 run 共享。
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ DEFAULT_IDLE_TTL_SECONDS = 600.0
 
 
 def fingerprint_config(config: McpServerConfig) -> str:
-    """Derive a stable key from everything that affects the connection itself."""
+    """从一切影响连接本身的字段推导稳定池键。"""
 
     payload = json.dumps(
         {
@@ -46,7 +43,7 @@ def fingerprint_config(config: McpServerConfig) -> str:
 
 @dataclass(slots=True)
 class _PooledSession:
-    """One reusable connection plus the bookkeeping that decides its fate."""
+    """一条可复用连接 + 决定其去留的租约/空闲记账。"""
 
     config: McpServerConfig
     session: McpSession
@@ -57,10 +54,10 @@ class _PooledSession:
 
 
 class McpSessionPool:
-    """Lease MCP sessions to request-scoped managers instead of reconnecting."""
+    """把 MCP 会话租给请求级 manager，而不是每轮重连。"""
 
     def __init__(self, *, idle_ttl_seconds: float = DEFAULT_IDLE_TTL_SECONDS) -> None:
-        """初始化对象依赖和内部状态。"""
+        """idle TTL 控制无租约会话何时被驱逐。"""
         self._idle_ttl_seconds = idle_ttl_seconds
         self._entries: dict[str, _PooledSession] = {}
         self._lock = asyncio.Lock()
@@ -71,7 +68,7 @@ class McpSessionPool:
         *,
         connect_timeout_seconds: float,
     ) -> tuple[str, McpSession]:
-        """Return a connected session for this configuration, reusing when possible."""
+        """返回该配置下已连接的会话；冷启动时用 per-entry 锁防重复拉起子进程。"""
 
         fingerprint = fingerprint_config(config)
         async with self._lock:
@@ -97,7 +94,7 @@ class McpSessionPool:
         return fingerprint, entry.session
 
     async def release(self, fingerprint: str, *, healthy: bool = True) -> None:
-        """Return a leased session to the pool, closing it when unusable."""
+        """归还租约；不健康则标记 retire，无租约时真正关闭。"""
 
         async with self._lock:
             entry = self._entries.get(fingerprint)
@@ -113,10 +110,9 @@ class McpSessionPool:
         await self._close_entry(entry)
 
     async def close_all(self, *, force: bool = False) -> None:
-        """Close idle sessions now and retire leased ones as their runs finish.
+        """立刻关闭空闲会话；仍有租约的标记 retire，等 run 结束再关。
 
-        Forcing is only correct at shutdown: closing a session that an in-flight
-        run still holds would fail that run's remaining tool calls.
+        `force=True` 仅适合进程关闭：强关仍在使用的会话会让进行中工具调用失败。
         """
 
         async with self._lock:
@@ -131,7 +127,7 @@ class McpSessionPool:
             await self._close_entry(entry)
 
     async def stats(self) -> dict[str, int]:
-        """Expose pool occupancy for health and debugging endpoints."""
+        """健康/调试端点用的池占用统计。"""
 
         async with self._lock:
             return {
@@ -142,7 +138,7 @@ class McpSessionPool:
             }
 
     async def _evict_idle_locked(self) -> None:
-        """Drop unleased sessions that outlived the idle window."""
+        """丢掉超过空闲窗口且无租约的会话。"""
 
         deadline = time.monotonic() - self._idle_ttl_seconds
         stale = [
@@ -158,7 +154,7 @@ class McpSessionPool:
 
     @staticmethod
     async def _close_entry(entry: _PooledSession) -> None:
-        """Close one pooled session without letting failures leak to callers."""
+        """关闭一条池内会话；失败吞掉，避免泄漏到调用方。"""
 
         try:
             await entry.session.close()

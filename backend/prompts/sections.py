@@ -1,4 +1,4 @@
-"""Reusable prompt sections and a fingerprint-keyed section cache."""
+"""可复用的 prompt 区块，以及按指纹键控的进程内 section 缓存。"""
 
 from __future__ import annotations
 
@@ -15,25 +15,24 @@ class PromptSection:
 
 
 class PromptSectionCache:
-    """Small in-process cache for stable prompt sections.
+    """稳定 prompt 区块的小进程内缓存。
 
-    Dynamic sections such as connected MCP tools should be rebuilt every request;
-    static sections can be reused until settings or memory state changes.
+    已连接 MCP 工具等动态区块应每请求重建；静态区块可复用到设置/记忆变更。
     """
 
     def __init__(self) -> None:
-        """初始化对象依赖和内部状态。"""
+        """空缓存表；键为 `(section_name, fingerprint)`。"""
         self._cache: dict[tuple[str, str], str] = {}
 
     def get(self, name: str, fingerprint: str, compute: Callable[[], str]) -> str:
-        """读取或创建当前对象管理的条目。"""
+        """指纹命中则复用，否则调用 `compute` 并写入。"""
         key = (name, fingerprint)
         if key not in self._cache:
             self._cache[key] = compute()
         return self._cache[key]
 
     def clear(self) -> None:
-        """清空当前对象维护的缓存或会话状态。"""
+        """清空全部 section 缓存（配合 prompt lifecycle reset）。"""
         self._cache.clear()
 
 

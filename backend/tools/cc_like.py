@@ -1,4 +1,8 @@
-"""Workspace-scoped file, search, shell, and task-list tools for the agent."""
+"""工作区作用域的文件/搜索/Shell/任务列表工具（Claude Code 风格）。
+
+所有路径经 `_resolve_workspace_path` 限制在 ContextVar 绑定的 workspace 内；
+Bash 再交给 sandbox 规划是否走 `srt`。
+"""
 
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ from backend.tools.workspace import current_tool_network_access, current_tool_wo
 
 
 async def _workspace_root() -> Path:
-    """返回当前工作区根目录。"""
+    """当前 ContextVar 绑定的工作区；未绑定时回落 Settings 配置根。"""
     scoped = current_tool_workspace()
     if scoped is not None:
         return scoped
@@ -72,7 +76,7 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
 
 
 async def cc_read(payload: dict[str, Any]) -> str:
-    """Read a bounded UTF-8 representation of a workspace file."""
+    """读取工作区内文件的有界 UTF-8 表示。"""
 
     path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
     if not path.exists():

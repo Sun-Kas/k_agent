@@ -1,4 +1,4 @@
-"""Lookup table from agentKind → runner implementation."""
+"""agentKind → Runner 工厂表；进程内注册，Runner 本身仍按请求新建、无状态。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from backend.runners.k_agent import KAgentRunner
 
 
 class RunnerRegistry:
-    """Process-local registry; runners themselves stay request-scoped/stateless."""
+    """进程级 kind 查找表；`get` 每次调用 factory()，避免跨 run 复用实例状态。"""
 
     def __init__(self) -> None:
         self._factories: dict[AgentKind, RunnerFactory] = {}
@@ -30,6 +30,7 @@ class RunnerRegistry:
 
 
 def build_default_registry() -> RunnerRegistry:
+    """注册内置 k_agent / codex / claude_code 三种 Runner。"""
     registry = RunnerRegistry()
     registry.register("k_agent", KAgentRunner)
     registry.register("codex", CodexRunner)

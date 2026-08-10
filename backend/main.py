@@ -1,4 +1,9 @@
-"""Private Agent Backend: owns integrations, prompts, context and AG-UI events."""
+"""私有 Agent Backend HTTP 服务：无会话状态，只负责单次 run 的模型/工具执行与 AG-UI 流。
+
+Access Layer 持有会话与并发；本进程按请求组装 Runner、MCP、workspace/env，
+把内部事件翻译成 AG-UI NDJSON 后返回。进程级只缓存 MCP 连接池、审批经纪与
+prompt 失效监听，不在请求间保留对话内容。
+"""
 
 from __future__ import annotations
 
@@ -57,7 +62,7 @@ from backend.watchers import PollingChangeWatcher
 
 
 class AgentBackendRunInput(BaseModel):
-    """Only conversation history and runtime selections cross the service boundary."""
+    """跨服务边界的唯一入参：对话历史 + 本轮选中的模型/MCP/Skill/工作区等。"""
 
     thread_id: str = Field(alias="threadId")
     run_id: str = Field(alias="runId")
@@ -77,7 +82,7 @@ class AgentBackendRunInput(BaseModel):
 
 
 def _team_workspace(raw_path: str | None) -> Path | None:
-    """Validate that a Team-provided cwd stays inside the Team state root."""
+    """校验 Team 传入的 cwd 必须落在 `$K_AGENT_HOME/state/teams` 内，防止越权写盘。"""
 
     if not raw_path:
         return None
@@ -94,7 +99,7 @@ def _team_workspace(raw_path: str | None) -> Path | None:
 
 
 def _resolve_run_workspace(thread_id: str, raw_path: str | None) -> Path:
-    """Prefer Team cwd when provided; otherwise use the session collaboration dir."""
+    """优先用 Team 任务目录；普通对话则回落到 session workspace。"""
 
     team_workspace = _team_workspace(raw_path)
     if team_workspace is not None:
@@ -105,14 +110,14 @@ def _resolve_run_workspace(thread_id: str, raw_path: str | None) -> Path:
 
 
 def create_app() -> FastAPI:
-    """创建 FastAPI 应用并注册服务路由。"""
+    """组装 Agent Backend：内部健康/能力探测 + `/internal/agent/run` AG-UI 流。"""
     settings = Settings()
     configure_agent_backend_logging(settings.agent_backend_log_level)
     runner_registry = build_default_registry()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """管理应用启动和关闭时的资源生命周期。"""
+        """启动时预热 home/MCP/Langfuse；关闭时停 watcher 并强制回收连接池。"""
         log_event(
             "service.starting",
             host=settings.agent_backend_host,
@@ -126,8 +131,8 @@ def create_app() -> FastAPI:
         app.state.mcp_pool = McpSessionPool(
             idle_ttl_seconds=settings.mcp_session_idle_ttl_seconds
         )
-        # The startup manager shares the pool with agent runs, so servers warmed
-        # here are already connected when the first request selects them.
+        # 启动时的 manager 与 agent run 共用连接池，预热过的 server
+        # 在首个请求选中时往往已经连上。
         manager = await load_mcp_manager(app.state.mcp_pool)
         await manager.connect_all()
         app.state.mcp_manager = manager
@@ -168,12 +173,11 @@ def create_app() -> FastAPI:
 
     @app.get("/internal/health")
     async def health() -> dict[str, Any]:
-        """返回当前私有服务健康状态。"""
+        """进程存活探针；顺带暴露 MCP 池占用与 bash sandbox 能力。"""
         return {
             "ok": True,
             "service": "agent-backend",
-            # Agent runs carry no conversation state between requests. Integration
-            # connections and caches are pooled per process, hence the qualifier.
+            # Agent run 在请求间不携带对话状态。集成连接与缓存按进程池化，故有此限定。
             "stateless": "runs",
             "mcpPool": await app.state.mcp_pool.stats(),
             "langfuse": app.state.langfuse.status(),
@@ -182,13 +186,13 @@ def create_app() -> FastAPI:
 
     @app.get("/internal/agents")
     async def list_agents() -> dict[str, Any]:
-        """Detect built-in and local CLI agents available on this host."""
+        """探测本机可用的内置/CLI Agent（k_agent、codex、claude_code 等）。"""
 
         return await detect_agents_payload()
 
     @app.get("/internal/runtime/status")
     async def runtime_status() -> dict[str, Any]:
-        """返回本地工具和 MCP 工具的运行时统计。"""
+        """本地工具数量 + 各 MCP server 连接态，供 Access Layer 展示运行时。"""
         local_tools = await load_local_tools()
         mcp_tools = await app.state.mcp_manager.list_tools()
         return {
@@ -202,7 +206,7 @@ def create_app() -> FastAPI:
 
     @app.get("/internal/mcp/capabilities")
     async def mcp_capabilities() -> dict[str, Any]:
-        """返回 MCP tools/resources/prompts 能力清单。"""
+        """枚举已连接 MCP 的 tools/resources/prompts，供前端能力面板使用。"""
         manager = app.state.mcp_manager
         return {
             "tools": [asdict(tool) for tool in await manager.list_tools()],
@@ -212,12 +216,12 @@ def create_app() -> FastAPI:
 
     @app.post("/internal/mcp/reload")
     async def reload_mcp() -> dict[str, Any]:
-        """代理触发 Agent Backend 重新加载 MCP 连接。"""
+        """运维入口：关闭旧 manager+池内会话后按最新配置全量重连。"""
         log_event("mcp.reload.started")
         previous = app.state.mcp_manager
         await previous.close_all()
-        # Reload is also the operator's "reconnect everything" button, so pooled
-        # sessions are retired first instead of being handed to the new manager.
+        # Reload 也是运维的「全部重连」按钮：先退役池内会话，
+        # 再交给新 manager，而不是把旧连接直接移交。
         await app.state.mcp_pool.close_all()
         manager = await load_mcp_manager(app.state.mcp_pool)
         await manager.connect_all()
@@ -232,11 +236,10 @@ def create_app() -> FastAPI:
 
     @app.post("/internal/prompt/reset")
     async def reset_prompt_cache() -> dict[str, Any]:
-        """Drop cached prompt sections and memory.
+        """丢弃进程内 prompt section / memory 缓存。
 
-        Skills themselves are not reloaded here: the Access Layer sends resolved
-        skill definitions with each run, so there is no backend skill registry
-        left to refresh.
+        Skill 不在此重载：Access Layer 每轮随请求下发已解析定义，
+        Backend 没有独立的 Skill 注册表可刷新。
         """
 
         reset_prompt_caches("agent_backend_prompt_reset")
@@ -244,7 +247,7 @@ def create_app() -> FastAPI:
 
     @app.get("/internal/prompt/context")
     async def prompt_context() -> dict[str, Any]:
-        """返回 Agent Backend 当前 prompt 构建状态。"""
+        """调试用：当前 prompt 生命周期代数与拼装后的上下文键。"""
         manager = app.state.mcp_manager
         mcp_tools = await manager.list_tools()
         mcp_prompts = await manager.list_prompts()
@@ -265,11 +268,11 @@ def create_app() -> FastAPI:
 
     @app.post("/internal/agent/run")
     async def run_agent(payload: AgentBackendRunInput, request: Request) -> StreamingResponse:
-        """执行一次内部 Agent run 并输出 AG-UI NDJSON 流。"""
+        """核心入口：按 agentKind 选 Runner，经 ApprovalBroker 合流后输出 AG-UI NDJSON。"""
         async def internal_events():
             # 每次 run 只消费 Access Layer 已解析的 MCP/Skill 定义；
             # Agent Backend 不读取列表 JSON，也不扫描 Skill 目录。
-            """生成 Agent 内部事件流。"""
+            """绑定 workspace/网络/共享 runtime env，驱动 Runner 并产出内部事件。"""
             request_id = request.headers.get("x-request-id", "")
             stream_started_at = time.perf_counter()
             logging_callback = AgentBackendLoggingCallback(
@@ -312,8 +315,8 @@ def create_app() -> FastAPI:
             )
             workspace_token = set_tool_workspace(ctx.workspace_dir)
             network_token = set_tool_network_access(network_access_enabled(ctx))
-            # One project-wide Node/npm prefix for chat and Team runs. Explicit
-            # agentOptions.toolEnv wins on conflicting keys.
+            # 全项目一份 Node/npm 前缀，对话与 Team 共用。冲突键以
+            # agentOptions.toolEnv 为准。
             runtime = ensure_shared_runtime()
             if ctx.workspace_dir is not None:
                 link_shared_runtime(ctx.workspace_dir, runtime)
@@ -379,7 +382,7 @@ def create_app() -> FastAPI:
         async def agui_stream():
             # Agent 内部事件在这里统一转换为 AG-UI。HTTP 边界之后只允许
             # 标准 start/content/end/result 事件，前端按到达顺序渲染即可。
-            """把内部事件转换为 AG-UI NDJSON 流。"""
+            """`translate_agent_events` → 逐行 JSON，媒体类型 application/x-ndjson。"""
             async for event in translate_agent_events(
                 internal_events(),
                 thread_id=payload.thread_id,
@@ -411,7 +414,7 @@ def create_app() -> FastAPI:
     async def resolve_approval(
         request_id: str, payload: ApprovalResolutionInput
     ) -> dict[str, Any]:
-        """Resume a suspended Agent run after validating its routing scope."""
+        """人类审批回调：校验 threadId/runId 后唤醒挂起的工具调用。"""
 
         resolved = await app.state.approvals.resolve(
             request_id,

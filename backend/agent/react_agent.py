@@ -1,4 +1,9 @@
-"""Streaming tool-using agent loop backed by an OpenAI-compatible chat API."""
+"""OpenAI 兼容聊天 API 上的流式 React 主循环（模型 ↔ 工具交替）。
+
+pipeline 核心：`KAgentRunner` 交给本模块；产出 thinking/message/tool/trace/final
+内部事件，再由 `agui` 转 AG-UI。可变状态全部放在 `run_stream` 局部变量，
+实例可并发服务多轮而不串味。
+"""
 
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ from backend.tools import ToolDefinition, validate_tool_arguments
 
 
 class OpenAIAgent:
-    """Execute a bounded model/tool loop and emit transport-neutral run events."""
+    """有界模型/工具循环；发出与传输无关的内部 run 事件。"""
 
     def __init__(
         self,
@@ -56,26 +61,24 @@ class OpenAIAgent:
             Awaitable[dict[str, Any]],
         ] | None = None,
     ):
-        """初始化对象依赖和内部状态。"""
+        """注入本轮工具、MCP manager、回调与审批钩子；不持有会话历史。"""
         if not config:
             config = Settings()
         self.config = config
         self.tools = tools
         self.mcp_client_manager = mcp_client_manager
         self.callbacks = callbacks or []
-        # Only aliases selected for this request may resolve to the canonical
-        # Skill tool. Arbitrary unknown function names still fail closed.
+        # 只有本轮选中的 Skill 别名才能解析到规范 Skill 工具；未知函数名一律失败关闭。
         self.skills = list(skills or [])
         self.approval_handler = approval_handler
-        # Session approval means the rest of this Agent run. Durable permission
-        # changes still belong in the explicit permission-rules configuration.
+        # 「本次会话记住」只覆盖本 Agent run 剩余时间；持久权限变更仍走规则文件。
         self._approved_targets: set[str] = set()
 
     async def run(
         self,
         request: AgentRunRequest,
     ) -> dict[str, Any]:
-        """Consume a streaming run and return only its final state payload."""
+        """消费流式 run，只返回最终 `final` 载荷（非流式调用方用）。"""
 
         final_state = None
         async for event in self.run_stream(request):
@@ -89,7 +92,7 @@ class OpenAIAgent:
         self,
         request: AgentRunRequest,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield observable thinking, message, tool, trace, and final events."""
+        """主循环：上下文预算 → 模型调用 → 权限/工具 → 直到无工具或达迭代上限。"""
 
         # 本次 run 的全部可变状态都是这里的局部变量，不挂在 self 上：
         # 同一个 OpenAIAgent 实例可能被并发调用，实例级状态会导致会话串味。
@@ -541,7 +544,7 @@ class OpenAIAgent:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> str:
-        """Execute one tool and convert its exceptions into model-visible results."""
+        """执行单个工具；异常转成模型可见结果，避免整轮 run 中断。"""
 
         try:
             return await self._execute_tool(
@@ -570,7 +573,7 @@ class OpenAIAgent:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> str:
-        """Execute a validated local or MCP tool; callers own recovery."""
+        """执行已校验的本地或 MCP 工具；调用方负责可恢复错误包装。"""
 
         local_tool = next((tool for tool in self.tools if tool.name == tool_name), None)
         selected_skill = self._selected_skill(tool_name)
@@ -671,7 +674,7 @@ class OpenAIAgent:
         decision: PermissionDecision,
         detail: dict[str, Any],
     ) -> None:
-        """Enforce deny rules and suspend ask rules for a human decision."""
+        """执行权限：deny 立即失败；ask 经 approval_handler 挂起等人决策。"""
 
         if decision.behavior == "allow" or target in self._approved_targets:
             return
@@ -688,7 +691,7 @@ class OpenAIAgent:
 
     @staticmethod
     def _enforce_skill_allowlist(context: AgentRunContext, tool_name: str) -> None:
-        """Apply the allowed-tools restriction declared by an invoked Skill."""
+        """应用已调用 Skill 声明的 allowedTools 白名单。"""
 
         allowlist = context.skill_allowlist
         if allowlist is None or tool_name in allowlist:
@@ -701,11 +704,10 @@ class OpenAIAgent:
 
     @staticmethod
     def _activate_skill_allowlist(context: AgentRunContext, result: str) -> None:
-        """Latch a skill's allowedTools for the rest of this run.
+        """把 Skill 返回的 allowedTools 闩到本 run 剩余生命周期。
 
-        The Skill tool only returns instructions, so the skill stays in effect
-        until the run ends. Declaring allowedTools previously had no effect at
-        all, which made the field misleading in both the UI and the model's view.
+        Skill 工具只回指令文本，白名单在 run 结束前一直生效；此前该字段
+        若未闩住会对 UI 与模型都形成误导。
         """
 
         try:

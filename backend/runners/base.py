@@ -1,7 +1,7 @@
-"""Pluggable agent runners behind `/internal/agent/run`.
+"""可插拔 Agent Runner 契约：`/internal/agent/run` 按 agentKind 调度。
 
-Each runner yields the same internal event dialect as `OpenAIAgent` so the
-existing AG-UI translator stays the single wire-format boundary.
+每种 Runner 必须产出与 `OpenAIAgent` 相同的内部事件方言，
+这样 `agui.translate_agent_events` 仍是唯一的线协议边界。
 """
 
 from __future__ import annotations
@@ -18,13 +18,13 @@ from backend.mcp_tool import McpSessionPool
 from backend.observability import LangfuseRuntime
 
 
-# Extensible string kinds; built-ins are registered in `registry.py`.
+# 可扩展的字符串 kind；内置实现在 `registry.py` 注册。
 AgentKind = str
 
 
 @dataclass(frozen=True, slots=True)
 class RunnerContext:
-    """Per-run inputs shared by every agent backend implementation."""
+    """单次 run 的共享入参；所有后端实现只读这份上下文，不跨请求保留状态。"""
 
     thread_id: str
     run_id: str
@@ -35,8 +35,7 @@ class RunnerContext:
     skills: list[dict[str, Any]]
     reasoning_effort: str | None
     attachments: list[dict[str, Any]]
-    # Team runs receive a per-task workspace via workspaceDir. Conversation
-    # runs leave it unset so the backend falls back to the session workspace.
+    # Team 跑法经 workspaceDir 下发任务级目录；普通对话留空，回落 session workspace。
     workspace_dir: Path | None = None
     team_id: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
@@ -48,12 +47,12 @@ class RunnerContext:
 
 
 class AgentRunner(Protocol):
-    """Stateless executor that streams internal agent events for one turn."""
+    """无状态执行器：吃掉 RunnerContext，流式产出内部 `{type,payload}` 事件。"""
 
     kind: AgentKind
 
     async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
-        """Yield internal events consumed by `translate_agent_events`."""
+        """产出供 `translate_agent_events` 消费的内部事件。"""
 
         ...
 

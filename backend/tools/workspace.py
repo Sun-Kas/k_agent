@@ -1,4 +1,4 @@
-"""Request-scoped workspace boundary for local file and shell tools."""
+"""请求级工作区与出网策略：用 ContextVar 绑定，避免改全局 Settings。"""
 
 from __future__ import annotations
 
@@ -15,36 +15,36 @@ _network_access: ContextVar[bool | None] = ContextVar(
 
 
 def set_tool_workspace(path: Path | None) -> Token[Path | None]:
-    """Bind a workspace to the current Agent run without mutating global settings."""
+    """把工作区绑到当前异步上下文；run 结束必须 `reset_tool_workspace`。"""
 
     return _workspace_root.set(path.resolve() if path is not None else None)
 
 
 def reset_tool_workspace(token: Token[Path | None]) -> None:
-    """Restore the prior workspace when a streamed run closes."""
+    """流式 run 关闭时恢复先前的 workspace ContextVar。"""
 
     _workspace_root.reset(token)
 
 
 def current_tool_workspace() -> Path | None:
-    """Return the workspace inherited by tools in the current async context."""
+    """本地工具继承的当前异步上下文工作区。"""
 
     return _workspace_root.get()
 
 
 def set_tool_network_access(enabled: bool) -> Token[bool | None]:
-    """Bind the run's outbound policy for Bash without mutating Settings."""
+    """为本轮 Bash 绑定出网策略覆盖，不改 Settings。"""
 
     return _network_access.set(enabled)
 
 
 def reset_tool_network_access(token: Token[bool | None]) -> None:
-    """Restore the previous async-context network policy."""
+    """恢复先前的异步上下文出网策略。"""
 
     _network_access.reset(token)
 
 
 def current_tool_network_access() -> bool | None:
-    """Return the run override inherited by request-scoped local tools."""
+    """本轮对本地工具生效的出网覆盖；None 表示沿用 Settings 默认。"""
 
     return _network_access.get()

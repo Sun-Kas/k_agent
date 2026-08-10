@@ -1,4 +1,14 @@
-"""Background scheduler that turns durable Team tasks into isolated Agent runs."""
+"""后台调度器：把持久化 Team 任务变成隔离的 Agent Backend 运行。
+
+在请求链路中的角色：Access Layer lifespan 启动 `_scheduler_loop`；通过
+SQLite lease 认领 supervisor job / worker task，组装自包含载荷后调用
+`AgentBackendClient.stream`，再把输出投影为 Team 事件与 Artifact。
+
+服务边界：
+- 真相源是 TeamStore（SQLite）；任务目录/manifest 仅为可读镜像
+- 主管决策是控制面：故意不带 MCP/Skill 副作用权限
+- Artifact 先 stage 再 replace 发布到团队 workspace；依赖缓存不得进入交付树
+"""
 
 from __future__ import annotations
 
@@ -28,10 +38,9 @@ from backend.home import (
 
 logger = logging.getLogger("k_agent.access.team_runtime")
 
-# Deliverable trees are source snapshots. Dependency installs and tool caches
-# must not ship with Artifacts. Built output dirs like dist/ are allowed when
-# that is the intentional deliverable. Shared tooling lives under `.runtime/`
-# (sibling of output/), never inside the published tree.
+# 交付树是源码快照：依赖安装与工具缓存不得随 Artifact 发布。
+# dist/ 等构建产物在明确作为交付物时可保留。共享工具在 `.runtime/`
+#（与 output/ 同级），永不进入已发布树。
 _ARTIFACT_COPY_IGNORE = shutil.ignore_patterns(
     ".team-input",
     ".runtime",
@@ -54,7 +63,7 @@ _ARTIFACT_COPY_IGNORE = shutil.ignore_patterns(
 
 
 class TeamRuntime:
-    """Dispatch dependency-ready tasks while preserving Team state in SQLite."""
+    """在保留 SQLite Team 状态的前提下，调度依赖已就绪的任务与主管决策。"""
 
     def __init__(
         self,
@@ -66,6 +75,7 @@ class TeamRuntime:
         task_lease_seconds: int = 120,
         enabled: bool = True,
     ) -> None:
+        """注入 Store/后端客户端/目录，并配置全局并发信号量与 lease 时长。"""
         self.store = store
         self._backend_client = backend_client
         self._runtime_catalog = runtime_catalog
@@ -77,7 +87,7 @@ class TeamRuntime:
         self._stopping = False
 
     async def start(self) -> None:
-        """Start one process-local dispatcher after the durable store is ready."""
+        """初始化 Store、回收过期 lease，并启动本进程唯一的调度循环。"""
 
         await self.store.initialize()
         await self.store.recover_expired_leases()
@@ -90,7 +100,7 @@ class TeamRuntime:
         )
 
     async def stop(self) -> None:
-        """Stop dispatching and cancel only process-owned active HTTP streams."""
+        """停止调度，并只取消本进程持有的活跃 HTTP 流任务。"""
 
         self._stopping = True
         if self._scheduler_task is not None:
@@ -105,7 +115,7 @@ class TeamRuntime:
         self._active.clear()
 
     async def _scheduler_loop(self) -> None:
-        """Poll durable state; SQLite leases make the loop restart-safe."""
+        """轮询持久状态；SQLite lease 使循环在进程重启后可安全恢复。"""
 
         while not self._stopping:
             try:
@@ -118,9 +128,8 @@ class TeamRuntime:
             await asyncio.sleep(0.5)
 
     async def _dispatch_team(self, team_id: str) -> None:
-        # A Team has its own maxParallel and the global semaphore bounds total
-        # provider pressure. Claiming happens before spawning so two loops can
-        # never dispatch the same task.
+        # 团队有 maxParallel，全局 semaphore 限制总 provider 压力。
+        # 先 claim 再 spawn，避免两次循环派发同一任务。
         supervisor_key = f"supervisor:{team_id}"
         if supervisor_key in self._active:
             return
@@ -221,7 +230,7 @@ class TeamRuntime:
                 await self.store.fail_task(team_id, task_id, agent_id, str(exc))
 
     async def _run_supervisor(self, control: dict[str, Any]) -> None:
-        """Wake the manager only at a durable scheduling boundary."""
+        """仅在持久化调度边界唤醒主管；决策后先 stage Artifact 再提交状态。"""
 
         team = control["team"]
         job = control["job"]

@@ -1,4 +1,9 @@
-"""Polling watcher used to invalidate runtime state when configuration files change."""
+"""轮询监听配置/记忆相关路径，发现变更后触发运行时缓存失效。
+
+pipeline：Backend lifespan 启动 `PollingChangeWatcher`，回调接到
+`reset_prompt_caches`；在下一次拼 prompt 前清空 section/memory 缓存。
+不引入原生 FS 事件依赖，只轮询少量路径；任一变化即保守失效。
+"""
 
 from __future__ import annotations
 
@@ -10,20 +15,15 @@ from typing import Callable
 
 @dataclass
 class WatchedPathState:
-    """保存一个监听路径的最近修改时间。"""
+    """保存监听路径集合的最近 mtime 快照，供轮询对比。"""
     mtimes: dict[str, float | None] = field(default_factory=dict)
 
 
 class PollingChangeWatcher:
-    """Small polling watcher for prompt-affecting files.
-
-    Claude Code uses richer app/runtime hooks. In this backend we avoid adding a
-    native filesystem dependency and instead poll a tiny set of config/memory
-    paths. The watcher is conservative: any observed change clears caches.
-    """
+    """对 prompt 相关文件做轻量轮询；相对原生 FS hook，依赖更少、行为更保守。"""
 
     def __init__(self, roots: list[Path], on_change: Callable[[str], None], interval_seconds: float = 1.5):
-        """初始化对象依赖和内部状态。"""
+        """绑定监听根路径、变更回调与轮询间隔，并准备空快照状态。"""
         self.roots = roots
         self.on_change = on_change
         self.interval_seconds = interval_seconds
@@ -32,19 +32,19 @@ class PollingChangeWatcher:
         self._stop = asyncio.Event()
 
     def start(self) -> None:
-        """启动后台轮询监听任务。"""
+        """启动后台轮询任务（幂等：已启动则忽略）。"""
         if self._task is None:
             self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        """停止后台轮询监听任务。"""
+        """发出停止信号并等待轮询任务退出。"""
         self._stop.set()
         if self._task is not None:
             await self._task
         self._task = None
 
     async def _run(self) -> None:
-        """轮询快照，发现变化就触发一次缓存失效回调。"""
+        """周期性对比 mtime 快照；有差异则调用一次 on_change。"""
         # 先取基线快照，避免把启动时的既有状态误判成一次变更。
         self.state.mtimes = self._snapshot()
         while not self._stop.is_set():
@@ -60,7 +60,7 @@ class PollingChangeWatcher:
                     self.on_change("watched_files_changed")
 
     def _snapshot(self) -> dict[str, float | None]:
-        """采集当前监听路径的修改时间快照。"""
+        """遍历 roots，采集感兴趣文件的 path→mtime 映射。"""
         watched: dict[str, float | None] = {}
         for root in self.roots:
             if root.is_file():
@@ -78,12 +78,12 @@ class PollingChangeWatcher:
 
 
 def _interesting(path: Path) -> bool:
-    """判断文件是否属于需要监听的类型。"""
+    """是否监听该文件（规则/Skill/常见 md·json 配置）。"""
     return path.name in {"CLAUDE.md", "CLAUDE.local.md", "SKILL.md"} or path.suffix in {".md", ".json"}
 
 
 def _mtime(path: Path) -> float | None:
-    """读取文件或目录树的最新修改时间。"""
+    """读取单路径 mtime；不存在或不可读时返回 None。"""
     try:
         return path.stat().st_mtime
     except OSError:

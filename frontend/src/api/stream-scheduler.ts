@@ -1,6 +1,13 @@
+/**
+ * SSE 文本流的渲染背压：在可见标签页上等待下一帧再继续读流，避免高频 delta 卡死 UI。
+ */
 type StreamWindow = Pick<Window, "requestAnimationFrame" | "setTimeout" | "clearTimeout">;
 type StreamDocument = Pick<Document, "visibilityState">;
 
+/**
+ * 返回可继续消费下一条 TEXT_MESSAGE_CONTENT 的时机。
+ * 后台页 rAF 可能永不触发，故直接 resolve，让 React 在页签恢复时一次性应用积压状态。
+ */
 export function nextRenderOpportunity(
   targetWindow: StreamWindow | undefined = typeof window === "undefined" ? undefined : window,
   targetDocument: StreamDocument | undefined = typeof document === "undefined" ? undefined : document
@@ -9,9 +16,7 @@ export function nextRenderOpportunity(
     return Promise.resolve();
   }
 
-  // Background tabs may suspend requestAnimationFrame indefinitely. Do not let
-  // painting backpressure stop the response reader: React can apply the queued
-  // state immediately when this page becomes visible again.
+  // 后台标签可能无限挂起 requestAnimationFrame；不要让绘制背压卡住 response reader。
   if (targetDocument.visibilityState !== "visible") {
     return Promise.resolve();
   }
@@ -24,8 +29,7 @@ export function nextRenderOpportunity(
       targetWindow.clearTimeout(fallbackTimer);
       resolve();
     };
-    // The fallback also covers a tab becoming hidden between the visibility
-    // check above and the browser delivering its next animation frame.
+    // 覆盖：visibility 检查后、下一帧送达前标签被切到后台的竞态。
     const fallbackTimer = targetWindow.setTimeout(finish, 100);
     targetWindow.requestAnimationFrame(finish);
   });

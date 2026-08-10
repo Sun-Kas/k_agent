@@ -1,4 +1,4 @@
-"""Assemble and request-bind the complete tool registry available to agent runs."""
+"""组装并按请求绑定 Agent 可用的完整本地工具表。"""
 
 from __future__ import annotations
 

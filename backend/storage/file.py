@@ -1,4 +1,8 @@
-"""Filesystem implementation of the asynchronous storage interface."""
+"""基于本地文件系统的异步存储适配器（逻辑 key → 路径）。
+
+pipeline：Access Layer / Backend 经 `create_storage` 取得本实现；
+会话、配置与部分记忆读写落在该适配器上，调用方不感知具体目录布局。
+"""
 
 from __future__ import annotations
 
@@ -11,15 +15,10 @@ from typing import Any
 
 
 class FileStorage:
-    """Filesystem-backed storage.
-
-    The public methods use logical string keys so callers do not depend on a
-    concrete filesystem layout. Database-backed implementations can keep the
-    same contract and reinterpret keys as document IDs or namespaces.
-    """
+    """把逻辑 string key 映射到 `base_dir` 下文件；可替换为 DB 等同源接口实现。"""
 
     def __init__(self, base_dir: str | Path | None = None) -> None:
-        """初始化对象依赖和内部状态。"""
+        """设定存储根目录；后续相对 key 均相对该根解析。"""
         self.base_dir = Path(base_dir or ".").expanduser().resolve()
 
     def resolve(self, key: str) -> Path:

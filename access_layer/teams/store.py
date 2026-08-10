@@ -1,4 +1,14 @@
-"""Transactional SQLite store for the local-first Agent Team control plane."""
+"""本地优先的 Agent Team 控制面：事务型 SQLite 存储。
+
+在请求链路中的角色：Team 路由与 TeamRuntime 的唯一真相源——团队/成员/
+任务/Artifact/邮箱/事件/supervisor_jobs；写路径经 `_write_lock` +
+`BEGIN IMMEDIATE`，用 lease 支持进程崩溃后的回收。
+
+服务边界：
+- Access Layer 拥有该库；Agent Backend 不读写 Team 表
+- 文件系统上的 task bundle / workspace Artifact 是镜像，SQLite 为准
+- supervisor_jobs 是调度硬门：提交后的验收边界未完成前，不 claim 新 worker 任务
+"""
 
 from __future__ import annotations
 
@@ -19,14 +29,15 @@ def _now() -> str:
 
 
 class TeamStore:
-    """Persist Team state with transactions instead of process-local file locks."""
+    """用事务持久化 Team 状态，而非进程内文件锁。"""
 
     def __init__(self, database_path: Path) -> None:
+        """绑定 SQLite 路径；异步写操作串行化在 `_write_lock`。"""
         self.database_path = database_path
         self._write_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
-        """Create the WAL database and idempotent schema."""
+        """创建 WAL 数据库与幂等 schema（含升级列与 supervisor 回填）。"""
 
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._initialize_sync)
@@ -217,7 +228,7 @@ class TeamStore:
                     )
 
     async def create_team(self, payload: TeamCreateInput, teams_root: Path) -> dict[str, Any]:
-        """Create members and any explicit/manual task drafts in one transaction."""
+        """在同一事务中创建成员与可选任务草稿，并入队 team.started 主管决策。"""
 
         async with self._write_lock:
             return await asyncio.to_thread(self._create_team_sync, payload, teams_root)
@@ -812,7 +823,7 @@ class TeamStore:
     async def claim_supervisor_job(
         self, team_id: str, lease_seconds: int = 120
     ) -> dict[str, Any] | None:
-        """Atomically lease the oldest pending Team control decision."""
+        """原子租约最旧的 pending 主管决策；成功则标记 supervisor 为 busy。"""
 
         async with self._write_lock:
             return await asyncio.to_thread(
@@ -889,7 +900,7 @@ class TeamStore:
         return {"team": snapshot, "jobId": job_id}
 
     async def claim_next_task(self, team_id: str, lease_seconds: int = 120) -> dict[str, Any] | None:
-        """Atomically claim one dependency-ready task whose owner is idle."""
+        """原子认领一个依赖已完成且负责人空闲的任务；有 pending 主管边界时硬门拒绝。"""
 
         async with self._write_lock:
             return await asyncio.to_thread(self._claim_next_task_sync, team_id, lease_seconds)
@@ -995,7 +1006,7 @@ class TeamStore:
                     "mailbox": [self._mail_dict(row) for row in mailbox_rows]}
 
     async def submit_task(self, team_id: str, task_id: str, agent_id: str, content: str) -> str:
-        """Persist an Agent deliverable without treating it as supervisor-accepted."""
+        """持久化 worker 交付物为 pending_review Artifact，并入队 task.submitted 主管决策。"""
 
         async with self._write_lock:
             return await asyncio.to_thread(self._submit_task_sync, team_id, task_id, agent_id, content)
@@ -1046,7 +1057,7 @@ class TeamStore:
     async def apply_supervisor_decision(
         self, team_id: str, job_id: str, supervisor_id: str, decision: SupervisorDecision
     ) -> dict[str, Any]:
-        """Validate and commit all supervisor actions as one control-plane transaction."""
+        """校验并在同一控制面事务中提交主管全部 actions（验收/建任务/收尾等）。"""
 
         async with self._write_lock:
             return await asyncio.to_thread(
@@ -1581,7 +1592,7 @@ class TeamStore:
         return await asyncio.to_thread(self._running_team_ids_sync)
 
     async def recover_expired_leases(self) -> int:
-        """Return abandoned process-owned runs to the durable dispatch queue."""
+        """把租约过期的 running 任务/主管 job 退回可调度队列（进程崩溃恢复）。"""
 
         async with self._write_lock:
             return await asyncio.to_thread(self._recover_expired_leases_sync)

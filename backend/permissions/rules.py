@@ -1,4 +1,8 @@
-"""Load and evaluate ordered allow/deny rules for agent tool execution."""
+"""加载并按序评估 Agent 工具执行的 allow/deny/ask 规则。
+
+pipeline：`OpenAIAgent` 在真正执行工具前调用 `check_permission(s)`；
+`ask` 经 ApprovalBroker 挂起。规则文件变更靠 mtime 签名立即失效缓存。
+"""
 
 from __future__ import annotations
 
@@ -15,14 +19,13 @@ PermissionBehavior = Literal["allow", "deny", "ask"]
 
 logger = logging.getLogger("k_agent.permissions")
 
-# Rules are re-read whenever a source file changes so edits apply immediately,
-# but unchanged files are not re-parsed on every single tool call.
+# 源文件变更时重读规则以便立即生效；未变文件不在每次工具调用时重新解析。
 _RULE_CACHE: tuple[tuple[tuple[str, int, int], ...], list["PermissionRule"]] | None = None
 
 
 @dataclass(frozen=True)
 class PermissionDecision:
-    """Resolved behavior and optional human-readable matching reason."""
+    """解析后的行为，以及可选的人类可读命中原因。"""
 
     behavior: PermissionBehavior
     reason: str | None = None
@@ -30,7 +33,7 @@ class PermissionDecision:
 
 @dataclass(frozen=True)
 class PermissionRule:
-    """One ordered wildcard rule for a tool and its invocation subject."""
+    """一条有序通配规则：工具名 + 调用对象 pattern + 行为。"""
 
     tool: str
     pattern: str
@@ -38,11 +41,10 @@ class PermissionRule:
 
 
 def load_permission_rules() -> list[PermissionRule]:
-    """Load user/project permission rules.
+    """加载用户/项目权限规则。
 
-    The file format is intentionally close to Claude Code's rule model: each
-    rule names a tool, a match pattern, and a behavior. Keeping this as data
-    makes it possible to add UI editing later without changing the agent loop.
+    文件格式刻意贴近 Claude Code：每条含 tool、pattern、behavior。
+    数据驱动便于日后加 UI 编辑而不改 Agent 循环。
     """
     global _RULE_CACHE
     signature = _rule_file_signature()
@@ -77,11 +79,10 @@ def load_permission_rules() -> list[PermissionRule]:
 
 
 def default_behavior() -> PermissionBehavior:
-    """Behavior applied when no rule matches an invocation.
+    """无规则命中时的默认行为。
 
-    Defaults to allow because the backend binds to loopback for single-user
-    local use. Deployments that expose it must set this to deny and enumerate
-    an explicit allowlist.
+    默认 allow：Backend 本机 loopback、单用户场景。对外暴露部署必须设
+    `K_AGENT_PERMISSION_DEFAULT=deny` 并显式写 allowlist。
     """
 
     configured = (os.getenv("K_AGENT_PERMISSION_DEFAULT") or "allow").strip().lower()
@@ -94,7 +95,7 @@ def default_behavior() -> PermissionBehavior:
 
 
 def check_permission(tool_name: str, subject: str | None = None) -> PermissionDecision:
-    """Return the first matching deny/allow/ask rule for a tool invocation."""
+    """返回工具调用命中的首条 deny/allow/ask 规则（文件书写顺序即优先级）。"""
     # subject 是工具的具体调用对象（Bash 的命令、Read 的路径等），
     # 缺省时退回工具名，让只按工具粒度写的规则依然可用。
     value = subject or tool_name
@@ -124,10 +125,9 @@ def check_permission(tool_name: str, subject: str | None = None) -> PermissionDe
 
 
 def check_permissions(tool_name: str, subjects: list[str]) -> PermissionDecision:
-    """Evaluate several subjects for one call and return the strictest outcome.
+    """对一次调用的多个 subject 取最严结果。
 
-    A shell command such as ``cd /tmp && rm -rf x`` is checked both whole and
-    per segment, so a ``rm *`` deny rule cannot be bypassed by chaining.
+    如 ``cd /tmp && rm -rf x`` 既查整句也查分段，避免用链式绕过 ``rm *`` deny。
     """
 
     strictest = PermissionDecision("allow")
@@ -155,7 +155,7 @@ def _rule_paths() -> list[Path]:
 
 
 def _rule_file_signature() -> tuple[tuple[str, int, int], ...]:
-    """Snapshot rule-file identity so edits invalidate the cache immediately."""
+    """快照规则文件身份（路径/mtime/size），编辑后立即失效缓存。"""
 
     signature: list[tuple[str, int, int]] = []
     for path in _rule_paths():

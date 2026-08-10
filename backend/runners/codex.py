@@ -1,8 +1,7 @@
-"""Codex app-server runner with bidirectional approval support.
+"""Codex app-server Runner：双向审批挂起/恢复走共享 ApprovalBroker。
 
-The app-server protocol keeps stdin open for JSON-RPC, so command, file, MCP,
-and elicitation approvals can pause and resume through the shared frontend card.
-Session resume remains opt-in via agentOptions.
+app-server 协议保持 stdin 打开做 JSON-RPC，因此命令/文件/MCP/elicitation
+审批可经前端审批卡暂停再继续。会话 resume 仅在 agentOptions 显式开启时生效。
 """
 
 from __future__ import annotations

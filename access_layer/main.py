@@ -1,4 +1,15 @@
-"""FastAPI application for public APIs, configuration, sessions, and AG-UI ingress."""
+"""Access Layer FastAPI 应用：公开 API、配置、会话、AG-UI 入口与静态前端。
+
+在请求链路中的角色：
+- lifespan：初始化 home 布局、SessionStore、并发守卫、AgentBackendClient、
+  RuntimeCatalog、TeamRuntime（后台调度）
+- 中间件：为每个请求绑定 RequestContext / x-request-id
+- `/api/agent` → AgentAccessLayer；Team 路由委托 TeamStore/Runtime
+- 配置中心读写 `$K_AGENT_HOME`；MCP reload / approval 等代理到后端 `/internal/*`
+
+服务边界：本进程是唯一对外入口；Agent Backend 不暴露给浏览器。本地构建时
+在全部 API 注册后再挂载 frontend/dist，保证 `/api` 语义优先。
+"""
 
 from __future__ import annotations
 
@@ -79,11 +90,7 @@ def _all_skills() -> list[SkillDefinition]:
 
 
 def _public_skill(skill: SkillDefinition, *, editable: bool = False) -> dict:
-    """Serialize a loaded skill without hiding its source boundary.
-
-    Every editable Skill comes from `$K_AGENT_HOME/content/skills`. Source
-    metadata remains visible so the frontend can audit that storage boundary.
-    """
+    """序列化已加载 Skill；可编辑项来自 `$K_AGENT_HOME/content/skills`，保留来源元数据供审计。"""
     return {
         "id": skill.id,
         "name": skill.name,
@@ -173,7 +180,7 @@ def _yaml_scalar(value: object) -> str:
 
 
 def _validate_and_install_skill_zip(archive: bytes, filename: str) -> tuple[str, str, Path]:
-    """Validate an uploaded Skill archive and atomically install its single root."""
+    """校验上传的 Skill zip（大小/路径穿越/特殊文件），再原子安装到唯一根目录。"""
 
     if not filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="请上传 .zip 格式的 Skill 压缩包")
@@ -328,7 +335,7 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 
 
 def _serialize_mcp_server(server: dict) -> dict:
-    """Preserve the MCP config format while masking browser-visible secrets."""
+    """保留 MCP 配置结构，但把浏览器可见的 env/headers 密钥掩码为 ***。"""
     env = {key: "***" for key in server.get("env", {})}
     headers = {key: "***" for key in server.get("headers", {})}
     return {
@@ -419,16 +426,15 @@ def _public_models(settings: Settings) -> list[dict]:
 
 
 def create_app() -> FastAPI:
-    """Construct the stateful public access-layer application."""
+    """构造有状态的公开 Access Layer 应用（会话、配置、Team、AG-UI）。"""
 
     settings = Settings()
-    # Reuse the Agent Backend logging setup so Access Layer also quiets third-party
-    # noise and filters high-frequency health/catalog access lines.
+    # 复用后端日志配置：压制第三方噪音，并过滤高频 health/catalog 访问行。
     configure_agent_backend_logging(settings.agent_backend_log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """管理应用启动和关闭时的资源生命周期。"""
+        """启动时装配依赖并启动 Team 调度；关闭时仅停止本进程拥有的 TeamRuntime。"""
         ensure_home_layout(migrate=True)
         app.state.settings = await get_or_init_settings()
         app.state.base_system_prompt = app.state.settings.system_prompt
@@ -468,7 +474,7 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def request_context_middleware(request: Request, call_next):
-        """为每个公开请求创建并清理请求上下文。"""
+        """为每个公开请求创建 RequestContext，并在响应头回写 x-request-id。"""
         request_id = request.headers.get("x-request-id")
         token = set_request_context(new_request_context(str(request.url.path), request.method, request_id))
         try:
@@ -487,18 +493,15 @@ def create_app() -> FastAPI:
         allow_headers=settings.cors_allow_headers,
     )
 
-    # Team routes are registered before the SPA catch-all mount. Their runtime
-    # owns durable state in the Access Layer and only delegates individual runs.
-    # Lifespan creates the initialized runtime; route closures resolve it lazily
-    # so importing/constructing the app never opens the database or starts jobs.
+    # Team 路由须在 SPA catch-all 之前注册。持久状态在 Access Layer；
+    # lifespan 负责初始化 runtime，路由用代理懒解析，避免 import/构造时开库或起任务。
     class _RuntimeProxy:
         @property
         def store(self):
             return app.state.team_runtime.store
 
     runtime_proxy = _RuntimeProxy()
-    # Route handlers only require ``store`` today. Keeping the scheduler on
-    # app.state avoids starting a duplicate runtime during app construction.
+    # 路由目前只需 store；调度器留在 app.state，避免构造应用时重复启动 runtime。
     app.include_router(build_team_router(runtime_proxy))
 
     @app.get("/api/health", response_model=HealthResponse)
@@ -525,7 +528,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health/concurrency")
     async def concurrency_health():
-        """Expose the live concurrency shape used by operations and tests."""
+        """暴露当前进程内并发槽位/会话锁形状，供运维与测试观测。"""
         snapshot = await app.state.request_limiter.snapshot()
         return {
             "serverWorkers": app.state.settings.server_workers,
@@ -703,7 +706,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/agents")
     async def list_agents():
-        """Return built-in + auto-detected local CLI agents."""
+        """代理后端：内置 + 本机探测到的 CLI agent 列表。"""
 
         return await app.state.agent_backend_client.get_json("/internal/agents")
 
@@ -756,14 +759,14 @@ def create_app() -> FastAPI:
 
     @app.post("/api/agent")
     async def run_agui_agent(payload: RunAgentInput):
-        """把前端 RunAgentInput 交给接入网关处理。"""
+        """公开 AG-UI 入口：把 RunAgentInput 交给 AgentAccessLayer 编排。"""
         return await app.state.access_layer.run(payload)
 
     @app.post("/api/approvals/{request_id}")
     async def resolve_approval(
         request_id: str, payload: ApprovalResolutionInput
     ) -> dict:
-        """Forward a scoped approval decision to the private Agent Backend."""
+        """把工作台审批决定转发到私有 Agent Backend，并保留其后端状态码语义。"""
 
         try:
             return await app.state.agent_backend_client.post_json(
@@ -813,7 +816,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/runs/cancel")
     async def cancel_session_run(session_id: str, payload: SessionRunCancelInput):
-        """Cancel persistence for an intentionally aborted conversation turn."""
+        """取消一轮会话运行的持久化（回滚本轮 user 与半截流状态）。"""
         session = await app.state.session_store.cancel_run(session_id, payload.run_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -825,7 +828,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/sessions/{session_id}/workspace")
     async def get_session_workspace(session_id: str):
-        """List user-visible files in the session workspace directory."""
+        """列出会话工作区中可对外预览的文件（过滤工具注入配置）。"""
 
         try:
             resolve_session_workspace(session_id)
@@ -848,7 +851,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/sessions/{session_id}/workspace/file")
     async def get_session_workspace_file(session_id: str, path: str):
-        """Read one workspace file preview for the chat workbench."""
+        """读取会话工作区单个文件预览内容（路径逃逸失败关闭）。"""
 
         try:
             resolve_session_workspace(session_id)
@@ -867,9 +870,8 @@ def create_app() -> FastAPI:
             "size": payload.size,
         }
 
-    # Local built deployments expose only the Access Layer. Mounting the
-    # compiled client after every API route preserves /api semantics while
-    # serving the workbench and its assets from the same origin.
+    # 本地一体部署只暴露 Access Layer。在全部 API 之后挂载编译后的前端，
+    # 保证 /api 优先，同时同源提供工作台静态资源。
     if FRONTEND_DIST_DIR.is_dir():
         app.mount(
             "/",

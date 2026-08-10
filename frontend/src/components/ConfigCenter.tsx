@@ -1,3 +1,7 @@
+/**
+ * 配置中心：模型 / MCP / Skills / 语音 的读写 UI。
+ * 挂载时并行拉三类配置；按 tab 保存，MCP 变更后可触发 reload。
+ */
 import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   getMcpCapabilities,
@@ -38,6 +42,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
   const [voiceConfig, setVoiceConfig] = useState<VoiceConfig>(readVoiceConfig);
 
   useEffect(() => {
+    // 三个独立请求并行；用 pending 计数统一关闭 loading。
     let pending = 3;
     const complete = () => {
       pending -= 1;
@@ -76,6 +81,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
       .catch((error: Error) => setNotice((current) => current || `MCP 能力加载失败：${error.message}`));
   }, [tab, servers.length]);
 
+  /** 按当前 tab 写回对应配置；语音只写 localStorage。 */
   async function save(event: FormEvent) {
     event.preventDefault();
     setSaving(true);

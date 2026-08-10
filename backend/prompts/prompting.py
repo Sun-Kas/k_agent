@@ -1,4 +1,8 @@
-"""Compose system, user, memory, Skill, and MCP context into effective prompts."""
+"""把 system / user / memory / Skill / MCP 上下文拼成生效 prompt。
+
+pipeline：`KAgentRunner` 每轮调用 `build_prompt_bundle`；静态 section 可指纹缓存，
+动态 MCP/记忆变更走 `lifecycle.reset_prompt_caches`。
+"""
 
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ Do not mention memory files unless they are relevant to the user's request.
 
 @dataclass(frozen=True)
 class EffectivePrompt:
-    """Rendered prompt plus traceability metadata for its loaded context."""
+    """渲染后的 prompt，外加已加载上下文的可追溯元数据。"""
 
     system_prompt: str
     user_context: dict[str, str]
@@ -45,7 +49,7 @@ def build_effective_system_prompt(
     proactive: bool = False,
     mcp_tools: list[McpPromptTool] | None = None,
 ) -> str:
-    """Apply K Agent's precedence rules for system prompts."""
+    """按 K Agent 优先级规则合成 system prompt（override 完全替换）。"""
     # override 是完全替换：连 Skill 摘要和 append 都不再拼接，
     # 用于调用方需要精确控制整段提示词的场景。
     if override_system_prompt:
@@ -81,7 +85,7 @@ def build_prompt_bundle(
     referenced_paths: list[Path] | None = None,
     mcp_tools: list[McpPromptTool] | None = None,
 ) -> EffectivePrompt:
-    """Build the complete prompt payload used for a single model request."""
+    """单次模型请求用的完整 prompt 载荷（system + user/system context）。"""
     cwd = (cwd or Path.cwd()).resolve()
     system_prompt = build_effective_system_prompt(
         base_prompt,

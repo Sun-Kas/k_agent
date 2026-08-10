@@ -1,4 +1,4 @@
-"""Typed lifecycle callbacks used to observe Agent Backend model and tool activity."""
+"""Agent 模型/工具生命周期的类型化观察回调（日志、Langfuse、trace）。"""
 
 from __future__ import annotations
 
@@ -29,9 +29,8 @@ class AgentRunContext:
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     started_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
-    # An invoked Skill may restrict which tools stay usable. This lives on the
-    # run context rather than the agent instance because one OpenAIAgent can
-    # serve concurrent runs.
+    # 已调用的 Skill 可能收窄后续可用工具。放在 run context 而非 agent 实例上，
+    # 因为同一个 OpenAIAgent 可能并发服务多轮。
     skill_allowlist: set[str] | None = None
     skill_allowlist_owner: str = "skill"
 
@@ -47,7 +46,7 @@ class ModelCallPayload:
 
 @dataclass(slots=True)
 class ContextPlanPayload:
-    """Describe context budgeting and compaction without carrying message content."""
+    """上下文预算与压缩摘要；故意不携带消息正文，避免回调侧泄漏大 payload。"""
 
     input_message_count: int
     active_message_count: int
@@ -62,7 +61,7 @@ class ContextPlanPayload:
 
 @dataclass(slots=True)
 class ContextPrunePayload:
-    """Describe old tool-output pruning before one model iteration."""
+    """单轮模型调用前，旧工具输出裁剪的统计。"""
 
     iteration: int
     pruned_output_count: int
@@ -135,7 +134,7 @@ class AgentCallback(Protocol):
         context: AgentRunContext,
         payload: ContextPlanPayload,
     ) -> None:
-        """Receive the safe context budget and compaction summary."""
+        """接收上下文预算与压缩摘要（不含消息正文）。"""
         ...
 
     async def on_context_pruned(
@@ -143,7 +142,7 @@ class AgentCallback(Protocol):
         context: AgentRunContext,
         payload: ContextPrunePayload,
     ) -> None:
-        """Receive old tool-output pruning statistics."""
+        """接收旧工具输出裁剪统计。"""
         ...
 
     async def after_model(
@@ -190,7 +189,7 @@ class AgentCallback(Protocol):
 class CallbackManager:
     """顺序分发 Agent 生命周期回调。"""
     def __init__(self, callbacks: list[AgentCallback] | None = None):
-        """初始化对象依赖和内部状态。"""
+        """持有回调列表；缺实现的方法在 `_emit` 时静默跳过。"""
         self.callbacks = callbacks or []
 
     async def on_agent_start(
@@ -210,7 +209,7 @@ class CallbackManager:
         context: AgentRunContext,
         payload: ContextPlanPayload,
     ) -> None:
-        """Dispatch the context planning summary."""
+        """分发上下文规划摘要。"""
         await self._emit("on_context_built", context, payload)
 
     async def on_context_pruned(
@@ -218,7 +217,7 @@ class CallbackManager:
         context: AgentRunContext,
         payload: ContextPrunePayload,
     ) -> None:
-        """Dispatch old tool-output pruning statistics."""
+        """分发旧工具输出裁剪统计。"""
         await self._emit("on_context_pruned", context, payload)
 
     async def after_model(self, context: AgentRunContext, payload: ModelResultPayload) -> None:
@@ -252,7 +251,7 @@ class CallbackManager:
 class TraceCallback:
     """把 Agent 生命周期事件记录为 trace 字符串。"""
     def __init__(self, trace: list[str]):
-        """初始化对象依赖和内部状态。"""
+        """写入调用方提供的共享 `trace` 列表，供最终状态回传。"""
         self.trace = trace
 
     async def on_agent_start(

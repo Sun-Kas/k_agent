@@ -1,48 +1,27 @@
-"""Single layout for durable agent state under `$K_AGENT_HOME`.
+"""`$K_AGENT_HOME` 持久布局：会话/Team/记忆/配置/共享 runtime 的唯一真相源。
 
-Default home is `~/.k_agent`. Set `K_AGENT_HOME` (relative paths resolve against
-the project root) for project-local development. Layout:
+默认 `~/.k_agent`；`K_AGENT_HOME` 相对路径相对仓库根解析。Access Layer 与
+Agent Backend 都通过本模块定位路径；相对路径入库时用 `to_managed_path`，
+读回时用 `resolve_managed_path`，避免部署 cwd 不一致。
 
 ```
 $K_AGENT_HOME/
   config/
-    mcp.json                 # managed MCP connection config
-    user-mcp.json            # optional user MCP overlay
+    mcp.json                 # 托管 MCP 连接
+    user-mcp.json            # 可选用户覆盖
     models.json
     permissions.json
     catalog/
-      mcp.json               # frontend MCP picker summaries
-      skills.json            # frontend Skill picker summaries
-  cache/
-    runtime/                 # project-wide shared Node/npm tooling (all sessions + teams)
-      node/                  # npm --prefix for global CLIs
-      npm-cache/
-      projects/              # shared package installs reused across the whole home
+      mcp.json / skills.json # 前端选择器摘要
+  cache/runtime/             # 全项目共享 Node/npm（会话与 Team 共用）
   state/
-    sessions/                # FileStorage session root
-      {session_id}/
-        {session_id}.json    # conversation + AG-UI log
-        workspace/           # per-session cwd for CLI agents / tools
-          .runtime -> $K_AGENT_HOME/cache/runtime
-    teams/
-      team_runtime.db        # durable Team control plane
-      {team_id}/
-        workspace/           # default Team workspace; accepted deliverables only
-          artifacts/{task_id}/{artifact_id}/
-        tasks/{task_id}/
-          manifest.json      # task/run/file lineage
-          input/             # task, mailbox, dependency Artifact metadata
-          output/            # deliverables only (Agent cwd is the task dir)
-          .runtime -> $K_AGENT_HOME/cache/runtime
-          artifacts/         # readable copies of submitted Artifact text
-          logs/              # raw provider event stream by run
+    sessions/{id}/           # 会话 JSON + workspace/
+    teams/                   # Team 控制面与任务目录
   content/
-    memory/                  # durable MEMORY.md
-    skills/                  # installed Skill packages
+    memory/ / skills/
 ```
 
-Legacy repo paths (`data/…`, `backend/config/runtime/…`) are copied into an empty
-home on first start; originals are left untouched.
+首次启动可把遗留 `data/…`、`backend/config/runtime/…` 拷入空 home；原件不动。
 """
 
 from __future__ import annotations
@@ -64,7 +43,7 @@ _migrated = False
 
 
 def reset_home_cache() -> None:
-    """Drop cached home resolution (tests / reconfiguration)."""
+    """测试/重配：丢弃缓存的 home 解析与迁移标志。"""
 
     global _home_cache, _migrated
     _home_cache = None
@@ -72,7 +51,7 @@ def reset_home_cache() -> None:
 
 
 def agent_home() -> Path:
-    """Resolve `$K_AGENT_HOME`, defaulting to `~/.k_agent`."""
+    """解析 `$K_AGENT_HOME`；未设置时默认 `~/.k_agent`（进程内缓存）。"""
 
     global _home_cache
     if _home_cache is not None:
@@ -109,19 +88,19 @@ def sessions_dir() -> Path:
 
 
 def teams_dir() -> Path:
-    """Durable Team Runtime metadata, artifacts, and isolated workspaces."""
+    """Team Runtime 持久根：元数据、工件与隔离工作区。"""
 
     return state_dir() / "teams"
 
 
 def shared_runtime_dir() -> Path:
-    """Project-wide Node/npm tooling shared by every session and Team task."""
+    """全项目共享的 Node/npm 工具前缀（所有 session/Team 共用一份）。"""
 
     return agent_home() / "cache" / "runtime"
 
 
 def ensure_shared_runtime() -> Path:
-    """Create the shared runtime layout used for CLI prefixes and npm caches."""
+    """确保 `cache/runtime/{node,npm-cache,projects}` 目录存在。"""
 
     runtime = shared_runtime_dir().resolve()
     (runtime / "npm-cache").mkdir(parents=True, exist_ok=True)
@@ -131,7 +110,7 @@ def ensure_shared_runtime() -> Path:
 
 
 def link_shared_runtime(target_dir: Path, runtime: Path | None = None) -> Path:
-    """Expose the project shared runtime inside a workspace as `.runtime`."""
+    """在工作区挂 `.runtime` → 共享 runtime；旧链接/目录先拆再建。"""
 
     runtime = (runtime or ensure_shared_runtime()).resolve()
     link = target_dir / ".runtime"
@@ -152,7 +131,7 @@ def link_shared_runtime(target_dir: Path, runtime: Path | None = None) -> Path:
 
 
 def shared_runtime_tool_env(runtime: Path | None = None) -> dict[str, str]:
-    """Env injected into Bash/CLI children so installs reuse one project prefix."""
+    """注入 Bash/CLI 子进程的 PATH/npm prefix，使安装复用同一项目前缀。"""
 
     runtime = (runtime or ensure_shared_runtime()).resolve()
     node_bin = str(runtime / "node" / "bin")
@@ -167,7 +146,7 @@ def shared_runtime_tool_env(runtime: Path | None = None) -> dict[str, str]:
 
 
 def session_bundle_dir(session_id: str) -> Path:
-    """Directory holding one session's JSON record and workspace."""
+    """单会话目录：会话 JSON + workspace。"""
 
     return sessions_dir() / session_id
 
@@ -177,29 +156,28 @@ def session_json_path(session_id: str) -> Path:
 
 
 def session_workspace_dir(session_id: str) -> Path:
-    """Working directory for CLI agents bound to this conversation."""
+    """对话绑定的 CLI/本地工具 cwd（非 Team 任务目录）。"""
 
     return session_bundle_dir(session_id) / "workspace"
 
 
 def team_workspace_dir(team_id: str, agent_id: str) -> Path:
-    """Return the legacy Agent-owned Team workspace path.
+    """遗留的 Agent 级 Team 工作区路径。
 
-    New Team runs use task-scoped directories instead. Keep this resolver for
-    old snapshots and callers that need to inspect pre-migration workspaces.
+    新跑法用任务级目录；保留本解析器供旧快照与迁移前巡检。
     """
 
     return teams_dir() / team_id / "workspaces" / agent_id
 
 
 def team_task_dir(team_id: str, task_id: str) -> Path:
-    """Return the durable file bundle owned by one Team task."""
+    """单个 Team 任务的持久文件包根目录。"""
 
     return teams_dir() / team_id / "tasks" / task_id
 
 
 def team_task_output_dir(team_id: str, task_id: str) -> Path:
-    """Return the task-local cwd exposed to its assigned Agent."""
+    """任务交付物目录；通常作为分配给该任务 Agent 的 cwd。"""
 
     return team_task_dir(team_id, task_id) / "output"
 
@@ -237,7 +215,7 @@ def skills_catalog_path() -> Path:
 
 
 def ensure_home_layout(*, migrate: bool = True) -> Path:
-    """Create the home tree and optionally import legacy project data."""
+    """创建 home 目录树；可选把遗留项目数据迁入空槽位。"""
 
     home = agent_home()
     for path in (
@@ -256,7 +234,7 @@ def ensure_home_layout(*, migrate: bool = True) -> Path:
 
 
 def migrate_legacy_home() -> list[str]:
-    """Copy known legacy locations into an empty home slot. Idempotent."""
+    """幂等：把已知遗留路径拷进尚未占用的 home 槽位。"""
 
     global _migrated
     if _migrated:
@@ -291,7 +269,7 @@ def migrate_legacy_home() -> list[str]:
 
 
 def _copy_if_needed(source: Path, destination: Path, *, is_directory: bool) -> bool:
-    """Copy source into destination only when destination is still unused."""
+    """仅当目标仍空/不存在时拷贝；同源同目标直接跳过。"""
 
     try:
         if not source.exists():
@@ -317,7 +295,7 @@ def _copy_if_needed(source: Path, destination: Path, *, is_directory: bool) -> b
 
 
 def display_home() -> str:
-    """Short path string for UI/docs (prefer ~ when under the user home)."""
+    """UI/文档用短路径；落在用户 home 下时优先写成 `~/…`。"""
 
     home = agent_home()
     try:
@@ -327,7 +305,7 @@ def display_home() -> str:
 
 
 def resolve_managed_path(value: str | Path) -> Path:
-    """Resolve a stored workspace path; relative values are under `$K_AGENT_HOME`."""
+    """解析入库路径：相对值一律相对 `$K_AGENT_HOME`，而非进程 cwd。"""
 
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -336,7 +314,7 @@ def resolve_managed_path(value: str | Path) -> Path:
 
 
 def to_managed_path(value: str | Path) -> str:
-    """Prefer a `$K_AGENT_HOME`-relative path for persistence and API responses."""
+    """持久化/API 优先返回相对 home 的路径；越界工作区仍给绝对路径。"""
 
     resolved = resolve_managed_path(value)
     try:
@@ -347,7 +325,7 @@ def to_managed_path(value: str | Path) -> str:
 
 
 def public_home_relative_path(value: str | Path | None) -> str | None:
-    """Return a path suitable for API/UI: relative to home, else `~/…`, else basename."""
+    """对外展示路径：相对 home → `~/…` → 否则 basename/绝对路径。"""
 
     if value is None:
         return None

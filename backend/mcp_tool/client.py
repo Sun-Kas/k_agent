@@ -1,4 +1,8 @@
-"""Lifecycle management and capability access for configured MCP servers."""
+"""已配置 MCP server 的连接生命周期与能力访问。
+
+pipeline：Access Layer 下发本轮 server 列表 → `McpClientManager`（可借
+`McpSessionPool`）连接 → Agent/工具调用 list/call；单 server 失败不拖垮其它。
+"""
 
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class McpServerConfig:
-    """Normalized connection settings for one MCP server."""
+    """单个 MCP server 的规范化连接设置。"""
 
     id: str
     scope: str
@@ -46,7 +50,7 @@ class McpServerConfig:
 
 @dataclass(slots=True)
 class McpToolDescriptor:
-    """Tool metadata annotated with the owning server identifier."""
+    """带所属 server_id 注解的工具元数据。"""
 
     server_id: str
     name: str
@@ -56,7 +60,7 @@ class McpToolDescriptor:
 
 @dataclass(slots=True)
 class McpServerStatus:
-    """Serializable connection and capability summary for configuration APIs."""
+    """可序列化的连接与能力摘要，供配置/健康 API 使用。"""
 
     id: str
     scope: str
@@ -69,15 +73,14 @@ class McpServerStatus:
 
 
 class McpSession:
-    """Owns one long-lived MCP client connection.
+    """持有一条长生命周期 MCP 客户端连接。
 
-    Claude Code treats each configured server as a persistent connection with a
-    status. We use the same shape here: connect once, keep the SDK session alive
-    in a background task, and let tools/resources/prompts share that connection.
+    与 Claude Code 类似：每个配置的 server 是持久连接 + 状态。后台任务持有
+    SDK 传输上下文，tools/resources/prompts 共享同一会话。
     """
 
     def __init__(self, config: McpServerConfig):
-        """初始化对象依赖和内部状态。"""
+        """登记配置；真正的传输在 `_run` 后台任务里进入/退出。"""
         self.config = config
         # SDK 的传输层是异步上下文管理器，必须在同一个任务里进入和退出。
         # 因此用一个常驻后台任务 _runner 持有它，再靠 _ready / _stop 两个
@@ -88,8 +91,7 @@ class McpSession:
         self.session: ClientSession | None = None
         self.instructions: str | None = None
         self.server_info: Any = None
-        # Keep the bridge alive for the session lifetime so MCP does not fall
-        # back to the process stderr after the object is garbage-collected.
+        # 桥接对象需与会话同寿命，否则 GC 后 MCP 会回落到进程 stderr。
         self._stderr_bridge: McpStderrBridge | None = None
 
     async def connect(self) -> None:
@@ -173,7 +175,7 @@ class McpSession:
         raise RuntimeError(f"unsupported MCP transport: {self.config.type}")
 
     async def list_tools(self) -> list[McpToolDescriptor]:
-        """列出当前对象可用的工具定义。"""
+        """向当前 MCP 会话请求 tools/list，并转成内部描述符。"""
         if self.session is None:
             raise RuntimeError("MCP session is not ready")
 
@@ -268,7 +270,7 @@ def _is_transient_result(result_json: str) -> bool:
 
 
 class McpClientManager:
-    """Coordinate independent MCP sessions while isolating per-server failures."""
+    """协调多个独立 MCP 会话，隔离单 server 失败。"""
 
     def __init__(
         self,
@@ -282,7 +284,7 @@ class McpClientManager:
         retry_base_delay_seconds: float = 1.0,
         session_pool: "McpSessionPool | None" = None,
     ):
-        """初始化对象依赖和内部状态。"""
+        """可注入进程级 `session_pool`：借共享连接，`close_all` 时归还而非杀进程。"""
         self.servers = servers
         self.load_result = load_result
         self.log_context = dict(log_context or {})
@@ -290,8 +292,7 @@ class McpClientManager:
         self.call_timeout_seconds = call_timeout_seconds
         self.max_call_retries = max_call_retries
         self.retry_base_delay_seconds = retry_base_delay_seconds
-        # With a pool, this manager borrows shared connections and returns them
-        # on close_all instead of tearing down a child process per run.
+        # 有池时本 manager 借用共享连接，close_all 归还而非每轮杀掉子进程。
         self._session_pool = session_pool
         self._leases: dict[str, str] = {}
         self.sessions: dict[str, McpSession] = {}
@@ -299,7 +300,7 @@ class McpClientManager:
         self.disabled: set[str] = {server.id for server in servers if not server.enabled}
 
     async def connect_all(self) -> None:
-        """Connect enabled servers without letting one failure block the others."""
+        """连接已启用 server；单个失败记入 `failed`，不阻塞其余。"""
 
         log_event(
             "mcp.load.started",
@@ -388,7 +389,7 @@ class McpClientManager:
         )
 
     async def list_tools(self) -> list[McpToolDescriptor]:
-        """列出当前对象可用的工具定义。"""
+        """汇总所有已连接 MCP server 的工具描述符（单 server 失败则跳过）。"""
         tools: list[McpToolDescriptor] = []
         for session in self.sessions.values():
             # 单个 server 查询失败只影响它自己的工具，其余照常暴露给模型。

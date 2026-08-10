@@ -1,4 +1,10 @@
-"""Create and encode the standard AG-UI event stream emitted by Agent Backend."""
+"""AG-UI 边界：把 Runner 内部事件方言翻译成标准 AG-UI 事件流。
+
+pipeline 位置：`/internal/agent/run` 在 HTTP 写出前唯一的协议转换层。
+关键语义差异：内部 thinking 是「同 step 整体快照、detail 变长」，
+AG-UI reasoning 是 start/增量 delta/end；工具参数在内部已齐全，
+这里一次性补齐 TOOL_CALL START/ARGS/END 三件套。
+"""
 
 from __future__ import annotations
 
@@ -35,12 +41,12 @@ encoder = EventEncoder()
 
 
 def encode_event(event: Any) -> str:
-    """把 AG-UI event 模型编码为传输文本。"""
+    """用官方 EventEncoder 把 AG-UI 模型编码为 SSE/传输文本。"""
     return encoder.encode(event)
 
 
 def to_chat_messages(messages: list[Any]) -> list[ChatMessage]:
-    """把 AG-UI 输入消息转换为后端 ChatMessage 并过滤空 assistant。"""
+    """入口清洗：只收 system/user/assistant 字符串；丢弃空 assistant 残留。"""
     converted: list[ChatMessage] = []
     for message in messages:
         if isinstance(message, dict):
@@ -75,7 +81,11 @@ async def translate_agent_events(
     thread_id: str,
     run_id: str,
 ) -> AsyncIterator[Any]:
-    """把 Agent 内部事件按流式顺序转换为标准 AG-UI events。"""
+    """按到达顺序把内部 `{type,payload}` 映射为 AG-UI Run/Text/Tool/Reasoning 事件。
+
+    先发 RUN_STARTED（在 try 外），异常转 RUN_ERROR 而非上抛，避免响应头已发后
+    连接静默断开、前端卡在 running。
+    """
     # 内部 thinking 是「同一个 step 反复整体重发、detail 越来越长」的快照语义，
     # 而 AG-UI reasoning 是「start / 增量 delta / end」的流式语义。下面四个变量
     # 就是这两种语义之间的转换状态：
@@ -89,7 +99,7 @@ async def translate_agent_events(
     completed_reasoning_message_ids: set[str] = set()
 
     def reasoning_events(step: dict[str, Any]) -> list[Any]:
-        """把内部 thinking step 转换为 AG-UI reasoning start/content/end 事件。"""
+        """thinking 快照 → REASONING 增量；tool 阶段 thinking 跳过以免与 TOOL_CALL 双记。"""
         nonlocal reasoning_message_id, active_reasoning_message_id, active_reasoning_step
         # 工具阶段的 thinking 由 TOOL_CALL_* 事件表达，不再重复成 reasoning，
         # 否则前端时间线上同一次调用会出现两条。
@@ -198,7 +208,7 @@ async def translate_agent_events(
         return events
 
     def close_reasoning_events() -> list[Any]:
-        """在正文、工具或结束边界关闭当前 reasoning 块。"""
+        """正文/工具/结束边界：关掉未收尾的 reasoning 消息与外层 REASONING 块。"""
         nonlocal reasoning_message_id, active_reasoning_message_id, active_reasoning_step
         if reasoning_message_id is None:
             return []
@@ -275,11 +285,10 @@ async def translate_agent_events(
             elif event_type == "trace":
                 yield CustomEvent(name="trace", value=payload)
             elif event_type == "cli_session":
-                # Persist provider-native session ids so users can opt into resume.
+                # 持久化 provider 原生 session id，便于用户选择 resume。
                 yield CustomEvent(name="cli_session", value=payload)
             elif event_type == "approval_request":
-                # Approval remains a custom AG-UI event because the protocol has
-                # no standard bidirectional human-approval event pair.
+                # 审批仍用自定义 AG-UI 事件：协议没有标准的双向人类审批事件对。
                 yield CustomEvent(name="approval_request", value=payload)
             elif event_type == "approval_resolved":
                 yield CustomEvent(name="approval_resolved", value=payload)

@@ -1,4 +1,8 @@
-"""Estimate prompt usage and compact older conversation context within model limits."""
+"""在模型上下文窗口内估算用量并压缩较旧对话。
+
+pipeline：`OpenAIAgent.run_stream` 每轮先 `build_context_plan`，再在迭代前
+`prune_old_tool_outputs`。启发式 token 估算留安全余量，避免估少触发 provider 报错。
+"""
 
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ MAX_TOOL_CONTEXT_CHARS = 50_000
 
 @dataclass(frozen=True)
 class ContextBudget:
-    """Token allocation reserved for input after output and safety margins."""
+    """扣掉输出与安全余量后，留给输入的 token 配额。"""
 
     context_window: int
     max_output_tokens: int
@@ -40,7 +44,7 @@ class ContextBudget:
 
 @dataclass(frozen=True)
 class ContextPlan:
-    """Messages and summary selected for a run, with an auditable budget breakdown."""
+    """本轮选用的消息与摘要，附可审计的预算 breakdown。"""
 
     messages: list[ChatMessage]
     summary: str
@@ -72,7 +76,7 @@ def build_context_plan(
     tool_definition_tokens: int = 0,
     force_compact: bool = False,
 ) -> ContextPlan:
-    """Build a context window plan and compact older messages when required."""
+    """构建上下文窗口计划；超预算时压缩较旧消息为摘要。"""
 
     budget = _context_budget(model_config)
     compacted = set(compacted_message_ids or [])
@@ -133,12 +137,10 @@ def build_context_plan(
 
 
 def pair_tool_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
-    """Drop tool-call halves that lost their counterpart.
+    """丢掉成对断裂的 tool_call / tool 半边。
 
-    Providers reject a tool result whose tool_call_id was never announced, and
-    an announced tool call that no result answers. Compaction, pruning, and
-    interrupted runs can all break a pair, so history is repaired before it is
-    measured or sent rather than failing the whole request at the provider.
+    Provider 拒绝「未宣告的 tool 结果」或「无结果的 tool_call」。压缩、裁剪、
+    中断都可能拆对，故在计量/发送前先修复，而不是整请求在 provider 侧失败。
     """
 
     answered = {

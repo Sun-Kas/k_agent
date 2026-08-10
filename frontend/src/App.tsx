@@ -1,3 +1,7 @@
+/**
+ * 单会话聊天主界面：组装 AG-UI run 请求、消费 SSE 事件、维护会话/run 状态机。
+ * 关键路径：submitConversation → streamAgentRun → applyAgUiEvent → messages/tools/thinking UI。
+ */
 import {
   Component,
   FormEvent,
@@ -121,6 +125,7 @@ type VoiceConversationState = {
   message: string;
 };
 
+/** 进行中的 run：按 session 缓冲事件，切回会话时可重放；AbortController 用于停止。 */
 type ActiveConversationRun = {
   controller: AbortController;
   events: AgUiEvent[];
@@ -296,6 +301,7 @@ function isThinkingStatus(value: unknown): value is ThinkingActivity["status"] {
   return value === "active" || value === "complete" || value === "error";
 }
 
+/** 会话壳：会话切换 / 提交 run / AG-UI 事件投影到聊天与活动时间线。 */
 export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -733,6 +739,10 @@ export function App() {
     }
   }
 
+  /**
+   * 打开历史会话：加载快照 →（可选）重放 events 重建时间线 → 拼接切会话期间缓冲的流式尾部。
+   * navigationToken 丢弃过期异步结果；bufferedRun 表示该会话仍有未结束的本地 run。
+   */
   async function openSession(nextId: string) {
     stopVoiceConversation("切换会话，语音会话已结束");
     const navigationToken = sessionNavigationTokenRef.current + 1;
@@ -775,6 +785,7 @@ export function App() {
       const normalizedMessages = normalizeMessages(data.messages);
       persistedMessageIdsRef.current = new Set(normalizedMessages.map((message) => message.id));
       const historicalEvents = Array.isArray(data.events) ? data.events : [];
+      // messages 是紧凑模型上下文；失败 run 可能只在 events 里，需合成错误气泡。
       setMessages(mergeHistoricalMessages(
         normalizedMessages,
         historicalEvents,
@@ -782,6 +793,7 @@ export function App() {
       ));
       if (Array.isArray(data.events) && data.events.length) {
         setTasks(normalizeStringList(data.tasks));
+        // 重放时跳过已持久化文本气泡，避免与 messages 重复；仍重建 thinking/tools。
         replayingHistoryRef.current = true;
         data.events.forEach((event) => applyAgUiEvent(event));
         replayingHistoryRef.current = false;
@@ -791,9 +803,7 @@ export function App() {
         setTasks(normalizeStringList(data.tasks));
         setThinking(normalizeThinking(data.thinking));
       }
-      // Events arriving while getSession was in flight are newer than its
-      // snapshot. Replaying only this tail prevents both gaps and duplicate
-      // deltas when the user returns to an actively streaming conversation.
+      // getSession 飞行期间到达的事件比快照新；只重放尾部，避免缺口与重复 delta。
       bufferedRun?.events.slice(bufferedEventCount).forEach((event) => applyAgUiEvent(event));
       const isRunning = activeRunsRef.current.has(data.sessionId);
       setSessionLoading(false);
@@ -803,8 +813,7 @@ export function App() {
       if (sessionNavigationTokenRef.current !== navigationToken) return;
       const localRun = activeRunsRef.current.get(nextId);
       if (localRun) {
-        // RUN_STARTED may not have reached persistence yet. The local event
-        // buffer is sufficient to reconstruct the in-flight view until it does.
+        // RUN_STARTED 可能尚未落库；用本地事件缓冲重建进行中视图。
         resetRunViewState();
         setMessages(localRun.initialMessages);
         pendingAssistantIdRef.current = localRun.pendingAssistantId;
@@ -824,6 +833,7 @@ export function App() {
     }
   }
 
+  /** 清空当前线程指针与视图；不中止其他会话上仍在跑的 activeRuns。 */
   function startNewSession() {
     stopVoiceConversation("新会话已准备，语音会话已结束");
     sessionNavigationTokenRef.current += 1;
@@ -866,8 +876,7 @@ export function App() {
     const activeRun = activeRunsRef.current.get(sessionId);
     activeRun?.controller.abort();
     if (activeRun) {
-      // The visible transcript mirrors Access Layer rollback: an intentional
-      // stop discards the user turn that started the aborted run.
+      // 主动停止与 Access Layer 回滚一致：去掉本轮 user + 占位 assistant，并通知服务端 cancel。
       const removableMessageIds = new Set([
         activeRun.userMessageId,
         activeRun.pendingAssistantId,
@@ -1262,6 +1271,10 @@ export function App() {
     void submitConversation(prompt);
   }
 
+  /**
+   * 提交一轮对话：乐观插入 user + 占位 assistant，组装 AgUiRunInput，再挂到 activeRuns 并开 SSE。
+   * 仅当前可见会话会把流事件应用到 UI；切走时仍写入 activeRun.events 供回来时重放。
+   */
   async function submitConversation(prompt: string) {
     if ((!prompt && !attachments.length) || loading || sessionLoading || !modelId) {
       if (voiceConversationActiveRef.current) {
@@ -1277,8 +1290,7 @@ export function App() {
       return;
     }
 
-    // A new user turn owns subsequent voice events. This also releases the
-    // temporary suppression used for late deltas from an interrupted run.
+    // 新用户回合接管后续语音事件，并解除打断后对迟到 delta 的抑制。
     voiceBargeInActiveRef.current = false;
 
     const agentModels = modelsForAgent(agentKind, models, agents);
@@ -1292,6 +1304,8 @@ export function App() {
     const userMessage = createMessage("user", prompt);
     const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
     const targetSessionId = sessionId ?? createClientId();
+    // Access Layer 只收本轮 user 消息；完整历史由服务端按 threadId 拼接。
+    // 模型/MCP/skills/agent 选项走 forwardedProps，不进入 messages 正文。
     const runInput: AgUiRunInput = {
       threadId: targetSessionId,
       runId,
@@ -1312,8 +1326,7 @@ export function App() {
         reasoningEffort: effectiveReasoningEffort,
         attachments,
         agentKind,
-        // Voice style is run-scoped metadata rather than user-visible prompt
-        // text, so persistence keeps the exact transcript the user spoke.
+        // 语音风格是 run 级元数据，不写进 prompt，保证落库 transcript 与用户原话一致。
         agentOptions: {
           voiceConversation: voiceConversationActiveRef.current,
           voiceStyle: voiceConfig.style,
@@ -1385,6 +1398,7 @@ export function App() {
         handleVoiceStreamEvent(errorEvent, targetSessionId);
       }
     } finally {
+      // 仅清除本 controller 拥有的 run，避免后发起的同会话 run 被误删。
       const stillOwnsSession = activeRunsRef.current.get(targetSessionId)?.controller === controller;
       if (stillOwnsSession) {
         activeRunsRef.current.delete(targetSessionId);
@@ -1401,6 +1415,11 @@ export function App() {
     }
   }
 
+  /**
+   * 将单条 AG-UI 事件投影到 React 状态（messages / thinking / tools / approvals / status）。
+   * 状态机大致：idle → preparing → processing（文本/工具/审批）→ complete | failed。
+   * replayingHistoryRef 为 true 时避免把已持久化消息再 append 一遍。
+   */
   function applyAgUiEvent(event: AgUiEvent) {
     switch (event.type) {
       case "RUN_STARTED":
@@ -1441,6 +1460,7 @@ export function App() {
         if (replayingHistoryRef.current && persistedMessageIdsRef.current.has(event.messageId)) {
           break;
         }
+        // 占位 assistant id 换成服务端 messageId，后续 CONTENT delta 按该 id 拼接。
         setMessages((current) => {
           const pendingAssistantId = pendingAssistantIdRef.current;
           const fallbackPendingId = [...current].reverse().find((message) => message.role === "assistant" && !message.content)?.id;
@@ -1541,6 +1561,7 @@ export function App() {
         break;
       }
       case "REASONING_START":
+        // 新协议：REASONING_*；旧协议：THINKING_*（下方分支）。二者都写入 thinkingBlocks。
         activeThinkingTitleRef.current = "思考过程";
         activeThinkingStepIdRef.current = null;
         beginThinkingBlock(
@@ -1627,6 +1648,7 @@ export function App() {
         const toolTurnId = activeRunIdRef.current ?? event.toolCallId;
         const toolSequence = activitySequenceRef.current + 1;
         activitySequenceRef.current = toolSequence;
+        // textOffset：工具卡片相对助手可见文本的插入位点，供 inline 时间线交错渲染。
         setTools((current) => [...current, {
           id: event.toolCallId,
           turnId: toolTurnId,
@@ -1655,6 +1677,7 @@ export function App() {
         }));
         break;
       case "CUSTOM":
+        // 扩展通道：status/trace 文案，以及人工审批请求/结果（非标准 AG-UI 字段）。
         if (event.name === "status") {
           setStatus(String(event.value.message ?? appConfig.status.processing));
         }
@@ -1714,9 +1737,7 @@ export function App() {
         activeRunIdRef.current = null;
         setActiveRunId(null);
         setStatus(appConfig.status.failed);
-        // Historical error rows were merged into their original run position
-        // before replay. Appending one here would move an older failed run
-        // behind later successful messages.
+        // 历史错误气泡已在 mergeHistoricalMessages 按原 run 位置插入；重放时再 append 会错序。
         if (replayingHistoryRef.current) break;
         setMessages((current) =>
           pendingAssistantId && current.some((message) => message.id === pendingAssistantId)

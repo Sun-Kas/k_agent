@@ -1,3 +1,8 @@
+/**
+ * 聊天 / AG-UI / 配置相关共享类型。
+ * SessionState：服务端会话快照；AgUiEvent / AgUiRunInput：流式协议与请求体。
+ */
+
 export type ChatRole = "user" | "assistant" | "system" | "tool";
 
 export interface ChatMessage {
@@ -41,6 +46,7 @@ export interface SessionWorkspaceFileContent {
   size: number;
 }
 
+/** 打开会话时的服务端快照：messages 供模型上下文；events 供 UI 时间线重放。 */
 export interface SessionState {
   sessionId: string;
   messages: ChatMessage[];
@@ -152,6 +158,7 @@ export interface McpCapabilities {
   prompts: Record<string, Array<Record<string, unknown>>>;
 }
 
+/** AG-UI / 扩展 SSE 事件联合类型；App.applyAgUiEvent 按 type 投影到 UI。 */
 export type AgUiEvent =
   | { type: "RUN_STARTED"; threadId: string; runId: string }
   | { type: "RUN_FINISHED"; threadId: string; runId: string; result?: unknown }
@@ -191,6 +198,10 @@ export interface ThinkingActivity {
   createdAt: string;
 }
 
+/**
+ * POST /api/agent 请求体。
+ * messages 仅含本轮用户消息；模型/能力/agent 选项在 forwardedProps，历史由服务端按 threadId 补齐。
+ */
 export interface AgUiRunInput {
   threadId: string;
   runId: string;

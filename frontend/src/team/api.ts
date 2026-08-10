@@ -1,3 +1,7 @@
+/**
+ * Team 工作台 API：CRUD、命令、消息，以及 EventSource 增量事件流。
+ * 与单会话 AG-UI SSE 不同：团队用独立 /api/teams/.../stream，按 seq 续传。
+ */
 import { appConfig } from "../config";
 import type {
   TeamAgentDraft,
@@ -111,6 +115,10 @@ export const sendTeamMessage = (teamId: string, recipientId: string, content: st
     body: JSON.stringify({ senderId: "user", recipientId, messageType: "user_message", content })
   });
 
+/**
+ * EventSource 订阅团队事件；afterSeq 之后增量推送。
+ * 返回关闭函数；畸形 JSON 丢弃以免中断后续更新。
+ */
 export function subscribeTeamEvents(
   teamId: string,
   afterSeq: number,

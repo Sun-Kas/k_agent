@@ -1,8 +1,8 @@
-"""Claude Code CLI runner (`claude -p --output-format stream-json`).
+"""Claude Code CLI Runner（`claude -p --output-format stream-json`）。
 
-Default permission mode is ``bypassPermissions`` so MCP and tool calls work
-in headless execution (stdin is /dev/null). Callers can restrict via
-agentOptions ``claudePermissionMode``.
+默认 permission mode 为 ``bypassPermissions``，以便无头执行下 MCP/工具可用
+（stdin 为 /dev/null）。调用方可经 agentOptions ``claudePermissionMode`` 收紧；
+需要人类审批时走 approval bridge MCP。
 """
 
 from __future__ import annotations

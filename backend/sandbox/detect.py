@@ -1,4 +1,4 @@
-"""Probe whether Anthropic's sandbox-runtime can run on this host."""
+"""探测本机能否运行 Anthropic sandbox-runtime（`srt`）。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SandboxSupport:
-    """Whether this host can sandbox a command, and why not when it cannot."""
+    """本机是否具备沙箱能力；不可用时带上原因。"""
 
     available: bool
     reason: str
@@ -19,14 +19,14 @@ _support_cache: SandboxSupport | None = None
 
 
 def reset_sandbox_detection() -> None:
-    """Drop the cached backend probe so tests and reconfiguration re-detect."""
+    """丢弃缓存的探测结果，供测试与重配重新检测。"""
 
     global _support_cache
     _support_cache = None
 
 
 def detect_support(sandbox_command: str) -> SandboxSupport:
-    """Probe once whether `srt` and its platform prerequisites are present."""
+    """进程内只探测一次：`srt` 与平台前置（Linux 还需 bwrap）是否就绪。"""
 
     global _support_cache
     if _support_cache is not None:
@@ -36,7 +36,7 @@ def detect_support(sandbox_command: str) -> SandboxSupport:
 
 
 def _detect_support_uncached(sandbox_command: str) -> SandboxSupport:
-    """Check the host platform and required binaries without caching."""
+    """检查平台与必需二进制，不写缓存。"""
 
     if sys.platform == "win32":
         return SandboxSupport(

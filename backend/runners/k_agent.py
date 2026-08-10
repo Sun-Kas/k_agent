@@ -1,4 +1,8 @@
-"""Built-in OpenAI-compatible React agent runner."""
+"""内置 OpenAI 兼容 React Agent Runner（默认 agentKind=`k_agent`）。
+
+pipeline：按请求连接 MCP → 拼 prompt → 绑定本轮工具 → `OpenAIAgent.run_stream`
+→ 内部事件。会话状态仍在 Access Layer；这里每轮新建 manager/agent，结束关闭 MCP。
+"""
 
 from __future__ import annotations
 
@@ -24,9 +28,12 @@ logger = logging.getLogger("k_agent.runners.k_agent")
 
 
 class KAgentRunner:
+    """默认 Runner：组装 prompt/工具/审批钩子后驱动 `OpenAIAgent` 主循环。"""
+
     kind = "k_agent"
 
     async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
+        """一次无状态执行：MCP 按本轮选中集合连接，finally 里关闭。"""
         if ctx.settings is None or ctx.mcp_pool is None or ctx.langfuse is None:
             raise RuntimeError("KAgentRunner requires settings, mcp_pool, and langfuse")
 

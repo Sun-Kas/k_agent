@@ -1,4 +1,4 @@
-"""Central cache-invalidation state for dynamically assembled prompts."""
+"""动态拼装 prompt 的集中式缓存失效状态。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from backend.prompts.sections import SECTION_CACHE
 
 @dataclass
 class PromptLifecycleState:
-    """说明 PromptLifecycleState 在当前模块中的具体职责。"""
+    """prompt/memory 缓存代数：generation 递增表示前端应视为「上下文代际」已变。"""
     generation: int = 0
     last_reset_at: str | None = None
     reason: str | None = None
@@ -21,7 +21,7 @@ STATE = PromptLifecycleState()
 
 
 def reset_prompt_caches(reason: str = "manual") -> PromptLifecycleState:
-    """Clear prompt and memory caches after /clear, /compact, config changes, or reconnects."""
+    """在 /clear、/compact、配置变更或重连后清空 prompt 与 memory 缓存。"""
     SECTION_CACHE.clear()
     clear_memory_cache()
     STATE.generation += 1
@@ -31,5 +31,5 @@ def reset_prompt_caches(reason: str = "manual") -> PromptLifecycleState:
 
 
 def prompt_lifecycle_state() -> PromptLifecycleState:
-    """说明 prompt_lifecycle_state 在当前模块中的具体职责。"""
+    """返回进程内当前的 prompt 生命周期快照（只读观察）。"""
     return STATE
