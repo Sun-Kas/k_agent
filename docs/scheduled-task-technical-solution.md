@@ -131,7 +131,10 @@ flowchart LR
 
 ### 5.2 休眠、停机与补跑
 
-Runtime 每 1 秒检查到期任务。恢复后：
+Runtime 不做固定按秒轮询。它查询最近的 `next_run_at` 后动态休眠；创建、编辑、
+暂停、恢复和删除操作通过 `asyncio.Event` 立即唤醒调度循环并重算截止时间。为处理
+电脑休眠、系统时钟跳变或遗漏的进程内信号，动态休眠最长每 60 秒做一次时钟校准，
+该间隔可通过 `SCHEDULED_TASK_CLOCK_RECHECK_SECONDS=60` 配置。恢复后：
 
 - 延迟不超过 15 分钟：执行最近一次到期触发。
 - 延迟超过 15 分钟：该触发记为 `missed`，不执行。
@@ -191,8 +194,8 @@ Runtime 每 1 秒检查到期任务。恢复后：
 ### 修改
 
 - `access_layer/main.py`：lifespan 装配和关闭 Runtime、注册路由、健康状态。
-- `access_layer/gateway.py`：抽取 HTTP SSE 与后台调度共用的运行核心，并保留现有公开行为。
-- `backend/config/config.py`：misfire grace、调度并发、启用开关。
+- `access_layer/gateway.py`：无需修改；Runtime 在进程内消费其 `StreamingResponse.body_iterator`，完整复用现有网关运行路径。
+- `access_layer/scheduled_tasks/runtime.py`：读取调度专用环境变量，包括 misfire grace、并发、lease、启用开关与时钟校准周期。
 - `frontend/src/App.tsx`：增加入口、视图路由状态、执行结果跳转。
 - `frontend/src/styles.css`：入口、列表、抽屉和各主题状态样式。
 - `frontend/src/types.ts`：会话摘要可选的定时任务关联字段（如 UI 确需展示来源）。

@@ -47,6 +47,9 @@ class SessionRecord:
     skill_ids: list[str] | None = None
     # Provider-native CLI session ids (codex / claude_code) for optional resume.
     cli_sessions: dict[str, str] = field(default_factory=dict)
+    # 来源是持久化边界：自动任务仍有完整 session/workspace，但不进入普通会话目录。
+    source: str = "interactive"
+    source_ref: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -75,11 +78,16 @@ class SessionStore:
         self,
         title: str | None = None,
         session_id: str | None = None,
+        source: str = "interactive",
+        source_ref: str | None = None,
     ) -> SessionRecord:
         """创建新会话并写入存储后端。"""
         settings = await get_or_init_settings()
         title = title or settings.default_session_title
-        session = SessionRecord(id=session_id or str(uuid.uuid4()), title=title)
+        session = SessionRecord(
+            id=session_id or str(uuid.uuid4()), title=title,
+            source=source, source_ref=source_ref,
+        )
         async with self._lock:
             self._sessions[session.id] = session
             await self._ensure_workspace(session.id)
@@ -99,7 +107,7 @@ class SessionStore:
         await self._ensure_loaded()
         async with self._lock:
             sessions = sorted(
-                list(self._sessions.values()),
+                [session for session in self._sessions.values() if session.source == "interactive"],
                 key=lambda session: session.updated_at,
                 reverse=True,
             )
@@ -112,6 +120,20 @@ class SessionStore:
             )
             for session in sessions
         ]
+
+    async def mark_source(
+        self, session_id: str, source: str, source_ref: str | None = None
+    ) -> SessionRecord | None:
+        """Persistently classify an existing session before catalogs expose it."""
+        await self._ensure_loaded()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            session.source = source
+            session.source_ref = source_ref
+            await self._persist(session)
+            return session
 
     async def update(
         self,
@@ -503,6 +525,8 @@ class SessionStore:
                 else None
             ),
             "cliSessions": dict(session.cli_sessions),
+            "source": session.source,
+            "sourceRef": session.source_ref,
             "updatedAt": session.updated_at.isoformat(),
         }
 
@@ -537,6 +561,8 @@ class SessionStore:
                 else None
             ),
             cli_sessions=cli_sessions,
+            source=str(payload.get("source") or "interactive"),
+            source_ref=(str(payload["sourceRef"]) if payload.get("sourceRef") is not None else None),
             updated_at=datetime.fromisoformat(updated_at) if updated_at else datetime.now(timezone.utc),
         )
 

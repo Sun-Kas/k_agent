@@ -26,9 +26,11 @@ import {
   streamAgentRun
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
+import { groupDisplayMessages, InlineToolActivity, toolResultFailed } from "./components/ConversationTranscript";
 import { ConfigCenter } from "./components/ConfigCenter";
 import { ContentStage, type ContentStageItem } from "./components/ContentStage";
 import { TeamWorkbench } from "./components/TeamWorkbench";
+import { ScheduledTasksView } from "./components/ScheduledTasksView";
 import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
 import { mergeHistoricalMessages } from "./history";
@@ -56,6 +58,7 @@ import type {
 const AGENT_KIND_STORAGE_KEY = "k-agent-agent-kind";
 const CLI_SESSION_MODE_STORAGE_KEY = "k-agent-cli-session-mode";
 const MODEL_BY_AGENT_STORAGE_KEY = "k-agent-model-by-agent";
+const ACTIVE_VIEW_STORAGE_KEY = "k-agent-active-view";
 
 function readModelByAgent(): Record<string, string> {
   try {
@@ -175,15 +178,6 @@ function safeStringify(value: unknown): string {
   }
 }
 
-function toolResultFailed(content: string): boolean {
-  try {
-    const payload = JSON.parse(content) as Record<string, unknown>;
-    return payload?.ok === false || payload?.success === false || payload?.isError === true;
-  } catch {
-    return false;
-  }
-}
-
 function isChatRole(value: unknown): value is ChatMessage["role"] {
   return value === "user" || value === "assistant" || value === "system" || value === "tool";
 }
@@ -266,29 +260,6 @@ function inlineTimeline(
   ].sort((left, right) => left.sequence - right.sequence);
 }
 
-function groupDisplayMessages(messages: ChatMessage[]): ChatMessage[] {
-  const grouped: ChatMessage[] = [];
-  for (const message of messages) {
-    if (message.role !== "user" && message.role !== "assistant") continue;
-    const runId = message.role === "assistant" ? message.meta?.runId : undefined;
-    const previous = grouped[grouped.length - 1];
-    if (
-      runId
-      && previous?.role === "assistant"
-      && previous.meta?.runId === runId
-    ) {
-      const separator = previous.content.trim() && message.content.trim() ? "\n\n" : "";
-      grouped[grouped.length - 1] = {
-        ...previous,
-        content: `${previous.content}${separator}${message.content}`
-      };
-      continue;
-    }
-    grouped.push(message);
-  }
-  return grouped;
-}
-
 function visibleTextLength(value: string): number {
   return value.replace(/\s/g, "").length;
 }
@@ -344,7 +315,9 @@ export function App() {
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const workspaceCacheRef = useRef<Map<string, string>>(new Map());
   const selectedWorkspacePathRef = useRef<string | null>(null);
-  const [view, setView] = useState<"chat" | "config" | "team">("chat");
+  const [view, setView] = useState<"chat" | "config" | "team" | "scheduled">(() => (
+    localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) === "scheduled" ? "scheduled" : "chat"
+  ));
   const [models, setModels] = useState<ModelProfile[]>([]);
   const [agents, setAgents] = useState<DetectedAgent[]>([]);
   const [agentKind, setAgentKind] = useState<AgentKind>(() => localStorage.getItem(AGENT_KIND_STORAGE_KEY) || "k_agent");
@@ -527,6 +500,12 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("k-agent-sidebar-collapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    // Only the scheduled-task surface survives a full reload. Config and Team
+    // keep their existing explicit back-navigation semantics.
+    localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, view === "scheduled" ? "scheduled" : "chat");
+  }, [view]);
 
   useEffect(() => {
     localStorage.setItem("k-agent-desktop-pet-enabled", String(desktopPetEnabled));
@@ -2290,7 +2269,7 @@ export function App() {
   return (
     <>
     <div
-      className={`shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${inspectorOpen ? "" : "inspector-hidden"}`}
+      className={`shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${inspectorOpen && view === "chat" ? "" : "inspector-hidden"}`}
       style={{
         "--sidebar-width": `${sidebarWidth}px`,
         "--inspector-width": `${inspectorWidth}px`
@@ -2309,15 +2288,18 @@ export function App() {
           <div><strong>K Agent</strong><small>本地执行台</small></div>
         </div>
         <nav className="workspace-switch" aria-label="工作模式">
-          <button className="active" type="button" aria-current="page">
+          <button className="active" type="button" aria-current="page" onClick={() => setView("chat")}>
             <span>◉</span><strong>Work</strong>
           </button>
           <button type="button" onClick={() => setView("team")}>
             <span>⌘</span><strong>Agent Team</strong>
           </button>
         </nav>
-        <button className="new-session" type="button" onClick={startNewSession}>
+        <button className="new-session" type="button" onClick={() => { setView("chat"); startNewSession(); }}>
           <span>＋</span> 新建会话 <kbd>⌘ N</kbd>
+        </button>
+        <button className={`new-session scheduled-session-entry ${view === "scheduled" ? "active" : ""}`} type="button" onClick={() => setView("scheduled")}>
+          <span>◷</span> 定时任务
         </button>
         <label className="session-search">
           <span>⌕</span>
@@ -2338,7 +2320,7 @@ export function App() {
               className={`session-item ${session.id === sessionId ? "active" : ""} ${runningSessionIds.has(session.id) ? "running" : ""}`}
               key={session.id}
               type="button"
-              onClick={() => void openSession(session.id)}
+              onClick={() => { setView("chat"); void openSession(session.id); }}
             >
               {runningSessionIds.has(session.id)
                 ? (
@@ -2406,7 +2388,16 @@ export function App() {
         onKeyDown={(event) => resizeWithKeyboard("sidebar", event)}
       />
 
-      <main className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""}`}>
+      <main className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""} ${view === "scheduled" ? "scheduled-conversation" : ""}`}>
+        {view === "scheduled" ? (
+          <ScheduledTasksView
+            models={models}
+            agents={agents}
+            mcpServers={mcpServers}
+            skills={skills}
+          />
+        ) : (
+        <>
         <header className="topbar">
           <button
             className="topbar-icon-button sidebar-toggle-button"
@@ -2563,7 +2554,7 @@ export function App() {
                       activity.type === "thinking"
                         ? <InlineThinking block={activity.block} key={`thinking-${activity.block.id}`} />
                         : activity.type === "tool"
-                          ? <InlineTool tool={activity.tool} key={`tool-${activity.tool.id}`} />
+                          ? <InlineToolActivity tool={activity.tool} key={`tool-${activity.tool.id}`} />
                           : activity.type === "approval"
                             ? (
                               <ApprovalCard
@@ -2742,6 +2733,8 @@ export function App() {
           </div>
         </form>
         <p className="disclaimer">Agent 可能会犯错，关键结果请核实。</p>
+        </>
+        )}
       </main>
 
       <div
@@ -3072,37 +3065,6 @@ function InlineThinking({ block }: { block: ThinkingBlock }) {
               </div>
             </article>
           ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function InlineTool({ tool }: { tool: ToolActivity }) {
-  const [open, setOpen] = useState(tool.status !== "complete");
-
-  useEffect(() => {
-    if (tool.status === "complete") setOpen(false);
-  }, [tool.status]);
-
-  return (
-    <section className={`inline-tool ${tool.status} ${open ? "open" : ""}`}>
-      <button
-        type="button"
-        className="inline-tool-summary"
-        aria-expanded={open}
-        onClick={() => setOpen((current) => !current)}
-      >
-        <ToolIcon className="inline-tool-icon" />
-        <strong>调用工具</strong>
-        <code>{tool.name}</code>
-        <b>{tool.status === "complete" ? "已完成" : tool.status === "error" ? "失败" : "运行中"}</b>
-        <i aria-hidden="true">⌃</i>
-      </button>
-      {open && (tool.arguments || tool.result) && (
-        <div className="inline-tool-detail">
-          {tool.arguments && <code>{tool.arguments}</code>}
-          {tool.result && <p>{tool.result}</p>}
         </div>
       )}
     </section>

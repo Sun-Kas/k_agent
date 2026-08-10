@@ -45,6 +45,8 @@ from access_layer.sessions.workspace import (
     read_session_workspace_file,
     resolve_session_workspace,
 )
+from access_layer.scheduled_tasks import ScheduledTaskRuntime, ScheduledTaskStore
+from access_layer.scheduled_tasks.router import build_scheduled_task_router
 from access_layer.teams import TeamRuntime, TeamStore, build_team_router
 from backend.api.schemas import (
     ApprovalResolutionInput,
@@ -455,6 +457,14 @@ def create_app() -> FastAPI:
             agent_backend_client=app.state.agent_backend_client,
             runtime_catalog=app.state.runtime_catalog,
         )
+        app.state.scheduled_task_store = ScheduledTaskStore(
+            teams_dir().parent / "scheduled_tasks" / "scheduled_tasks.db"
+        )
+        app.state.scheduled_task_runtime = ScheduledTaskRuntime(
+            store=app.state.scheduled_task_store,
+            access_layer=app.state.access_layer,
+            session_store=app.state.session_store,
+        )
         app.state.team_store = TeamStore(teams_dir() / "team_runtime.db")
         app.state.team_runtime = TeamRuntime(
             store=app.state.team_store,
@@ -464,11 +474,13 @@ def create_app() -> FastAPI:
             task_lease_seconds=app.state.settings.team_task_lease_seconds,
             enabled=app.state.settings.team_runtime_enabled,
         )
+        await app.state.scheduled_task_runtime.start()
         await app.state.team_runtime.start()
         try:
             yield
         finally:
             await app.state.team_runtime.stop()
+            await app.state.scheduled_task_runtime.stop()
 
     app = FastAPI(title=settings.app_title, lifespan=lifespan)
 
@@ -504,6 +516,14 @@ def create_app() -> FastAPI:
     # 路由目前只需 store；调度器留在 app.state，避免构造应用时重复启动 runtime。
     app.include_router(build_team_router(runtime_proxy))
 
+    class _ScheduledRuntimeProxy:
+        """Resolve lifespan-owned runtime lazily so app construction performs no I/O."""
+
+        def __getattr__(self, name: str):
+            return getattr(app.state.scheduled_task_runtime, name)
+
+    app.include_router(build_scheduled_task_router(_ScheduledRuntimeProxy()))
+
     @app.get("/api/health", response_model=HealthResponse)
     async def health_check() -> HealthResponse:
         """返回 Access Layer 和 Agent Backend 的健康状态。"""
@@ -537,6 +557,12 @@ def create_app() -> FastAPI:
             "availableRequestSlots": snapshot.available_request_slots,
             "sessionLockCount": snapshot.session_lock_count,
         }
+
+    @app.get("/api/health/scheduled-tasks")
+    async def scheduled_tasks_health():
+        """Expose scheduler liveness without expanding the stable HealthResponse schema."""
+
+        return await app.state.scheduled_task_runtime.health()
 
     @app.get("/api/config/models")
     async def get_models_config():
