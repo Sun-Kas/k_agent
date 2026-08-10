@@ -65,7 +65,6 @@ function readModelByAgent(): Record<string, string> {
     return {};
   }
 }
-
 function writeModelForAgent(kind: AgentKind, modelId: string) {
   const next = { ...readModelByAgent(), [kind]: modelId };
   localStorage.setItem(MODEL_BY_AGENT_STORAGE_KEY, JSON.stringify(next));
@@ -2674,42 +2673,36 @@ export function App() {
           />
           <div className="composer-footer">
             <div className="composer-toolbar composer-toolbar-left">
-              <label className={`attach-button ${agentKind === "k_agent" && models.find((model) => model.id === modelId)?.multimodal ? "" : "disabled"}`} title="添加图片">＋<span>图片</span><input type="file" accept="image/*" multiple disabled={agentKind !== "k_agent"} onChange={(event) => { void addImages(event.target.files); event.target.value = ""; }} /></label>
-              <Picker label={`MCP ${selectedMcp.length}`} items={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description }))} selected={selectedMcp} onChange={changeSelectedMcp} />
-              <Picker label={`Skill ${selectedSkills.length}`} items={skills.map((skill) => ({ id: skill.id, name: skill.name, description: skill.description }))} selected={selectedSkills} onChange={changeSelectedSkills} />
+              <ComposerAddMenu
+                imageEnabled={agentKind === "k_agent" && Boolean(models.find((model) => model.id === modelId)?.multimodal)}
+                onImages={(files) => { void addImages(files); }}
+                mcpItems={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description }))}
+                selectedMcp={selectedMcp}
+                onMcpChange={changeSelectedMcp}
+                skillItems={skills.map((skill) => ({ id: skill.id, name: skill.name, description: skill.description }))}
+                selectedSkills={selectedSkills}
+                onSkillsChange={changeSelectedSkills}
+              />
             </div>
             <div className="composer-toolbar composer-toolbar-right">
-              <AgentPicker
+              <RuntimeSettingsPicker
                 agentKind={agentKind}
                 agents={agents}
                 cliSessionMode={cliSessionMode}
-                onAgentChange={(value) => {
-                  setAgentKind(value);
-                  localStorage.setItem(AGENT_KIND_STORAGE_KEY, value);
-                  if (value !== "k_agent") setAttachments([]);
-                  const nextModel = resolveModelForAgent(value, models, agents);
+                modelId={modelId}
+                kAgentModels={models}
+                reasoningEffort={reasoningEffort}
+                onRuntimeChange={(nextAgent, nextModel) => {
+                  setAgentKind(nextAgent);
+                  localStorage.setItem(AGENT_KIND_STORAGE_KEY, nextAgent);
+                  if (nextAgent !== "k_agent" || !models.find((model) => model.id === nextModel)?.multimodal) setAttachments([]);
                   setModelId(nextModel);
-                  if (nextModel) writeModelForAgent(value, nextModel);
+                  if (nextModel) writeModelForAgent(nextAgent, nextModel);
                   setReasoningEffort("none");
                 }}
                 onCliSessionModeChange={(value) => {
                   setCliSessionMode(value);
                   localStorage.setItem(CLI_SESSION_MODE_STORAGE_KEY, value);
-                }}
-              />
-              <ModelSettingsPicker
-                modelId={modelId}
-                models={modelsForAgent(agentKind, models, agents)}
-                reasoningEffort={reasoningEffort}
-                showReasoning
-                onModelChange={(value) => {
-                  setModelId(value);
-                  writeModelForAgent(agentKind, value);
-                  setReasoningEffort("none");
-                  if (agentKind === "k_agent") {
-                    const next = models.find((model) => model.id === value);
-                    if (!next?.multimodal) setAttachments([]);
-                  }
                 }}
                 onReasoningChange={setReasoningEffort}
               />
@@ -3195,54 +3188,99 @@ function SidebarIcon({ side }: { side: "left" | "right" }) {
   );
 }
 
-function Picker({
-  label,
-  items,
-  selected,
-  onChange
+function ComposerAddMenu({
+  imageEnabled,
+  onImages,
+  mcpItems,
+  selectedMcp,
+  onMcpChange,
+  skillItems,
+  selectedSkills,
+  onSkillsChange
 }: {
-  label: string;
-  items: Array<{ id: string; name: string; description?: string }>;
-  selected: string[];
-  onChange: (ids: string[]) => void;
+  imageEnabled: boolean;
+  onImages: (files: FileList | null) => void;
+  mcpItems: Array<{ id: string; name: string; description?: string }>;
+  selectedMcp: string[];
+  onMcpChange: (ids: string[]) => void;
+  skillItems: Array<{ id: string; name: string; description?: string }>;
+  selectedSkills: string[];
+  onSkillsChange: (ids: string[]) => void;
 }) {
-  const pickerRef = useRef<HTMLDetailsElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
 
   useEffect(() => {
     const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
-      const picker = pickerRef.current;
-      if (picker?.open && !picker.contains(event.target as Node)) {
-        picker.removeAttribute("open");
-      }
+      if (open && menuRef.current && !menuRef.current.contains(event.target as Node)) setOpen(false);
     };
-
     document.addEventListener("pointerdown", closeOnOutsidePointerDown);
     return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
-  }, []);
+  }, [open]);
+
+  const renderSelection = (
+    item: { id: string; name: string; description?: string },
+    selected: string[],
+    onChange: (ids: string[]) => void
+  ) => {
+    const checked = selected.includes(item.id);
+    return (
+      <label className={`composer-menu-option ${checked ? "selected" : ""}`} key={item.id}>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(event) => onChange(event.target.checked
+            ? [...selected, item.id]
+            : selected.filter((id) => id !== item.id))}
+        />
+        <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
+        <i>{checked ? "✓" : ""}</i>
+      </label>
+    );
+  };
 
   return (
-    <details ref={pickerRef} className={`option-picker ${selected.length > 0 ? "has-selection" : ""}`}>
-      <summary>{label}<span>⌃</span></summary>
-      <div className="picker-popover">
-        <header><strong>{label.startsWith("MCP") ? "MCP 服务" : "Skills"}</strong><small>可多选</small></header>
-        {items.length === 0 && <p>暂无可用项</p>}
-        {items.map((item) => {
-          const isSelected = selected.includes(item.id);
-          return (
-            <label key={item.id} className={isSelected ? "selected" : ""}>
-              <input
-                type="checkbox"
-                checked={isSelected}
-                onChange={(event) => onChange(event.target.checked
-                  ? [...selected, item.id]
-                  : selected.filter((id) => id !== item.id))}
-              />
-              <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span><i>{isSelected ? "✓" : ""}</i>
-            </label>
-          );
-        })}
-      </div>
-    </details>
+    <div
+      ref={menuRef}
+      className={`composer-add-menu ${open ? "open" : ""}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") setOpen(false);
+      }}
+    >
+      {open && (
+        <section className="composer-add-popover" aria-label="添加内容与能力">
+          <header>添加</header>
+          <label className={`composer-menu-option composer-file-option ${imageEnabled ? "" : "disabled"}`}>
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              disabled={!imageEnabled}
+              onChange={(event) => {
+                onImages(event.target.files);
+                event.target.value = "";
+                setOpen(false);
+              }}
+            />
+            <b>＋</b><span><strong>图片</strong><small>{imageEnabled ? "添加一张或多张图片" : "当前 Agent 不支持图片"}</small></span>
+          </label>
+          <div className="composer-menu-section">
+            <header><span>MCP</span><small>{selectedMcp.length} 已选择</small></header>
+            {mcpItems.length === 0 && <p>暂无可用 MCP</p>}
+            {mcpItems.map((item) => renderSelection(item, selectedMcp, onMcpChange))}
+          </div>
+          <div className="composer-menu-section">
+            <header><span>Skills</span><small>{selectedSkills.length} 已选择</small></header>
+            {skillItems.length === 0 && <p>暂无可用 Skill</p>}
+            {skillItems.map((item) => renderSelection(item, selectedSkills, onSkillsChange))}
+          </div>
+        </section>
+      )}
+      <button className="composer-add-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen((value) => !value)}>
+        <span>＋</span><strong>添加</strong>
+        {(selectedMcp.length + selectedSkills.length) > 0 && <i>{selectedMcp.length + selectedSkills.length}</i>}
+      </button>
+    </div>
   );
 }
 
@@ -3309,124 +3347,42 @@ function resolveModelForAgent(
   return options[0]?.id ?? "";
 }
 
-function AgentPicker({
+function RuntimeSettingsPicker({
   agentKind,
   agents,
   cliSessionMode,
-  onAgentChange,
-  onCliSessionModeChange
+  modelId,
+  kAgentModels,
+  reasoningEffort,
+  onRuntimeChange,
+  onCliSessionModeChange,
+  onReasoningChange
 }: {
   agentKind: AgentKind;
   agents: DetectedAgent[];
   cliSessionMode: CliSessionMode;
-  onAgentChange: (value: AgentKind) => void;
-  onCliSessionModeChange: (value: CliSessionMode) => void;
-}) {
-  const pickerRef = useRef<HTMLDivElement>(null);
-  const [open, setOpen] = useState(false);
-  const current = agents.find((agent) => agent.kind === agentKind) ?? agents[0];
-  const supportsResume = Boolean(current?.supports_resume);
-
-  useEffect(() => {
-    const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
-      const picker = pickerRef.current;
-      if (open && picker && !picker.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("pointerdown", closeOnOutsidePointerDown);
-    return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
-  }, [open]);
-
-  return (
-    <div ref={pickerRef} className={`model-settings ${open ? "open" : ""}`}>
-      {open && (
-        <div className="model-settings-popovers">
-          <section className="agent-picker-card">
-            <div className="agent-picker-list">
-              {agents.map((agent) => (
-                <button
-                  className={agent.kind === agentKind ? "selected" : ""}
-                  disabled={!agent.available}
-                  key={agent.kind}
-                  type="button"
-                  onClick={() => {
-                    if (!agent.available) return;
-                    onAgentChange(agent.kind);
-                    if (!agent.supports_resume) setOpen(false);
-                  }}
-                >
-                  <span>
-                    <strong>{agent.name}</strong>
-                    {agent.version && <small>{agent.version}</small>}
-                    {!agent.available && <small>{agent.detail || "不可用"}</small>}
-                  </span>
-                  <i>{agent.kind === agentKind ? "✓" : ""}</i>
-                </button>
-              ))}
-            </div>
-            {supportsResume && (
-              <div className="agent-picker-sub">
-                <header>会话模式</header>
-                <div className="agent-picker-sub-options">
-                  {([
-                    { id: "ephemeral", name: "每次新建" },
-                    { id: "resume", name: "继续上次" }
-                  ] as const).map((option) => (
-                    <button
-                      className={option.id === cliSessionMode ? "selected" : ""}
-                      key={option.id}
-                      type="button"
-                      onClick={() => {
-                        onCliSessionModeChange(option.id);
-                        setOpen(false);
-                      }}
-                    >
-                      {option.name}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </section>
-        </div>
-      )}
-      <button className="model-settings-bar" type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)} title="选择 Agent">
-        <span className="model-settings-current">
-          <strong>{current?.name || "K Agent"}</strong>
-          {supportsResume && <em>{cliSessionMode === "resume" ? "resume" : "new"}</em>}
-        </span>
-        <i>⌃</i>
-      </button>
-    </div>
-  );
-}
-
-function ModelSettingsPicker({
-  modelId,
-  models,
-  reasoningEffort,
-  showReasoning = true,
-  onModelChange,
-  onReasoningChange
-}: {
   modelId: string;
-  models: Array<Pick<ModelProfile, "id" | "name" | "supportsReasoning" | "multimodal">>;
+  kAgentModels: ModelProfile[];
   reasoningEffort: ReasoningEffort;
-  showReasoning?: boolean;
-  onModelChange: (value: string) => void;
+  onRuntimeChange: (nextAgent: AgentKind, nextModel: string) => void;
+  onCliSessionModeChange: (value: CliSessionMode) => void;
   onReasoningChange: (value: ReasoningEffort) => void;
 }) {
   const pickerRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  const [panel, setPanel] = useState<"model" | "reasoning" | null>(null);
-  const currentModel = models.find((model) => model.id === modelId);
-  const availableReasoningOptions = showReasoning
-    ? reasoningOptionsForModel(currentModel)
-    : [reasoningOptions[0]];
+  const [preview, setPreview] = useState<{ agentKind: AgentKind; modelId: string } | null>(null);
+  const currentAgent = agents.find((agent) => agent.kind === agentKind) ?? agents[0];
+  const currentModels = modelsForAgent(agentKind, kAgentModels, agents);
+  const currentModel = currentModels.find((model) => model.id === modelId);
+  const availableReasoningOptions = reasoningOptionsForModel(currentModel);
   const normalizedReasoning = availableReasoningOptions.some((option) => option.id === reasoningEffort) ? reasoningEffort : "none";
   const currentReasoning = reasoningOptions.find((option) => option.id === normalizedReasoning);
-  const supportsReasoning = Boolean(showReasoning && currentModel?.supportsReasoning);
+  const supportsReasoning = Boolean(currentModel?.supportsReasoning);
+  const previewAgentKind = preview?.agentKind ?? agentKind;
+  const previewModelId = preview?.modelId ?? modelId;
+  const previewAgent = agents.find((agent) => agent.kind === previewAgentKind) ?? currentAgent;
+  const previewModel = modelsForAgent(previewAgentKind, kAgentModels, agents).find((model) => model.id === previewModelId) ?? currentModel;
+  const previewReasoningOptions = reasoningOptionsForModel(previewModel);
 
   useEffect(() => {
     if (normalizedReasoning !== reasoningEffort) onReasoningChange(normalizedReasoning);
@@ -3434,73 +3390,106 @@ function ModelSettingsPicker({
 
   useEffect(() => {
     const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
-      const picker = pickerRef.current;
-      if (open && picker && !picker.contains(event.target as Node)) {
+      if (open && pickerRef.current && !pickerRef.current.contains(event.target as Node)) {
         setOpen(false);
-        setPanel(null);
+        setPreview(null);
       }
     };
-
     document.addEventListener("pointerdown", closeOnOutsidePointerDown);
     return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
   }, [open]);
 
+  const close = () => {
+    setOpen(false);
+    setPreview(null);
+  };
+
   return (
-    <div ref={pickerRef} className={`model-settings ${open ? "open" : ""}`}>
+    <div
+      ref={pickerRef}
+      className={`runtime-settings ${open ? "open" : ""}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") close();
+      }}
+    >
       {open && (
-        <div className="model-settings-popovers">
-          {panel && (
-            <section className="model-options-card">
-              <header>{panel === "model" ? "模型" : "推理强度"}</header>
+        <div className="runtime-settings-popovers">
+          <section className="runtime-detail-card">
+            <header><strong>{previewModel?.name ?? "选择模型"}</strong><small>{previewAgent?.name ?? "Agent"}</small></header>
+            {previewAgent?.version && <p>{previewAgent.version}</p>}
+            <div className="runtime-detail-row">
+              <span>思考强度</span>
               <div>
-                {panel === "model" ? models.map((model) => (
-                  <button className={model.id === modelId ? "selected" : ""} key={model.id} type="button" onClick={() => {
-                    onModelChange(model.id);
-                    setPanel(null);
-                  }}>
-                    <span>{model.name}</span><i>{model.id === modelId ? "✓" : ""}</i>
-                  </button>
-                )) : availableReasoningOptions.map((option) => (
-                  <button className={option.id === reasoningEffort ? "selected" : ""} key={option.id} type="button" onClick={() => {
-                    onReasoningChange(option.id);
-                    setPanel(null);
-                  }}>
-                    <span><strong>{option.name}</strong>{option.hint && <small>{option.hint}</small>}</span>
-                    <i>{option.id === reasoningEffort ? "✓" : ""}</i>
-                  </button>
+                {previewReasoningOptions.map((option) => (
+                  <button
+                    className={previewAgentKind === agentKind && previewModelId === modelId && option.id === reasoningEffort ? "selected" : ""}
+                    key={option.id}
+                    type="button"
+                    onClick={() => {
+                      if (previewAgentKind !== agentKind || previewModelId !== modelId) onRuntimeChange(previewAgentKind, previewModelId);
+                      onReasoningChange(option.id);
+                    }}
+                  >{option.name}</button>
                 ))}
               </div>
-            </section>
-          )}
-          <section className="model-settings-card">
-            <button className={panel === "model" ? "active" : ""} type="button" onClick={() => setPanel(panel === "model" ? null : "model")}>
-              <strong>模型</strong><span>{currentModel?.name ?? "未选择"}</span><i>›</i>
-            </button>
-            {showReasoning && (
-              <button
-                className={panel === "reasoning" ? "active" : ""}
-                type="button"
-                disabled={!supportsReasoning}
-                onClick={() => setPanel(panel === "reasoning" ? null : "reasoning")}
-              >
-                <strong>推理强度</strong><span>{supportsReasoning ? currentReasoning?.name : "不支持"}</span><i>›</i>
-              </button>
+            </div>
+            {previewAgent?.supports_resume && (
+              <div className="runtime-detail-row">
+                <span>会话模式</span>
+                <div>
+                  {([['ephemeral', '新建'], ['resume', '继续']] as const).map(([id, name]) => (
+                    <button className={id === cliSessionMode ? "selected" : ""} key={id} type="button" onClick={() => onCliSessionModeChange(id)}>{name}</button>
+                  ))}
+                </div>
+              </div>
             )}
+          </section>
+          <section className="runtime-settings-card">
+            {agents.filter((agent) => agent.available).map((agent) => {
+              const agentModels = modelsForAgent(agent.kind, kAgentModels, agents);
+              return (
+                <div className="runtime-agent-group" key={agent.kind}>
+                  <header><strong>{agent.name}</strong>{agent.version && <small>{agent.version}</small>}</header>
+                  {agentModels.map((model) => {
+                    const selected = agent.kind === agentKind && model.id === modelId;
+                    return (
+                      <button
+                        className={selected ? "selected" : ""}
+                        key={`${agent.kind}:${model.id}`}
+                        type="button"
+                        onPointerEnter={() => setPreview({ agentKind: agent.kind, modelId: model.id })}
+                        onFocus={() => setPreview({ agentKind: agent.kind, modelId: model.id })}
+                        onClick={() => onRuntimeChange(agent.kind, model.id)}
+                      >
+                        <span>
+                          <strong>{model.name}</strong>
+                          {selected && (model.supportsReasoning || agent.supports_resume) && (
+                            <small>
+                              {model.supportsReasoning ? `思考强度 ${currentReasoning?.name ?? "none"}` : ""}
+                              {model.supportsReasoning && agent.supports_resume ? " · " : ""}
+                              {agent.supports_resume ? (cliSessionMode === "resume" ? "继续上次会话" : "新建会话") : ""}
+                            </small>
+                          )}
+                        </span>
+                        <i>{selected ? "✓" : ""}</i>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })}
           </section>
         </div>
       )}
-      <button className="model-settings-bar" type="button" aria-expanded={open} onClick={() => {
-        setOpen((current) => {
-          const nextOpen = !current;
-          setPanel(nextOpen ? "model" : null);
-          return nextOpen;
+      <button className="runtime-settings-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => {
+        setOpen((value) => {
+          const next = !value;
+          setPreview(next ? { agentKind, modelId } : null);
+          return next;
         });
       }}>
-        <span className="model-settings-current">
-          <strong>{currentModel?.name ?? "选择模型"}</strong>
-          {supportsReasoning && <em>{currentReasoning?.name}</em>}
-        </span>
-        <i>⌃</i>
+        <strong>{currentAgent?.name || "K Agent"}</strong><span>{currentModel?.name ?? "选择模型"}</span>
+        {supportsReasoning && <em>{currentReasoning?.name}</em>}<i>⌃</i>
       </button>
     </div>
   );
