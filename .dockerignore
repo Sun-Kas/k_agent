@@ -1,5 +1,10 @@
 .git
 .github
+.env
+.env.*
+!.env.example
+.k_agent
+data
 .venv
 **/__pycache__
 **/*.pyc
@@ -9,9 +14,3 @@
 .DS_Store
 frontend/node_modules
 frontend/dist
-
-# Intentionally NOT ignored for Dockerfile.snapshot:
-#   .env
-#   .k_agent/config
-#   .k_agent/content
-#   .k_agent/state

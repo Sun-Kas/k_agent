@@ -173,7 +173,30 @@ npm run deploy:local
 
 部署模式下 Access Layer 会在 `http://127.0.0.1:3001` 同源托管 `frontend/dist`，Agent Backend 继续运行在 `127.0.0.1:3002`。
 
-需要把当前 `.env`、Sessions、Skills、Team 和定时任务完整封装为仅供本机使用的容器镜像时，请参阅[私有快照镜像](docs/snapshot-image.md)。该镜像包含明文凭据和私人数据，禁止推送到公共 Registry。
+需要容器化部署时，请参阅 [Docker 部署指南](docs/docker-deployment.md)。镜像不会包含 `.env`、API Key 或 `.k_agent` 数据；凭据在运行时注入，状态保存在独立 Docker Volume 中。
+
+### Docker 运行流程
+
+```bash
+# 1. 准备运行时环境变量（不会进入镜像）
+cp .env.example .env
+# 编辑 .env，至少填写 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+
+# 2. 构建脱敏镜像
+docker compose build
+
+# 3. 后台启动
+docker compose up -d
+
+# 4. 验证服务与调度器
+curl http://127.0.0.1:3001/api/health
+curl http://127.0.0.1:3001/api/health/scheduled-tasks
+
+# 5. 停止并删除容器，保留 named volume 中的数据
+docker compose down
+```
+
+启动后打开 <http://127.0.0.1:3001>。不要使用 `docker compose down -v`，除非确定要永久删除容器内的 Sessions、Skills、Team 与定时任务数据。
 
 ## 运行时数据
 

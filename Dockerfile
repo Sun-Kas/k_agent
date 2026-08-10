@@ -5,7 +5,6 @@ WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
-# Production builds use same-origin /api through the Access Layer on port 3001.
 RUN npm run build:client
 
 FROM node:20-bookworm-slim AS runtime
@@ -26,13 +25,12 @@ COPY backend/ ./backend/
 COPY docs/ ./docs/
 COPY README.md LICENSE ./
 COPY --from=frontend-builder /build/frontend/dist ./frontend/dist/
+COPY docker/entrypoint.sh /usr/local/bin/k-agent
 
-# Snapshot-only boundary: these layers intentionally contain credentials and
-# private runtime history. Never publish this image or its build cache.
-COPY .env ./.env
-COPY .k_agent/ ./.k_agent/
-COPY docker/snapshot-entrypoint.sh /usr/local/bin/k-agent-snapshot
-RUN chmod 0700 /usr/local/bin/k-agent-snapshot \
+# Runtime state is always mounted here. The image contains no .env, credentials,
+# sessions, Skills, Team databases, scheduled-task databases, or workspaces.
+RUN chmod 0755 /usr/local/bin/k-agent \
+    && mkdir -p /app/.k_agent \
     && chown -R node:node /app
 
 ENV PATH="/app/.venv/bin:${PATH}" \
@@ -50,4 +48,4 @@ EXPOSE 3001
 HEALTHCHECK --interval=15s --timeout=5s --start-period=45s --retries=4 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3001/api/health', timeout=3)" || exit 1
 
-ENTRYPOINT ["/usr/local/bin/k-agent-snapshot"]
+ENTRYPOINT ["/usr/local/bin/k-agent"]

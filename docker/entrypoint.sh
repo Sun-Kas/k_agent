@@ -16,8 +16,6 @@ trap shutdown TERM INT EXIT
 python -m backend.run_server &
 backend_pid=$!
 
-# Do not expose the public API until the private backend has at least opened its
-# health endpoint. MCP initialization may continue and is reflected by /api/health.
 for _ in $(seq 1 60); do
   if python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3002/internal/health', timeout=1)" >/dev/null 2>&1; then
     break
@@ -31,6 +29,5 @@ done
 python -m access_layer.run_server &
 access_pid=$!
 
-# Bash wait -n returns as soon as either service exits; the EXIT trap then
-# terminates its peer so the container never reports a half-alive deployment.
+# Exit the container if either service dies; the EXIT trap terminates its peer.
 wait -n "$backend_pid" "$access_pid"

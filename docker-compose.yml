@@ -1,0 +1,26 @@
+services:
+  k-agent:
+    image: k-agent:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: k-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Container networking overrides the loopback values commonly used by .env.
+      HOST: 0.0.0.0
+      PORT: 3001
+      AGENT_BACKEND_HOST: 127.0.0.1
+      AGENT_BACKEND_PORT: 3002
+      AGENT_BACKEND_URL: http://127.0.0.1:3002
+      K_AGENT_HOME: /app/.k_agent
+      RELOAD: "false"
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - k-agent-data:/app/.k_agent
+
+volumes:
+  k-agent-data:
