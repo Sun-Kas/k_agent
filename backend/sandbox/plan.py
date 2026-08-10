@@ -97,7 +97,7 @@ def build_settings_payload(
     enabled = (
         settings.network_access_default if network_access is None else network_access
     )
-    return {
+    payload: dict = {
         "filesystem": {
             "denyRead": _dedupe(deny_read),
             "allowRead": [],
@@ -114,6 +114,12 @@ def build_settings_payload(
             "allowLocalBinding": False,
         },
     }
+    # Go CLIs on macOS (agently-cli / gh / …) verify TLS via Security.framework →
+    # com.apple.trustd.agent. srt blocks that Mach service by default, which
+    # surfaces as `x509: OSStatus -26276`. Re-enable only when configured.
+    if settings.bash_sandbox_weaker_network_isolation:
+        payload["enableWeakerNetworkIsolation"] = True
+    return payload
 
 
 def sanitize_srt_allowed_domains(

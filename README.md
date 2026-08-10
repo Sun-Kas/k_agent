@@ -1,197 +1,267 @@
-# k_agent
+<div align="center">
+  <img src="frontend/public/icon-512.png" width="112" alt="K Agent logo" />
 
-一个基于 OpenAI API 的 React Agent 初始框架，包含：
+  # K Agent
 
-- React 前端聊天界面
-- Python FastAPI 接入层与无状态 Agent Backend
-- OpenAI Chat Completions 流式接入
-- AG-UI 标准前后端通信
-- 本地工具注册与执行
-- MCP server 发现与调用桥接
+  **一个本地优先、可扩展、可观测的 AI Agent 工作台**
 
-协议说明见 [docs/ag-ui-protocol.md](docs/ag-ui-protocol.md)，工具说明见
-[docs/tools.md](docs/tools.md)。
+  从实时对话到定时执行，从单 Agent 到多 Agent 团队，统一管理模型、工具、MCP、Skills 与工作空间。
+
+  [![License: MIT](https://img.shields.io/badge/License-MIT-111111.svg)](LICENSE)
+  [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](requirements.txt)
+  [![React](https://img.shields.io/badge/React-18-149ECA?logo=react&logoColor=white)](frontend/package.json)
+  [![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688?logo=fastapi&logoColor=white)](requirements.txt)
+  [![AG--UI](https://img.shields.io/badge/Protocol-AG--UI-6C63FF)](docs/ag-ui-protocol.md)
+
+  [快速开始](#-快速开始) · [功能概览](#-功能概览) · [系统架构](#-系统架构) · [项目文档](#-项目文档)
+</div>
+
+---
+
+## 为什么选择 K Agent
+
+K Agent 不只是一个聊天页面。它把 Agent 运行需要的会话状态、工具调用、工作空间、能力配置与自动化调度放进同一套本地工作台，同时保持推理服务无状态、接入边界清晰。
+
+| 能力 | 说明 |
+| --- | --- |
+| 💬 **实时 Agent 对话** | 基于 AG-UI + SSE 展示文本、推理、工具调用、审批与运行状态 |
+| 🧰 **工具 / MCP / Skills** | 统一发现、配置和选择本地工具、MCP Server 与可复用 Skill 包 |
+| 🗂️ **持久化会话与工作空间** | 每个 Session 拥有独立历史、上下文、事件流和文件工作空间 |
+| ⏱️ **定时任务** | 按一次、每天或每周自动运行；结果在自动化页面独立查看，不污染普通会话列表 |
+| 👥 **Agent Team** | Supervisor 规划依赖任务，多个 Worker 并行协作并经过产物验收 |
+| 🎙️ **浏览器语音** | 支持单次语音输入、连续语音对话、朗读、打断与取消回滚 |
+| 🧠 **上下文管理** | 分层指令、长期记忆、上下文预算、历史压缩与旧工具结果裁剪 |
+| 🔍 **可观测与可恢复** | 执行轨迹、结构化日志、Langfuse；普通工具错误返回给模型继续修正 |
+| 🔒 **本地优先** | Access Layer 与 Agent Backend 默认仅监听 `127.0.0.1` |
+
+## 功能概览
+
+### Work：完整的 Agent 执行台
+
+- Markdown、GFM 表格、数学公式和代码块渲染
+- 推理过程、工具调用、人工审批与任务计划时间线
+- 会话切换期间保留后台流式运行状态
+- Session 级 MCP / Skill 选择与持久化
+- 独立 Workspace 文件浏览与内容预览
+- 多主题、字体调节和桌面宠物
+
+### Automations：可持久化的定时任务
+
+- 支持单次、每日、每周和 IANA 时区
+- 使用最近到期时间动态休眠，不进行按秒轮询
+- 每次执行创建独立 Session 与 Workspace
+- 自动任务 Session 与普通聊天目录在持久化层隔离
+- 页面内查看 Markdown 结果与折叠工具活动
+- 支持立即运行、暂停、恢复、编辑和执行历史
+
+### Agent Team：有计划的多 Agent 协作
+
+- 组合 `k_agent`、`codex` 与 `claude_code` Worker
+- Supervisor 生成带依赖关系的任务 DAG
+- 独立并发池执行无依赖根任务
+- Worker 提交后由 Supervisor 审核任务与 Artifact
+- 团队 Mailbox、事件序列和产物目录持久化
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    UI["React Workbench<br/>:5173 / :3001"]
+    AL["Access Layer<br/>FastAPI · :3001"]
+    BE["Stateless Agent Backend<br/>FastAPI · :3002"]
+    MODEL["OpenAI-compatible Model"]
+    MCP["MCP Servers"]
+    TOOLS["Local Tools / Skills"]
+    STATE[("$K_AGENT_HOME<br/>Sessions · Teams · Automations")]
+
+    UI -->|"HTTP + AG-UI/SSE"| AL
+    AL -->|"Internal NDJSON"| BE
+    AL <--> STATE
+    BE --> MODEL
+    BE <--> MCP
+    BE <--> TOOLS
+```
+
+请求链路为：
+
+```text
+Frontend → Access Layer (:3001) → Stateless Agent Backend (:3002)
+```
+
+- **Access Layer** 是公开接入边界，负责会话、并发、配置目录、Team、定时任务和持久化。
+- **Agent Backend** 不保存 Session 状态，只消费单次请求中携带的完整上下文与能力定义。
+- 两个服务通过内部 NDJSON 流式 HTTP 通信，不是进程内函数调用。
+- 默认仅允许本机访问。内部请求可能携带模型凭据，请勿直接暴露到公网或局域网。
+
+更多设计细节见[接口与架构变更记录](docs/interface-change-record.md)。
 
 ## 快速开始
 
-1. 安装前端依赖：`cd frontend && npm install`
-2. 安装后端依赖：`pip install -r requirements.txt`
-3. 复制 `.env.example` 为 `.env`
-4. 填入 `OPENAI_API_KEY`
-5. 可选：复制 `backend/config/runtime/mcp.config.example.json` 为 `backend/config/runtime/mcp.config.json`
-6. 运行 `cd frontend && npm run dev`
+### 环境要求
 
-该命令会同时启动三个独立进程：
+- Python 3.11+
+- Node.js 18+
+- npm 9+
+- 一个 OpenAI-compatible API Key
 
-- Access Layer：`http://localhost:3001`
-- Stateless Agent Backend：`http://127.0.0.1:3002`
-- Vite Frontend：`http://localhost:5173`
+### 1. 克隆项目
 
-## 项目结构
-
-```text
-frontend/             React 前端工程
-access_layer/         接入层：公开 API、完整会话持久化与 AG-UI 透传
-backend/              无状态 Agent 服务端
-backend/home.py       $K_AGENT_HOME 路径与旧 data/ 迁移
-backend/config/runtime/  仓库内 MCP/models 示例模板（运行时写入 $K_AGENT_HOME）
-
-$K_AGENT_HOME/        默认 ~/.k_agent，可用环境变量改到项目内 .k_agent
-  config/             mcp.json、models.json、permissions.json、catalog/
-  state/sessions/     会话历史
-  content/memory/     长期记忆
-  content/skills/     Skill 包
+```bash
+git clone https://github.com/Sun-Kas/k_agent.git
+cd k_agent
 ```
 
-## 服务边界
+### 2. 安装依赖
 
-请求链路为 `frontend -> access layer (:3001) -> agent backend (:3002)`：
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
-- 接入层负责会话读写、并发串行化、MCP/Skill 摘要目录和选择校验；运行时把完整历史以及选中 MCP/Skill 的自包含定义转发给 Agent Backend。
-- Agent Backend 不读取 MCP/Skill 摘要列表，也不扫描 Skill 目录；它只消费本次内部请求携带的定义，负责系统提示词拼接、上下文预算、模型消息组装、推理与工具调用，并直接生成标准 AG-UI Event。
-- 接入层通过内部 NDJSON 流式 HTTP 调用 Agent Backend；两个服务是独立进程，
-  并非进程内函数调用。
-- `access_layer/` 与 `backend/` 是并列的顶层目录，依赖方向为接入层调用后端。
-- `backend/agent/` 不依赖 access layer、session、memory、prompt 或 skill 模块，也不保存任何
-  按会话标识索引的缓存；每次运行所需状态都由请求显式传入并在运行结束后释放。
-- Access Layer 与 Agent Backend 默认分别只监听 `127.0.0.1:3001` 和
-  `127.0.0.1:3002`；内部接口会携带模型凭据，两个服务都不应暴露到公网或局域网。
+cd frontend
+npm install
+cd ..
+```
 
-### Agent Team Runtime
+> Windows PowerShell 请使用 `.venv\Scripts\Activate.ps1` 激活虚拟环境。
 
-Access Layer 同时提供持久化 Agent Team Control Plane。打开侧栏中的
-“Agent Team”即可创建由 `k_agent`、`codex`、`claude_code` 任意组合的团队，
-并为每个成员独立选择模型、MCP 和 Skill。创建 Team 时会明确一个团队工作空间；
-留空则使用 `$K_AGENT_HOME/state/teams/{teamId}/workspace/`。Team 的任务、
-Mailbox、Artifact 和事件序列保存在 `$K_AGENT_HOME/state/teams/team_runtime.db`；
-单个 Worker Run 仍由无状态 Agent Backend 执行。
+### 3. 配置环境变量
 
-新 Team 采用持久化 Supervisor Loop：初始计划、成员提交、最终失败和用户补充
-指令都会进入主管队列。Worker 结束后 Task 先进入 `submitted`，Artifact 先进入
-`pending_review`；只有主管的结构化决策通过 Access Layer 校验并事务提交后，
-任务才会变成 `completed`。验收后的文本、元数据和任务输出文件会发布到
-`{workspaceDir}/artifacts/{taskId}/{artifactId}/`；后续 Agent 通过 Artifact URI
-和任务目录中的只读快照消费成果，不直接并发修改团队工作空间。
+```bash
+cp .env.example .env
+```
 
-Team Scheduler 使用独立并发池，不获取公开对话的 same-session lock。每次任务
-在 `$K_AGENT_HOME/state/teams/{teamId}/tasks/{taskId}/` 下创建普通任务目录，
-其中 `output/` 是该次运行唯一可写的工作目录；系统不会复制当前仓库，也不会
-自动创建 Git worktree。普通工具失败只结束对应工具调用或 Task Attempt，不会
-清空 Team 的其它任务和 Artifact。
+至少填写：
 
 ```env
-TEAM_RUNTIME_ENABLED=true
-TEAM_MAX_ACTIVE_RUNS=8
-TEAM_TASK_LEASE_SECONDS=120
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
 ```
 
-主要 API：`/api/teams`、`/api/teams/{teamId}`、
-`/api/teams/{teamId}/stream`、`/api/teams/{teamId}/commands`。
+也可以把状态保存在项目目录，便于开发时查看：
 
-## 当前能力
-
-- 聊天消息发送与回显
-- AG-UI over SSE 流式响应
-- 标准运行、文本消息、工具调用和状态同步事件
-- 服务端统一维护模型调用
-- 会话记忆与历史列表
-- Claude Code 风格的分层指令、自动记忆、上下文预算与持久化压缩
-- 旧工具结果优先裁剪，以及 `/api/debug/prompt-context` 上下文查看接口
-- 多轮 tool_calls / tool 结果持久化，跨轮保留工具执行历史
-- MCP 会话池按连接配置复用，避免每轮 stdio 冷启动
-- 本地 function tools
-- Bash 经 `srt` OS 沙箱执行（macOS/Linux；默认 `auto`，可配 `required`），子进程环境变量白名单
-- 工具参数基础校验
-- 将 MCP tools 暴露给模型
-- Agent 生命周期 callbacks：`before_model`、`after_model`、`before_tool`、`after_tool`、`on_error`
-- 展示执行轨迹与任务拆解
-
-## AG-UI 接口
-
-前端通过 `POST /api/agent` 发送标准 `RunAgentInput`，后端返回
-`text/event-stream`。主要事件包括：
-
-- `RUN_STARTED` / `RUN_FINISHED` / `RUN_ERROR`
-- `TEXT_MESSAGE_START` / `TEXT_MESSAGE_CONTENT` / `TEXT_MESSAGE_END`
-- `REASONING_START` / `REASONING_MESSAGE_START` /
-  `REASONING_MESSAGE_CONTENT` / `REASONING_MESSAGE_END` / `REASONING_END`
-- `TOOL_CALL_START` / `TOOL_CALL_ARGS` / `TOOL_CALL_END` / `TOOL_CALL_RESULT`
-- `CUSTOM`，用于状态提示和执行轨迹
-
-协议适配位于 `backend/agui.py`，业务 Agent 保持独立，后续可以直接接入
-其他兼容 AG-UI 的 React 客户端。完整事件顺序、前端状态机和持久化约定见
-[K Agent AG-UI 协议约定](docs/ag-ui-protocol.md)。
-
-上下文来源、预算、路径规则、自动压缩与持久化字段见
-[K Agent 上下文管理系统](docs/context-management.md)。
-
-## Agent callbacks
-
-可以通过实现 callback 类来监听或扩展 agent 生命周期：
-
-```python
-from backend.agent.callbacks import AgentRunContext, ModelCallPayload, ToolCallPayload
-
-
-class AuditCallback:
-    async def before_model(self, context: AgentRunContext, payload: ModelCallPayload) -> None:
-        print("before model", context.run_id, payload.model)
-
-    async def before_tool(self, context: AgentRunContext, payload: ToolCallPayload) -> None:
-        print("before tool", payload.name, payload.arguments)
+```env
+K_AGENT_HOME=.k_agent
 ```
 
-然后在创建 agent 时传入：
+### 4. 启动开发环境
 
-```python
-agent = OpenAIAgent(LOCAL_TOOLS, mcp_manager, callbacks=[AuditCallback()])
+```bash
+cd frontend
+npm run dev
 ```
 
-## 配置
+该命令会同时启动：
 
-后端代码配置集中在 `backend/config/config.py`，运行配置文件集中在 `backend/config/runtime/`，会自动读取 `.env`。前端配置集中在 `frontend/src/config.ts`，支持 `VITE_*` 环境变量。
+| 服务 | 地址 | 职责 |
+| --- | --- | --- |
+| Frontend | `http://localhost:5173` | React / Vite 工作台 |
+| Access Layer | `http://127.0.0.1:3001` | 公开 API、状态与调度 |
+| Agent Backend | `http://127.0.0.1:3002` | 无状态推理与工具执行 |
 
-MCP 与 Skill 的前端选择列表由 Access Layer 直接读取 `data/mcp.json` 和
-`$K_AGENT_HOME/config/catalog/`。MCP 连接参数与模型配置在
-`$K_AGENT_HOME/config/`，Skill 正文在 `$K_AGENT_HOME/content/skills/`。
-首次启动若新目录为空，会从旧的 `data/` 与 `backend/config/runtime/` 复制一次。
-
-常用配置项：
-
-- `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`
-- `HOST` / `PORT` / `APP_TITLE`
-- `AGENT_BACKEND_HOST` / `AGENT_BACKEND_PORT` / `AGENT_BACKEND_LOG_LEVEL`
-- `CORS_ALLOW_ORIGINS` / `CORS_ALLOW_METHODS` / `CORS_ALLOW_HEADERS`
-- `MCP_CONFIG_PATH`
-- `MAX_MODEL_ITERATIONS` / `STREAM_CHUNK_SIZE`
-- `DEFAULT_SESSION_TITLE` / `SESSION_TITLE_MAX_LENGTH`
-- `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL`
-- `LANGFUSE_ENABLED` / `LANGFUSE_TRACING_ENVIRONMENT` / `LANGFUSE_SAMPLE_RATE`
-- `VITE_API_BASE_URL` / `VITE_SESSION_STORAGE_KEY` / `VITE_CLIENT_PORT`
+打开 [http://localhost:5173](http://localhost:5173) 即可使用。
 
 ## 本地部署
 
-需要使用构建后的前端时，先构建前端，再以非 reload 模式启动两个本地服务：
+构建前端并以非 reload 模式启动两个本地服务：
 
 ```bash
 cd frontend
 npm run deploy:local
 ```
 
-Access Layer 默认监听 `127.0.0.1:3001`，并在同一端口托管
-`frontend/dist`；Agent Backend 监听 `127.0.0.1:3002`。两个端口都只允许
-当前机器访问，不再向局域网开放。启动后使用 `http://127.0.0.1:3001` 或
-`http://localhost:3001` 访问；构建后的前端默认通过同源 `/api` 调用接入层。
+部署模式下 Access Layer 会在 `http://127.0.0.1:3001` 同源托管 `frontend/dist`，Agent Backend 继续运行在 `127.0.0.1:3002`。
 
-Agent Backend 默认向终端输出 `INFO` 级别的单行文本日志，格式为
-`时间 [级别] 模块 [sess/run/trace] [组件] 事件 | key=value`，包括服务生命周期、
-请求、Prompt 拼接、MCP 配置与连接、上下文预算与压缩、模型调用、工具调用、完成、
-取消和异常。日志只记录关联 ID、计数、长度、预算、工具名和耗时，不记录消息正文、
-Prompt 正文、工具参数值、工具输出或凭据。可以通过
-`AGENT_BACKEND_LOG_LEVEL=DEBUG|INFO|WARNING|ERROR` 调整级别。
+## 运行时数据
 
-## 后续建议
+持久化内容默认写入 `~/.k_agent`，可通过 `K_AGENT_HOME` 修改：
 
-- 为上下文预算接入各模型提供方的精确 tokenizer
-- 为工具参数加入完整 JSON Schema 校验
-- 增加鉴权和任务状态管理
+```text
+$K_AGENT_HOME/
+├── config/
+│   ├── mcp.json
+│   ├── models.json
+│   ├── permissions.json
+│   └── catalog/
+├── content/
+│   ├── memory/
+│   └── skills/
+└── state/
+    ├── sessions/
+    ├── teams/
+    └── scheduled_tasks/
+```
+
+每个会话目录包含持久化 JSON 与独立 `workspace/`。Agent Team 和定时任务由 Access Layer 使用 SQLite 保存调度状态。
+
+## 常用配置
+
+| 配置项 | 用途 | 默认值 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | 模型 API Key | 必填 |
+| `OPENAI_BASE_URL` | OpenAI-compatible API 地址 | `https://api.openai.com/v1` |
+| `OPENAI_MODEL` | 默认模型 | `gpt-4.1-mini` |
+| `K_AGENT_HOME` | 配置、内容与状态根目录 | `~/.k_agent` |
+| `HOST` / `PORT` | Access Layer 地址 | `127.0.0.1:3001` |
+| `AGENT_BACKEND_HOST` / `AGENT_BACKEND_PORT` | Agent Backend 地址 | `127.0.0.1:3002` |
+| `MCP_CONNECT_TIMEOUT_SECONDS` | MCP 连接超时 | `60` |
+| `MAX_MODEL_ITERATIONS` | 单轮最大模型迭代次数 | `6` |
+| `LANGFUSE_ENABLED` | 是否启用 Langfuse | `true` |
+| `TEAM_RUNTIME_ENABLED` | 是否启用 Agent Team 调度 | `true` |
+| `SCHEDULED_TASK_RUNTIME_ENABLED` | 是否启用定时任务调度 | `true` |
+
+完整模板见 [.env.example](.env.example)。
+
+## 项目结构
+
+```text
+k_agent/
+├── frontend/                 # React / Vite 工作台
+├── access_layer/             # 公开 API、会话、Team、自动化与持久化
+├── backend/                  # 无状态 Agent、模型、工具、MCP 与上下文管理
+├── docs/                     # 协议与技术方案
+├── requirements.txt
+└── README.md
+```
+
+## 项目文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [AG-UI 协议约定](docs/ag-ui-protocol.md) | SSE 事件顺序、状态机与持久化规则 |
+| [工具系统](docs/tools.md) | 本地工具、MCP 与错误返回契约 |
+| [上下文管理](docs/context-management.md) | 指令、记忆、预算、裁剪与压缩 |
+| [Agent Team 技术方案](docs/agent-team-technical-solution.md) | Supervisor、DAG、Mailbox 与 Artifact |
+| [定时任务技术方案](docs/scheduled-task-technical-solution.md) | 调度、租约、Session 隔离与运行记录 |
+| [接口变更记录](docs/interface-change-record.md) | Access Layer / Backend 服务边界 |
+
+## 开发与验证
+
+```bash
+# Frontend 类型与边界检查
+cd frontend
+npm run check
+npm run build:client
+
+# Python 测试
+cd ..
+.venv/bin/python -m pytest backend/tests -q
+```
+
+## 安全说明
+
+- Access Layer 与 Agent Backend 默认只监听 loopback 地址。
+- Bash 工具可通过 `srt` OS 沙箱执行，并限制子进程环境变量。
+- 日志只记录关联 ID、计数、工具名和耗时，不应记录 Prompt、工具参数、输出或凭据正文。
+- 如果需要远程访问，请先增加身份认证、TLS、权限隔离和反向代理，不要直接修改监听地址后暴露服务。
+
+## License
+
+本项目基于 [MIT License](LICENSE) 开源。
+
+---
+
+<div align="center">
+  如果这个项目对你有帮助，欢迎 Star ⭐、提交 Issue 或参与改进。
+</div>

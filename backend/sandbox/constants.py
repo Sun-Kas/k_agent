@@ -69,4 +69,8 @@ DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS = (
     "steamcommunity.com",
     "*.steamcommunity.com",
     "api.steampowered.com",
+    # Agently Mail (腾讯企微/QQ 邮助手 CLI) — skill 通过 Bash 调 agently-cli。
+    "agent.qq.com",
+    "*.agent.qq.com",
+    "api.agent.qq.com",
 )

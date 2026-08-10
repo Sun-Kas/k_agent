@@ -27,6 +27,7 @@ def _settings(**overrides: object) -> Settings:
         "bash_sandbox_mode": "auto",
         "bash_sandbox_command": "srt",
         "bash_sandbox_allowed_domains": [],
+        "bash_sandbox_weaker_network_isolation": True,
         "bash_sandbox_write_paths": [],
         "bash_sandbox_deny_read": [],
     }
@@ -167,6 +168,21 @@ class SandboxSettingsTests(unittest.TestCase):
         )
         # Bare "*" / "*.com" are invalid for srt; keep sandbox with valid hosts.
         self.assertEqual(payload["network"]["allowedDomains"], ["example.com"])
+        self.assertTrue(payload.get("enableWeakerNetworkIsolation"))
+
+    def test_settings_payload_can_disable_weaker_network_isolation(self) -> None:
+        payload = build_settings_payload(
+            workspace_root=Path("/tmp/ws"),
+            settings=_settings(bash_sandbox_weaker_network_isolation=False),
+            network_access=True,
+        )
+        self.assertNotIn("enableWeakerNetworkIsolation", payload)
+
+    def test_default_allowlist_includes_agently_mail_hosts(self) -> None:
+        from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS
+
+        self.assertIn("api.agent.qq.com", DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS)
+        self.assertIn("*.agent.qq.com", DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS)
 
     def test_plan_keeps_sandbox_when_star_domain_configured(self) -> None:
         from unittest.mock import patch

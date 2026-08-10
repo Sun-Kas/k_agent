@@ -189,6 +189,12 @@ class Settings(BaseSettings):
         default_factory=_default_bash_sandbox_allowed_domains,
         alias="BASH_SANDBOX_ALLOWED_DOMAINS",
     )
+    # macOS Seatbelt blocks com.apple.trustd.agent by default; Go binaries then
+    # fail TLS with OSStatus -26276. Default on so tools like agently-cli / gh
+    # work inside Bash sandbox; set false to tighten isolation.
+    bash_sandbox_weaker_network_isolation: bool = Field(
+        default=True, alias="BASH_SANDBOX_WEAKER_NETWORK_ISOLATION"
+    )
     bash_sandbox_write_paths: list[str] = Field(
         default_factory=list, alias="BASH_SANDBOX_WRITE_PATHS"
     )
