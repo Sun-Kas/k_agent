@@ -153,6 +153,27 @@ def sanitize_srt_allowed_domains(
     return cleaned
 
 
+def is_domain_allowed(hostname: str, configured: list[str] | tuple[str, ...]) -> bool:
+    """Match one concrete hostname against the effective srt allowlist.
+
+    Approval requests carry a hostname, never a URL or shell fragment. Keeping
+    matching here aligned with srt wildcard semantics prevents an allowlisted
+    transient failure from being misrepresented as a need for host access.
+    """
+    host = str(hostname).strip().lower().rstrip(".")
+    if not host or "://" in host or "/" in host or ":" in host:
+        return False
+    for pattern in sanitize_srt_allowed_domains(configured):
+        normalized = pattern.lower().rstrip(".")
+        if normalized.startswith("*."):
+            suffix = normalized[2:]
+            if host.endswith(f".{suffix}"):
+                return True
+        elif host == normalized:
+            return True
+    return False
+
+
 def _is_srt_allowed_domain(value: str) -> bool:
     """对齐 srt domainPatternSchema，拒绝已知非法条目。"""
 

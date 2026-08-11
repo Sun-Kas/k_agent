@@ -133,6 +133,159 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "ran")
         self.assertEqual(calls, ["approval:Read:ask", "tool"])
 
+    async def test_unstructured_bash_escalation_is_denied_before_hitl(self) -> None:
+        calls: list[str] = []
+
+        async def execute(_: dict) -> str:
+            calls.append("tool")
+            return "ran"
+
+        async def approve(*_args):
+            calls.append("approval")
+            return {"action": "approve"}
+
+        agent = OpenAIAgent(
+            [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
+            mcp_client_manager=None,
+            approval_handler=approve,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "default"
+        result = await agent._run_tool(
+            callbacks=CallbackManager([]), context=context, iteration=0,
+            tool_name="Bash",
+            arguments={
+                "command": "curl https://store.steampowered.com",
+                "description": "required network destination",
+                "sandbox_permissions": "require_escalated",
+            },
+        )
+
+        payload = json.loads(result)
+        self.assertFalse(payload["ok"])
+        self.assertIn("requires escalation_scope", payload["error"])
+        self.assertEqual(calls, [])
+
+    async def test_allowlisted_network_escalation_is_denied_before_hitl(self) -> None:
+        calls: list[str] = []
+
+        async def execute(_: dict) -> str:
+            calls.append("tool")
+            return "ran"
+
+        async def approve(*_args):
+            calls.append("approval")
+            return {"action": "approve"}
+
+        agent = OpenAIAgent(
+            [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
+            mcp_client_manager=None,
+            approval_handler=approve,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "default"
+        result = await agent._run_tool(
+            callbacks=CallbackManager([]), context=context, iteration=0,
+            tool_name="Bash",
+            arguments={
+                "command": "curl https://store.steampowered.com",
+                "sandbox_permissions": "require_escalated",
+                "escalation_scope": "network_destination",
+                "escalation_resource": "store.steampowered.com",
+            },
+        )
+
+        payload = json.loads(result)
+        self.assertFalse(payload["ok"])
+        self.assertIn("already allowed", payload["error"])
+        self.assertEqual(calls, [])
+
+    async def test_non_allowlisted_network_destination_uses_hitl(self) -> None:
+        calls: list[str] = []
+
+        async def execute(_: dict) -> str:
+            calls.append("tool")
+            return "ran"
+
+        async def approve(_target, decision, _detail):
+            calls.append(f"approval:{decision.behavior}")
+            return {"action": "approve", "remember": False}
+
+        parameters = {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "sandbox_permissions": {"type": "string"},
+                "escalation_scope": {"type": "string"},
+                "escalation_resource": {"type": "string"},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        }
+        agent = OpenAIAgent(
+            [ToolDefinition("Bash", "", parameters, execute)],
+            mcp_client_manager=None,
+            approval_handler=approve,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "default"
+        result = await agent._run_tool(
+            callbacks=CallbackManager([]), context=context, iteration=0,
+            tool_name="Bash",
+            arguments={
+                "command": "curl https://outside.example",
+                "sandbox_permissions": "require_escalated",
+                "escalation_scope": "network_destination",
+                "escalation_resource": "outside.example",
+            },
+        )
+
+        self.assertEqual(result, "ran")
+        self.assertEqual(calls, ["approval:ask", "tool"])
+
+    async def test_structured_bash_local_resource_escalation_uses_hitl(self) -> None:
+        calls: list[str] = []
+
+        async def execute(_: dict) -> str:
+            calls.append("tool")
+            return "ran"
+
+        async def approve(_target, decision, _detail):
+            calls.append(f"approval:{decision.behavior}")
+            return {"action": "approve", "remember": False}
+
+        parameters = {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "sandbox_permissions": {"type": "string"},
+                "escalation_scope": {"type": "string"},
+                "escalation_resource": {"type": "string"},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        }
+        agent = OpenAIAgent(
+            [ToolDefinition("Bash", "", parameters, execute)],
+            mcp_client_manager=None,
+            approval_handler=approve,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "default"
+        result = await agent._run_tool(
+            callbacks=CallbackManager([]), context=context, iteration=0,
+            tool_name="Bash",
+            arguments={
+                "command": "touch /etc/example",
+                "sandbox_permissions": "require_escalated",
+                "escalation_scope": "outside_workspace_write",
+                "escalation_resource": "/etc/example",
+            },
+        )
+
+        self.assertEqual(result, "ran")
+        self.assertEqual(calls, ["approval:ask", "tool"])
+
     async def test_full_access_bypasses_permission_rules(self) -> None:
         async def execute(_: dict) -> str:
             return "ran"

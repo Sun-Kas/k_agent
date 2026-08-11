@@ -115,6 +115,22 @@ Bash 示例：
 }
 ```
 
+`require_escalated` 采用正向触发规则。只有当前任务必须执行下列行为之一时，模型才可
+申请 HITL：
+
+1. 写入、修改或删除 Session workspace 之外的路径；
+2. 访问默认沙箱阻止的宿主设备、本地 Socket、GUI、进程、凭据存储或系统服务；
+3. 访问一个不在当前 `BASH_SANDBOX_ALLOWED_DOMAINS` 中的具体网络域名。
+
+申请中的 `description` 必须指出具体资源及其必要性，例如“写入
+`/etc/example/config` 以完成用户要求的系统级配置”，不能只写“需要 host access”。
+这是允许发起 Bash 审批的完整条件集合。调用还必须提供
+`escalation_scope=outside_workspace_write|host_resource|network_destination` 与具体的
+`escalation_resource`，Backend 会在进入 ApprovalBroker 前强制校验。网络资源必须是
+不带协议、路径和端口的准确 hostname；Backend 使用本轮实际域名白名单匹配，白名单
+内的目标不会进入审批。普通网络超时、DNS 失败、HTTP 错误、连接重置、
+`IncompleteRead`、远端限流以及脚本异常也不会进入审批。
+
 ### 4.2 审批前置
 
 `OpenAIAgent` 在参数校验、`before_tool` 回调和工具执行之前完成权限判断：
@@ -320,4 +336,3 @@ Frontend 把 `approval_request` 投影为时间线审批卡，展示 Agent、类
 | `backend/runners/claude_code.py` | Claude sandbox/permission 映射 |
 | `frontend/src/components/PermissionModeField.tsx` | Team/定时任务权限选择与风险提示 |
 | `frontend/src/components/ConversationTranscript.tsx` | 定时任务原页审批 |
-

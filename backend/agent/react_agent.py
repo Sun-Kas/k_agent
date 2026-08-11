@@ -42,7 +42,7 @@ from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager, McpToolDescriptor
 from backend.permissions import PermissionDecision, check_permission, check_permissions
 from backend.api.schemas import ChatMessage, ChatMeta, ChatRole
-from backend.sandbox import notice_from_tool_result
+from backend.sandbox import is_domain_allowed, notice_from_tool_result
 from backend.tools import ToolDefinition, validate_tool_arguments
 
 
@@ -601,10 +601,47 @@ class OpenAIAgent:
                 context.metadata.get("permission_mode") != "full_access"
                 and arguments.get("sandbox_permissions") == "require_escalated"
             ):
-                decision = PermissionDecision(
-                    "ask",
-                    "该工具请求访问默认沙箱范围之外的本机资源。",
-                )
+                # Bash escalation is narrower than "run without srt for any
+                # reason". Network requests are checked against the effective
+                # allowlist so only a new destination can reach HITL; transport
+                # failures on an existing destination stay ordinary failures.
+                if permission_tool_name == "Bash":
+                    scope = arguments.get("escalation_scope")
+                    resource = str(arguments.get("escalation_resource") or "").strip()
+                    valid_scope = scope in {
+                        "outside_workspace_write",
+                        "host_resource",
+                        "network_destination",
+                    }
+                    if not valid_scope or not resource:
+                        decision = PermissionDecision(
+                            "deny",
+                            "Bash escalation requires escalation_scope and a concrete "
+                            "escalation_resource.",
+                        )
+                    elif scope == "network_destination" and is_domain_allowed(
+                        resource, self.config.bash_sandbox_allowed_domains
+                    ):
+                        decision = PermissionDecision(
+                            "deny",
+                            f"Network destination {resource!r} is already allowed by the "
+                            "Bash sandbox; retry normally or adjust timeout_seconds "
+                            "instead of requesting escalation.",
+                        )
+                    else:
+                        decision = PermissionDecision(
+                            "ask",
+                            (
+                                f"该命令请求访问网络白名单外的目标：{resource}"
+                                if scope == "network_destination"
+                                else f"该命令请求访问默认沙箱外的本机资源：{resource}"
+                            ),
+                        )
+                else:
+                    decision = PermissionDecision(
+                        "ask",
+                        "该工具请求访问默认沙箱范围之外的本机资源。",
+                    )
             await self._enforce_permission(
                 permission_tool_name,
                 decision,

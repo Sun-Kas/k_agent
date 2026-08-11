@@ -51,7 +51,24 @@ curl http://127.0.0.1:3001/api/health
 curl http://127.0.0.1:3001/api/health/scheduled-tasks
 ```
 
-浏览器打开 <http://127.0.0.1:3001>。
+部署机浏览器打开 <http://127.0.0.1:3001>。同一内网的设备打开
+`http://<部署机内网 IP>:3001`；Compose 默认监听宿主机全部 IPv4 网卡，因此不需要
+提前把动态内网 IP 写入配置。
+
+可以在部署机查询当前内网地址：
+
+```bash
+# macOS 常见 Wi-Fi 接口
+ipconfig getifaddr en0
+
+# Linux
+hostname -I
+```
+
+> [!WARNING]
+> `0.0.0.0:3001` 会让所有能够连接部署机的网络访问 K Agent。请通过开发机防火墙
+> 将来源限制在可信内网；在未增加登录认证前，不要通过路由器端口转发或公网安全组
+> 暴露该端口。
 
 ### 5. 停止或更新
 
@@ -112,7 +129,7 @@ docker run -d \
   -e AGENT_BACKEND_HOST=127.0.0.1 \
   -e AGENT_BACKEND_URL=http://127.0.0.1:3002 \
   -e K_AGENT_HOME=/app/.k_agent \
-  -p 127.0.0.1:3001:3001 \
+  -p 0.0.0.0:3001:3001 \
   -v k-agent-data:/app/.k_agent \
   k-agent:local
 ```

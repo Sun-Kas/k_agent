@@ -38,6 +38,7 @@ from backend.sandbox.plan import (
     BashInvocation,
     SandboxUnavailable,
     build_settings_payload,
+    is_domain_allowed,
     plan_bash_invocation,
 )
 
@@ -51,6 +52,7 @@ __all__ = [
     "SandboxUnavailable",
     "build_child_env",
     "build_settings_payload",
+    "is_domain_allowed",
     "current_tool_env_overrides",
     "detect_support",
     "enrich_bash_result",

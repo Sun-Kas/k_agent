@@ -1,7 +1,7 @@
 import type { AgUiEvent, ToolActivity } from "../types";
 
 export type StaticTimelineActivity =
-  | { type: "thinking"; id: string; title: string; detail: string }
+  | { type: "thinking"; id: string; title: string; detail: string; status: "running" | "complete" }
   | { type: "tool"; id: string; tool: ToolActivity }
   | { type: "text"; id: string; content: string };
 
@@ -25,12 +25,12 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
   for (const event of events) {
     if (event.type === "RUN_STARTED") runId = event.runId;
     if (event.type === "REASONING_START") {
-      activeThinking = { type: "thinking", id: event.messageId, title: "思考过程", detail: "" };
+      activeThinking = { type: "thinking", id: event.messageId, title: "思考过程", detail: "", status: "running" };
       timeline.push(activeThinking);
     } else if (event.type === "REASONING_MESSAGE_START") {
       const raw = event.rawEvent && typeof event.rawEvent === "object" ? event.rawEvent as Record<string, unknown> : {};
       if (!activeThinking) {
-        activeThinking = { type: "thinking", id: `reasoning-${event.messageId}`, title: "思考过程", detail: "" };
+        activeThinking = { type: "thinking", id: `reasoning-${event.messageId}`, title: "思考过程", detail: "", status: "running" };
         timeline.push(activeThinking);
       }
       if (typeof raw.title === "string" && raw.title) activeThinking.title = raw.title;
@@ -40,6 +40,7 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
       const raw = event.rawEvent && typeof event.rawEvent === "object" ? event.rawEvent as Record<string, unknown> : {};
       if (!activeThinking.detail && typeof raw.detail === "string") activeThinking.detail = raw.detail;
     } else if (event.type === "REASONING_END") {
+      if (activeThinking) activeThinking.status = "complete";
       activeThinking = null;
     } else if (event.type === "TEXT_MESSAGE_START") {
       const text: Extract<StaticTimelineActivity, { type: "text" }> = { type: "text", id: event.messageId, content: "" };
@@ -54,6 +55,9 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
       }
       text.content += event.delta;
     } else if (event.type === "TOOL_CALL_START") {
+      // Some providers omit REASONING_END before starting a tool. The hard
+      // timeline boundary still means the preceding reasoning block finished.
+      if (activeThinking) activeThinking.status = "complete";
       const tool = { id: event.toolCallId, turnId: runId, name: event.toolCallName, arguments: "", status: "preparing" as const, sequence: timeline.length };
       tools.set(event.toolCallId, tool);
       timeline.push({ type: "tool", id: event.toolCallId, tool });
@@ -63,6 +67,9 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
     else if (event.type === "TOOL_CALL_RESULT") {
       const tool = tools.get(event.toolCallId);
       if (tool) Object.assign(tool, { result: event.content, status: toolResultFailed(event.content) ? "error" : "complete" });
+    } else if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
+      if (activeThinking) activeThinking.status = "complete";
+      activeThinking = null;
     }
   }
   return timeline.filter((activity) => activity.type !== "text" || activity.content.length > 0);

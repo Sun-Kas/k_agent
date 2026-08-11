@@ -196,7 +196,10 @@ curl http://127.0.0.1:3001/api/health/scheduled-tasks
 docker compose down
 ```
 
-启动后打开 <http://127.0.0.1:3001>。不要使用 `docker compose down -v`，除非确定要永久删除容器内的 Sessions、Skills、Team 与定时任务数据。
+启动后，部署机打开 <http://127.0.0.1:3001>；同一内网设备打开
+`http://<部署机内网 IP>:3001`。Compose 默认监听宿主机全部 IPv4 网卡，请使用防火墙
+限制可信内网来源，且不要直接暴露到公网。不要使用 `docker compose down -v`，除非
+确定要永久删除容器内的 Sessions、Skills、Team 与定时任务数据。
 
 ## 运行时数据
 

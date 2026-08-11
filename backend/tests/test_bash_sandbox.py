@@ -160,6 +160,24 @@ class SandboxPlanningTests(unittest.TestCase):
 
 
 class SandboxSettingsTests(unittest.TestCase):
+    def test_bash_contract_uses_positive_escalation_conditions(self) -> None:
+        bash_tool = next(tool for tool in cc_like.CC_LIKE_TOOLS if tool.name == "Bash")
+
+        self.assertIn("ONLY when", bash_tool.description)
+        self.assertIn("outside the session workspace", bash_tool.description)
+        self.assertIn("outside the configured sandbox domain allowlist", bash_tool.description)
+        self.assertIn("escalation_resource", bash_tool.description)
+
+    def test_domain_allowlist_matching_uses_srt_wildcard_semantics(self) -> None:
+        from backend.sandbox import is_domain_allowed
+
+        allowed = ["example.com", "*.steampowered.com"]
+        self.assertTrue(is_domain_allowed("example.com", allowed))
+        self.assertTrue(is_domain_allowed("store.steampowered.com", allowed))
+        self.assertFalse(is_domain_allowed("steampowered.com", allowed))
+        self.assertFalse(is_domain_allowed("https://example.com/path", allowed))
+        self.assertFalse(is_domain_allowed("outside.example", allowed))
+
     def test_default_settings_use_concrete_srt_domains(self) -> None:
         from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS
 
@@ -293,6 +311,21 @@ class ChildEnvTests(unittest.TestCase):
 
 
 class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cc_bash_accepts_a_bounded_per_call_timeout(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            settings = _settings(bash_sandbox_mode="off")
+            with (
+                patch.object(cc_like, "_workspace_root", AsyncMock(return_value=workspace)),
+                patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
+                patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(30.0, 10_000))),
+            ):
+                raw = await cc_like.cc_bash({"command": "sleep 2", "timeout_seconds": 1})
+
+        payload = json.loads(raw)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["timeoutSeconds"], 1.0)
+
     async def test_cc_bash_uses_scrubbed_env_and_reports_sandbox_state(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)

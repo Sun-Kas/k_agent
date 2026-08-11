@@ -31,7 +31,21 @@ const events: AgUiEvent[] = [
 const timeline = timelineFromEvents(events);
 assert.deepEqual(timeline.map((activity) => activity.type), ["thinking", "text", "tool", "thinking", "text"]);
 assert.equal(timeline[0]?.type === "thinking" && timeline[0].detail, "先分析。");
+assert.equal(timeline[0]?.type === "thinking" && timeline[0].status, "complete");
 assert.equal(timeline[2]?.type === "tool" && timeline[2].tool.status, "complete");
+assert.equal(timeline[3]?.type === "thinking" && timeline[3].status, "complete");
 assert.equal(timeline[4]?.type === "text" && timeline[4].content, "最终正文。");
+
+const missingReasoningEnd = timelineFromEvents([
+  { type: "RUN_STARTED", threadId: "scheduled-session", runId: "run-2" },
+  { type: "REASONING_START", messageId: "reasoning-3" },
+  { type: "REASONING_MESSAGE_CONTENT", messageId: "reasoning-3", delta: "准备调用。" },
+  { type: "TOOL_CALL_START", toolCallId: "tool-2", toolCallName: "Skill" },
+]);
+assert.equal(
+  missingReasoningEnd[0]?.type === "thinking" && missingReasoningEnd[0].status,
+  "complete",
+  "a tool boundary completes reasoning even when the provider omits REASONING_END",
+);
 
 console.log("conversation transcript timeline tests passed");

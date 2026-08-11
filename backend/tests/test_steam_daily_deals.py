@@ -65,3 +65,22 @@ class SteamDailyDealsRequestTests(TestCase):
         self.assertIsNone(result)
         self.assertEqual(urlopen.call_count, self.skill.REQUEST_MAX_ATTEMPTS)
         self.assertEqual(sleep.call_count, self.skill.REQUEST_MAX_ATTEMPTS - 1)
+
+    def test_parallel_enrichment_preserves_deal_order(self):
+        deals = [
+            {"app_id": 1, "name": "one"},
+            {"app_id": 2, "name": "two"},
+            {"app_id": 3, "name": "three"},
+        ]
+
+        def enrich(deal, _country, _language):
+            return {**deal, "enriched": True}
+
+        with mock.patch.object(
+            self.skill, "enrich_deal_with_details", side_effect=enrich
+        ) as enrich_mock:
+            result = self.skill.enrich_deals_with_details(deals)
+
+        self.assertEqual([item["app_id"] for item in result], [1, 2, 3])
+        self.assertTrue(all(item["enriched"] for item in result))
+        self.assertEqual(enrich_mock.call_count, 3)

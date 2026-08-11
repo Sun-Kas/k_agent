@@ -314,6 +314,9 @@ img.brand-symbol {
 .scheduled-transcript .message-row.user { flex-direction: row; }
 .scheduled-transcript .message-row.user .message-body { align-items: flex-start; }
 .scheduled-transcript .message-row:last-child { margin-bottom: 0; }
+/* Run results reuse the main conversation typography. Only remove the chat
+   bubble width cap because the scheduled result already owns a bounded card. */
+.scheduled-transcript .message-body { width: 100%; max-width: none; }
 .scheduled-empty { min-height: 180px; padding: 28px 18px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: var(--dim); }
 .scheduled-empty p { max-width: 300px; line-height: 1.5; }
 .scheduled-drawer-backdrop { position: fixed; inset: 0; z-index: 100; display: flex; justify-content: flex-end; background: rgba(0, 0, 0, .32); }
@@ -1794,6 +1797,7 @@ img.brand-symbol {
 .inline-thinking-list { max-height: 360px; margin: 4px 0 0 1px; padding: 4px 0 4px 16px; overflow-y: auto; border-left: 2px solid var(--line); display: flex; flex-direction: column; gap: 13px; }
 .inline-thinking-step { display: grid; grid-template-columns: 15px minmax(0, 1fr); gap: 8px; align-items: start; }
 .inline-thinking-step > span { width: 15px; height: 15px; margin-top: 3px; border: 1.5px solid currentColor; border-radius: 50%; display: grid; place-items: center; color: var(--muted); background: transparent; font-size: var(--type-micro); line-height: 1; }
+.inline-thinking-step > div { min-width: 0; }
 .inline-thinking-step strong { display: block; color: var(--ink); font-size: var(--type-ui); font-weight: 600; line-height: 1.45; }
 .inline-thinking-step p { margin: 5px 0 0; color: var(--dim); font-size: var(--type-ui); line-height: 1.65; white-space: pre-wrap; overflow-wrap: break-word; }
 .inline-thinking-step.active > span { animation: pulse 1.2s infinite; }

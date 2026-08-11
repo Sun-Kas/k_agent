@@ -205,7 +205,11 @@ async def cc_bash(payload: dict[str, Any]) -> str:
     command = str(payload.get("command") or "").strip()
     if not command:
         return _json({"ok": False, "error": "command is required"})
-    timeout, max_chars = await _tool_limits()
+    default_timeout, max_chars = await _tool_limits()
+    # Long but bounded jobs (for example, a Skill aggregating several APIs)
+    # may declare their expected duration without requesting broader access.
+    # The schema caps this value so a model cannot create an unbounded process.
+    timeout = float(payload.get("timeout_seconds", default_timeout))
     try:
         invocation = plan_bash_invocation(
             command,
@@ -363,11 +367,20 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
             "result includes userMessage/installGuidance — relay that full message to "
             "the user in Chinese (manual install vs confirm-then-InstallSandbox; "
             "Windows native unsupported / WSL2). Only call InstallSandbox after they "
-            "explicitly confirm. In default permission mode, retry a command that "
-            "needs host access with sandbox_permissions=require_escalated so HITL can "
-            "ask the user. Full-access runs execute without the OS sandbox."
+            "explicitly confirm. Set sandbox_permissions=require_escalated ONLY when "
+            "the user's task necessarily requires this command to (1) write, modify, "
+            "or delete a path outside the session workspace; (2) access a host device, "
+            "local socket, GUI, process, credential store, or system service blocked by "
+            "the default sandbox; or (3) connect to a concrete hostname outside the "
+            "configured sandbox domain allowlist. Also set escalation_scope and "
+            "escalation_resource. A network escalation resource must be only the exact "
+            "hostname, not a URL. Timeouts, DNS/HTTP errors, connection resets, truncated "
+            "responses, and rate limits do not trigger escalation. For an inherently long "
+            "but bounded command, set timeout_seconds "
+            "instead of requesting escalation; this changes duration, not permissions. "
+            "Full-access runs execute without the OS sandbox."
         ),
-        parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["command"], "additionalProperties": False},
+        parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string", "description": "Explain why the command or requested resource is required."}, "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 300, "description": "Bounded wall-clock timeout for an inherently long command. Increasing it does not grant additional permissions."}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"], "description": "Request HITL only for a structured out-of-sandbox resource or a concrete hostname outside the domain allowlist."}, "escalation_scope": {"type": "string", "enum": ["outside_workspace_write", "host_resource", "network_destination"], "description": "Required with require_escalated: the exact class of access requested."}, "escalation_resource": {"type": "string", "description": "Required with require_escalated: concrete outside path, host resource, or exact network hostname without scheme/path/port."}}, "required": ["command"], "additionalProperties": False},
         execute=cc_bash,
     ),
     ToolDefinition(

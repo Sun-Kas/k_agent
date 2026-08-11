@@ -18,7 +18,9 @@ services:
       K_AGENT_HOME: /app/.k_agent
       RELOAD: "false"
     ports:
-      - "127.0.0.1:3001:3001"
+      # Bind every host IPv4 interface because the development machine's LAN
+      # address may be assigned dynamically. Port 3002 remains container-local.
+      - "0.0.0.0:3001:3001"
     volumes:
       - k-agent-data:/app/.k_agent
 

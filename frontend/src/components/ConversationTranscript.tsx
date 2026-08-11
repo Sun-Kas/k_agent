@@ -130,11 +130,13 @@ function StaticApprovalCard({ approval }: { approval: ApprovalActivity }) {
 
 function StaticThinkingActivity({ activity }: { activity: Extract<StaticTimelineActivity, { type: "thinking" }> }) {
   const [open, setOpen] = useState(false);
-  return <section className={`inline-thinking ${open ? "open" : ""}`}>
+  return <section className={`inline-thinking ${activity.status} ${open ? "open" : ""}`}>
     <button type="button" className="inline-thinking-summary" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-      <span aria-hidden="true">✦</span><strong>{activity.title || "思考过程"}</strong><i aria-hidden="true">⌃</i>
+      <span>{activity.status === "complete" ? "已完成思考" : "思考过程"}</span>
+      {activity.status === "running" && <b>进行中</b>}
+      <i aria-hidden="true">⌃</i>
     </button>
-    {open && <div className="inline-thinking-list"><article className="inline-thinking-step complete"><p>{activity.detail}</p></article></div>}
+    {open && <div className="inline-thinking-list"><article className={`inline-thinking-step ${activity.status}`}><span aria-hidden="true">{activity.status === "complete" ? "✓" : "✦"}</span><div><strong>{activity.title || "思考过程"}</strong>{activity.detail && <p>{activity.detail}</p>}</div></article></div>}
   </section>;
 }
 
