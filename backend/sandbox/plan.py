@@ -44,9 +44,14 @@ def plan_bash_invocation(
     workspace_root: Path,
     settings: Settings,
     network_access: bool | None = None,
+    full_access: bool = False,
 ) -> BashInvocation:
     """按 `bash_sandbox_mode` 决定本条命令走 srt 还是裸 shell。"""
 
+    if full_access:
+        # Full access is an explicit run-level user choice. Keep this separate
+        # from global Settings so one conversation cannot weaken another run.
+        return BashInvocation(None, False, "full access selected for this run")
     mode = settings.bash_sandbox_mode
     if mode == "off":
         return BashInvocation(None, False, "sandbox disabled by configuration")

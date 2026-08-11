@@ -45,6 +45,7 @@ class SessionRecord:
     events: list[dict] = field(default_factory=list)
     mcp_server_ids: list[str] | None = None
     skill_ids: list[str] | None = None
+    permission_mode: str = "default"
     # Provider-native CLI session ids (codex / claude_code) for optional resume.
     cli_sessions: dict[str, str] = field(default_factory=dict)
     # 来源是持久化边界：自动任务仍有完整 session/workspace，但不进入普通会话目录。
@@ -167,6 +168,7 @@ class SessionStore:
         run_id: str | None = None,
         mcp_server_ids: list[str],
         skill_ids: list[str],
+        permission_mode: str = "default",
     ) -> SessionRecord:
         """在拿到会话锁之后调用：合并本轮 user 消息、记录可回滚 ID、清旧缓冲。"""
         settings = await get_or_init_settings()
@@ -187,6 +189,9 @@ class SessionStore:
                 }
             session.mcp_server_ids = list(dict.fromkeys(mcp_server_ids))
             session.skill_ids = list(dict.fromkeys(skill_ids))
+            session.permission_mode = (
+                "full_access" if permission_mode == "full_access" else "default"
+            )
             session.updated_at = datetime.now(timezone.utc)
             if session.title == settings.default_session_title:
                 session.title = await self._derive_title(session.messages)
@@ -519,6 +524,7 @@ class SessionStore:
                 {
                     "mcpServerIds": session.mcp_server_ids,
                     "skillIds": session.skill_ids,
+                    "permissionMode": session.permission_mode,
                 }
                 if session.mcp_server_ids is not None
                 and session.skill_ids is not None
@@ -559,6 +565,12 @@ class SessionStore:
                 list(capabilities.get("skillIds", []))
                 if isinstance(capabilities, dict)
                 else None
+            ),
+            permission_mode=(
+                "full_access"
+                if isinstance(capabilities, dict)
+                and capabilities.get("permissionMode") == "full_access"
+                else "default"
             ),
             cli_sessions=cli_sessions,
             source=str(payload.get("source") or "interactive"),

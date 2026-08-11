@@ -12,6 +12,9 @@ _workspace_root: ContextVar[Path | None] = ContextVar(
 _network_access: ContextVar[bool | None] = ContextVar(
     "k_agent_tool_network_access", default=None
 )
+_permission_mode: ContextVar[str] = ContextVar(
+    "k_agent_tool_permission_mode", default="default"
+)
 
 
 def set_tool_workspace(path: Path | None) -> Token[Path | None]:
@@ -48,3 +51,21 @@ def current_tool_network_access() -> bool | None:
     """本轮对本地工具生效的出网覆盖；None 表示沿用 Settings 默认。"""
 
     return _network_access.get()
+
+
+def set_tool_permission_mode(mode: str) -> Token[str]:
+    """Bind the validated run-level permission boundary to local tools."""
+
+    return _permission_mode.set("full_access" if mode == "full_access" else "default")
+
+
+def reset_tool_permission_mode(token: Token[str]) -> None:
+    """Restore the previous permission mode when a streamed run closes."""
+
+    _permission_mode.reset(token)
+
+
+def current_tool_permission_mode() -> str:
+    """Return the current run permission mode without consulting global settings."""
+
+    return _permission_mode.get()

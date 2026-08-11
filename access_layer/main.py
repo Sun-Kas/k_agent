@@ -833,6 +833,7 @@ def create_app() -> FastAPI:
                 SessionCapabilities(
                     mcpServerIds=session.mcp_server_ids,
                     skillIds=session.skill_ids,
+                    permissionMode=session.permission_mode,
                 )
                 if session.mcp_server_ids is not None
                 and session.skill_ids is not None

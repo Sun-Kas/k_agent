@@ -1,7 +1,7 @@
 /**
  * 多 Agent 团队领域类型：快照、任务状态机、有序事件（seq）与创建草稿。
  */
-import type { AgentKind } from "../types";
+import type { AgentKind, PermissionMode } from "../types";
 
 export type TeamStatus = "draft" | "running" | "paused" | "completed" | "failed" | "cancelled";
 /** 任务生命周期：pending → ready → claimed → running → submitted → completed（或 failed/cancelled）。 */
@@ -14,6 +14,7 @@ export interface TeamSummary {
   mode: "auto" | "manual";
   status: TeamStatus;
   workspaceDir: string;
+  permissionMode: PermissionMode;
   agentCount: number;
   taskCount: number;
   completedTaskCount: number;
@@ -36,6 +37,7 @@ export interface TeamAgent {
   creationReason: string;
   capabilities: { mcpServerIds: string[]; skillIds: string[] };
   workspaceDir: string;
+  permissionMode: PermissionMode;
   updatedAt: string;
 }
 

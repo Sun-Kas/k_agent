@@ -266,23 +266,27 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
                 [user],
                 mcp_server_ids=["mcp-a", "mcp-a"],
                 skill_ids=["skill-a"],
+                permission_mode="full_access",
             )
 
             reloaded = await SessionStore(storage).get("thread-capabilities")
             assert reloaded is not None
             self.assertEqual(reloaded.mcp_server_ids, ["mcp-a"])
             self.assertEqual(reloaded.skill_ids, ["skill-a"])
+            self.assertEqual(reloaded.permission_mode, "full_access")
 
             await store.save_run_start(
                 "thread-capabilities",
                 [],
                 mcp_server_ids=[],
                 skill_ids=[],
+                permission_mode="default",
             )
             cleared = await SessionStore(storage).get("thread-capabilities")
             assert cleared is not None
             self.assertEqual(cleared.mcp_server_ids, [])
             self.assertEqual(cleared.skill_ids, [])
+            self.assertEqual(cleared.permission_mode, "default")
 
     async def test_text_uses_standard_start_content_end_events(self) -> None:
         assistant = ChatMessage(
@@ -630,6 +634,16 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             event_types.index("REASONING_END"),
             event_types.index("TEXT_MESSAGE_START"),
         )
+        # 正文边界关掉 reasoning 时必须带上已累积 detail，避免前端把思考正文盖空。
+        end_events = [
+            event
+            for event in translated
+            if isinstance(event, ReasoningMessageEndEvent)
+        ]
+        self.assertTrue(end_events)
+        self.assertEqual(end_events[0].raw_event.get("detail"), "working")
+        self.assertEqual(end_events[0].raw_event.get("title"), "分析并决定下一步")
+        self.assertEqual(end_events[0].raw_event.get("status"), "complete")
 
     async def test_error_closes_open_thinking_before_run_error(self) -> None:
         thinking = {

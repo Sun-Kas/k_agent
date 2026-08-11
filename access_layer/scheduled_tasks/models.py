@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 ScheduleKind = Literal["once", "daily", "weekly"]
 TaskStatus = Literal["active", "paused"]
 RunStatus = Literal["queued", "running", "succeeded", "failed", "missed"]
+PermissionMode = Literal["default", "full_access"]
 
 
 class ScheduledTaskInput(BaseModel):
@@ -29,6 +30,7 @@ class ScheduledTaskInput(BaseModel):
     reasoning_effort: str = Field(default="none", alias="reasoningEffort", max_length=20)
     mcp_server_ids: list[str] = Field(default_factory=list, alias="mcpServerIds")
     skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
+    permission_mode: PermissionMode = Field(default="default", alias="permissionMode")
 
     @field_validator("name", "prompt", "timezone", "agent_kind", "model_id", mode="before")
     @classmethod
@@ -100,6 +102,7 @@ class ScheduledTaskOutput(BaseModel):
     reasoning_effort: str = Field(alias="reasoningEffort")
     mcp_server_ids: list[str] = Field(alias="mcpServerIds")
     skill_ids: list[str] = Field(alias="skillIds")
+    permission_mode: PermissionMode = Field(alias="permissionMode")
     created_at: str = Field(alias="createdAt")
     updated_at: str = Field(alias="updatedAt")
     latest_run: ScheduledRunOutput | None = Field(default=None, alias="latestRun")

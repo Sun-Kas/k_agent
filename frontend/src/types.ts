@@ -60,6 +60,7 @@ export interface SessionState {
   capabilities?: {
     mcpServerIds: string[];
     skillIds: string[];
+    permissionMode?: PermissionMode;
   } | null;
 }
 
@@ -222,6 +223,7 @@ export interface AgUiRunInput {
       cliSessionMode?: CliSessionMode;
       resumeSessionId?: string;
       networkAccess?: boolean;
+      permissionMode?: PermissionMode;
       claudeAutoApproveTools?: string[];
     };
   };
@@ -229,6 +231,8 @@ export interface AgUiRunInput {
 
 export type AgentKind = "k_agent" | "codex" | "claude_code" | string;
 export type CliSessionMode = "ephemeral" | "resume";
+/** default 保持沙箱并对越权动作发起 HITL；full_access 由用户显式承担宿主机风险。 */
+export type PermissionMode = "default" | "full_access";
 export type VoiceStyleId = "natural" | "warm" | "lively" | "professional" | "storytelling";
 
 export interface DetectedAgent {

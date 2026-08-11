@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 AgentKind = Literal["k_agent", "codex", "claude_code"]
 TeamMode = Literal["auto", "manual"]
+PermissionMode = Literal["default", "full_access"]
 
 
 class TeamAgentInput(BaseModel):
@@ -60,6 +61,7 @@ class TeamCreateInput(BaseModel):
     agents: list[TeamAgentInput] = Field(min_length=1, max_length=12)
     tasks: list[TeamTaskInput] = Field(default_factory=list, max_length=100)
     max_parallel: int = Field(default=4, alias="maxParallel", ge=1, le=12)
+    permission_mode: PermissionMode = Field(default="default", alias="permissionMode")
 
     @field_validator("agents")
     @classmethod

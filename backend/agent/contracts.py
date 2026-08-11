@@ -22,4 +22,5 @@ class AgentRunRequest:
     attachments: list[dict[str, Any]] = field(default_factory=list)
     mcp_server_ids: set[str] = field(default_factory=set)
     reasoning_effort: str | None = None
+    permission_mode: str = "default"
     loaded_memory_paths: list[str] = field(default_factory=list)

@@ -178,7 +178,11 @@ async def translate_agent_events(
             events.append(
                 ReasoningMessageEndEvent(
                     message_id=active_reasoning_message_id,
-                    raw_event={"id": active_reasoning_message_id, "status": "complete"}
+                    raw_event={
+                        **(active_reasoning_step or {"id": active_reasoning_message_id}),
+                        "id": active_reasoning_message_id,
+                        "status": "complete",
+                    },
                 )
             )
         active_reasoning_message_id = step_id
@@ -217,10 +221,17 @@ async def translate_agent_events(
         # 就应该关闭当前 thinking 块；如果后面还有 thinking，会重新 start。
         if active_reasoning_message_id is not None:
             completed_reasoning_message_ids.add(active_reasoning_message_id)
+            # 必须带上当前 step 快照：正文/工具边界会提前关掉 reasoning，
+            # 若 raw_event 只有 id，前端 complete 时会把已流式累积的 detail 盖成空。
+            end_snapshot = {
+                **(active_reasoning_step or {}),
+                "id": active_reasoning_message_id,
+                "status": "complete",
+            }
             events.append(
                 ReasoningMessageEndEvent(
                     message_id=active_reasoning_message_id,
-                    raw_event={"id": active_reasoning_message_id, "status": "complete"}
+                    raw_event=end_snapshot,
                 )
             )
             active_reasoning_message_id = None

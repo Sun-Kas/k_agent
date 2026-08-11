@@ -105,6 +105,54 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("requires manual approval", payload["error"])
 
+    async def test_default_escalation_uses_hitl_before_local_tool_runs(self) -> None:
+        calls: list[str] = []
+
+        async def execute(_: dict) -> str:
+            calls.append("tool")
+            return "ran"
+
+        async def approve(target, decision, detail):
+            calls.append(f"approval:{target}:{decision.behavior}")
+            self.assertEqual(detail["arguments"]["sandbox_permissions"], "require_escalated")
+            return {"action": "approve", "remember": False}
+
+        agent = OpenAIAgent(
+            [ToolDefinition("Read", "", {"type": "object", "properties": {}}, execute)],
+            mcp_client_manager=None,
+            approval_handler=approve,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "default"
+        result = await agent._run_tool(
+            callbacks=CallbackManager([]), context=context, iteration=0,
+            tool_name="Read",
+            arguments={"file_path": "/outside/file", "sandbox_permissions": "require_escalated"},
+        )
+
+        self.assertEqual(result, "ran")
+        self.assertEqual(calls, ["approval:Read:ask", "tool"])
+
+    async def test_full_access_bypasses_permission_rules(self) -> None:
+        async def execute(_: dict) -> str:
+            return "ran"
+
+        agent = OpenAIAgent(
+            [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
+            mcp_client_manager=None,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "full_access"
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "permissions.json"
+            path.write_text(json.dumps({"rules": [{"tool": "Bash", "pattern": "*", "behavior": "deny"}]}), encoding="utf-8")
+            with patch.dict(os.environ, {"K_AGENT_PERMISSION_RULES": str(path)}):
+                result = await agent._run_tool(
+                    callbacks=CallbackManager([]), context=context, iteration=0,
+                    tool_name="Bash", arguments={"command": "whoami"},
+                )
+        self.assertEqual(result, "ran")
+
 
 class SkillAllowlistTests(unittest.IsolatedAsyncioTestCase):
     async def test_invoked_skill_restricts_later_tools_in_the_run(self) -> None:

@@ -47,6 +47,7 @@ import type {
   DetectedAgent,
   HealthState,
   ModelProfile,
+  PermissionMode,
   ReasoningEffort,
   RuntimeOption,
   SessionSummary,
@@ -331,6 +332,7 @@ export function App() {
   const [selectedMcp, setSelectedMcp] = useState<string[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("none");
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>("default");
   const [attachments, setAttachments] = useState<Array<{ name: string; dataUrl: string; type: string }>>([]);
   const [listening, setListening] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedback | null>(null);
@@ -406,6 +408,7 @@ export function App() {
   const capabilitySelectionRef = useRef<{
     mcpServerIds: string[];
     skillIds: string[];
+    permissionMode?: PermissionMode;
   } | null>(null);
   const catalogLoadedRef = useRef(false);
 
@@ -703,9 +706,11 @@ export function App() {
       setSelectedMcp(nextMcp);
       setSelectedSkills(nextSkills);
       if (remembered) {
+        setPermissionMode(remembered.permissionMode ?? "default");
         capabilitySelectionRef.current = {
           mcpServerIds: nextMcp,
-          skillIds: nextSkills
+          skillIds: nextSkills,
+          permissionMode: remembered.permissionMode ?? "default"
         };
       }
     } catch {
@@ -759,6 +764,7 @@ export function App() {
         // 语义，让随后完成的 refreshOptions 应用当前全部可用 MCP。
         setSelectedMcp(mcpServers.map((server) => server.id));
         setSelectedSkills([]);
+        setPermissionMode("default");
       }
       resetRunViewState();
       const normalizedMessages = normalizeMessages(data.messages);
@@ -822,6 +828,7 @@ export function App() {
     capabilitySelectionRef.current = null;
     setSelectedMcp(mcpServers.map((server) => server.id));
     setSelectedSkills([]);
+    setPermissionMode("default");
     persistedMessageIdsRef.current = new Set();
     resetRunViewState();
     setSessionLoading(false);
@@ -889,7 +896,8 @@ export function App() {
     setSelectedMcp(ids);
     capabilitySelectionRef.current = {
       mcpServerIds: ids,
-      skillIds: selectedSkills
+      skillIds: selectedSkills,
+      permissionMode
     };
   }
 
@@ -897,7 +905,17 @@ export function App() {
     setSelectedSkills(ids);
     capabilitySelectionRef.current = {
       mcpServerIds: selectedMcp,
-      skillIds: ids
+      skillIds: ids,
+      permissionMode
+    };
+  }
+
+  function changePermissionMode(value: PermissionMode) {
+    setPermissionMode(value);
+    capabilitySelectionRef.current = {
+      mcpServerIds: selectedMcp,
+      skillIds: selectedSkills,
+      permissionMode: value
     };
   }
 
@@ -1307,6 +1325,7 @@ export function App() {
         agentKind,
         // 语音风格是 run 级元数据，不写进 prompt，保证落库 transcript 与用户原话一致。
         agentOptions: {
+          permissionMode,
           voiceConversation: voiceConversationActiveRef.current,
           voiceStyle: voiceConfig.style,
           ...(agentKind === "k_agent" ? {} : { cliSessionMode })
@@ -1899,10 +1918,28 @@ export function App() {
   }
 
   function completeThinkingStep(id: string, finalStep: ThinkingActivity | null) {
-    const complete = (step: ThinkingActivity) =>
-      step.id === id
-        ? { ...(finalStep ?? step), id, status: "complete" as const }
-        : step;
+    // END 事件的 rawEvent 有时只有 id/status（或标题回落成「思考步骤」），
+    // 不能整对象覆盖，否则会把 CONTENT 已流式拼好的 detail 清掉。
+    const complete = (step: ThinkingActivity) => {
+      if (step.id !== id) return step;
+      if (!finalStep) return { ...step, status: "complete" as const };
+      const detail =
+        finalStep.detail && finalStep.detail.length >= step.detail.length
+          ? finalStep.detail
+          : step.detail;
+      const title =
+        finalStep.title && !(finalStep.title === "思考步骤" && step.title)
+          ? finalStep.title
+          : step.title || finalStep.title;
+      return {
+        ...step,
+        ...finalStep,
+        id,
+        title,
+        detail,
+        status: "complete" as const
+      };
+    };
     setThinking((current) => current.map(complete));
     setThinkingBlocks((current) => current.map((block) => ({
       ...block,
@@ -2695,6 +2732,7 @@ export function App() {
                 selectedSkills={selectedSkills}
                 onSkillsChange={changeSelectedSkills}
               />
+              <ComposerPermissionPicker value={permissionMode} onChange={changePermissionMode} />
             </div>
             <div className="composer-toolbar composer-toolbar-right">
               <RuntimeSettingsPicker
@@ -3473,6 +3511,54 @@ function RuntimeSettingsPicker({
       }}>
         <strong>{currentAgent?.name || "K Agent"}</strong><span>{currentModel?.name ?? "选择模型"}</span>
         {supportsReasoning && <em>{currentReasoning?.name}</em>}<i>⌃</i>
+      </button>
+    </div>
+  );
+}
+
+function ComposerPermissionPicker({ value, onChange }: {
+  value: PermissionMode;
+  onChange: (value: PermissionMode) => void;
+}) {
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
+      if (open && pickerRef.current && !pickerRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointerDown);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
+  }, [open]);
+
+  return (
+    <div
+      ref={pickerRef}
+      className={`composer-permission ${open ? "open" : ""} ${value === "full_access" ? "danger" : ""}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") setOpen(false);
+      }}
+    >
+      {open && (
+        <section className="composer-permission-popover" aria-label="运行权限">
+          <header><strong>运行权限</strong><small>应用于当前对话</small></header>
+          <button className={value === "default" ? "selected" : ""} type="button" onClick={() => { onChange("default"); setOpen(false); }}>
+            <span><strong>默认权限</strong><small>越过沙箱边界时请求审批</small></span><i>{value === "default" ? "✓" : ""}</i>
+          </button>
+          <button className={`danger-option ${value === "full_access" ? "selected" : ""}`} type="button" onClick={() => { onChange("full_access"); setOpen(false); }}>
+            <span><strong>完全权限</strong><small>关闭沙箱和审批，可访问宿主机</small></span><i>{value === "full_access" ? "✓" : ""}</i>
+          </button>
+        </section>
+      )}
+      <button
+        className="composer-permission-trigger"
+        type="button"
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title={value === "full_access" ? "完全权限：已关闭沙箱和审批" : "默认权限：越权时需要审批"}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span aria-hidden="true">◉</span><strong>{value === "full_access" ? "完全权限" : "默认权限"}</strong><i>⌃</i>
       </button>
     </div>
   );

@@ -45,6 +45,7 @@ async def run_codex_app_server(
     public_thread_id: str,
     run_id: str,
     network_access: bool,
+    permission_mode: str,
     mapper: CodexItemMapper,
     env: dict[str, str] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -106,13 +107,14 @@ async def run_codex_app_server(
         )
         await send({"method": "initialized", "params": {}})
 
+        full_access = permission_mode == "full_access"
         thread_params: dict[str, Any] = {
             "cwd": str(cwd),
             # App-server must be allowed to ask; the ApprovalBroker supplies the
             # bidirectional answer that codex exec cannot receive.
-            "approvalPolicy": "on-request",
+            "approvalPolicy": "never" if full_access else "on-request",
             "approvalsReviewer": "user",
-            "sandbox": "workspace-write",
+            "sandbox": "danger-full-access" if full_access else "workspace-write",
             "model": model,
         }
         if resume_thread_id:
@@ -134,14 +136,18 @@ async def run_codex_app_server(
             "threadId": codex_thread_id,
             "input": [{"type": "text", "text": prompt}],
             "cwd": str(cwd),
-            "approvalPolicy": "on-request",
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [str(cwd)],
-                # Codex keeps workspace-write isolation even when outbound
-                # access is enabled; this flag changes only the network edge.
-                "networkAccess": network_access,
-            },
+            "approvalPolicy": "never" if full_access else "on-request",
+            "sandboxPolicy": (
+                {"type": "dangerFullAccess"}
+                if full_access
+                else {
+                    "type": "workspaceWrite",
+                    "writableRoots": [str(cwd)],
+                    # Default mode keeps file isolation even when outbound
+                    # access is enabled; this flag changes only the network edge.
+                    "networkAccess": network_access,
+                }
+            ),
         }
         if model:
             turn_params["model"] = model

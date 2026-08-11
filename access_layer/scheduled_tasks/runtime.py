@@ -193,7 +193,10 @@ class ScheduledTaskRuntime:
                         "agentKind": task["agentKind"],
                         # Scheduled CLI work must be isolated; silently resuming an
                         # interactive provider session would couple unrelated runs.
-                        "agentOptions": {"cliSessionMode": "ephemeral"},
+                        "agentOptions": {
+                            "cliSessionMode": "ephemeral",
+                            "permissionMode": task["permissionMode"],
+                        },
                     },
                 })
                 response = await self._access_layer.run(payload)

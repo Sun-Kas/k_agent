@@ -197,4 +197,17 @@ async def test_runtime_reuses_access_layer_run_and_persists_success(tmp_path) ->
     assert runs[0]["status"] == "succeeded"
     assert access.payloads[0].thread_id == runs[0]["sessionId"]
     assert access.payloads[0].forwarded_props["agentOptions"]["cliSessionMode"] == "ephemeral"
+    assert access.payloads[0].forwarded_props["agentOptions"]["permissionMode"] == "default"
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_full_access_permission_is_persisted_for_every_scheduled_run(tmp_path) -> None:
+    store = ScheduledTaskStore(tmp_path / "scheduled.db")
+    await store.initialize()
+    task = await store.create(task_input(permissionMode="full_access"))
+
+    assert task["permissionMode"] == "full_access"
+    reloaded = await store.get(task["id"])
+    assert reloaded is not None
+    assert reloaded["permissionMode"] == "full_access"

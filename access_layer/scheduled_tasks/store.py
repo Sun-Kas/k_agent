@@ -68,6 +68,7 @@ class ScheduledTaskStore:
                     reasoning_effort TEXT NOT NULL,
                     mcp_server_ids_json TEXT NOT NULL,
                     skill_ids_json TEXT NOT NULL,
+                    permission_mode TEXT NOT NULL DEFAULT 'default',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -93,6 +94,16 @@ class ScheduledTaskStore:
                     ON scheduled_runs(task_id, scheduled_for DESC);
                 """
             )
+            task_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
+            }
+            if "permission_mode" not in task_columns:
+                # Existing automations retain today's behavior after migration.
+                db.execute(
+                    "ALTER TABLE scheduled_tasks ADD COLUMN permission_mode "
+                    "TEXT NOT NULL DEFAULT 'default'"
+                )
 
     async def create(self, payload: ScheduledTaskInput) -> dict[str, Any]:
         now = _now()
@@ -113,14 +124,15 @@ class ScheduledTaskStore:
                     id, name, prompt, status, schedule_kind, local_date,
                     weekdays_json, local_time, timezone, next_run_at, agent_kind,
                     model_id, reasoning_effort, mcp_server_ids_json, skill_ids_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    permission_mode, created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     task_id, payload.name, payload.prompt, payload.schedule_kind,
                     payload.local_date, json.dumps(payload.weekdays), payload.local_time,
                     payload.timezone, _iso(next_run) if next_run else None,
                     payload.agent_kind, payload.model_id, payload.reasoning_effort,
                     json.dumps(payload.mcp_server_ids), json.dumps(payload.skill_ids),
+                    payload.permission_mode,
                     _iso(now), _iso(now),
                 ),
             )
@@ -182,13 +194,13 @@ class ScheduledTaskStore:
                 """UPDATE scheduled_tasks SET name=?, prompt=?, schedule_kind=?, local_date=?,
                     weekdays_json=?, local_time=?, timezone=?, next_run_at=?, agent_kind=?,
                     model_id=?, reasoning_effort=?, mcp_server_ids_json=?, skill_ids_json=?,
-                    updated_at=? WHERE id=?""",
+                    permission_mode=?, updated_at=? WHERE id=?""",
                 (
                     payload.name, payload.prompt, payload.schedule_kind, payload.local_date,
                     json.dumps(payload.weekdays), payload.local_time, payload.timezone,
                     _iso(next_run) if next_run else None, payload.agent_kind, payload.model_id,
                     payload.reasoning_effort, json.dumps(payload.mcp_server_ids),
-                    json.dumps(payload.skill_ids), _iso(now), task_id,
+                    json.dumps(payload.skill_ids), payload.permission_mode, _iso(now), task_id,
                 ),
             )
             return cursor.rowcount > 0
@@ -408,6 +420,7 @@ class ScheduledTaskStore:
             "modelId": row["model_id"], "reasoningEffort": row["reasoning_effort"],
             "mcpServerIds": json.loads(row["mcp_server_ids_json"]),
             "skillIds": json.loads(row["skill_ids_json"]),
+            "permissionMode": row["permission_mode"],
         })
 
     @classmethod
@@ -431,6 +444,7 @@ class ScheduledTaskStore:
             "modelId": row["model_id"], "reasoningEffort": row["reasoning_effort"],
             "mcpServerIds": json.loads(row["mcp_server_ids_json"]),
             "skillIds": json.loads(row["skill_ids_json"]),
+            "permissionMode": row["permission_mode"],
             "createdAt": row["created_at"], "updatedAt": row["updated_at"],
             "latestRun": latest,
         }

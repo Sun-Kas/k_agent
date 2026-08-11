@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
+PermissionMode = Literal["default", "full_access"]
 
 
 class ChatMeta(BaseModel):
@@ -66,6 +67,7 @@ class SessionCapabilities(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     mcp_server_ids: list[str] = Field(default_factory=list, alias="mcpServerIds")
     skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
+    permission_mode: PermissionMode = Field(default="default", alias="permissionMode")
 
 
 class SessionState(BaseModel):

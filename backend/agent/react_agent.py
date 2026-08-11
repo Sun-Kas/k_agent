@@ -105,6 +105,7 @@ class OpenAIAgent:
             base_url=request.model_config.get("baseUrl") or self.config.openai_base_url,
         )
         context = AgentRunContext()
+        context.metadata["permission_mode"] = request.permission_mode
         callbacks = CallbackManager([TraceCallback(trace), *self.callbacks])
 
         try:
@@ -588,13 +589,25 @@ class OpenAIAgent:
                 arguments = self._skill_alias_arguments(tool_name, arguments)
         if local_tool is not None:
             permission_tool_name = local_tool.name
-            self._enforce_skill_allowlist(context, permission_tool_name)
+            if context.metadata.get("permission_mode") != "full_access":
+                self._enforce_skill_allowlist(context, permission_tool_name)
+            decision = check_permissions(
+                permission_tool_name,
+                self._permission_subjects(permission_tool_name, arguments),
+            )
+            if context.metadata.get("permission_mode") == "full_access":
+                decision = PermissionDecision("allow", "full access selected for this run")
+            elif (
+                context.metadata.get("permission_mode") != "full_access"
+                and arguments.get("sandbox_permissions") == "require_escalated"
+            ):
+                decision = PermissionDecision(
+                    "ask",
+                    "该工具请求访问默认沙箱范围之外的本机资源。",
+                )
             await self._enforce_permission(
                 permission_tool_name,
-                check_permissions(
-                    permission_tool_name,
-                    self._permission_subjects(permission_tool_name, arguments),
-                ),
+                decision,
                 {"toolName": tool_name, "arguments": arguments, "source": "local"},
             )
             before_payload = ToolCallPayload(
@@ -631,10 +644,15 @@ class OpenAIAgent:
             raise RuntimeError(f"Unknown tool requested: {tool_name}")
 
         server_id, name = target
-        self._enforce_skill_allowlist(context, tool_name)
+        if context.metadata.get("permission_mode") != "full_access":
+            self._enforce_skill_allowlist(context, tool_name)
         await self._enforce_permission(
             f"MCP tool {server_id}:{name}",
-            check_permission("mcp", f"{server_id}:{name}"),
+            (
+                PermissionDecision("allow", "full access selected for this run")
+                if context.metadata.get("permission_mode") == "full_access"
+                else check_permission("mcp", f"{server_id}:{name}")
+            ),
             {
                 "toolName": name,
                 "serverId": server_id,

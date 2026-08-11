@@ -63,6 +63,7 @@ class TeamStore:
                     max_parallel INTEGER NOT NULL,
                     supervisor_agent_id TEXT,
                     workspace_dir TEXT,
+                    permission_mode TEXT NOT NULL DEFAULT 'default',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -167,6 +168,12 @@ class TeamStore:
             }
             if "workspace_dir" not in team_columns:
                 db.execute("ALTER TABLE teams ADD COLUMN workspace_dir TEXT")
+            if "permission_mode" not in team_columns:
+                # Existing Teams keep the historical sandbox + HITL behavior.
+                db.execute(
+                    "ALTER TABLE teams ADD COLUMN permission_mode "
+                    "TEXT NOT NULL DEFAULT 'default'"
+                )
             agent_columns = {
                 row["name"]
                 for row in db.execute("PRAGMA table_info(team_agents)").fetchall()
@@ -286,8 +293,8 @@ class TeamStore:
                 """
                 INSERT INTO teams
                 (id, name, goal, mode, status, max_parallel, supervisor_agent_id,
-                 workspace_dir, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)
+                 workspace_dir, permission_mode, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     team_id,
@@ -297,6 +304,7 @@ class TeamStore:
                     payload.max_parallel,
                     agent_ids[supervisor_index],
                     stored_workspace,
+                    payload.permission_mode,
                     timestamp,
                     timestamp,
                 ),
@@ -541,6 +549,7 @@ class TeamStore:
                 {
                     "id": row["id"], "name": row["name"], "goal": row["goal"],
                     "mode": row["mode"], "status": row["status"],
+                    "permissionMode": row["permission_mode"],
                     "workspaceDir": public_home_relative_path(row["workspace_dir"]) or row["workspace_dir"],
                     "agentCount": row["agent_count"], "taskCount": row["task_count"],
                     "completedTaskCount": row["completed_count"],
@@ -582,6 +591,7 @@ class TeamStore:
             return {
                 "id": team["id"], "name": team["name"], "goal": team["goal"],
                 "mode": team["mode"], "status": team["status"],
+                "permissionMode": team["permission_mode"],
                 "maxParallel": team["max_parallel"],
                 "supervisorAgentId": team["supervisor_agent_id"],
                 "workspaceDir": public_home_relative_path(team["workspace_dir"]) or team["workspace_dir"],

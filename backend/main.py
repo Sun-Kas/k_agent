@@ -53,8 +53,10 @@ from backend.runners.network_policy import network_access_enabled
 from backend.runners.detect import detect_agents_payload
 from backend.tools import load_local_tools
 from backend.tools.workspace import (
+    reset_tool_permission_mode,
     reset_tool_network_access,
     reset_tool_workspace,
+    set_tool_permission_mode,
     set_tool_network_access,
     set_tool_workspace,
 )
@@ -315,6 +317,9 @@ def create_app() -> FastAPI:
             )
             workspace_token = set_tool_workspace(ctx.workspace_dir)
             network_token = set_tool_network_access(network_access_enabled(ctx))
+            permission_token = set_tool_permission_mode(
+                str(ctx.options.get("permissionMode") or "default")
+            )
             # 全项目一份 Node/npm 前缀，对话与 Team 共用。冲突键以
             # agentOptions.toolEnv 为准。
             runtime = ensure_shared_runtime()
@@ -365,6 +370,7 @@ def create_app() -> FastAPI:
                 raise
             finally:
                 reset_tool_env_overrides(env_token)
+                reset_tool_permission_mode(permission_token)
                 reset_tool_network_access(network_token)
                 reset_tool_workspace(workspace_token)
                 log_event(

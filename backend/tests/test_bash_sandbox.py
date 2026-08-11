@@ -86,6 +86,17 @@ class SandboxPlanningTests(unittest.TestCase):
         self.assertIsNone(invocation.argv)
         self.assertFalse(invocation.sandboxed)
 
+    def test_full_access_skips_sandbox_per_run(self) -> None:
+        invocation = plan_bash_invocation(
+            "echo hi",
+            workspace_root=Path("/tmp/ws"),
+            settings=_settings(bash_sandbox_mode="required"),
+            full_access=True,
+        )
+        self.assertIsNone(invocation.argv)
+        self.assertFalse(invocation.sandboxed)
+        self.assertIn("full access", invocation.reason)
+
     def test_required_mode_raises_when_unavailable(self) -> None:
         with patch(
             "backend.sandbox.plan.detect_support",

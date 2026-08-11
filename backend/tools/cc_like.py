@@ -24,7 +24,11 @@ from backend.sandbox import (
     plan_bash_invocation,
 )
 from backend.tools.local import ToolDefinition
-from backend.tools.workspace import current_tool_network_access, current_tool_workspace
+from backend.tools.workspace import (
+    current_tool_network_access,
+    current_tool_permission_mode,
+    current_tool_workspace,
+)
 
 
 async def _workspace_root() -> Path:
@@ -39,7 +43,7 @@ async def _workspace_root() -> Path:
     return root.resolve()
 
 
-async def _resolve_workspace_path(raw_path: str) -> Path:
+async def _resolve_workspace_path(raw_path: str, *, allow_outside: bool = False) -> Path:
     """将模型传入的路径限制在工作区内，避免本地工具越权读写用户其它目录。"""
     root = await _workspace_root()
     candidate = Path(raw_path or ".").expanduser()
@@ -48,11 +52,22 @@ async def _resolve_workspace_path(raw_path: str) -> Path:
     # 必须先 resolve 再比较：它会展开 `..` 和符号链接，
     # 否则 `workspace/../../etc/passwd` 这类路径能绕过下面的包含检查。
     resolved = candidate.resolve()
+    if allow_outside or current_tool_permission_mode() == "full_access":
+        return resolved
     try:
         resolved.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"path is outside workspace: {raw_path}") from exc
     return resolved
+
+
+def _requests_host_access(payload: dict[str, Any]) -> bool:
+    """Only approved escalations or full-access runs may cross the workspace."""
+
+    return (
+        current_tool_permission_mode() == "full_access"
+        or payload.get("sandbox_permissions") == "require_escalated"
+    )
 
 
 async def _tool_limits() -> tuple[float, int]:
@@ -78,7 +93,10 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
 async def cc_read(payload: dict[str, Any]) -> str:
     """读取工作区内文件的有界 UTF-8 表示。"""
 
-    path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
+    path = await _resolve_workspace_path(
+        str(payload.get("file_path") or payload.get("path") or ""),
+        allow_outside=_requests_host_access(payload),
+    )
     if not path.exists():
         return _json({"ok": False, "error": "file not found", "path": str(path)})
     if path.is_dir():
@@ -91,7 +109,10 @@ async def cc_read(payload: dict[str, Any]) -> str:
 async def cc_write(payload: dict[str, Any]) -> str:
     """Write a file after resolving its target inside the workspace boundary."""
 
-    path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
+    path = await _resolve_workspace_path(
+        str(payload.get("file_path") or payload.get("path") or ""),
+        allow_outside=_requests_host_access(payload),
+    )
     content = str(payload.get("content") or "")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -101,7 +122,10 @@ async def cc_write(payload: dict[str, Any]) -> str:
 async def cc_edit(payload: dict[str, Any]) -> str:
     """Apply an exact replacement and reject ambiguous matches by default."""
 
-    path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
+    path = await _resolve_workspace_path(
+        str(payload.get("file_path") or payload.get("path") or ""),
+        allow_outside=_requests_host_access(payload),
+    )
     old_string = str(payload.get("old_string") or payload.get("oldString") or "")
     new_string = str(payload.get("new_string") or payload.get("newString") or "")
     replace_all = bool(payload.get("replace_all") or payload.get("replaceAll") or False)
@@ -124,7 +148,10 @@ async def cc_edit(payload: dict[str, Any]) -> str:
 
 async def cc_glob(payload: dict[str, Any]) -> str:
     """按 glob 模式在工作区内查找文件。"""
-    root = await _resolve_workspace_path(str(payload.get("path") or "."))
+    root = await _resolve_workspace_path(
+        str(payload.get("path") or "."),
+        allow_outside=_requests_host_access(payload),
+    )
     pattern = str(payload.get("pattern") or "**/*")
     _, max_chars = await _tool_limits()
     matches = []
@@ -144,7 +171,10 @@ async def cc_glob(payload: dict[str, Any]) -> str:
 
 async def cc_grep(payload: dict[str, Any]) -> str:
     """按正则在工作区文件内容中搜索。"""
-    root = await _resolve_workspace_path(str(payload.get("path") or "."))
+    root = await _resolve_workspace_path(
+        str(payload.get("path") or "."),
+        allow_outside=_requests_host_access(payload),
+    )
     pattern = str(payload.get("pattern") or "")
     include = str(payload.get("include") or "**/*")
     if not pattern:
@@ -182,6 +212,10 @@ async def cc_bash(payload: dict[str, Any]) -> str:
             workspace_root=root,
             settings=settings,
             network_access=current_tool_network_access(),
+            full_access=(
+                current_tool_permission_mode() == "full_access"
+                or payload.get("sandbox_permissions") == "require_escalated"
+            ),
         )
     except SandboxUnavailable as exc:
         return _json(
@@ -293,32 +327,32 @@ async def cc_todo_write(payload: dict[str, Any]) -> str:
 CC_LIKE_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="Read",
-        description="Read a UTF-8 text file from the workspace.",
-        parameters={"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"], "additionalProperties": False},
+        description="Read a UTF-8 text file. Paths outside the workspace require sandbox_permissions=require_escalated so the user can approve them.",
+        parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["file_path"], "additionalProperties": False},
         execute=cc_read,
     ),
     ToolDefinition(
         name="Write",
-        description="Write UTF-8 text to a workspace file, creating parent directories as needed.",
-        parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"], "additionalProperties": False},
+        description="Write UTF-8 text. Paths outside the workspace require sandbox_permissions=require_escalated so the user can approve them.",
+        parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["file_path", "content"], "additionalProperties": False},
         execute=cc_write,
     ),
     ToolDefinition(
         name="Edit",
-        description="Replace text in a workspace file. old_string must be unique unless replace_all is true.",
-        parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean", "default": False}}, "required": ["file_path", "old_string", "new_string"], "additionalProperties": False},
+        description="Replace text in a file. old_string must be unique unless replace_all is true. Outside-workspace paths require sandbox_permissions=require_escalated.",
+        parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean", "default": False}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["file_path", "old_string", "new_string"], "additionalProperties": False},
         execute=cc_edit,
     ),
     ToolDefinition(
         name="Glob",
-        description="Find workspace files by glob pattern, sorted by recent modification time.",
-        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}}, "required": ["pattern"], "additionalProperties": False},
+        description="Find files by glob pattern, sorted by recent modification time. Outside-workspace paths require sandbox_permissions=require_escalated.",
+        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["pattern"], "additionalProperties": False},
         execute=cc_glob,
     ),
     ToolDefinition(
         name="Grep",
-        description="Search workspace files with a regular expression.",
-        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "include": {"type": "string", "default": "**/*"}}, "required": ["pattern"], "additionalProperties": False},
+        description="Search files with a regular expression. Outside-workspace paths require sandbox_permissions=require_escalated.",
+        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "include": {"type": "string", "default": "**/*"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["pattern"], "additionalProperties": False},
         execute=cc_grep,
     ),
     ToolDefinition(
@@ -329,9 +363,11 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
             "result includes userMessage/installGuidance — relay that full message to "
             "the user in Chinese (manual install vs confirm-then-InstallSandbox; "
             "Windows native unsupported / WSL2). Only call InstallSandbox after they "
-            "explicitly confirm."
+            "explicitly confirm. In default permission mode, retry a command that "
+            "needs host access with sandbox_permissions=require_escalated so HITL can "
+            "ask the user. Full-access runs execute without the OS sandbox."
         ),
-        parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string"}}, "required": ["command"], "additionalProperties": False},
+        parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["command"], "additionalProperties": False},
         execute=cc_bash,
     ),
     ToolDefinition(

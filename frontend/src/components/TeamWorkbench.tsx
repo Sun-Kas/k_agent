@@ -42,6 +42,7 @@ import type {
   ModelProfile,
   RuntimeOption
 } from "../types";
+import type { PermissionMode } from "../types";
 import type {
   TeamAgentDraft,
   TeamArtifact,
@@ -50,6 +51,7 @@ import type {
   TeamSummary,
   TeamTask
 } from "../team/types";
+import { PermissionModeField } from "./PermissionModeField";
 
 
 const BUILTIN_AGENTS: DetectedAgent[] = [
@@ -590,6 +592,7 @@ function TeamComposer({
   const [workspaceDir, setWorkspaceDir] = useState("");
   const [maxParallel, setMaxParallel] = useState(4);
   const [mode, setMode] = useState<"auto" | "manual">("manual");
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>("default");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [members, setMembers] = useState<TeamAgentDraft[]>(() => defaultMembers(agents));
@@ -617,6 +620,7 @@ function TeamComposer({
         goal: goal.trim(),
         workspaceDir: workspaceDir.trim() || undefined,
         mode,
+        permissionMode,
         maxParallel: Math.min(maxParallel, members.length),
         agents: members.map((member, index) => ({
           ...member,
@@ -646,6 +650,7 @@ function TeamComposer({
             <button className={mode === "manual" ? "active" : ""} type="button" onClick={() => setMode("manual")}><strong>手动组队</strong><span>明确指定每个 Agent</span></button>
             <button className={mode === "auto" ? "active" : ""} type="button" onClick={() => setMode("auto")}><strong>自动调度</strong><span>由主管动态拆解与指派</span></button>
           </div>
+          <PermissionModeField value={permissionMode} onChange={setPermissionMode} context="team" />
           <label className="team-field"><span>团队目标</span><textarea rows={6} value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="描述最终需要交付的结果、约束和质量要求…" /></label>
           <label className="team-field compact"><span>最大并行任务</span><input type="number" min={1} max={12} value={maxParallel} onChange={(event) => setMaxParallel(Number(event.target.value) || 1)} /></label>
           <div className="team-runtime-assurance"><span>✓</span><p><strong>运行时保证</strong>普通工具失败只返回对应 Agent；暂停和刷新不会丢失任务状态。</p></div>

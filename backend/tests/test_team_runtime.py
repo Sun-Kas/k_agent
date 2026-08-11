@@ -113,6 +113,19 @@ def test_team_store_registers_all_builtin_agent_kinds(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_team_permission_mode_is_persisted(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = TeamStore(tmp_path / "team_runtime.db")
+        await store.initialize()
+        payload = _team_payload().model_copy(update={"permission_mode": "full_access"})
+        team = await store.create_team(payload, tmp_path)
+        assert team["permissionMode"] == "full_access"
+        summaries = await store.list_teams()
+        assert summaries[0]["permissionMode"] == "full_access"
+
+    asyncio.run(scenario())
+
+
 def test_supervisor_plan_gate_and_task_claim_are_atomic(tmp_path: Path) -> None:
     async def scenario() -> None:
         store = TeamStore(tmp_path / "team_runtime.db")

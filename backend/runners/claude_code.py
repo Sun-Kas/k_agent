@@ -76,9 +76,12 @@ class ClaudeCodeRunner:
         mode = cli_session_mode(ctx)
         resume_id = resume_session_id(ctx) if mode == "resume" else None
         async with _approval_bridge(ctx) as approval_bridge:
+            full_access = ctx.options.get("permissionMode") == "full_access"
             permission_mode = _claude_permission_mode(
                 ctx, approval_available=approval_bridge is not None
             )
+            if full_access:
+                permission_mode = "bypassPermissions"
             claude_mcp_servers = list(ctx.mcp_servers)
             if approval_bridge is not None and permission_mode != "bypassPermissions":
                 claude_mcp_servers.append(approval_bridge.mcp_server())
@@ -101,7 +104,9 @@ class ClaudeCodeRunner:
             argv.extend([
                 "--settings",
                 json.dumps(
-                    claude_sandbox_settings(network_access_enabled(ctx)),
+                    claude_sandbox_settings(
+                        network_access_enabled(ctx), full_access=full_access
+                    ),
                     separators=(",", ":"),
                 ),
             ])
@@ -153,12 +158,14 @@ class ClaudeCodeStreamState(_CliStreamState):
         self.tool_id_map: dict[str, str] = {}
 
 
-def claude_sandbox_settings(network_access: bool) -> dict[str, Any]:
-    """Build flag-scoped Claude settings without weakening file isolation."""
+def claude_sandbox_settings(
+    network_access: bool, *, full_access: bool = False
+) -> dict[str, Any]:
+    """Build run-scoped Claude settings; full access explicitly disables sandboxing."""
 
     return {
         "sandbox": {
-            "enabled": True,
+            "enabled": not full_access,
             "network": {"allowedDomains": ["*"] if network_access else []},
         }
     }

@@ -127,6 +127,11 @@ class KAgentRunner:
                 reasoning_effort=normalize_reasoning_effort(
                     model, ctx.reasoning_effort
                 ),
+                permission_mode=(
+                    "full_access"
+                    if ctx.options.get("permissionMode") == "full_access"
+                    else "default"
+                ),
                 loaded_memory_paths=prompt_bundle.memory_paths,
             )
             callbacks = [cb for cb in (ctx.logging_callback,) if cb is not None]

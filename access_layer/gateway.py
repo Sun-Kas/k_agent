@@ -76,6 +76,13 @@ class AgentAccessLayer:
         if not isinstance(raw_options, dict):
             raise HTTPException(status_code=400, detail="agentOptions must be an object")
         agent_options = dict(raw_options)
+        permission_mode = str(agent_options.get("permissionMode") or "default")
+        if permission_mode not in {"default", "full_access"}:
+            raise HTTPException(
+                status_code=400,
+                detail="agentOptions.permissionMode must be default or full_access",
+            )
+        agent_options["permissionMode"] = permission_mode
         mcp_ids = self._string_list(forwarded.get("mcpServerIds"), "mcpServerIds")
         skill_ids = self._string_list(forwarded.get("skillIds"), "skillIds")
         try:
@@ -124,6 +131,7 @@ class AgentAccessLayer:
                     run_id=payload.run_id,
                     mcp_server_ids=mcp_ids,
                     skill_ids=skill_ids,
+                    permission_mode=permission_mode,
                 )
             except BaseException:
                 await stream_guard.__aexit__(None, None, None)

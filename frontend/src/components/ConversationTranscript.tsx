@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 
-import type { AgUiEvent, ChatMessage, SessionState, ToolActivity } from "../types";
+import { resolveApproval } from "../api/agui";
+import type { AgUiEvent, ApprovalActivity, ChatMessage, SessionState, ToolActivity } from "../types";
 import { MarkdownContent } from "./MarkdownContent";
+import { timelineFromEvents, type StaticTimelineActivity } from "./transcript-timeline";
 
 export function groupDisplayMessages(messages: ChatMessage[]): ChatMessage[] {
   const grouped: ChatMessage[] = [];
@@ -30,17 +32,110 @@ export function toolResultFailed(content: string): boolean {
 /** Read-only sessions reuse chat's bubbles, Markdown and collapsed tool presentation. */
 export function StaticConversationTranscript({ session }: { session: SessionState }) {
   const messages = useMemo(() => groupDisplayMessages(session.messages), [session.messages]);
-  const tools = useMemo(() => toolsFromEvents(session.events ?? []), [session.events]);
-  return <div className="scheduled-transcript">{messages.map((message, index) =>
+  const timeline = useMemo(() => timelineFromEvents(session.events ?? []), [session.events]);
+  const userMessages = messages.filter((message) => message.role === "user");
+  const assistantMessages = messages.filter((message) => message.role === "assistant");
+  const fallbackAnswer = assistantMessages.map((message) => message.content).filter(Boolean).join("\n\n");
+  const approvals = useMemo(() => approvalsFromEvents(session.events ?? []), [session.events]);
+  return <div className="scheduled-transcript">{userMessages.map((message) =>
     <article className={`message-row ${message.role}`} key={message.id}>
-      <div className="avatar">{message.role === "user" ? "你" : "K"}</div>
+      <div className="avatar">你</div>
       <div className="message-body">
-        {message.role === "assistant" && index === messages.length - 1 && tools.map((tool) => <InlineToolActivity tool={tool} key={tool.id} />)}
-        {message.role === "assistant"
-          ? <div className="assistant-output"><MarkdownContent content={message.content} /></div>
-          : <div className="bubble"><MarkdownContent content={message.content} /></div>}
+        <div className="bubble"><MarkdownContent content={message.content} /></div>
       </div>
-    </article>)}</div>;
+    </article>)}
+    {(timeline.length > 0 || fallbackAnswer || approvals.length > 0) && <article className="message-row assistant">
+      <div className="avatar">K</div>
+      <div className="message-body">
+        {timeline.length > 0
+          ? timeline.map((activity) => activity.type === "thinking"
+            ? <StaticThinkingActivity activity={activity} key={activity.id} />
+            : activity.type === "tool"
+              ? <InlineToolActivity tool={activity.tool} key={activity.id} />
+              : <div className="assistant-output" key={activity.id}><MarkdownContent content={activity.content} /></div>)
+          : <div className="assistant-output"><MarkdownContent content={fallbackAnswer} /></div>}
+        {approvals.map((approval) => <StaticApprovalCard approval={approval} key={approval.id} />)}
+      </div>
+    </article>}
+  </div>;
+}
+
+function approvalsFromEvents(events: AgUiEvent[]): ApprovalActivity[] {
+  const approvals = new Map<string, ApprovalActivity>();
+  let sequence = 0;
+  for (const event of events) {
+    if (event.type !== "CUSTOM") continue;
+    if (event.name === "approval_request") {
+      const id = String(event.value.id ?? "");
+      const runId = String(event.value.runId ?? "");
+      if (!id || !runId || approvals.has(id)) continue;
+      approvals.set(id, {
+        id,
+        threadId: String(event.value.threadId ?? ""),
+        runId,
+        agentKind: String(event.value.agentKind ?? "k_agent"),
+        category: String(event.value.category ?? "tool"),
+        title: String(event.value.title ?? "需要你的确认"),
+        message: String(event.value.message ?? "请确认是否继续。"),
+        detail: event.value.detail && typeof event.value.detail === "object"
+          ? event.value.detail as Record<string, unknown>
+          : {},
+        status: "pending",
+        sequence: sequence += 1
+      });
+    } else if (event.name === "approval_resolved") {
+      const id = String(event.value.id ?? "");
+      const existing = approvals.get(id);
+      if (!existing) continue;
+      const action = String(event.value.action ?? "cancel");
+      approvals.set(id, { ...existing, status: action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled" });
+    }
+  }
+  return [...approvals.values()];
+}
+
+/** 定时任务在原页面内完成 HITL；审批后轮询到的持久化事件会成为最终状态。 */
+function StaticApprovalCard({ approval }: { approval: ApprovalActivity }) {
+  const [status, setStatus] = useState(approval.status);
+  const [error, setError] = useState("");
+  useEffect(() => { setStatus(approval.status); }, [approval.status]);
+  const pending = status === "pending" || status === "error";
+  const preview = approval.detail.command ?? approval.detail.arguments;
+
+  async function decide(action: "approve" | "deny", remember = false) {
+    setStatus("submitting");
+    setError("");
+    try {
+      await resolveApproval(approval.id, {
+        threadId: approval.threadId,
+        runId: approval.runId,
+        action,
+        remember
+      });
+      setStatus(action === "approve" ? "approved" : "denied");
+    } catch (reason) {
+      setStatus("error");
+      setError(reason instanceof Error ? reason.message : "审批提交失败");
+    }
+  }
+
+  return <section className={`approval-card ${status}`} aria-live="polite">
+    <header><span className="approval-shield" aria-hidden="true">!</span><div><small>{approval.agentKind} · {approval.category}</small><strong>{approval.title}</strong></div><b>{status === "pending" ? "等待确认" : status === "submitting" ? "正在提交" : status === "approved" ? "已允许" : status === "denied" ? "已拒绝" : "提交失败"}</b></header>
+    <p>{approval.message}</p>
+    {preview !== undefined && <code>{typeof preview === "string" ? preview : JSON.stringify(preview, null, 2)}</code>}
+    {error && <p className="approval-error">{error}</p>}
+    {pending && <footer><button type="button" onClick={() => void decide("deny")}>拒绝</button><button type="button" onClick={() => void decide("approve")}>允许一次</button><button className="primary" type="button" onClick={() => void decide("approve", true)}>本轮始终允许</button></footer>}
+  </section>;
+}
+
+function StaticThinkingActivity({ activity }: { activity: Extract<StaticTimelineActivity, { type: "thinking" }> }) {
+  const [open, setOpen] = useState(false);
+  return <section className={`inline-thinking ${open ? "open" : ""}`}>
+    <button type="button" className="inline-thinking-summary" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+      <span aria-hidden="true">✦</span><strong>{activity.title || "思考过程"}</strong><i aria-hidden="true">⌃</i>
+    </button>
+    {open && <div className="inline-thinking-list"><article className="inline-thinking-step complete"><p>{activity.detail}</p></article></div>}
+  </section>;
 }
 
 export function InlineToolActivity({ tool }: { tool: ToolActivity }) {
@@ -55,17 +150,4 @@ export function InlineToolActivity({ tool }: { tool: ToolActivity }) {
       {tool.arguments && <code>{tool.arguments}</code>}{tool.result && <p>{tool.result}</p>}
     </div>}
   </section>;
-}
-
-function toolsFromEvents(events: AgUiEvent[]): ToolActivity[] {
-  const tools = new Map<string, ToolActivity>();
-  let runId = "scheduled"; let sequence = 0;
-  for (const event of events) {
-    if (event.type === "RUN_STARTED") runId = event.runId;
-    if (event.type === "TOOL_CALL_START") tools.set(event.toolCallId, { id: event.toolCallId, turnId: runId, name: event.toolCallName, arguments: "", status: "preparing", sequence: sequence++ });
-    else if (event.type === "TOOL_CALL_ARGS") { const tool = tools.get(event.toolCallId); if (tool) tools.set(event.toolCallId, { ...tool, arguments: tool.arguments + event.delta, status: "running" }); }
-    else if (event.type === "TOOL_CALL_END") { const tool = tools.get(event.toolCallId); if (tool) tools.set(event.toolCallId, { ...tool, status: "waiting" }); }
-    else if (event.type === "TOOL_CALL_RESULT") { const tool = tools.get(event.toolCallId); if (tool) tools.set(event.toolCallId, { ...tool, result: event.content, status: toolResultFailed(event.content) ? "error" : "complete" }); }
-  }
-  return [...tools.values()];
 }

@@ -69,6 +69,11 @@ class CodexRunner:
             public_thread_id=ctx.thread_id,
             run_id=ctx.run_id,
             network_access=network_access_enabled(ctx),
+            permission_mode=(
+                "full_access"
+                if ctx.options.get("permissionMode") == "full_access"
+                else "default"
+            ),
             mapper=map_codex_event,
             # Codex shell inherits this process env; pin shared Node/npm here.
             env=build_cli_child_env(ctx, workspace=workspace),

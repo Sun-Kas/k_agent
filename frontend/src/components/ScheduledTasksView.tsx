@@ -6,6 +6,7 @@ import {
 import type { ScheduledRun, ScheduledTask, ScheduledTaskInput } from "../scheduled-tasks/types";
 import type { DetectedAgent, ModelProfile, RuntimeOption, SessionState } from "../types";
 import { StaticConversationTranscript } from "./ConversationTranscript";
+import { PermissionModeField } from "./PermissionModeField";
 
 type Props = {
   models: ModelProfile[];
@@ -28,7 +29,7 @@ function initialInput(models: ModelProfile[], agents: DetectedAgent[]): Schedule
     localDate,
     weekdays: [], localTime: now.toTimeString().slice(0, 5),
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai",
-    agentKind, modelId, reasoningEffort: "none", mcpServerIds: [], skillIds: []
+    agentKind, modelId, reasoningEffort: "none", mcpServerIds: [], skillIds: [], permissionMode: "default"
   };
 }
 
@@ -67,6 +68,21 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
     if (!selectedId) { setRuns([]); return; }
     void listScheduledRuns(selectedId).then(setRuns).catch(() => setRuns([]));
   }, [selectedId, tasks.find((task) => task.id === selectedId)?.latestRun?.id]);
+
+  useEffect(() => {
+    if (!selectedId || !openedRunId) return;
+    let cancelled = false;
+    const reloadOpenedRun = async () => {
+      try {
+        const session = await getScheduledRunSession(selectedId, openedRunId);
+        if (!cancelled) setOpenedRunSession(session);
+      } catch {
+        // 列表轮询会继续暴露运行错误；短暂读取失败不应收起用户正在审批的结果。
+      }
+    };
+    const timer = window.setInterval(() => { if (!document.hidden) void reloadOpenedRun(); }, 2000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [openedRunId, selectedId]);
 
   async function toggleRunResult(run: ScheduledRun) {
     if (!selectedId || !run.sessionId) return;
@@ -154,7 +170,8 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
               <button type="button" onClick={() => beginEdit(selected)}>编辑</button>
               <button className="danger" type="button" disabled={busy} onClick={() => { if (window.confirm(`删除“${selected.name}”？已生成的会话会保留。`)) void mutate(() => deleteScheduledTask(selected.id)); }}>删除</button>
             </div></header>
-            <div className="scheduled-summary-grid"><article><small>计划</small><strong>{scheduleLabel(selected)}</strong></article><article><small>时区</small><strong>{selected.timezone}</strong></article><article><small>Agent / 模型</small><strong>{selected.agentKind} · {selected.modelId}</strong></article><article><small>下次执行</small><strong>{selected.nextRunAt ? formatDate(selected.nextRunAt) : "—"}</strong></article></div>
+            <div className="scheduled-summary-grid"><article><small>计划</small><strong>{scheduleLabel(selected)}</strong></article><article><small>时区</small><strong>{selected.timezone}</strong></article><article><small>Agent / 模型</small><strong>{selected.agentKind} · {selected.modelId}</strong></article><article><small>权限</small><strong>{selected.permissionMode === "full_access" ? "完全权限" : "默认权限"}</strong></article><article><small>下次执行</small><strong>{selected.nextRunAt ? formatDate(selected.nextRunAt) : "—"}</strong></article></div>
+            {selected.permissionMode === "full_access" && <p className="scheduled-permission-warning"><b>完全权限持续生效：</b>每次计划或手动触发都不会启用沙箱或等待审批，可直接访问和修改宿主机资源。</p>}
             <article className="scheduled-prompt"><small>任务提示词</small><p>{selected.prompt}</p></article>
             <h3>执行记录</h3>
             <div className="scheduled-runs">{!runs.length && <p className="empty-note">还没有执行记录</p>}{runs.map((run) => <div className="scheduled-run-entry" key={run.id}><div className="scheduled-run-row"><span className={`scheduled-dot ${run.status}`} /><span><strong>{runStatus(run.status)}</strong><small>{formatDate(run.scheduledFor)} · {run.triggerType === "manual" ? "手动" : "计划"}{run.errorMessage ? ` · ${run.errorMessage}` : ""}</small></span>{run.sessionId && <button type="button" disabled={busy} onClick={() => void toggleRunResult(run)}>{openedRunId === run.id ? "收起结果" : "查看结果"}</button>}</div>{openedRunId === run.id && openedRunSession && <section className="scheduled-run-result" aria-label="定时任务执行结果"><StaticConversationTranscript session={openedRunSession} /></section>}</div>)}</div>
@@ -171,6 +188,7 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
         <label>时区<input required value={draft.timezone} onChange={(e) => setDraft({ ...draft, timezone: e.target.value })} /></label>
         <div className="scheduled-form-row"><label>Agent<select value={draft.agentKind} onChange={(e) => { const kind = e.target.value; const agent = agents.find((item) => item.kind === kind); setDraft({ ...draft, agentKind: kind, modelId: kind === "k_agent" ? models.find((item) => item.enabled)?.id ?? "" : agent?.models?.[0]?.id ?? "" }); }}>{agents.map((agent) => <option key={agent.kind} value={agent.kind}>{agent.name}</option>)}</select></label><label>模型<select required value={draft.modelId} onChange={(e) => setDraft({ ...draft, modelId: e.target.value })}>{availableModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label></div>
         <label>推理强度<select value={draft.reasoningEffort} onChange={(e) => setDraft({ ...draft, reasoningEffort: e.target.value as ScheduledTaskInput["reasoningEffort"] })}><option value="none">默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最高</option></select></label>
+        <PermissionModeField value={draft.permissionMode} onChange={(permissionMode) => setDraft({ ...draft, permissionMode })} context="scheduled" />
         <CapabilityField title="MCP" items={mcpServers} selected={draft.mcpServerIds} onChange={(mcpServerIds) => setDraft({ ...draft, mcpServerIds })} />
         <CapabilityField title="Skills" items={skills} selected={draft.skillIds} onChange={(skillIds) => setDraft({ ...draft, skillIds })} />
         <footer><button type="button" onClick={() => setEditing(null)}>取消</button><button className="scheduled-primary" disabled={busy} type="submit">{busy ? "保存中…" : "保存任务"}</button></footer>

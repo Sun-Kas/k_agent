@@ -9,6 +9,7 @@ import type {
   TeamSnapshot,
   TeamSummary
 } from "./types";
+import type { PermissionMode } from "../types";
 
 export interface TeamWorkspaceFile {
   path: string;
@@ -80,6 +81,7 @@ export function createTeam(input: {
   goal: string;
   workspaceDir?: string;
   mode: "auto" | "manual";
+  permissionMode: PermissionMode;
   maxParallel: number;
   agents: TeamAgentDraft[];
 }): Promise<TeamSnapshot> {

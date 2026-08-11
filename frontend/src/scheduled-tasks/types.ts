@@ -1,4 +1,4 @@
-import type { AgentKind, ReasoningEffort } from "../types";
+import type { AgentKind, PermissionMode, ReasoningEffort } from "../types";
 
 export type ScheduleKind = "once" | "daily" | "weekly";
 export type ScheduledRunStatus = "queued" | "running" | "succeeded" | "failed" | "missed";
@@ -30,6 +30,7 @@ export interface ScheduledTaskInput {
   reasoningEffort: ReasoningEffort;
   mcpServerIds: string[];
   skillIds: string[];
+  permissionMode: PermissionMode;
 }
 
 export interface ScheduledTask extends ScheduledTaskInput {

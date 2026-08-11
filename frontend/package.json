@@ -19,6 +19,7 @@
     "check": "npm run check:boundary && tsc --noEmit",
     "check:boundary": "node scripts/check-boundary.mjs",
     "test:history": "node --import tsx scripts/test-history.ts",
+    "test:transcript": "node --import tsx scripts/test-conversation-transcript.ts",
     "test:stream": "node --import tsx scripts/test-stream-scheduler.ts",
     "test:voice": "node --import tsx scripts/test-voice-interruption.ts"
   },

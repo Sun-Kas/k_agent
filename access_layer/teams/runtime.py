@@ -198,6 +198,11 @@ class TeamRuntime:
                     request_id=request_id,
                     prompt=prompt,
                     agent=agent,
+                    permission_mode=str(
+                        context["team"].get("permissionMode")
+                        or context["team"].get("permission_mode")
+                        or "default"
+                    ),
                     mcp_servers=mcp_servers,
                     skills=skills,
                     workspace=workspace,
@@ -259,6 +264,11 @@ class TeamRuntime:
                     request_id=f"team-supervisor-{uuid.uuid4().hex}",
                     prompt=prompt,
                     agent=supervisor,
+                    permission_mode=str(
+                        context["team"].get("permissionMode")
+                        or context["team"].get("permission_mode")
+                        or "default"
+                    ),
                     # Scheduling is a control-plane operation. It must not gain
                     # side-effecting MCP/Skill authority from a worker profile.
                     mcp_servers=[],
@@ -810,6 +820,7 @@ class TeamRuntime:
         mcp_servers: list[dict[str, Any]],
         skills: list[dict[str, Any]],
         workspace: Path,
+        permission_mode: str = "default",
         tool_env: dict[str, str] | None = None,
         run_log: Path | None = None,
     ) -> str:
@@ -820,6 +831,7 @@ class TeamRuntime:
         created_at = datetime.now(timezone.utc).isoformat()
         agent_options: dict[str, Any] = {
             "cliSessionMode": "ephemeral",
+            "permissionMode": permission_mode,
             **(
                 {"networkAccess": agent["networkAccess"]}
                 if isinstance(agent.get("networkAccess"), bool)

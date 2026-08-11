@@ -2,6 +2,26 @@
 
 > 维护约定：后续涉及前后端接口、MCP/Skill/Memory 加载链路、系统提示词拼接、权限边界或缓存策略的重要修改，都需要在本文追加记录。
 
+## 2026-08-11 会话、Team 与定时任务统一权限模式
+
+> 设计依据、完整审批时序、Runner 映射与失败恢复见
+> [权限模式与 HITL 技术方案](permission-and-hitl-technical-solution.md)。
+
+- 三类运行入口统一新增 `permissionMode: "default" | "full_access"`。省略时为
+  `default`，旧会话、旧 Team 与旧定时任务通过数据库/JSON 迁移继续沿用原沙箱行为。
+- `default` 保持运行时沙箱和现有权限规则；K Agent 本地工具以
+  `sandbox_permissions=require_escalated` 请求越过工作区时，统一经现有
+  `ApprovalBroker` 发出 HITL。Codex app-server 与 Claude approval bridge 继续使用
+  同一 Access Layer 审批接口。
+- `full_access` 是 run 级高风险授权：K Agent Bash 跳过 srt 且文件工具允许工作区外
+  路径；Codex 使用 `danger-full-access + never`；Claude Code 使用
+  `bypassPermissions` 并关闭 sandbox。该模式也跳过 K Agent 权限规则和 Skill 工具
+  白名单，但不会凭空提供操作系统权限、第三方凭据或外部服务 OAuth scope。
+- 会话把选择写入 session capabilities；Team 写入 `teams.permission_mode` 并传给主管
+  与所有成员；定时任务写入 `scheduled_tasks.permission_mode`，每次计划/手动触发都
+  复用该授权。定时任务页面必须持续提示：完全权限会在无人值守执行时直接生效，
+  不等待审批；默认模式的审批则在执行记录原页面完成并轮询恢复状态。
+
 ## 2026-08-04 流式消息字体稳定性
 
 - 用户与 Agent 消息正文改用本机稳定的中文字体栈，不再依赖远程

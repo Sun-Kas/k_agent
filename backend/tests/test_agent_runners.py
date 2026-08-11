@@ -145,6 +145,10 @@ class NetworkPolicyTests(unittest.TestCase):
         self.assertTrue(settings["sandbox"]["enabled"])
         self.assertEqual(settings["sandbox"]["network"]["allowedDomains"], [])
 
+    def test_claude_full_access_disables_run_sandbox(self) -> None:
+        settings = claude_sandbox_settings(True, full_access=True)
+        self.assertFalse(settings["sandbox"]["enabled"])
+
     def test_claude_routine_tools_are_preapproved_and_can_be_overridden(self) -> None:
         enabled = self._context()
         allowed = _claude_allowed_tools(enabled)
