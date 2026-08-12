@@ -42,6 +42,14 @@ def _default_bash_sandbox_allowed_domains() -> list[str]:
     return list(DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS)
 
 
+def _default_bash_sandbox_write_paths() -> list[str]:
+    # Agently Mail persists its token/state under the user's home directory.
+    # Keep only the exact directories writable instead of opening all of HOME.
+    from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_WRITE_PATHS
+
+    return list(DEFAULT_BASH_SANDBOX_WRITE_PATHS)
+
+
 class Settings(BaseSettings):
     """集中定义服务端端口、模型默认值、存储路径和工具限制。"""
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
@@ -181,10 +189,8 @@ class Settings(BaseSettings):
         default="auto", alias="BASH_SANDBOX_MODE"
     )
     bash_sandbox_command: str = Field(default="srt", alias="BASH_SANDBOX_COMMAND")
-    # srt cannot express allow-all (`*` / `*.com` are rejected). Default to a
-    # concrete host allowlist so Bash stays inside the filesystem sandbox while
-    # common package registries and skill APIs remain reachable. Override via
-    # BASH_SANDBOX_ALLOWED_DOMAINS; bare `*` entries are ignored.
+    # srt cannot express allow-all (`*` / `*.com` are rejected). Use concrete
+    # hosts and service-level wildcards such as `*.agent.qq.com`.
     bash_sandbox_allowed_domains: list[str] = Field(
         default_factory=_default_bash_sandbox_allowed_domains,
         alias="BASH_SANDBOX_ALLOWED_DOMAINS",
@@ -196,7 +202,7 @@ class Settings(BaseSettings):
         default=True, alias="BASH_SANDBOX_WEAKER_NETWORK_ISOLATION"
     )
     bash_sandbox_write_paths: list[str] = Field(
-        default_factory=list, alias="BASH_SANDBOX_WRITE_PATHS"
+        default_factory=_default_bash_sandbox_write_paths, alias="BASH_SANDBOX_WRITE_PATHS"
     )
     bash_sandbox_deny_read: list[str] = Field(
         default_factory=list, alias="BASH_SANDBOX_DENY_READ"

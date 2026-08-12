@@ -44,6 +44,11 @@ from backend.permissions import PermissionDecision, check_permission, check_perm
 from backend.api.schemas import ChatMessage, ChatMeta, ChatRole
 from backend.sandbox import is_domain_allowed, notice_from_tool_result
 from backend.tools import ToolDefinition, validate_tool_arguments
+from backend.tools.streaming import reset_tool_output_sink, set_tool_output_sink
+
+
+_READ_ONLY_LOCAL_TOOLS = frozenset({"Read", "Glob", "Grep", "LS"})
+_ESCALATABLE_LOCAL_TOOLS = frozenset({"Bash", "Write", "Edit", "NotebookEdit"})
 
 
 class OpenAIAgent:
@@ -426,13 +431,57 @@ class OpenAIAgent:
                             error=argument_error,
                         )
                     else:
-                        tool_result = await self._run_tool(
-                            callbacks=callbacks,
-                            context=context,
-                            iteration=iteration,
-                            tool_name=tool_name,
-                            arguments=raw_arguments,
-                        )
+                        # A long-running interactive CLI can print an OAuth URL
+                        # and then wait. Run the tool in a sibling task so its
+                        # ContextVar output sink can feed AG-UI before completion.
+                        output_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+                        sink_token = set_tool_output_sink(output_queue.put_nowait)
+                        try:
+                            tool_task = asyncio.create_task(self._run_tool(
+                                callbacks=callbacks,
+                                context=context,
+                                iteration=iteration,
+                                tool_name=tool_name,
+                                arguments=raw_arguments,
+                            ))
+                        finally:
+                            # The child task captured the binding; resetting the
+                            # parent prevents output leaking into the next call.
+                            reset_tool_output_sink(sink_token)
+
+                        output_task: asyncio.Task[dict[str, Any]] | None = None
+                        try:
+                            while not tool_task.done():
+                                output_task = asyncio.create_task(output_queue.get())
+                                done, _ = await asyncio.wait(
+                                    {tool_task, output_task},
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                if output_task in done:
+                                    output = output_task.result()
+                                    yield {
+                                        "type": "tool_output",
+                                        "payload": {"toolCallId": tc["id"], **output},
+                                    }
+                                else:
+                                    output_task.cancel()
+                                    await asyncio.gather(output_task, return_exceptions=True)
+                        except asyncio.CancelledError:
+                            if output_task is not None:
+                                output_task.cancel()
+                            tool_task.cancel()
+                            await asyncio.gather(
+                                *(task for task in (tool_task, output_task) if task is not None),
+                                return_exceptions=True,
+                            )
+                            raise
+                        while not output_queue.empty():
+                            output = output_queue.get_nowait()
+                            yield {
+                                "type": "tool_output",
+                                "payload": {"toolCallId": tc["id"], **output},
+                            }
+                        tool_result = await tool_task
                     working_messages.append(self._message("tool", tool_result, tool_name=tool_name))
                     tool_failed = self._tool_result_failed(tool_result)
                     tool_step["status"] = "error" if tool_failed else "complete"
@@ -589,16 +638,30 @@ class OpenAIAgent:
                 arguments = self._skill_alias_arguments(tool_name, arguments)
         if local_tool is not None:
             permission_tool_name = local_tool.name
+            if permission_tool_name in _READ_ONLY_LOCAL_TOOLS:
+                # Older turns or providers can replay the former escalation field.
+                # Drop it before validation so a harmless read neither asks for HITL
+                # nor fails merely because its schema has since been tightened.
+                arguments = {
+                    key: value
+                    for key, value in arguments.items()
+                    if key not in {"sandbox_permissions", "escalation_scope", "escalation_resource"}
+                }
             if context.metadata.get("permission_mode") != "full_access":
                 self._enforce_skill_allowlist(context, permission_tool_name)
             decision = check_permissions(
                 permission_tool_name,
                 self._permission_subjects(permission_tool_name, arguments),
             )
+            # Explicit deny rules remain authoritative, but read-only tools do not
+            # turn an `ask` rule into a misleading write/sandbox escalation card.
+            if permission_tool_name in _READ_ONLY_LOCAL_TOOLS and decision.behavior == "ask":
+                decision = PermissionDecision("allow", "read-only local access does not require HITL")
             if context.metadata.get("permission_mode") == "full_access":
                 decision = PermissionDecision("allow", "full access selected for this run")
             elif (
-                context.metadata.get("permission_mode") != "full_access"
+                permission_tool_name in _ESCALATABLE_LOCAL_TOOLS
+                and context.metadata.get("permission_mode") != "full_access"
                 and arguments.get("sandbox_permissions") == "require_escalated"
             ):
                 # Bash escalation is narrower than "run without srt for any
@@ -626,7 +689,7 @@ class OpenAIAgent:
                             "deny",
                             f"Network destination {resource!r} is already allowed by the "
                             "Bash sandbox; retry normally or adjust timeout_seconds "
-                            "instead of requesting escalation.",
+                            "timeout_seconds instead of requesting escalation.",
                         )
                     else:
                         decision = PermissionDecision(

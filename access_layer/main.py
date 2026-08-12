@@ -811,6 +811,19 @@ def create_app() -> FastAPI:
                 pass
             raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
 
+    @app.get("/api/approvals/{request_id}")
+    async def get_approval_status(
+        request_id: str, threadId: str, runId: str
+    ) -> dict:
+        """Proxy a scoped liveness check so stale cards can close before a click."""
+
+        from urllib.parse import urlencode
+
+        query = urlencode({"threadId": threadId, "runId": runId})
+        return await app.state.agent_backend_client.get_json(
+            f"/internal/approvals/{request_id}?{query}"
+        )
+
     @app.get("/api/sessions")
     async def list_sessions():
         """返回持久化会话摘要列表。"""
@@ -851,6 +864,20 @@ def create_app() -> FastAPI:
             "sessionId": session.id,
             "runId": payload.run_id,
             "messageCount": len(session.messages),
+        }
+
+    @app.post("/api/sessions/{session_id}/runs/stop")
+    async def stop_session_run(session_id: str, payload: SessionRunCancelInput):
+        """手动结束运行并保留 user、已到达输出及 AG-UI 终止边界。"""
+
+        session = await app.state.session_store.stop_run(session_id, payload.run_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "sessionId": session.id,
+            "runId": payload.run_id,
+            "messageCount": len(session.messages),
+            "status": "stopped",
         }
 
     @app.get("/api/sessions/{session_id}/workspace")

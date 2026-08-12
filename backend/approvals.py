@@ -15,12 +15,13 @@ from typing import Any
 
 @dataclass(slots=True)
 class _PendingApproval:
-    """待决审批：Future + 不可变 threadId/runId，resolve 时必须三者齐全。"""
+    """待决审批：保存完整 activity 快照，resolve 时原位更新同一张卡片。"""
 
     request_id: str
     thread_id: str
     run_id: str
     future: asyncio.Future[dict[str, Any]]
+    payload: dict[str, Any]
 
 
 class ApprovalBroker:
@@ -99,7 +100,18 @@ class ApprovalBroker:
         request_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
-        pending = _PendingApproval(request_id, thread_id, run_id, future)
+        payload = {
+            "id": request_id,
+            "threadId": thread_id,
+            "runId": run_id,
+            "agentKind": agent_kind,
+            "category": category,
+            "title": title,
+            "message": message,
+            "detail": detail or {},
+            "status": "pending",
+        }
+        pending = _PendingApproval(request_id, thread_id, run_id, future, payload)
         key = (thread_id, run_id)
         async with self._lock:
             queue = self._queues.get(key)
@@ -110,21 +122,29 @@ class ApprovalBroker:
                 "event",
                 {
                     "type": "approval_request",
-                    "payload": {
-                        "id": request_id,
-                        "threadId": thread_id,
-                        "runId": run_id,
-                        "agentKind": agent_kind,
-                        "category": category,
-                        "title": title,
-                        "message": message,
-                        "detail": detail or {},
-                    },
+                    "payload": payload,
                 },
             ))
         try:
             return await asyncio.wait_for(future, timeout=self._timeout_seconds)
         except TimeoutError as exc:
+            # Timeout is a lifecycle transition, not merely an exception. Emit
+            # it before removing the pending entry so streamed and persisted UI
+            # state cannot leave an actionable card behind forever.
+            async with self._lock:
+                queue = self._queues.get(key)
+                if queue is not None:
+                    await queue.put((
+                        "event",
+                        {
+                            "type": "approval_resolved",
+                            "payload": {
+                                **pending.payload,
+                                "action": "expired",
+                                "status": "expired",
+                            },
+                        },
+                    ))
             raise RuntimeError("Human approval timed out") from exc
         finally:
             async with self._lock:
@@ -156,14 +176,33 @@ class ApprovalBroker:
                     {
                         "type": "approval_resolved",
                         "payload": {
-                            "id": request_id,
-                            "threadId": thread_id,
-                            "runId": run_id,
+                            **pending.payload,
                             "action": decision.get("action"),
+                            "status": (
+                                "approved"
+                                if decision.get("action") == "approve"
+                                else "denied"
+                                if decision.get("action") == "deny"
+                                else "cancelled"
+                            ),
                         },
                     },
                 ))
             return True
+
+    async def is_pending(
+        self, request_id: str, *, thread_id: str, run_id: str
+    ) -> bool:
+        """Check the exact run-scoped request without exposing another run's state."""
+
+        async with self._lock:
+            pending = self._pending.get(request_id)
+            return bool(
+                pending is not None
+                and pending.thread_id == thread_id
+                and pending.run_id == run_id
+                and not pending.future.done()
+            )
 
     async def cancel_run(self, *, thread_id: str, run_id: str) -> None:
         """HTTP 流关闭时取消该 run 上仍在等待的审批，避免 Future 泄漏。"""
@@ -174,4 +213,3 @@ class ApprovalBroker:
                     continue
                 if not pending.future.done():
                     pending.future.cancel()
-

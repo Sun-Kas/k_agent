@@ -20,6 +20,8 @@
     "check:boundary": "node scripts/check-boundary.mjs",
     "test:history": "node --import tsx scripts/test-history.ts",
     "test:transcript": "node --import tsx scripts/test-conversation-transcript.ts",
+    "test:approval": "node --import tsx scripts/test-live-approval.ts",
+    "test:run-visibility": "node --import tsx scripts/test-run-visibility.ts",
     "test:stream": "node --import tsx scripts/test-stream-scheduler.ts",
     "test:voice": "node --import tsx scripts/test-voice-interruption.ts"
   },

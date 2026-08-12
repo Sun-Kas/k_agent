@@ -3,7 +3,8 @@
 在请求链路中的角色：
 - `save_run_start`：在会话锁保护下写入本轮 user 消息
 - `append_event`：消费后端 AG-UI 流，投影为可再输入的 messages，并按边界落盘
-- `cancel_run`：回滚本轮用户消息与半截流状态
+- `cancel_run`：撤销本轮用户消息与半截流状态
+- `stop_run`：保留本轮已接收内容并写入稳定的手动终止边界
 
 服务边界：
 - 存储布局 `sessions/{id}/{id}.json` + 同级 `workspace/`；本层拥有，后端无状态
@@ -69,6 +70,9 @@ class SessionStore:
         self._run_input_message_ids: dict[tuple[str, str], set[str]] = {}
         self._cancelled_run_ids: set[tuple[str, str]] = set()
         self._cancelled_active_run_ids: dict[str, str] = {}
+        # 手动停止与撤销不同：已接收内容保留，但终止点之后的迟到事件必须丢弃。
+        self._stopped_run_ids: set[tuple[str, str]] = set()
+        self._stopped_active_run_ids: dict[str, str] = {}
         self._text_buffers: dict[tuple[str, str], dict[str, Any]] = {}
         # 工具调用须等 RESULT 才完整；START/ARGS 片段先缓冲，再成对写入。
         self._tool_call_buffers: dict[tuple[str, str], dict[str, Any]] = {}
@@ -176,6 +180,7 @@ class SessionStore:
             session = self._sessions[session_id]
             self._active_run_ids.pop(session_id, None)
             self._cancelled_active_run_ids.pop(session_id, None)
+            self._stopped_active_run_ids.pop(session_id, None)
             self._drop_session_buffers(session_id)
             existing_ids = {message.id for message in session.messages}
             session.messages = self._merge_messages(session.messages, messages)
@@ -224,6 +229,64 @@ class SessionStore:
             await self._persist(session)
             return session
 
+    async def stop_run(self, session_id: str, run_id: str) -> SessionRecord | None:
+        """手动终止一轮运行：保留 user、已到达事件与非空 assistant 增量。
+
+        终止边界由 Access Layer 持久化，而不是依赖已被浏览器 abort 的后端流继续
+        发送事件。这样当前页面与刷新后的重放都停在同一个确定位置。
+        """
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            if self._run_has_terminal_event(session.events, run_id):
+                return session
+
+            key = (session_id, run_id)
+            self._stopped_run_ids.add(key)
+            self._stopped_active_run_ids[session_id] = run_id
+
+            # TEXT_MESSAGE_END 不会在浏览器主动断流后到达，因此在这里把已有 delta
+            # 封口为普通 assistant 消息。空占位不落盘，避免刷新后出现空白气泡。
+            for (buffer_session_id, message_id), buffer in list(self._text_buffers.items()):
+                if buffer_session_id != session_id or buffer.get("runId") != run_id:
+                    continue
+                content = str(buffer.get("content") or "")
+                if content.strip():
+                    message = ChatMessage(
+                        id=message_id,
+                        role="assistant",
+                        content=content,
+                        createdAt=buffer["createdAt"],
+                        meta=ChatMeta(runId=run_id),
+                    )
+                    session.messages = self._upsert_message(session.messages, message)
+                self._text_buffers.pop((buffer_session_id, message_id), None)
+
+            self._drop_run_buffers(session_id, run_id)
+            self._active_run_ids.pop(session_id, None)
+            self._run_input_message_ids.pop(key, None)
+
+            if not any(
+                event.get("type") == "RUN_STARTED" and event.get("runId") == run_id
+                for event in session.events
+            ):
+                session.events.append({
+                    "type": "RUN_STARTED",
+                    "threadId": session_id,
+                    "runId": run_id,
+                })
+            session.events.append({
+                "type": "RUN_FINISHED",
+                "threadId": session_id,
+                "runId": run_id,
+                "result": {"status": "stopped", "stopped": True},
+            })
+            session.updated_at = datetime.now(timezone.utc)
+            await self._persist(session)
+            return session
+
     async def append_event(
         self,
         session_id: str,
@@ -235,6 +298,13 @@ class SessionStore:
             session.events.append(event)
             event_type = str(event.get("type") or "")
             run_id = event.get("runId")
+            if isinstance(run_id, str) and (session_id, run_id) in self._stopped_run_ids:
+                session.events.pop()
+                return session
+            stopped_active_run_id = self._stopped_active_run_ids.get(session_id)
+            if stopped_active_run_id and (not isinstance(run_id, str) or run_id == stopped_active_run_id):
+                session.events.pop()
+                return session
             if isinstance(run_id, str) and (session_id, run_id) in self._cancelled_run_ids:
                 if event_type == "RUN_STARTED":
                     self._cancelled_active_run_ids[session_id] = run_id
@@ -363,6 +433,16 @@ class SessionStore:
             for key, value in list(buffers.items()):
                 if key[0] == session_id and value.get("runId") == run_id:
                     buffers.pop(key, None)
+
+    @staticmethod
+    def _run_has_terminal_event(events: list[dict[str, Any]], run_id: str) -> bool:
+        """Return true only for a persisted terminal boundary of this exact run."""
+
+        return any(
+            event.get("type") in {"RUN_FINISHED", "RUN_ERROR"}
+            and event.get("runId") == run_id
+            for event in events
+        )
 
     @staticmethod
     def _events_without_run(events: list[dict[str, Any]], run_id: str) -> list[dict[str, Any]]:

@@ -20,6 +20,7 @@ from backend.sandbox import (
     sandbox_runtime_status,
 )
 from backend.tools import cc_like
+from backend.tools.streaming import reset_tool_output_sink, set_tool_output_sink
 
 
 def _settings(**overrides: object) -> Settings:
@@ -180,12 +181,17 @@ class SandboxSettingsTests(unittest.TestCase):
 
     def test_default_settings_use_concrete_srt_domains(self) -> None:
         from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS
+        from backend.sandbox.constants import DEFAULT_BASH_SANDBOX_WRITE_PATHS
 
         settings = Settings(_env_file=None)
         self.assertTrue(settings.network_access_default)
         self.assertEqual(
             settings.bash_sandbox_allowed_domains,
             list(DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS),
+        )
+        self.assertEqual(
+            settings.bash_sandbox_write_paths,
+            list(DEFAULT_BASH_SANDBOX_WRITE_PATHS),
         )
         self.assertNotIn("*", settings.bash_sandbox_allowed_domains)
 
@@ -311,6 +317,54 @@ class ChildEnvTests(unittest.TestCase):
 
 
 class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auth_login_command_auto_enters_interactive_mode(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            settings = _settings(bash_sandbox_mode="off")
+            output: list[dict[str, str]] = []
+            token = set_tool_output_sink(output.append)
+            try:
+                with (
+                    patch.object(cc_like, "_workspace_root", AsyncMock(return_value=workspace)),
+                    patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
+                    patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(5.0, 10_000))),
+                ):
+                    raw = await cc_like.cc_bash({
+                        "command": "printf '%s\\n' \"$BROWSER|$CI\" # oauth login",
+                    })
+            finally:
+                reset_tool_output_sink(token)
+
+        payload = json.loads(raw)
+        self.assertTrue(payload["ok"])
+        self.assertIn("echo|1", payload["stdout"])
+        self.assertTrue(output)
+        self.assertTrue(all(item["executionMode"] == "interactive" for item in output))
+
+    async def test_interactive_bash_streams_output_and_disables_backend_browser(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            settings = _settings(bash_sandbox_mode="off")
+            output: list[dict[str, str]] = []
+            token = set_tool_output_sink(output.append)
+            try:
+                with (
+                    patch.object(cc_like, "_workspace_root", AsyncMock(return_value=workspace)),
+                    patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
+                    patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(5.0, 10_000))),
+                ):
+                    raw = await cc_like.cc_bash({
+                        "command": "printf '%s\\n' \"$BROWSER|$CI|$K_AGENT_INTERACTIVE\"",
+                        "execution_mode": "interactive",
+                    })
+            finally:
+                reset_tool_output_sink(token)
+
+        payload = json.loads(raw)
+        self.assertTrue(payload["ok"])
+        self.assertIn("echo|1|1", payload["stdout"])
+        self.assertEqual("".join(item["delta"] for item in output), payload["stdout"])
+
     async def test_cc_bash_accepts_a_bounded_per_call_timeout(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)

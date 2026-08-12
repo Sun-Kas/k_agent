@@ -13,8 +13,14 @@ from backend.agent.react_agent import OpenAIAgent
 from backend.permissions import check_permissions, default_behavior
 from backend.permissions import rules as permission_rules
 from backend.tools import ToolDefinition
-from backend.tools.cc_extra import _html_to_text, _is_public_address, cc_web_fetch
-from backend.tools.workspace import reset_tool_network_access, set_tool_network_access
+from backend.tools.cc_like import cc_glob, cc_grep, cc_read
+from backend.tools.cc_extra import _html_to_text, _is_public_address, cc_ls, cc_web_fetch
+from backend.tools.workspace import (
+    reset_tool_network_access,
+    reset_tool_workspace,
+    set_tool_network_access,
+    set_tool_workspace,
+)
 
 
 class PermissionRuleTests(unittest.TestCase):
@@ -105,16 +111,15 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("requires manual approval", payload["error"])
 
-    async def test_default_escalation_uses_hitl_before_local_tool_runs(self) -> None:
+    async def test_read_ignores_stale_escalation_without_hitl(self) -> None:
         calls: list[str] = []
 
         async def execute(_: dict) -> str:
             calls.append("tool")
             return "ran"
 
-        async def approve(target, decision, detail):
-            calls.append(f"approval:{target}:{decision.behavior}")
-            self.assertEqual(detail["arguments"]["sandbox_permissions"], "require_escalated")
+        async def approve(*_args):
+            calls.append("approval")
             return {"action": "approve", "remember": False}
 
         agent = OpenAIAgent(
@@ -131,7 +136,57 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result, "ran")
-        self.assertEqual(calls, ["approval:Read:ask", "tool"])
+        self.assertEqual(calls, ["tool"])
+
+    async def test_read_only_tools_can_access_paths_outside_session_workspace(self) -> None:
+        with TemporaryDirectory() as session_dir, TemporaryDirectory() as project_dir:
+            project = Path(project_dir)
+            report = project / "report.html"
+            report.write_text("permission-boundary-marker", encoding="utf-8")
+            token = set_tool_workspace(Path(session_dir))
+            try:
+                read_result = json.loads(await cc_read({"file_path": str(report)}))
+                ls_result = json.loads(await cc_ls({"path": str(project)}))
+                glob_result = json.loads(await cc_glob({"path": str(project), "pattern": "*.html"}))
+                grep_result = json.loads(await cc_grep({"path": str(project), "pattern": "boundary-marker"}))
+            finally:
+                reset_tool_workspace(token)
+
+        self.assertTrue(read_result["ok"])
+        self.assertEqual(read_result["content"], "permission-boundary-marker")
+        resolved_report = str(report.resolve())
+        self.assertEqual([item["path"] for item in ls_result["entries"]], [resolved_report])
+        self.assertEqual(glob_result["matches"], [resolved_report])
+        self.assertEqual(len(grep_result["matches"]), 1)
+
+    async def test_write_escalation_still_uses_hitl(self) -> None:
+        calls: list[str] = []
+
+        async def execute(_: dict) -> str:
+            calls.append("tool")
+            return "ran"
+
+        async def approve(_target, decision, _detail):
+            calls.append(f"approval:{decision.behavior}")
+            return {"action": "approve", "remember": False}
+
+        agent = OpenAIAgent(
+            [ToolDefinition("Write", "", {"type": "object", "properties": {}}, execute)],
+            mcp_client_manager=None,
+            approval_handler=approve,
+        )
+        context = AgentRunContext()
+        context.metadata["permission_mode"] = "default"
+        result = await agent._run_tool(
+            callbacks=CallbackManager([]),
+            context=context,
+            iteration=0,
+            tool_name="Write",
+            arguments={"file_path": "/outside/file", "sandbox_permissions": "require_escalated"},
+        )
+
+        self.assertEqual(result, "ran")
+        self.assertEqual(calls, ["approval:ask", "tool"])
 
     async def test_unstructured_bash_escalation_is_denied_before_hitl(self) -> None:
         calls: list[str] = []

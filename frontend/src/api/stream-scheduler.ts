@@ -34,3 +34,14 @@ export function nextRenderOpportunity(
     targetWindow.requestAnimationFrame(finish);
   });
 }
+
+/** Only backpressure batches that actually dispatched UI events. */
+export function yieldAfterStreamBatch(
+  hasDispatchedEvents: boolean,
+  targetWindow: StreamWindow | undefined = typeof window === "undefined" ? undefined : window,
+  targetDocument: StreamDocument | undefined = typeof document === "undefined" ? undefined : document
+): Promise<void> {
+  return hasDispatchedEvents
+    ? nextRenderOpportunity(targetWindow, targetDocument)
+    : Promise.resolve();
+}

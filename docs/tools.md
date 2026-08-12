@@ -34,10 +34,10 @@
 - `BASH_SANDBOX_COMMAND`：包装器命令，默认 `srt`。
 - `NETWORK_ACCESS_DEFAULT`：K Agent、Codex、Claude Code 的统一出站开关，默认 `true`；单次运行可用 `agentOptions.networkAccess` 覆盖。
 - `CLAUDE_AUTO_APPROVE_TOOLS`：Claude Code 常规工具的默认授权列表。默认包含 Bash、Read、Edit、Write、Glob、Grep、NotebookEdit、WebFetch/WebSearch、TodoWrite、任务板工具和 Skill；MCP 与未列出的工具仍进入 Human Approval。
-- `BASH_SANDBOX_ALLOWED_DOMAINS`：K Agent Bash 的出站域名白名单。`srt` 不接受裸 `*` / `*.com`；默认是一组具体域名（GitHub/npm/PyPI/Steam 等）。非法项会被忽略，Bash 仍留在文件系统沙箱内。统一开关为 `false` 时，此列表不会放行网络。
+- `BASH_SANDBOX_ALLOWED_DOMAINS`：K Agent Bash 的出站域名白名单。`srt` 不接受裸 `*` / `*.com`；默认是一组具体域名（GitHub/npm/PyPI/Steam/Agently 等）。非法项会被忽略，统一开关为 `false` 时完全禁网。
 - Bash 的 `sandbox_permissions=require_escalated` 只用于任务必须写入 workspace 外路径、访问被默认沙箱阻止的本机资源，或访问当前域名白名单外的准确 hostname，并且必须同时提交 `escalation_scope` 与具体 `escalation_resource`。Backend 会在 HITL 前匹配实际白名单；白名单内目标以及普通超时、HTTP/DNS/断流错误不会进入审批。
 - Bash 可用 `timeout_seconds` 为本来就耗时的命令声明 1–300 秒的执行期限；它只调整当前子进程的 wall-clock deadline，不改变文件、网络或宿主机权限。
-- `BASH_SANDBOX_WRITE_PATHS` / `BASH_SANDBOX_DENY_READ`：额外可写路径和额外拒绝读取路径。
+- `BASH_SANDBOX_WRITE_PATHS` / `BASH_SANDBOX_DENY_READ`：额外可写路径和额外拒绝读取路径。默认写路径已包含 `~/.agently-cli` 与 `~/Library/Application Support/agently-cli`，用于 Agently Mail 的本地 token/state 落盘。
 
 默认策略：工作区和系统临时目录可写；`~/.ssh`、`~/.aws`、项目 `.env` 等凭据路径拒绝读取；子进程环境变量按白名单拷贝（`PATH`/`HOME`/`LANG` 等），模型 API key、Langfuse、AWS 密钥不会进入子进程。
 

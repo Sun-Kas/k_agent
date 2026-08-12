@@ -74,3 +74,11 @@ DEFAULT_BASH_SANDBOX_ALLOWED_DOMAINS = (
     "*.agent.qq.com",
     "api.agent.qq.com",
 )
+
+# Agently Mail writes its encrypted bootstrap token and local state outside the
+# repo workspace. Keep those exact directories writable so OAuth refresh can
+# complete without opening the broader home directory.
+DEFAULT_BASH_SANDBOX_WRITE_PATHS = (
+    "~/.agently-cli",
+    "~/Library/Application Support/agently-cli",
+)

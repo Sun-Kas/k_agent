@@ -1806,17 +1806,24 @@ img.brand-symbol {
 .inline-tool-summary:hover,
 .inline-tool-summary:not(:disabled):hover,
 .inline-tool-summary:not(:disabled):active { background: transparent !important; transform: none; }
-.inline-tool-icon { width: 14px; height: 14px; flex: 0 0 14px; color: var(--dim); }
+.inline-tool-icon { width: 16px; height: 16px; flex: 0 0 16px; align-self: center; display: block; color: var(--dim); }
 .inline-tool-summary strong { font-size: var(--type-ui); font-weight: 600; line-height: 1.8; }
 .inline-tool-summary code { padding: 2px 6px; border: 0; border-radius: 5px; color: var(--ink); background: color-mix(in srgb, var(--surface) 82%, transparent); font: var(--type-ui)/1.4 var(--mono-font), monospace; }
 .inline-tool-summary b { color: var(--dim); font-size: var(--type-small); font-weight: 500; white-space: nowrap; }
 .inline-tool.error .inline-tool-summary b { color: #d2766e; }
+.inline-tool.stopped .inline-tool-summary b { color: var(--muted); }
 .inline-tool-summary i { color: var(--dim); font-size: var(--type-ui); font-style: normal; line-height: 1; transition: transform .16s; }
 .inline-tool:not(.open) .inline-tool-summary i { transform: rotate(180deg); }
 .inline-tool-detail { max-width: min(760px, 100%); margin: 4px 0 0 1px; padding: 4px 0 4px 16px; border-left: 2px solid var(--line); }
 .inline-tool-detail > code,
 .inline-tool-detail > p { display: block; max-height: 160px; margin: 0 0 7px; padding: 8px; overflow: auto; border-radius: 5px; color: var(--dim); background: color-mix(in srgb, var(--surface) 88%, transparent); font: var(--type-small)/1.6 var(--mono-font), monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .inline-tool-detail > :last-child { margin-bottom: 0; }
+.inline-tool-live-output { display: block; max-height: 160px; margin: 0 0 7px; padding: 8px; overflow: auto; border-radius: 5px; color: var(--dim); background: color-mix(in srgb, var(--surface) 88%, transparent); font: var(--type-small)/1.6 var(--mono-font), monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.external-action-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 4px 0 10px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--ink) 18%, var(--line)); border-radius: 10px; background: var(--surface); }
+.external-action-card > div { display: grid; gap: 2px; min-width: 0; }
+.external-action-card strong { color: var(--ink); font-size: var(--type-ui); }
+.external-action-card span { color: var(--dim); font-size: var(--type-small); line-height: 1.45; }
+.external-action-card a { flex: 0 0 auto; padding: 7px 12px; border: 1px solid var(--ink); border-radius: 8px; color: var(--surface); background: var(--ink); font-size: var(--type-small); font-weight: 600; text-decoration: none; }
 
 .approval-card { max-width: min(760px, 100%); margin: 8px 0 14px; padding: 15px; border: 1px solid color-mix(in srgb, #d69b3a 48%, var(--line)); border-radius: 12px; background: color-mix(in srgb, #d69b3a 8%, var(--surface)); box-shadow: 0 10px 28px rgba(0, 0, 0, .08); }
 .approval-card > header { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 10px; }

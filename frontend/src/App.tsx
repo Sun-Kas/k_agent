@@ -13,7 +13,6 @@ import {
   useState
 } from "react";
 import {
-  cancelSessionRun,
   getAgentsCatalog,
   getHealth,
   getModelsConfig,
@@ -22,7 +21,9 @@ import {
   getSessionWorkspace,
   getSessionWorkspaceFile,
   listSessions,
+  getApprovalStatus,
   resolveApproval,
+  stopSessionRun,
   streamAgentRun
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
@@ -35,6 +36,8 @@ import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
 import { mergeHistoricalMessages } from "./history";
 import { createClientId } from "./id";
+import { bindApprovalRunToAssistant } from "./live-approval";
+import { keepStoppedRunMessages } from "./run-visibility";
 import { readVoiceConfig, type VoiceConfig } from "./voice-config";
 import { shouldInterruptForTranscript } from "./voice-interruption";
 import type {
@@ -137,6 +140,8 @@ type ActiveConversationRun = {
   pendingAssistantId: string;
   runId: string;
   userMessageId: string;
+  /** Prevent queued stream callbacks from mutating a durable manual-stop snapshot. */
+  stopped?: boolean;
 };
 
 const createMessage = (role: ChatMessage["role"], content: string): ChatMessage => ({
@@ -270,7 +275,7 @@ function isThinkingPhase(value: unknown): value is ThinkingActivity["phase"] {
 }
 
 function isThinkingStatus(value: unknown): value is ThinkingActivity["status"] {
-  return value === "active" || value === "complete" || value === "error";
+  return value === "active" || value === "complete" || value === "error" || value === "stopped";
 }
 
 /** 会话壳：会话切换 / 提交 run / AG-UI 事件投影到聊天与活动时间线。 */
@@ -860,24 +865,20 @@ export function App() {
   function stopRun() {
     if (!sessionId) return;
     const activeRun = activeRunsRef.current.get(sessionId);
-    activeRun?.controller.abort();
     if (activeRun) {
-      // 主动停止与 Access Layer 回滚一致：去掉本轮 user + 占位 assistant，并通知服务端 cancel。
-      const removableMessageIds = new Set([
-        activeRun.userMessageId,
-        activeRun.pendingAssistantId,
-        ...activeRun.events.flatMap((event) =>
-          event.type === "TEXT_MESSAGE_START" || event.type === "TEXT_MESSAGE_CONTENT" || event.type === "TEXT_MESSAGE_END"
-            ? [event.messageId]
-            : []
-        )
-      ]);
-      setMessages((current) => current.filter((message) => !removableMessageIds.has(message.id)));
-      setTextBlocks((current) => current.filter((text) => !removableMessageIds.has(text.id)));
-      void cancelSessionRun(sessionId, activeRun.runId)
+      // 手动停止是“封口并保存”，不是撤销。先冻结前端快照，再通知 Access Layer
+      // 持久化 partial assistant 与 RUN_FINISHED(stopped)，防止刷新后回退或缺失 user。
+      activeRun.stopped = true;
+      activeRun.controller.abort();
+      stopRunActivities(activeRun.runId);
+      setMessages((current) => keepStoppedRunMessages(current, activeRun.runId, activeRun.events));
+      void stopSessionRun(sessionId, activeRun.runId)
         .then(() => refreshSessions())
         .catch(() => refreshSessions());
     }
+    pendingAssistantIdRef.current = null;
+    activeRunIdRef.current = null;
+    setActiveRunId(null);
     stopVoicePlayback("已停止生成和朗读");
     voiceRunFinishedRef.current = true;
     if (voiceConversationActiveRef.current) {
@@ -1376,6 +1377,7 @@ export function App() {
       await streamAgentRun(
         runInput,
         (streamEvent) => {
+          if (activeRun.stopped) return;
           activeRun.events.push(streamEvent);
           if (activeSessionIdRef.current === targetSessionId) {
             applyAgUiEvent(streamEvent);
@@ -1418,6 +1420,69 @@ export function App() {
    * 状态机大致：idle → preparing → processing（文本/工具/审批）→ complete | failed。
    * replayingHistoryRef 为 true 时避免把已持久化消息再 append 一遍。
    */
+  function applyApprovalSnapshot(value: Record<string, unknown>) {
+    const id = String(value.id ?? "");
+    const runId = String(value.runId ?? activeRunIdRef.current ?? "");
+    if (!id || !runId) return;
+
+    // ACTIVITY_SNAPSHOT 自带 runId，但聊天时间线仍需一条 assistant 宿主。
+    // RUN_STARTED 通常已经完成绑定；这里保留同事件批次下的兜底。
+    setMessages((current) => bindApprovalRunToAssistant(
+      current,
+      runId,
+      pendingAssistantIdRef.current
+    ));
+    setApprovals((current) => {
+      const existing = current.find((approval) => approval.id === id);
+      const action = String(value.action ?? "");
+      const rawStatus = String(value.status ?? "");
+      const status: ApprovalActivity["status"] = rawStatus === "approved" || action === "approve"
+        ? "approved"
+        : rawStatus === "denied" || action === "deny"
+          ? "denied"
+          : rawStatus === "expired" || action === "expired"
+            ? "expired"
+            : rawStatus === "cancelled" || action === "cancel"
+              ? "cancelled"
+              : "pending";
+      if (existing) {
+        return current.map((approval) => approval.id === id
+          ? {
+            ...approval,
+            threadId: String(value.threadId ?? approval.threadId),
+            runId,
+            agentKind: String(value.agentKind ?? approval.agentKind),
+            category: String(value.category ?? approval.category),
+            title: String(value.title ?? approval.title),
+            message: String(value.message ?? approval.message),
+            detail: value.detail && typeof value.detail === "object"
+              ? value.detail as Record<string, unknown>
+              : approval.detail,
+            status
+          }
+          : approval);
+      }
+      activitySequenceRef.current += 1;
+      return [...current, {
+        id,
+        threadId: String(value.threadId ?? sessionId ?? ""),
+        runId,
+        agentKind: String(value.agentKind ?? "k_agent"),
+        category: String(value.category ?? "tool"),
+        title: String(value.title ?? "需要你的确认"),
+        message: String(value.message ?? "请确认是否继续。"),
+        detail: value.detail && typeof value.detail === "object"
+          ? value.detail as Record<string, unknown>
+          : {},
+        status,
+        sequence: activitySequenceRef.current
+      }];
+    });
+    setStatus(String(value.status ?? "pending") === "pending"
+      ? "等待人工审批"
+      : appConfig.status.processing);
+  }
+
   function applyAgUiEvent(event: AgUiEvent) {
     switch (event.type) {
       case "RUN_STARTED":
@@ -1674,8 +1739,28 @@ export function App() {
           status: toolResultFailed(event.content) ? "error" : "complete"
         }));
         break;
+      case "ACTIVITY_SNAPSHOT":
+        if (event.activityType === "approval" && event.content && typeof event.content === "object") {
+          applyApprovalSnapshot(event.content as Record<string, unknown>);
+        }
+        break;
       case "CUSTOM":
-        // 扩展通道：status/trace 文案，以及人工审批请求/结果（非标准 AG-UI 字段）。
+        // 扩展通道只承载没有标准 AG-UI 类型的增量。旧会话中的 CUSTOM
+        // 审批仍兼容回放，新运行统一使用 ACTIVITY_SNAPSHOT。
+        if (event.name === "tool_output_delta") {
+          const toolCallId = String(event.value.toolCallId ?? "");
+          const delta = String(event.value.delta ?? "");
+          if (toolCallId && delta) {
+            updateTool(toolCallId, (tool) => ({
+              ...tool,
+              liveOutput: `${tool.liveOutput ?? ""}${delta}`,
+              executionMode: event.value.executionMode === "interactive"
+                ? "interactive"
+                : tool.executionMode ?? "foreground",
+              status: "running"
+            }));
+          }
+        }
         if (event.name === "status") {
           setStatus(String(event.value.message ?? appConfig.status.processing));
         }
@@ -1684,48 +1769,25 @@ export function App() {
           if (entry) setTrace((current) => [...current, entry]);
         }
         if (event.name === "approval_request") {
-          const value = event.value;
-          const id = String(value.id ?? "");
-          const runId = String(value.runId ?? activeRunIdRef.current ?? "");
-          if (id && runId) {
-            const sequence = activitySequenceRef.current + 1;
-            activitySequenceRef.current = sequence;
-            setApprovals((current) => current.some((approval) => approval.id === id)
-              ? current
-              : [...current, {
-                id,
-                threadId: String(value.threadId ?? sessionId ?? ""),
-                runId,
-                agentKind: String(value.agentKind ?? "k_agent"),
-                category: String(value.category ?? "tool"),
-                title: String(value.title ?? "需要你的确认"),
-                message: String(value.message ?? "请确认是否继续。"),
-                detail: value.detail && typeof value.detail === "object"
-                  ? value.detail as Record<string, unknown>
-                  : {},
-                status: "pending",
-                sequence
-              }]);
-            setStatus("等待人工审批");
-          }
+          applyApprovalSnapshot({ ...event.value, status: "pending" });
         }
         if (event.name === "approval_resolved") {
-          const id = String(event.value.id ?? "");
-          const action = String(event.value.action ?? "cancel");
-          setApprovals((current) => current.map((approval) => approval.id === id
-            ? {
-              ...approval,
-              status: action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled"
-            }
-            : approval));
+          applyApprovalSnapshot(event.value);
         }
         break;
-      case "RUN_FINISHED":
+      case "RUN_FINISHED": {
+        const stopped = Boolean(
+          event.result
+          && typeof event.result === "object"
+          && (event.result as Record<string, unknown>).status === "stopped"
+        );
+        if (stopped) stopRunActivities(event.runId);
         activeRunIdRef.current = null;
         setActiveRunId(null);
         pendingAssistantIdRef.current = null;
-        setStatus(appConfig.status.complete);
+        setStatus(stopped ? "已停止" : appConfig.status.complete);
         break;
+      }
       case "RUN_ERROR": {
         const pendingAssistantId = pendingAssistantIdRef.current;
         const failedRunId = activeRunIdRef.current;
@@ -1793,6 +1855,42 @@ export function App() {
     activeTextMessageIdRef.current = null;
   }
 
+  function stopRunActivities(runId: string) {
+    setTools((current) => current.map((tool) =>
+      tool.turnId === runId && tool.status !== "complete" && tool.status !== "error"
+        ? { ...tool, status: "stopped" }
+        : tool
+    ));
+    setTextBlocks((current) => current.map((text) =>
+      text.turnId === runId && text.status === "streaming"
+        ? { ...text, status: "complete" }
+        : text
+    ));
+    setThinking((current) => current.map((step) =>
+      step.status === "active" ? { ...step, status: "stopped" } : step
+    ));
+    setThinkingBlocks((current) => current.map((block) =>
+      block.turnId === runId
+        ? {
+          ...block,
+          closed: true,
+          steps: block.steps.map((step) =>
+            step.status === "active" ? { ...step, status: "stopped" } : step
+          )
+        }
+        : block
+    ));
+    setApprovals((current) => current.map((approval) =>
+      approval.runId === runId && (approval.status === "pending" || approval.status === "submitting")
+        ? { ...approval, status: "cancelled" }
+        : approval
+    ));
+    activeThinkingBlockIdRef.current = null;
+    activeThinkingStepIdRef.current = null;
+    activeTextActivityIdRef.current = null;
+    activeTextMessageIdRef.current = null;
+  }
+
   function updateTool(id: string, transform: (tool: ToolActivity) => ToolActivity) {
     setTools((current) => current.map((tool) => tool.id === id ? transform(tool) : tool));
   }
@@ -1820,11 +1918,13 @@ export function App() {
         : item));
       setStatus(action === "approve" ? appConfig.status.processing : "已拒绝工具调用");
     } catch (error) {
+      const message = error instanceof Error ? error.message : "审批提交失败";
+      const expired = /no longer pending|不再等待|已失效/i.test(message);
       setApprovals((current) => current.map((item) => item.id === approval.id
         ? {
           ...item,
-          status: "error",
-          error: error instanceof Error ? error.message : "审批提交失败"
+          status: expired ? "expired" : "error",
+          error: expired ? "该审批已失效，请重新发起任务。" : message
         }
         : item));
     }
@@ -3074,6 +3174,7 @@ function InlineThinking({ block }: { block: ThinkingBlock }) {
   const { steps } = block;
   const latestActive = [...steps].reverse().find((step) => step.status === "active") ?? steps[steps.length - 1];
   const hasActive = !block.closed && steps.some((step) => step.status === "active");
+  const wasStopped = steps.some((step) => step.status === "stopped");
   const [open, setOpen] = useState(!block.closed);
 
   useEffect(() => {
@@ -3088,7 +3189,7 @@ function InlineThinking({ block }: { block: ThinkingBlock }) {
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
-        <span>{hasActive ? "思考过程" : "已完成思考"}</span>
+        <span>{hasActive ? "思考过程" : wasStopped ? "思考已停止" : "已完成思考"}</span>
         {latestActive?.status === "active" && <b>进行中</b>}
         <i aria-hidden="true">⌃</i>
       </button>
@@ -3122,6 +3223,19 @@ function ApprovalCard({
 }) {
   const pending = approval.status === "pending" || approval.status === "error";
   const submitting = approval.status === "submitting";
+  useEffect(() => {
+    if (approval.status !== "pending") return;
+    let active = true;
+    void getApprovalStatus(approval.id, {
+      threadId: approval.threadId,
+      runId: approval.runId
+    }).then(({ pending: stillPending }) => {
+      if (active && !stillPending) {
+        void onDecision(approval, "cancel").catch(() => undefined);
+      }
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [approval.id, approval.runId, approval.status, approval.threadId]);
   const argumentsValue = approval.detail.arguments;
   const command = approval.detail.command;
   const preview = command
@@ -3135,6 +3249,7 @@ function ApprovalCard({
     approved: "已允许",
     denied: "已拒绝",
     cancelled: "已取消",
+    expired: "已失效",
     error: "提交失败"
   }[approval.status];
 

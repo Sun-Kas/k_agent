@@ -434,4 +434,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Approval request is no longer pending")
         return {"ok": True, "requestId": request_id}
 
+    @app.get("/internal/approvals/{request_id}")
+    async def get_approval_status(
+        request_id: str, threadId: str, runId: str
+    ) -> dict[str, Any]:
+        """Expose only whether this exact run-scoped approval is still actionable."""
+
+        pending = await app.state.approvals.is_pending(
+            request_id, thread_id=threadId, run_id=runId
+        )
+        return {"ok": True, "requestId": request_id, "pending": pending}
+
     return app

@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="K Agent 2026-07-29 至 2026-08-11 双周研发汇报" />
+  <title>K Agent 双周研发汇报 · 2026-08-11</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f6f4ef;
+      --surface: rgba(255, 255, 255, .84);
+      --ink: #151515;
+      --muted: #686861;
+      --line: rgba(21, 21, 21, .12);
+      --accent: #5b66e8;
+      --accent-soft: #eceeff;
+      --green: #167b5b;
+      --amber: #b16816;
+      --shadow: 0 18px 50px rgba(32, 30, 24, .08);
+      --radius: 24px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 86% 5%, rgba(91, 102, 232, .14), transparent 24rem),
+        radial-gradient(circle at 10% 30%, rgba(44, 157, 116, .09), transparent 22rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: inherit; text-decoration-color: rgba(91, 102, 232, .45); text-underline-offset: 3px; }
+    .page { width: min(1180px, calc(100% - 40px)); margin: 0 auto; padding: 28px 0 80px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; color: var(--muted); font-size: 13px; }
+    .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); font-weight: 760; letter-spacing: -.02em; }
+    .brand-mark { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; color: white; background: #151515; font-weight: 850; }
+    .period { padding: 7px 11px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.55); }
+
+    .hero {
+      min-height: 470px;
+      padding: clamp(34px, 6vw, 72px);
+      border: 1px solid rgba(255,255,255,.8);
+      border-radius: 34px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr);
+      gap: 48px;
+      align-items: end;
+      overflow: hidden;
+      position: relative;
+      background: linear-gradient(135deg, rgba(255,255,255,.95), rgba(249,249,255,.72));
+      box-shadow: var(--shadow);
+    }
+    .hero::after { content: "K"; position: absolute; right: -30px; top: -112px; color: rgba(91,102,232,.055); font-size: 460px; font-weight: 900; line-height: 1; pointer-events: none; }
+    .eyebrow { margin: 0 0 14px; color: var(--accent); font: 700 12px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .16em; text-transform: uppercase; }
+    h1 { max-width: 720px; margin: 0; font-size: clamp(48px, 7vw, 88px); line-height: .98; letter-spacing: -.065em; font-weight: 850; }
+    .hero-copy { max-width: 680px; margin: 26px 0 0; color: var(--muted); font-size: clamp(17px, 2vw, 21px); line-height: 1.65; }
+    .hero-summary { position: relative; z-index: 1; padding: 24px; border: 1px solid rgba(91,102,232,.16); border-radius: 22px; background: rgba(236,238,255,.68); backdrop-filter: blur(18px); }
+    .hero-summary strong { display: block; margin-bottom: 8px; font-size: 18px; }
+    .hero-summary p { margin: 0; color: #555873; }
+
+    .metrics { margin: 22px 0 56px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .metric { padding: 24px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); box-shadow: 0 8px 24px rgba(32,30,24,.035); }
+    .metric b { display: block; font-size: clamp(28px, 4vw, 42px); line-height: 1.1; letter-spacing: -.05em; }
+    .metric span { display: block; margin-top: 8px; color: var(--muted); font-size: 13px; }
+
+    section { margin-top: 64px; }
+    .section-head { display: grid; grid-template-columns: 180px 1fr; gap: 28px; align-items: start; margin-bottom: 24px; }
+    .section-no { color: var(--accent); font: 700 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .13em; }
+    h2 { margin: 0; font-size: clamp(30px, 4vw, 48px); line-height: 1.08; letter-spacing: -.045em; }
+    .section-intro { max-width: 760px; margin: 13px 0 0; color: var(--muted); }
+
+    .outcomes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+    .outcome { min-height: 225px; padding: 28px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+    .outcome-number { color: var(--accent); font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .outcome h3 { margin: 38px 0 8px; font-size: 22px; line-height: 1.25; letter-spacing: -.025em; }
+    .outcome p { margin: 0; color: var(--muted); }
+
+    .architecture { padding: 32px; border-radius: var(--radius); color: white; background: #171719; box-shadow: var(--shadow); }
+    .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; align-items: stretch; }
+    .node { min-height: 126px; padding: 18px; border: 1px solid rgba(255,255,255,.14); border-radius: 16px; display: flex; flex-direction: column; justify-content: space-between; background: rgba(255,255,255,.055); }
+    .node small { color: rgba(255,255,255,.5); font: 11px/1.3 ui-monospace, monospace; letter-spacing: .1em; }
+    .node strong { font-size: 16px; line-height: 1.3; }
+    .architecture-note { margin: 22px 0 0; color: rgba(255,255,255,.63); font-size: 14px; }
+
+    .timeline { position: relative; padding-left: 28px; }
+    .timeline::before { content: ""; position: absolute; left: 7px; top: 10px; bottom: 12px; width: 1px; background: var(--line); }
+    .timeline-item { position: relative; padding: 0 0 28px 22px; display: grid; grid-template-columns: 130px 1fr; gap: 22px; }
+    .timeline-item::before { content: ""; position: absolute; left: -26px; top: 8px; width: 11px; height: 11px; border: 3px solid var(--paper); border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .timeline-item time { color: var(--muted); font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .timeline-item h3 { margin: 0 0 5px; font-size: 19px; letter-spacing: -.02em; }
+    .timeline-item p { margin: 0; color: var(--muted); }
+
+    .quality-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 16px; }
+    .panel { padding: 28px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+    .panel h3 { margin: 0 0 18px; font-size: 21px; letter-spacing: -.02em; }
+    .checklist { list-style: none; margin: 0; padding: 0; display: grid; gap: 13px; }
+    .checklist li { display: grid; grid-template-columns: 22px 1fr; gap: 10px; color: var(--muted); }
+    .checklist li::before { content: "✓"; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; color: white; background: var(--green); font-size: 11px; font-weight: 800; }
+    .risk { padding: 14px 0; border-top: 1px solid var(--line); }
+    .risk:first-of-type { padding-top: 0; border-top: 0; }
+    .risk b { display: flex; align-items: center; gap: 8px; font-size: 15px; }
+    .risk b::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+    .risk p { margin: 5px 0 0 16px; color: var(--muted); font-size: 14px; }
+
+    .next { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .next article { padding: 26px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); }
+    .next span { color: var(--accent); font: 700 12px/1 ui-monospace, monospace; }
+    .next h3 { margin: 22px 0 8px; font-size: 19px; }
+    .next p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .sources { display: flex; flex-wrap: wrap; gap: 9px; }
+    .sources a { padding: 8px 11px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: rgba(255,255,255,.55); font-size: 13px; text-decoration: none; }
+    .sources a:hover { color: var(--ink); border-color: rgba(91,102,232,.35); }
+    footer.report-footer { margin-top: 72px; padding-top: 22px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; }
+
+    @media (max-width: 860px) {
+      .hero { min-height: auto; grid-template-columns: 1fr; gap: 30px; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+      .section-head { grid-template-columns: 1fr; gap: 8px; }
+      .outcomes, .quality-grid { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr 1fr; }
+      .next { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      .page { width: min(100% - 22px, 1180px); padding-top: 14px; }
+      .topbar { align-items: flex-start; gap: 12px; }
+      .hero { padding: 28px 22px; border-radius: 24px; }
+      .hero::after { display: none; }
+      .metrics, .outcomes, .flow { grid-template-columns: 1fr; }
+      .timeline-item { grid-template-columns: 1fr; gap: 3px; }
+      footer.report-footer { flex-direction: column; gap: 6px; }
+    }
+    @media print {
+      @page { size: A4; margin: 14mm; }
+      body { background: white; font-size: 10pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, .metric, .outcome, .architecture, .panel, .next article { box-shadow: none; break-inside: avoid; }
+      .hero { min-height: 238mm; }
+      section { break-before: page; margin-top: 0; }
+      a { text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">K</span><span>K Agent · Engineering</span></div>
+      <span class="period">2026.07.29 — 2026.08.11</span>
+    </header>
+
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Biweekly Engineering Review</p>
+        <h1>K Agent<br />双周研发汇报</h1>
+        <p class="hero-copy">本周期完成从“单一 Agent 对话”向本地 AI 工作台的关键演进：统一实时对话、Agent Team、定时任务、工作空间、权限沙箱、语音交互与可部署能力。</p>
+      </div>
+      <aside class="hero-summary">
+        <strong>本期判断</strong>
+        <p>核心产品骨架已经形成。下一阶段重点应从功能扩张转向权限边界收敛、流式体验稳定性、跨平台验证与发布质量。</p>
+      </aside>
+    </section>
+
+    <div class="metrics" aria-label="研发数据概览">
+      <article class="metric"><b>24</b><span>Git commits</span></article>
+      <article class="metric"><b>233</b><span>涉及文件</span></article>
+      <article class="metric"><b>36.6k</b><span>新增代码与文档行</span></article>
+      <article class="metric"><b>3</b><span>核心运行形态：Chat / Team / Automation</span></article>
+    </div>
+
+    <section>
+      <header class="section-head">
+        <span class="section-no">01 / OUTCOMES</span>
+        <div><h2>本周期核心交付</h2><p class="section-intro">围绕“可运行、可追踪、可恢复、可部署”推进，不只增加页面，也补齐了运行时与持久化边界。</p></div>
+      </header>
+      <div class="outcomes">
+        <article class="outcome"><span class="outcome-number">01</span><h3>双进程架构完成收敛</h3><p>Access Layer 负责公开 API、会话真相源、目录解析和流式透传；Agent Backend 保持无状态，专注模型、工具、MCP、Skill 与 AG-UI 协议适配。</p></article>
+        <article class="outcome"><span class="outcome-number">02</span><h3>Agent Team 正式落地</h3><p>Supervisor 先生成带依赖关系的任务 DAG，再按最大并行度调度 Worker；任务工作空间隔离，并支持验收、审批和持久化恢复。</p></article>
+        <article class="outcome"><span class="outcome-number">03</span><h3>定时任务形成闭环</h3><p>支持单次、每日、每周与 IANA 时区；采用最近到期时间动态休眠，每次运行拥有独立 Session 与 Workspace，结果不污染普通会话列表。</p></article>
+        <article class="outcome"><span class="outcome-number">04</span><h3>权限与沙箱进入产品层</h3><p>增加默认权限与完全权限语义、HITL 审批、Bash 结构化升级、网络白名单和有界超时，为无人值守自动化建立明确风险边界。</p></article>
+        <article class="outcome"><span class="outcome-number">05</span><h3>实时交互能力增强</h3><p>AG-UI 时间线统一展示正文、推理与工具；浏览器语音支持输入、连续对话、朗读、打断和取消回滚，后台运行在会话切换后仍可继续。</p></article>
+        <article class="outcome"><span class="outcome-number">06</span><h3>部署与数据边界可交付</h3><p>补齐脱敏 Docker 镜像、Compose、持久卷与内网访问流程。密钥、Sessions、Skills、Memory、Team 和 Workspace 均不写入镜像层。</p></article>
+      </div>
+    </section>
+
+    <section>
+      <header class="section-head">
+        <span class="section-no">02 / ARCHITECTURE</span>
+        <div><h2>运行链路与职责边界</h2><p class="section-intro">本周期最重要的工程收益，是把数据所有权和运行职责从“隐式约定”变成可检查的结构。</p></div>
+      </header>
+      <div class="architecture">
+        <div class="flow">
+          <div class="node"><small>CLIENT</small><strong>React Workbench</strong></div>
+          <div class="node"><small>PUBLIC EDGE</small><strong>Access Layer<br />Session · Team · Schedule</strong></div>
+          <div class="node"><small>INTERNAL STREAM</small><strong>NDJSON / AG-UI<br />Raw Order</strong></div>
+          <div class="node"><small>EXECUTION</small><strong>Agent Backend<br />Runner Registry</strong></div>
+          <div class="node"><small>CAPABILITIES</small><strong>Models · MCP<br />Skills · Tools</strong></div>
+        </div>
+        <p class="architecture-note">状态写入统一停留在 Access Layer；Agent Backend 不读取前端状态文件。跨服务事件保持原始到达顺序，最终由前端按 runId / messageId / toolCallId 投影。</p>
+      </div>
+    </section>
+
+    <section>
+      <header class="section-head">
+        <span class="section-no">03 / TIMELINE</span>
+        <div><h2>两周推进节奏</h2><p class="section-intro">从底层边界开始，逐步扩展到协作、自动化、体验与部署。</p></div>
+      </header>
+      <div class="timeline">
+        <article class="timeline-item"><time>07.30</time><div><h3>架构与可靠性基线</h3><p>重构 Agent 架构和前端集成；服务默认绑定 loopback；普通工具失败改为模型可见结果；引入持久化 Home、Bash 沙箱和运行日志。</p></div></article>
+        <article class="timeline-item"><time>08.04 — 08.05</time><div><h3>Agent Team 与 DAG 调度</h3><p>实现持久化 Team runtime、隔离工作空间、审批链路和 Supervisor 依赖规划，避免无依赖依据的盲目并行。</p></div></article>
+        <article class="timeline-item"><time>08.06 — 08.08</time><div><h3>工作空间、前端与共享运行时</h3><p>加入 Session/Team 文件浏览，完善 Markdown 数学与复制体验，统一 Node/npm 运行时，并确保不同运行形态写入正确 Workspace。</p></div></article>
+        <article class="timeline-item"><time>08.09</time><div><h3>实时语音与可撤销运行</h3><p>上线连续语音、TTS、自然打断；取消操作同步回滚 UI、持久化历史、上下文摘要和迟到 AG-UI 事件。</p></div></article>
+        <article class="timeline-item"><time>08.10</time><div><h3>定时任务与部署体系</h3><p>完成调度、独立历史页面与技术方案；整理项目架构、限制 reload watcher，并将 Docker 流程改为脱敏、可发布形态。</p></div></article>
+        <article class="timeline-item"><time>08.11</time><div><h3>权限模式与 HITL 加固</h3><p>引入运行级权限选择、统一审批 Broker、CLI bridge、结构化 Bash 越权原因与可调有界超时。</p></div></article>
+      </div>
+    </section>
+
+    <section>
+      <header class="section-head">
+        <span class="section-no">04 / QUALITY</span>
+        <div><h2>质量建设与风险</h2><p class="section-intro">功能链路已完整，但涉及本机能力与无人值守运行，必须继续把安全与恢复能力当作产品功能。</p></div>
+      </header>
+      <div class="quality-grid">
+        <article class="panel">
+          <h3>已建立的工程保障</h3>
+          <ul class="checklist">
+            <li>AG-UI start/content/end 生命周期与原始事件顺序形成文档和回归约束。</li>
+            <li>工具错误结构化返回模型，避免普通失败直接终止整个 run。</li>
+            <li>Session、Team、Automation 工作空间与持久化路径明确隔离。</li>
+            <li>上下文预算、自动压缩与旧工具结果裁剪降低长会话失控风险。</li>
+            <li>Docker 镜像排除密钥与用户状态，运行数据通过环境变量和卷注入。</li>
+          </ul>
+        </article>
+        <aside class="panel">
+          <h3>当前重点风险</h3>
+          <div class="risk"><b>权限规则复杂度</b><p>读、写、网络、主机资源和完全权限需继续用能力模型收敛，避免模型通过参数误触发审批。</p></div>
+          <div class="risk"><b>跨平台沙箱</b><p>macOS Seatbelt、Linux sandbox-runtime 与容器运行差异仍需在真实部署机持续验证。</p></div>
+          <div class="risk"><b>流式 UI 一致性</b><p>推理、工具、审批、正文都依赖严格事件顺序和及时绘制，需要覆盖更多中断与后台页场景。</p></div>
+          <div class="risk"><b>无人值守副作用</b><p>定时任务不得自动重放已开始的副作用调用；完全权限必须持续显示高风险提示。</p></div>
+        </aside>
+      </div>
+    </section>
+
+    <section>
+      <header class="section-head">
+        <span class="section-no">05 / NEXT</span>
+        <div><h2>下一周期建议</h2><p class="section-intro">控制新增面，把现有能力打磨到可稳定演示、可部署复现、可追责定位。</p></div>
+      </header>
+      <div class="next">
+        <article><span>P0</span><h3>权限能力模型收敛</h3><p>按只读、工作区写、越界写、网络目标和主机资源统一判定；补齐 Chat、Team、Automation 三条端到端审批测试。</p></article>
+        <article><span>P0</span><h3>真实环境发布验证</h3><p>在 Linux 开发机完成 Compose、持久卷、内网访问、重启恢复和密钥注入演练，并沉淀一键验收脚本。</p></article>
+        <article><span>P1</span><h3>流式体验回归</h3><p>覆盖工具卡、审批卡、思考块、Markdown 增量、后台标签恢复和取消后的迟到事件，建立稳定的浏览器回归集。</p></article>
+      </div>
+    </section>
+
+    <section>
+      <header class="section-head">
+        <span class="section-no">06 / REFERENCES</span>
+        <div><h2>依据与延伸阅读</h2><p class="section-intro">本报告由本周期 Git 历史、代码变更统计和仓库内技术方案汇总生成。</p></div>
+      </header>
+      <nav class="sources" aria-label="项目文档">
+        <a href="../README.md">README</a>
+        <a href="agent-team-technical-solution.md">Agent Team 技术方案</a>
+        <a href="scheduled-task-technical-solution.md">定时任务技术方案</a>
+        <a href="permission-and-hitl-technical-solution.md">权限与 HITL 技术方案</a>
+        <a href="ag-ui-protocol.md">AG-UI 协议</a>
+        <a href="context-management.md">上下文管理</a>
+        <a href="docker-deployment.md">Docker 部署</a>
+      </nav>
+    </section>
+
+    <footer class="report-footer">
+      <span>K Agent · Biweekly Engineering Review</span>
+      <span>Generated on 2026-08-11 · Asia/Shanghai</span>
+    </footer>
+  </main>
+</body>
+</html>

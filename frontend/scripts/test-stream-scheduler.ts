@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { nextRenderOpportunity } from "../src/api/stream-scheduler";
+import { nextRenderOpportunity, yieldAfterStreamBatch } from "../src/api/stream-scheduler";
 
 let backgroundFrameRequested = false;
 const backgroundWindow = {
@@ -37,5 +37,31 @@ await nextRenderOpportunity(
 );
 assert.equal(foregroundFrameRequested, true);
 assert.equal(foregroundTimerCleared, true);
+
+// Approval/tool batches can contain no text delta. A dispatched non-text batch
+// must still yield one paint, while an empty reader batch must not yield.
+let approvalPaints = 0;
+const approvalWindow = {
+  requestAnimationFrame: (callback: FrameRequestCallback) => {
+    approvalPaints += 1;
+    callback(0);
+    return approvalPaints;
+  },
+  setTimeout: () => 1,
+  clearTimeout: () => undefined
+};
+const visibleDocument = { visibilityState: "visible" };
+await yieldAfterStreamBatch(
+  true,
+  approvalWindow as unknown as Window,
+  visibleDocument as Document
+);
+assert.equal(approvalPaints, 1);
+await yieldAfterStreamBatch(
+  false,
+  approvalWindow as unknown as Window,
+  visibleDocument as Document
+);
+assert.equal(approvalPaints, 1);
 
 console.log("stream scheduler regression tests passed");

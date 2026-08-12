@@ -1,7 +1,7 @@
 import type { AgUiEvent, ToolActivity } from "../types";
 
 export type StaticTimelineActivity =
-  | { type: "thinking"; id: string; title: string; detail: string; status: "running" | "complete" }
+  | { type: "thinking"; id: string; title: string; detail: string; status: "running" | "complete" | "stopped" }
   | { type: "tool"; id: string; tool: ToolActivity }
   | { type: "text"; id: string; content: string };
 
@@ -68,7 +68,16 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
       const tool = tools.get(event.toolCallId);
       if (tool) Object.assign(tool, { result: event.content, status: toolResultFailed(event.content) ? "error" : "complete" });
     } else if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
-      if (activeThinking) activeThinking.status = "complete";
+      const stopped = event.type === "RUN_FINISHED"
+        && event.result
+        && typeof event.result === "object"
+        && (event.result as Record<string, unknown>).status === "stopped";
+      if (stopped) {
+        for (const tool of tools.values()) {
+          if (tool.status !== "complete" && tool.status !== "error") tool.status = "stopped";
+        }
+      }
+      if (activeThinking) activeThinking.status = stopped ? "stopped" : "complete";
       activeThinking = null;
     }
   }

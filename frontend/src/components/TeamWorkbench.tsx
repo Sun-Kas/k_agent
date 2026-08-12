@@ -1297,6 +1297,20 @@ function buildConversationItems(events: TeamEvent[]): ConversationItem[] {
       if (!raw || typeof raw !== "object") continue;
       const value = raw as Record<string, unknown>;
       const type = String(value.type ?? "CUSTOM");
+      if (type === "ACTIVITY_SNAPSHOT" && String(value.activityType ?? "") === "approval") {
+        const content = value.content && typeof value.content === "object"
+          ? value.content as Record<string, unknown>
+          : {};
+        if (String(content.status ?? "pending") === "pending") {
+          appendApprovalRequest(items, approvals, content, event);
+        } else {
+          // A snapshot may be the first retained event after compaction, so make
+          // sure the card exists before applying its terminal state.
+          appendApprovalRequest(items, approvals, content, event);
+          resolveApprovalItem(approvals, content);
+        }
+        continue;
+      }
       if (type === "CUSTOM") {
         const customName = String(value.name ?? "");
         const customValue = value.value && typeof value.value === "object"
@@ -1384,8 +1398,13 @@ function resolveApprovalItem(
   const approval = approvals.get(String(value.id ?? ""));
   if (!approval) return;
   const action = String(value.action ?? "cancel");
+  const snapshotStatus = String(value.status ?? "");
   approval.action = action;
-  approval.status = action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled";
+  approval.status = snapshotStatus === "approved" || action === "approve"
+    ? "approved"
+    : snapshotStatus === "denied" || action === "deny"
+      ? "denied"
+      : "cancelled";
 }
 
 function approvalPreview(detail: Record<string, unknown>): string {

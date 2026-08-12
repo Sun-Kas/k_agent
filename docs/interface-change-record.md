@@ -95,6 +95,9 @@
 - 配置项：`BASH_SANDBOX_MODE`（默认 `auto`）、`BASH_SANDBOX_COMMAND`、
   `BASH_SANDBOX_ALLOWED_DOMAINS`、`BASH_SANDBOX_WRITE_PATHS`、
   `BASH_SANDBOX_DENY_READ`。原生 Windows 明确不支持，需 WSL2。
+- `BASH_SANDBOX_WRITE_PATHS` 默认包含 `~/.agently-cli` 和
+  `~/Library/Application Support/agently-cli`，这样 Agently Mail 的本地 token/state
+  可以写入，而不是把整个 home 目录放开。
 
 ## 2026-07-30 架构评估后的可靠性与权限收口
 

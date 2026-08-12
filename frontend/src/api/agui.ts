@@ -3,7 +3,7 @@
  * streamAgentRun 是聊天主路径的网络入口；事件由调用方（App.applyAgUiEvent）投影到 UI。
  */
 import { appConfig } from "../config";
-import { nextRenderOpportunity } from "./stream-scheduler";
+import { yieldAfterStreamBatch } from "./stream-scheduler";
 import type {
   AgUiEvent,
   AgUiRunInput,
@@ -213,6 +213,18 @@ export async function resolveApproval(
   }
 }
 
+export async function getApprovalStatus(
+  requestId: string,
+  input: { threadId: string; runId: string }
+): Promise<{ pending: boolean }> {
+  const query = new URLSearchParams(input);
+  const response = await fetch(apiUrl(
+    `/api/approvals/${encodeURIComponent(requestId)}?${query.toString()}`
+  ));
+  if (!response.ok) throw new Error(await configResponseError(response, "审批状态查询失败"));
+  return response.json() as Promise<{ pending: boolean }>;
+}
+
 export async function getSkillsConfig(): Promise<{ path: string; skillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }> {
   const response = await configFetch("/api/config/skills");
   if (!response.ok) throw new Error(`Unable to load skills config (${response.status})`);
@@ -268,9 +280,22 @@ export async function cancelSessionRun(sessionId: string, runId: string): Promis
   }
 }
 
+/** Manual stop is a durable terminal boundary; unlike cancel it preserves this turn. */
+export async function stopSessionRun(sessionId: string, runId: string): Promise<void> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/runs/stop`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ runId })
+  });
+  if (!response.ok) {
+    throw new Error(`Unable to stop session run (${response.status})`);
+  }
+}
+
 /**
  * POST AgUiRunInput，按 SSE 帧解析为 AgUiEvent 并回调。
- * TEXT_MESSAGE_CONTENT 后 await nextRenderOpportunity，给 React 绘制喘息，避免读流饿死主线程。
+ * 每批完整 SSE 帧投影后 await nextRenderOpportunity，给 React 绘制喘息。
+ * 这不只服务文本 delta：工具、思考和审批卡片也必须在 run 暂停前立刻可见。
  */
 export async function streamAgentRun(
   input: AgUiRunInput,
@@ -305,21 +330,25 @@ export async function streamAgentRun(
     // 不完整帧留在 buffer；完整帧以空行分隔。
     const frames = buffer.split(appConfig.sseMessageDelimiter);
     buffer = frames.pop() ?? "";
+    let dispatchedVisibleEvent = false;
 
     for (const frame of frames) {
       const event = parseSseFrame(frame);
       if (event) {
         onEvent(event);
-        if (event.type === "TEXT_MESSAGE_CONTENT") {
-          await nextRenderOpportunity();
-        }
+        dispatchedVisibleEvent = true;
       }
     }
+
+    // React 可能把同一读取循环中的多次 setState 合并。按网络批次只让出
+    // 一次绘制机会，既能实时显示审批/工具卡片，也不会让同批事件逐个跳帧。
+    await yieldAfterStreamBatch(dispatchedVisibleEvent);
 
     if (done) {
       const finalEvent = parseSseFrame(buffer);
       if (finalEvent) {
         onEvent(finalEvent);
+        await yieldAfterStreamBatch(true);
       }
       return;
     }

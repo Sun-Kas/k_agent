@@ -905,15 +905,26 @@ class TeamRuntime:
             elif event_type == "RUN_ERROR":
                 await flush_stream_activity(force=True)
                 raise RuntimeError(str(event.get("message") or "Agent run failed"))
-            elif event_type == "CUSTOM" and str(event.get("name") or "") in {
-                "approval_request", "approval_resolved",
-            }:
+            elif (
+                event_type == "ACTIVITY_SNAPSHOT"
+                and str(event.get("activityType") or "") == "approval"
+            ) or (
+                event_type == "CUSTOM"
+                and str(event.get("name") or "") in {
+                    "approval_request", "approval_resolved",
+                }
+            ):
                 await flush_stream_activity(force=True)
-                value = event.get("value") if isinstance(event.get("value"), dict) else {}
+                # 新运行使用标准 AG-UI activity；CUSTOM 仅兼容旧后端事件。
+                raw_value = event.get("content") if event_type == "ACTIVITY_SNAPSHOT" else event.get("value")
+                value = raw_value if isinstance(raw_value, dict) else {}
+                resolved = (
+                    str(value.get("status") or "") != "pending"
+                    if event_type == "ACTIVITY_SNAPSHOT"
+                    else event.get("name") == "approval_resolved"
+                )
                 approval_event_type = (
-                    "approval.requested"
-                    if event.get("name") == "approval_request"
-                    else "approval.resolved"
+                    "approval.resolved" if resolved else "approval.requested"
                 )
                 await self.store.record_approval(
                     team_id,

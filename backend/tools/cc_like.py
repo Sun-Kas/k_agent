@@ -1,7 +1,7 @@
-"""工作区作用域的文件/搜索/Shell/任务列表工具（Claude Code 风格）。
+"""文件/搜索/Shell/任务列表工具（Claude Code 风格）。
 
-所有路径经 `_resolve_workspace_path` 限制在 ContextVar 绑定的 workspace 内；
-Bash 再交给 sandbox 规划是否走 `srt`。
+只读文件工具可访问本机路径；写工具默认限制在 ContextVar 绑定的 workspace，
+越界写入需要审批。Bash 再交给 sandbox 规划是否走 `srt`。
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from backend.sandbox import (
     plan_bash_invocation,
 )
 from backend.tools.local import ToolDefinition
+from backend.tools.streaming import emit_tool_output
 from backend.tools.workspace import (
     current_tool_network_access,
     current_tool_permission_mode,
@@ -91,11 +92,13 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
 
 
 async def cc_read(payload: dict[str, Any]) -> str:
-    """读取工作区内文件的有界 UTF-8 表示。"""
+    """读取任意本机普通文件的有界 UTF-8 表示。"""
 
     path = await _resolve_workspace_path(
         str(payload.get("file_path") or payload.get("path") or ""),
-        allow_outside=_requests_host_access(payload),
+        # Read-only filesystem access is not a mutation boundary. Keeping this
+        # separate from Write/Edit prevents harmless project reads from HITL.
+        allow_outside=True,
     )
     if not path.exists():
         return _json({"ok": False, "error": "file not found", "path": str(path)})
@@ -147,10 +150,10 @@ async def cc_edit(payload: dict[str, Any]) -> str:
 
 
 async def cc_glob(payload: dict[str, Any]) -> str:
-    """按 glob 模式在工作区内查找文件。"""
+    """按 glob 模式在指定本机目录中查找文件。"""
     root = await _resolve_workspace_path(
         str(payload.get("path") or "."),
-        allow_outside=_requests_host_access(payload),
+        allow_outside=True,
     )
     pattern = str(payload.get("pattern") or "**/*")
     _, max_chars = await _tool_limits()
@@ -170,10 +173,10 @@ async def cc_glob(payload: dict[str, Any]) -> str:
 
 
 async def cc_grep(payload: dict[str, Any]) -> str:
-    """按正则在工作区文件内容中搜索。"""
+    """按正则在指定本机目录的文件内容中搜索。"""
     root = await _resolve_workspace_path(
         str(payload.get("path") or "."),
-        allow_outside=_requests_host_access(payload),
+        allow_outside=True,
     )
     pattern = str(payload.get("pattern") or "")
     include = str(payload.get("include") or "**/*")
@@ -197,6 +200,17 @@ async def cc_grep(payload: dict[str, Any]) -> str:
     return _json({"ok": True, "root": str(root), "matches": content.splitlines() if content else [], "truncated": truncated})
 
 
+def _looks_like_interactive_auth(command: str) -> bool:
+    """Recognize common user-driven auth flows without naming a specific CLI."""
+
+    normalized = " ".join(command.lower().split())
+    return bool(
+        re.search(r"\b(?:auth|oauth)\s+(?:login|authorize|signin|sign-in)\b", normalized)
+        or re.search(r"\b(?:login|signin|sign-in)\b[^;&|]*\b(?:device|oauth)\b", normalized)
+        or re.search(r"\bdevice[-_ ]code\b", normalized)
+    )
+
+
 async def cc_bash(payload: dict[str, Any]) -> str:
     """Run a time- and output-bounded shell command from the workspace root."""
 
@@ -209,7 +223,16 @@ async def cc_bash(payload: dict[str, Any]) -> str:
     # Long but bounded jobs (for example, a Skill aggregating several APIs)
     # may declare their expected duration without requesting broader access.
     # The schema caps this value so a model cannot create an unbounded process.
-    timeout = float(payload.get("timeout_seconds", default_timeout))
+    requested_mode = str(payload.get("execution_mode") or "auto")
+    execution_mode = (
+        "interactive"
+        if requested_mode == "auto" and _looks_like_interactive_auth(command)
+        else "foreground" if requested_mode == "auto" else requested_mode
+    )
+    timeout = float(payload.get(
+        "timeout_seconds",
+        max(default_timeout, 300.0) if execution_mode == "interactive" else default_timeout,
+    ))
     try:
         invocation = plan_bash_invocation(
             command,
@@ -237,6 +260,11 @@ async def cc_bash(payload: dict[str, Any]) -> str:
     # Env scrubbing is independent of the OS sandbox: a Seatbelt profile cannot
     # stop the child from reading whatever the parent put in its environ.
     child_env = build_child_env()
+    if execution_mode == "interactive":
+        # OAuth/device-code CLIs must print their URL instead of trying to open a
+        # browser on the headless backend host. K_AGENT_INTERACTIVE is also a
+        # generic capability signal that project CLIs may opt into later.
+        child_env.update({"BROWSER": "echo", "CI": "1", "K_AGENT_INTERACTIVE": "1"})
     if invocation.argv is None:
         process = await asyncio.create_subprocess_shell(
             command,
@@ -253,14 +281,32 @@ async def cc_bash(payload: dict[str, Any]) -> str:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+
+    async def consume(stream_name: str, reader: asyncio.StreamReader | None) -> None:
+        if reader is None:
+            return
+        while chunk := await reader.read(4096):
+            # Keep the final result bounded while still draining both pipes so a
+            # verbose child cannot deadlock. Live output is forwarded immediately.
+            remaining = max(0, max_chars * 4 - len(captured[stream_name]))
+            captured[stream_name].extend(chunk[:remaining])
+            emit_tool_output(
+                stream=stream_name,
+                delta=chunk.decode(errors="replace"),
+                executionMode=execution_mode,
+            )
+
+    stdout_task = asyncio.create_task(consume("stdout", process.stdout))
+    stderr_task = asyncio.create_task(consume("stderr", process.stderr))
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+        await asyncio.gather(stdout_task, stderr_task)
     except TimeoutError:
         # kill 之后必须 wait，否则子进程留成僵尸；长时间运行的服务会逐渐堆积。
         process.kill()
         await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
         return _json(
             enrich_bash_result(
                 {
@@ -274,12 +320,15 @@ async def cc_bash(payload: dict[str, Any]) -> str:
                 settings=settings,
             )
         )
-    stdout, stdout_truncated = _truncate(
-        stdout_bytes.decode(errors="replace"), max_chars
-    )
-    stderr, stderr_truncated = _truncate(
-        stderr_bytes.decode(errors="replace"), max_chars
-    )
+    except asyncio.CancelledError:
+        # Cancelling a task must also stop an OAuth CLI that may otherwise wait
+        # indefinitely for a browser callback after its HTTP client disappeared.
+        process.kill()
+        await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        raise
+    stdout, stdout_truncated = _truncate(captured["stdout"].decode(errors="replace"), max_chars)
+    stderr, stderr_truncated = _truncate(captured["stderr"].decode(errors="replace"), max_chars)
     return _json(
         enrich_bash_result(
             {
@@ -331,8 +380,8 @@ async def cc_todo_write(payload: dict[str, Any]) -> str:
 CC_LIKE_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="Read",
-        description="Read a UTF-8 text file. Paths outside the workspace require sandbox_permissions=require_escalated so the user can approve them.",
-        parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["file_path"], "additionalProperties": False},
+        description="Read a UTF-8 text file from any local path. Read-only access does not require permission escalation.",
+        parameters={"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"], "additionalProperties": False},
         execute=cc_read,
     ),
     ToolDefinition(
@@ -349,14 +398,14 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="Glob",
-        description="Find files by glob pattern, sorted by recent modification time. Outside-workspace paths require sandbox_permissions=require_escalated.",
-        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["pattern"], "additionalProperties": False},
+        description="Find files under any local directory by glob pattern, sorted by recent modification time. Read-only access does not require permission escalation.",
+        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}}, "required": ["pattern"], "additionalProperties": False},
         execute=cc_glob,
     ),
     ToolDefinition(
         name="Grep",
-        description="Search files with a regular expression. Outside-workspace paths require sandbox_permissions=require_escalated.",
-        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "include": {"type": "string", "default": "**/*"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["pattern"], "additionalProperties": False},
+        description="Search files under any local directory with a regular expression. Read-only access does not require permission escalation.",
+        parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "include": {"type": "string", "default": "**/*"}}, "required": ["pattern"], "additionalProperties": False},
         execute=cc_grep,
     ),
     ToolDefinition(
@@ -378,9 +427,13 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
             "responses, and rate limits do not trigger escalation. For an inherently long "
             "but bounded command, set timeout_seconds "
             "instead of requesting escalation; this changes duration, not permissions. "
+            "For OAuth, device-code login, or another command that waits for a user "
+            "in an external web page, set execution_mode=interactive. Interactive mode "
+            "streams stdout while the process is running and prevents the backend from "
+            "opening a browser; do not pipe that command through head or tail. "
             "Full-access runs execute without the OS sandbox."
         ),
-        parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string", "description": "Explain why the command or requested resource is required."}, "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 300, "description": "Bounded wall-clock timeout for an inherently long command. Increasing it does not grant additional permissions."}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"], "description": "Request HITL only for a structured out-of-sandbox resource or a concrete hostname outside the domain allowlist."}, "escalation_scope": {"type": "string", "enum": ["outside_workspace_write", "host_resource", "network_destination"], "description": "Required with require_escalated: the exact class of access requested."}, "escalation_resource": {"type": "string", "description": "Required with require_escalated: concrete outside path, host resource, or exact network hostname without scheme/path/port."}}, "required": ["command"], "additionalProperties": False},
+        parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string", "description": "Explain why the command or requested resource is required."}, "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 300, "description": "Bounded wall-clock timeout for an inherently long command. Increasing it does not grant additional permissions."}, "execution_mode": {"type": "string", "enum": ["auto", "foreground", "interactive"], "default": "auto", "description": "Auto-detect OAuth/device-code login commands; use interactive explicitly for other commands that print a URL and wait for the user."}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"], "description": "Request HITL only for a structured out-of-sandbox resource or a concrete hostname outside the domain allowlist."}, "escalation_scope": {"type": "string", "enum": ["outside_workspace_write", "host_resource", "network_destination"], "description": "Required with require_escalated: the exact class of access requested."}, "escalation_resource": {"type": "string", "description": "Required with require_escalated: concrete outside path, host resource, or exact network hostname without scheme/path/port."}}, "required": ["command"], "additionalProperties": False},
         execute=cc_bash,
     ),
     ToolDefinition(

@@ -48,4 +48,19 @@ assert.equal(
   "a tool boundary completes reasoning even when the provider omits REASONING_END",
 );
 
+const stoppedTimeline = timelineFromEvents([
+  { type: "RUN_STARTED", threadId: "scheduled-session", runId: "run-stopped" },
+  { type: "REASONING_START", messageId: "reasoning-stopped" },
+  { type: "REASONING_MESSAGE_CONTENT", messageId: "reasoning-stopped", delta: "partial thought" },
+  { type: "TOOL_CALL_START", toolCallId: "tool-stopped", toolCallName: "Bash" },
+  { type: "TOOL_CALL_ARGS", toolCallId: "tool-stopped", delta: "{\"cmd\":\"sleep 10\"}" },
+  {
+    type: "RUN_FINISHED",
+    threadId: "scheduled-session",
+    runId: "run-stopped",
+    result: { status: "stopped", stopped: true }
+  }
+]);
+assert.equal(stoppedTimeline[1]?.type === "tool" && stoppedTimeline[1].tool.status, "stopped");
+
 console.log("conversation transcript timeline tests passed");

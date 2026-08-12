@@ -224,6 +224,79 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             [("RUN_FINISHED", "run-1")],
         )
 
+    async def test_stop_run_persists_user_partial_output_and_rejects_late_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = FileStorage(tmp)
+            store = SessionStore(storage)
+            await store.create_session(session_id="thread-stop")
+            user = ChatMessage(
+                id="user-stop",
+                role="user",
+                content="keep this request",
+                createdAt=datetime.now(timezone.utc),
+            )
+            await store.save_run_start(
+                "thread-stop",
+                [user],
+                run_id="run-stop",
+                mcp_server_ids=[],
+                skill_ids=[],
+            )
+            await store.append_event(
+                "thread-stop",
+                {"type": "RUN_STARTED", "threadId": "thread-stop", "runId": "run-stop"},
+            )
+            await store.append_event(
+                "thread-stop",
+                {"type": "TEXT_MESSAGE_START", "messageId": "assistant-stop"},
+            )
+            await store.append_event(
+                "thread-stop",
+                {
+                    "type": "TEXT_MESSAGE_CONTENT",
+                    "messageId": "assistant-stop",
+                    "delta": "partial answer",
+                },
+            )
+
+            stopped = await store.stop_run("thread-stop", "run-stop")
+
+            assert stopped is not None
+            self.assertEqual(
+                [(message.id, message.content) for message in stopped.messages],
+                [("user-stop", "keep this request"), ("assistant-stop", "partial answer")],
+            )
+            self.assertEqual(stopped.events[-1], {
+                "type": "RUN_FINISHED",
+                "threadId": "thread-stop",
+                "runId": "run-stop",
+                "result": {"status": "stopped", "stopped": True},
+            })
+
+            # Backend cancellation can race with already queued deltas. They must
+            # not alter the durable snapshot after the manual-stop boundary.
+            await store.append_event(
+                "thread-stop",
+                {
+                    "type": "TEXT_MESSAGE_CONTENT",
+                    "messageId": "assistant-stop",
+                    "delta": " late",
+                },
+            )
+            await store.append_event(
+                "thread-stop",
+                {"type": "RUN_ERROR", "runId": "run-stop", "message": "late error"},
+            )
+
+            reloaded = SessionStore(FileStorage(tmp))
+            persisted = await reloaded.get("thread-stop")
+            assert persisted is not None
+            self.assertEqual(
+                [(message.id, message.content) for message in persisted.messages],
+                [("user-stop", "keep this request"), ("assistant-stop", "partial answer")],
+            )
+            self.assertEqual(persisted.events[-1]["result"]["status"], "stopped")
+
     async def test_cancel_after_finished_does_not_remove_completed_user_turn(self) -> None:
         store = SessionStore()
         await store.create_session(session_id="thread-finished-cancel")

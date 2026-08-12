@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ag_ui.core import (
+    ActivitySnapshotEvent,
     CustomEvent,
     EventType,
     ReasoningEndEvent,
@@ -291,6 +292,11 @@ async def translate_agent_events(
                     content=payload["content"],
                     role="tool",
                 )
+            elif event_type == "tool_output":
+                # AG-UI has a final tool-result event but no standard process
+                # stdout delta. Keep this run-scoped extension small and keyed
+                # by toolCallId so clients can update the existing tool card.
+                yield CustomEvent(name="tool_output_delta", value=payload)
             elif event_type == "status":
                 yield CustomEvent(name="status", value=payload)
             elif event_type == "trace":
@@ -299,10 +305,22 @@ async def translate_agent_events(
                 # 持久化 provider 原生 session id，便于用户选择 resume。
                 yield CustomEvent(name="cli_session", value=payload)
             elif event_type == "approval_request":
-                # 审批仍用自定义 AG-UI 事件：协议没有标准的双向人类审批事件对。
-                yield CustomEvent(name="approval_request", value=payload)
+                # 审批卡是可更新的 UI activity。使用 AG-UI 标准 activity
+                # 快照后，请求与结果会按 messageId 原位更新，实时流与历史回放
+                # 不再依赖 CUSTOM 事件和前端的额外挂靠协议。
+                yield ActivitySnapshotEvent(
+                    message_id=payload["id"],
+                    activity_type="approval",
+                    content=payload,
+                    replace=True,
+                )
             elif event_type == "approval_resolved":
-                yield CustomEvent(name="approval_resolved", value=payload)
+                yield ActivitySnapshotEvent(
+                    message_id=payload["id"],
+                    activity_type="approval",
+                    content=payload,
+                    replace=True,
+                )
             elif event_type == "thinking":
                 for reasoning_event in reasoning_events(payload):
                     yield reasoning_event

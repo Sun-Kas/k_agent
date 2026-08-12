@@ -207,8 +207,13 @@ class AgentAccessLayer:
                     persist_task = asyncio.create_task(_persist_worker())
                     try:
                         async for event in backend_events:
-                            persist_queue.put_nowait(event)
+                            # 先写出 SSE，再入落盘队列：HITL 空闲前最后一帧
+                            # 不能被磁盘 I/O 抢占事件循环，否则浏览器读不到审批卡。
                             yield self._encode_sse(event)
+                            if self._is_approval_activity(event):
+                                yield self._encode_sse_comment("flush", pad_bytes=2048)
+                                await asyncio.sleep(0)
+                            persist_queue.put_nowait(event)
                     finally:
                         await persist_queue.put(None)
                         await persist_task
@@ -269,8 +274,29 @@ class AgentAccessLayer:
         return [item for item in value if isinstance(item, dict)]
 
     @staticmethod
+    def _is_approval_activity(event: dict[str, Any]) -> bool:
+        """HITL 审批快照：阻塞前最后一帧，需要强制刷到浏览器。"""
+        return (
+            event.get("type") == "ACTIVITY_SNAPSHOT"
+            and event.get("activityType") == "approval"
+        )
+
+    @staticmethod
     def _encode_sse(event: dict[str, Any]) -> str:
         """将单个 AG-UI 事件编码为 SSE data 帧。"""
         return "data: " + json.dumps(
             event, ensure_ascii=False, separators=(",", ":")
         ) + "\n\n"
+
+    @staticmethod
+    def _encode_sse_comment(label: str = "", *, pad_bytes: int = 0) -> str:
+        """SSE 注释帧：不进入 AG-UI 投影，只用于推动连接写出缓冲。
+
+        pad_bytes 用于撑过中间层的最小缓冲阈值；正文仍是合法 SSE 注释。
+        """
+        text = label.strip() or "ping"
+        padding = ""
+        if pad_bytes > 0:
+            # 注释行以 ':' 开头；填充只用空格，避免被当成字段。
+            padding = " " * max(0, pad_bytes - len(text) - 1)
+        return f": {text}{padding}\n\n"

@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from backend.config import get_or_init_settings
-from backend.tools.cc_like import _resolve_workspace_path, _tool_limits
+from backend.tools.cc_like import _requests_host_access, _resolve_workspace_path, _tool_limits
 from backend.tools.local import ToolDefinition
 from backend.tools.workspace import current_tool_network_access
 
@@ -34,8 +34,8 @@ def _truncate(text: str, max_chars: int) -> tuple[str, bool]:
 
 
 async def cc_ls(payload: dict[str, Any]) -> str:
-    """列出目录内容，路径解析复用文件工具的工作区隔离逻辑。"""
-    path = await _resolve_workspace_path(str(payload.get("path") or "."))
+    """列出任意本机目录内容；只读目录遍历无需提升写权限。"""
+    path = await _resolve_workspace_path(str(payload.get("path") or "."), allow_outside=True)
     if not path.exists():
         return _json({"ok": False, "error": "path not found", "path": str(path)})
     if not path.is_dir():
@@ -206,7 +206,10 @@ async def cc_web_search(payload: dict[str, Any]) -> str:
 
 async def cc_notebook_edit(payload: dict[str, Any]) -> str:
     """编辑 Jupyter notebook 单元格，只处理 ipynb JSON，不执行其中代码。"""
-    path = await _resolve_workspace_path(str(payload.get("file_path") or payload.get("path") or ""))
+    path = await _resolve_workspace_path(
+        str(payload.get("file_path") or payload.get("path") or ""),
+        allow_outside=_requests_host_access(payload),
+    )
     cell_index = int(payload.get("cell_index") if payload.get("cell_index") is not None else payload.get("cellIndex", -1))
     source = payload.get("source")
     cell_type = str(payload.get("cell_type") or payload.get("cellType") or "code")
@@ -325,7 +328,7 @@ def build_mcp_resource_tools(
 CC_EXTRA_TOOLS: list[ToolDefinition] = [
     ToolDefinition(
         name="LS",
-        description="List files and directories under a workspace directory.",
+        description="List files and directories under any local directory. Read-only access does not require permission escalation.",
         parameters={
             "type": "object",
             "properties": {
@@ -368,7 +371,7 @@ CC_EXTRA_TOOLS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="NotebookEdit",
-        description="Insert, replace, or delete a cell in a Jupyter .ipynb notebook.",
+        description="Insert, replace, or delete a cell in a Jupyter .ipynb notebook. Editing outside the workspace requires sandbox_permissions=require_escalated.",
         parameters={
             "type": "object",
             "properties": {
@@ -377,6 +380,7 @@ CC_EXTRA_TOOLS: list[ToolDefinition] = [
                 "source": {"type": "string"},
                 "cell_type": {"type": "string", "default": "code"},
                 "mode": {"type": "string", "default": "replace"},
+                "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]},
             },
             "required": ["file_path", "cell_index"],
             "additionalProperties": False,

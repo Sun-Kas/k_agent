@@ -90,6 +90,31 @@ class AccessBoundaryTests(unittest.TestCase):
             },
         )
 
+    def test_activity_snapshot_is_encoded_as_a_regular_sse_frame(self) -> None:
+        approval_event = {
+            "type": "ACTIVITY_SNAPSHOT",
+            "messageId": "approval-1",
+            "activityType": "approval",
+            "content": {"id": "approval-1", "runId": "run-1", "status": "pending"},
+        }
+
+        frame = AgentAccessLayer._encode_sse(approval_event)
+
+        self.assertTrue(frame.startswith("data: "))
+        self.assertIn('"ACTIVITY_SNAPSHOT"', frame)
+        self.assertTrue(frame.endswith("\n\n"))
+        self.assertNotIn(": flush ", frame)
+
+    def test_regular_sse_frame_has_no_padding(self) -> None:
+        frame = AgentAccessLayer._encode_sse({
+            "type": "TOOL_CALL_START",
+            "toolCallId": "tool-1",
+            "toolCallName": "Bash",
+        })
+
+        self.assertTrue(frame.startswith("data: "))
+        self.assertNotIn(": flush ", frame)
+
     def test_agent_backend_run_receives_resolved_catalog_entries(self) -> None:
         backend_main = (
             Path(__file__).resolve().parents[1] / "main.py"

@@ -187,6 +187,13 @@ export type AgUiEvent =
       content: string;
       role?: "tool";
     }
+  | {
+      type: "ACTIVITY_SNAPSHOT";
+      messageId: string;
+      activityType: string;
+      content: unknown;
+      replace?: boolean;
+    }
   | { type: "CUSTOM"; name: string; value: Record<string, unknown> };
 
 export interface ThinkingActivity {
@@ -194,7 +201,7 @@ export interface ThinkingActivity {
   phase: "analysis" | "reasoning" | "tool" | "synthesis" | "complete";
   title: string;
   detail: string;
-  status: "active" | "complete" | "error";
+  status: "active" | "complete" | "error" | "stopped";
   iteration: number;
   createdAt: string;
 }
@@ -261,7 +268,9 @@ export interface ToolActivity {
   name: string;
   arguments: string;
   result?: string;
-  status: "preparing" | "running" | "waiting" | "complete" | "error";
+  liveOutput?: string;
+  executionMode?: "foreground" | "interactive";
+  status: "preparing" | "running" | "waiting" | "complete" | "error" | "stopped";
   sequence?: number;
   textOffset?: number;
 }
@@ -283,7 +292,7 @@ export interface ApprovalActivity {
   title: string;
   message: string;
   detail: Record<string, unknown>;
-  status: "pending" | "submitting" | "approved" | "denied" | "cancelled" | "error";
+  status: "pending" | "submitting" | "approved" | "denied" | "cancelled" | "expired" | "error";
   sequence: number;
   error?: string;
 }
