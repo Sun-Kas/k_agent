@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
@@ -33,6 +33,15 @@ class ToolCallRecord(BaseModel):
     arguments: str = ""
 
 
+class MessageAttachment(BaseModel):
+    """Persisted inline media owned by one user turn."""
+
+    model_config = ConfigDict(populate_by_name=True)
+    name: str = Field(min_length=1, max_length=255)
+    type: str = Field(min_length=1, max_length=100)
+    data_url: str = Field(alias="dataUrl", min_length=1)
+
+
 class ChatMessage(BaseModel):
     """描述可写入历史并参与下一轮上下文的消息。"""
     model_config = ConfigDict(populate_by_name=True)
@@ -42,6 +51,7 @@ class ChatMessage(BaseModel):
     created_at: datetime = Field(alias="createdAt")
     meta: ChatMeta | None = None
     tool_calls: list[ToolCallRecord] = Field(default_factory=list, alias="toolCalls")
+    attachments: list[MessageAttachment] = Field(default_factory=list)
 
     def carries_context(self) -> bool:
         """Whether this message still contributes input for the next model call.
@@ -51,7 +61,7 @@ class ChatMessage(BaseModel):
         orphans that providers reject.
         """
 
-        return bool(self.content.strip()) or bool(self.tool_calls)
+        return bool(self.content.strip()) or bool(self.tool_calls) or bool(self.attachments)
 
 
 class SessionSummary(BaseModel):
@@ -126,11 +136,24 @@ class ModelProfileInput(BaseModel):
     api_key: str | None = Field(default=None, alias="apiKey")
     api_key_env: str | None = Field(default=None, alias="apiKeyEnv")
     multimodal: bool = False
+    input_modalities: list[Literal["text", "image", "video"]] | None = Field(
+        default=None, alias="inputModalities"
+    )
     supports_reasoning: bool = Field(default=False, alias="supportsReasoning")
     context_window: int = Field(default=128_000, alias="contextWindow", ge=8_000)
     max_output_tokens: int = Field(default=8_192, alias="maxOutputTokens", ge=256)
     context_safety_tokens: int = Field(default=4_096, alias="contextSafetyTokens", ge=0)
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def normalize_input_modalities(self) -> "ModelProfileInput":
+        """Upgrade legacy multimodal=true profiles to explicit image capability."""
+        if self.input_modalities is None:
+            self.input_modalities = ["text", "image"] if self.multimodal else ["text"]
+        elif "text" not in self.input_modalities:
+            self.input_modalities.insert(0, "text")
+        self.multimodal = "image" in self.input_modalities or "video" in self.input_modalities
+        return self
 
 
 class ModelsConfigUpdate(BaseModel):

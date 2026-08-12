@@ -50,6 +50,7 @@ import type {
   DetectedAgent,
   HealthState,
   ModelProfile,
+  MediaAttachment,
   PermissionMode,
   ReasoningEffort,
   RuntimeOption,
@@ -144,11 +145,12 @@ type ActiveConversationRun = {
   stopped?: boolean;
 };
 
-const createMessage = (role: ChatMessage["role"], content: string): ChatMessage => ({
+const createMessage = (role: ChatMessage["role"], content: string, attachments?: MediaAttachment[]): ChatMessage => ({
   id: createClientId(),
   role,
   content,
-  createdAt: new Date().toISOString()
+  createdAt: new Date().toISOString(),
+  ...(attachments?.length ? { attachments } : {})
 });
 
 function normalizeMessages(messages: unknown): ChatMessage[] {
@@ -170,10 +172,27 @@ function normalizeMessages(messages: unknown): ChatMessage[] {
         : record.content == null
           ? ""
           : safeStringify(record.content),
+      attachments: Array.isArray(record.attachments)
+        ? record.attachments.filter(isMediaAttachment)
+        : undefined,
       createdAt,
       meta: record.meta && typeof record.meta === "object" ? record.meta as ChatMessage["meta"] : undefined
     };
   });
+}
+
+function isMediaAttachment(value: unknown): value is MediaAttachment {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.name === "string"
+    && typeof item.type === "string"
+    && typeof item.dataUrl === "string"
+    && (item.type.startsWith("image/") || item.type.startsWith("video/"));
+}
+
+function modelInputModalities(model: ModelProfile | undefined): Set<"text" | "image" | "video"> {
+  const configured = model?.inputModalities?.filter((item) => ["text", "image", "video"].includes(item));
+  return new Set(configured?.length ? configured : model?.multimodal ? ["text", "image"] : ["text"]);
 }
 
 function safeStringify(value: unknown): string {
@@ -338,7 +357,7 @@ export function App() {
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("none");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("default");
-  const [attachments, setAttachments] = useState<Array<{ name: string; dataUrl: string; type: string }>>([]);
+  const [attachments, setAttachments] = useState<MediaAttachment[]>([]);
   const [listening, setListening] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<CopyFeedback | null>(null);
   const [voicePlayback, setVoicePlayback] = useState<VoicePlaybackState>(() => {
@@ -700,6 +719,10 @@ export function App() {
       setAgentKind(nextKind);
       const nextModel = resolveModelForAgent(nextKind, enabledModels, availableAgents);
       setModelId(nextModel);
+      const nextReasoningModel = nextKind === "k_agent"
+        ? enabledModels.find((model) => model.id === nextModel)
+        : modelsForAgent(nextKind, enabledModels, availableAgents).find((model) => model.id === nextModel);
+      setReasoningEffort(defaultReasoningForModel(nextReasoningModel));
       if (nextModel) writeModelForAgent(nextKind, nextModel);
       const remembered = capabilitySelectionRef.current;
       const nextMcp = remembered
@@ -1299,7 +1322,8 @@ export function App() {
       : "none";
     const runId = createClientId();
     const pendingAssistantId = createClientId();
-    const userMessage = createMessage("user", prompt);
+    const submittedAttachments = attachments;
+    const userMessage = createMessage("user", prompt, submittedAttachments);
     const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
     const targetSessionId = sessionId ?? createClientId();
     // Access Layer 只收本轮 user 消息；完整历史由服务端按 threadId 拼接。
@@ -1322,7 +1346,7 @@ export function App() {
         mcpServerIds: selectedMcp,
         skillIds: selectedSkills,
         reasoningEffort: effectiveReasoningEffort,
-        attachments,
+        attachments: submittedAttachments,
         agentKind,
         // 语音风格是 run 级元数据，不写进 prompt，保证落库 transcript 与用户原话一致。
         agentOptions: {
@@ -2071,21 +2095,32 @@ export function App() {
     }
   }
 
-  async function addImages(files: FileList | null) {
+  async function addMedia(files: FileList | null) {
     if (!files) return;
     const selectedModel = models.find((model) => model.id === modelId);
-    if (!selectedModel?.multimodal) {
-      setStatus("当前模型不支持图片输入");
+    const modalities = modelInputModalities(selectedModel);
+    const remaining = Math.max(0, 4 - attachments.length);
+    const accepted = Array.from(files).filter((file) => {
+      const modality = file.type.startsWith("video/") ? "video" : file.type.startsWith("image/") ? "image" : null;
+      return modality !== null && modalities.has(modality);
+    }).slice(0, remaining);
+    const oversized = accepted.find((file) => file.size > 20 * 1024 * 1024);
+    if (oversized) {
+      setStatus(`${oversized.name} 超过 20 MB，无法添加`);
       return;
     }
-    const images = Array.from(files).filter((file) => file.type.startsWith("image/")).slice(0, 4);
-    const encoded = await Promise.all(images.map((file) => new Promise<{ name: string; dataUrl: string; type: string }>((resolve, reject) => {
+    if (!accepted.length) {
+      setStatus("当前模型不支持所选媒体类型，或附件已达到 4 个");
+      return;
+    }
+    const encoded = await Promise.all(accepted.map((file) => new Promise<MediaAttachment>((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve({ name: file.name, dataUrl: String(reader.result), type: file.type });
       reader.onerror = () => reject(reader.error);
       reader.readAsDataURL(file);
     })));
     setAttachments((current) => [...current, ...encoded].slice(0, 4));
+    setStatus(`已添加 ${encoded.length} 个媒体文件`);
   }
 
   function toggleVoiceInput() {
@@ -2716,7 +2751,8 @@ export function App() {
                       )
                       : (
                         <div className="bubble">
-                          {message.content ? <MarkdownContent content={message.content} /> : <Typing />}
+                          {message.attachments?.length ? <MessageMedia attachments={message.attachments} /> : null}
+                          {message.content ? <MarkdownContent content={message.content} /> : message.attachments?.length ? null : <Typing />}
                         </div>
                       )}
                     {!isActiveAssistant && (
@@ -2803,8 +2839,32 @@ export function App() {
             </div>
           </div>
         )}
+        <div className="composer-dock">
+        {(attachments.length > 0 || selectedMcp.length > 0 || selectedSkills.length > 0) && (
+          <ComposerSelectionRail
+            items={[
+              ...attachments.map((attachment, index) => ({
+                id: `media:${index}:${attachment.name}`,
+                kind: attachment.type.startsWith("video/") ? "video" as const : "image" as const,
+                label: attachment.name,
+                onRemove: () => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))
+              })),
+              ...selectedMcp.map((id) => ({
+                id: `mcp:${id}`,
+                kind: "mcp" as const,
+                label: mcpServers.find((server) => server.id === id)?.name || id,
+                onRemove: () => changeSelectedMcp(selectedMcp.filter((item) => item !== id))
+              })),
+              ...selectedSkills.map((id) => ({
+                id: `skill:${id}`,
+                kind: "skill" as const,
+                label: skills.find((skill) => skill.id === id)?.name || id,
+                onRemove: () => changeSelectedSkills(selectedSkills.filter((item) => item !== id))
+              }))
+            ]}
+          />
+        )}
         <form className="composer" onSubmit={handleSubmit}>
-          {attachments.length > 0 && <div className="attachment-list">{attachments.map((attachment, index) => <span key={`${attachment.name}-${index}`}>▧ {attachment.name}<button type="button" onClick={() => setAttachments(attachments.filter((_, i) => i !== index))}>×</button></span>)}</div>}
           <textarea
             ref={composerTextareaRef}
             aria-label="给 Agent 发送消息"
@@ -2823,8 +2883,8 @@ export function App() {
           <div className="composer-footer">
             <div className="composer-toolbar composer-toolbar-left">
               <ComposerAddMenu
-                imageEnabled={agentKind === "k_agent" && Boolean(models.find((model) => model.id === modelId)?.multimodal)}
-                onImages={(files) => { void addImages(files); }}
+                mediaModalities={agentKind === "k_agent" ? modelInputModalities(models.find((model) => model.id === modelId)) : new Set(["text"])}
+                onMedia={(files) => { void addMedia(files); }}
                 mcpItems={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description }))}
                 selectedMcp={selectedMcp}
                 onMcpChange={changeSelectedMcp}
@@ -2845,10 +2905,14 @@ export function App() {
                 onRuntimeChange={(nextAgent, nextModel) => {
                   setAgentKind(nextAgent);
                   localStorage.setItem(AGENT_KIND_STORAGE_KEY, nextAgent);
-                  if (nextAgent !== "k_agent" || !models.find((model) => model.id === nextModel)?.multimodal) setAttachments([]);
+                  const nextModalities = nextAgent === "k_agent" ? modelInputModalities(models.find((model) => model.id === nextModel)) : new Set(["text"]);
+                  setAttachments((current) => current.filter((item) => nextModalities.has(item.type.startsWith("video/") ? "video" : "image")));
                   setModelId(nextModel);
                   if (nextModel) writeModelForAgent(nextAgent, nextModel);
-                  setReasoningEffort("none");
+                  const nextReasoningModel = nextAgent === "k_agent"
+                    ? models.find((model) => model.id === nextModel)
+                    : modelsForAgent(nextAgent, models, agents).find((model) => model.id === nextModel);
+                  setReasoningEffort(defaultReasoningForModel(nextReasoningModel));
                 }}
                 onCliSessionModeChange={(value) => {
                   setCliSessionMode(value);
@@ -2870,6 +2934,7 @@ export function App() {
             </div>
           </div>
         </form>
+        </div>
         <p className="disclaimer">Agent 可能会犯错，关键结果请核实。</p>
         </>
         )}
@@ -3315,6 +3380,87 @@ function ToolIcon({ className = "" }: { className?: string }) {
   );
 }
 
+function MessageMedia({ attachments }: { attachments: MediaAttachment[] }) {
+  return (
+    <div className="message-media" aria-label="消息附件">
+      {attachments.map((attachment, index) => attachment.type.startsWith("video/") ? (
+        <video key={`${attachment.name}-${index}`} src={attachment.dataUrl} controls preload="metadata" aria-label={attachment.name} />
+      ) : (
+        <a key={`${attachment.name}-${index}`} href={attachment.dataUrl} target="_blank" rel="noreferrer" aria-label={`查看图片 ${attachment.name}`}>
+          <img src={attachment.dataUrl} alt={attachment.name} />
+        </a>
+      ))}
+    </div>
+  );
+}
+
+type ComposerSelectionItem = {
+  id: string;
+  kind: "image" | "video" | "mcp" | "skill";
+  label: string;
+  onRemove: () => void;
+};
+
+function ComposerSelectionRail({ items }: { items: ComposerSelectionItem[] }) {
+  const railRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ pointerId: number; startX: number; startScrollLeft: number; moved: boolean } | null>(null);
+  const [edges, setEdges] = useState({ start: false, end: false });
+
+  const updateEdges = () => {
+    const rail = railRef.current;
+    if (!rail) return;
+    setEdges({
+      start: rail.scrollLeft > 2,
+      end: rail.scrollLeft + rail.clientWidth < rail.scrollWidth - 2
+    });
+  };
+
+  useEffect(() => {
+    updateEdges();
+    const rail = railRef.current;
+    if (!rail) return;
+    const observer = new ResizeObserver(updateEdges);
+    observer.observe(rail);
+    return () => observer.disconnect();
+  }, [items]);
+
+  return (
+    <div className={`composer-selection-shell ${edges.start ? "fade-start" : ""} ${edges.end ? "fade-end" : ""}`}>
+      <div
+        ref={railRef}
+        className="composer-selection-rail"
+        aria-label="已添加的附件和能力"
+        onScroll={updateEdges}
+        onPointerDown={(event) => {
+          if ((event.target as HTMLElement).closest("button")) return;
+          dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startScrollLeft: event.currentTarget.scrollLeft, moved: false };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = dragRef.current;
+          if (!drag || drag.pointerId !== event.pointerId) return;
+          const delta = event.clientX - drag.startX;
+          if (Math.abs(delta) > 3) drag.moved = true;
+          event.currentTarget.scrollLeft = drag.startScrollLeft - delta;
+        }}
+        onPointerUp={(event) => {
+          if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null;
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => { dragRef.current = null; }}
+      >
+        {items.map((item) => (
+          <span className={`composer-selection-chip ${item.kind}`} key={item.id} title={item.label}>
+            <i aria-hidden="true">{item.kind === "image" ? "▧" : item.kind === "video" ? "▶" : item.kind === "mcp" ? "⌁" : "✦"}</i>
+            <strong>{item.label}</strong>
+            <button type="button" aria-label={`移除 ${item.label}`} onClick={item.onRemove}>×</button>
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function SidebarIcon({ side }: { side: "left" | "right" }) {
   return (
     <svg className={side === "right" ? "mirrored" : ""} viewBox="0 0 24 24" aria-hidden="true">
@@ -3325,8 +3471,8 @@ function SidebarIcon({ side }: { side: "left" | "right" }) {
 }
 
 function ComposerAddMenu({
-  imageEnabled,
-  onImages,
+  mediaModalities,
+  onMedia,
   mcpItems,
   selectedMcp,
   onMcpChange,
@@ -3334,8 +3480,8 @@ function ComposerAddMenu({
   selectedSkills,
   onSkillsChange
 }: {
-  imageEnabled: boolean;
-  onImages: (files: FileList | null) => void;
+  mediaModalities: Set<"text" | "image" | "video">;
+  onMedia: (files: FileList | null) => void;
   mcpItems: Array<{ id: string; name: string; description?: string }>;
   selectedMcp: string[];
   onMcpChange: (ids: string[]) => void;
@@ -3345,6 +3491,25 @@ function ComposerAddMenu({
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
+  const [contextQuery, setContextQuery] = useState("");
+  const [contextTab, setContextTab] = useState<"attachments" | "mcp" | "skills">("attachments");
+  const acceptsImage = mediaModalities.has("image");
+  const acceptsVideo = mediaModalities.has("video");
+  const mediaEnabled = acceptsImage || acceptsVideo;
+  const accept = [acceptsImage ? "image/*" : "", acceptsVideo ? "video/*" : ""].filter(Boolean).join(",");
+  const normalizedQuery = contextQuery.trim().toLocaleLowerCase();
+  const visibleMcp = mcpItems.filter((item) => !normalizedQuery || `${item.name} ${item.description ?? ""}`.toLocaleLowerCase().includes(normalizedQuery));
+  const visibleSkills = skillItems.filter((item) => !normalizedQuery || `${item.name} ${item.description ?? ""}`.toLocaleLowerCase().includes(normalizedQuery));
+
+  const openMenu = () => {
+    setContextQuery("");
+    setOpen(true);
+  };
+
+  const closeMenu = () => {
+    setOpen(false);
+    setContextQuery("");
+  };
 
   useEffect(() => {
     const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
@@ -3362,6 +3527,7 @@ function ComposerAddMenu({
     const checked = selected.includes(item.id);
     return (
       <label className={`composer-menu-option ${checked ? "selected" : ""}`} key={item.id}>
+        <b className="composer-context-avatar" aria-hidden="true">{item.name.slice(0, 1).toUpperCase()}</b>
         <input
           type="checkbox"
           checked={checked}
@@ -3370,7 +3536,7 @@ function ComposerAddMenu({
             : selected.filter((id) => id !== item.id))}
         />
         <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
-        <i>{checked ? "✓" : ""}</i>
+        <i>{checked ? "✓" : "+"}</i>
       </label>
     );
   };
@@ -3380,40 +3546,58 @@ function ComposerAddMenu({
       ref={menuRef}
       className={`composer-add-menu ${open ? "open" : ""}`}
       onKeyDown={(event) => {
-        if (event.key === "Escape") setOpen(false);
+        if (event.key === "Escape") closeMenu();
       }}
     >
       {open && (
-        <section className="composer-add-popover" aria-label="添加内容与能力">
-          <header>添加</header>
-          <label className={`composer-menu-option composer-file-option ${imageEnabled ? "" : "disabled"}`}>
-            <input
-              type="file"
-              accept="image/*"
-              multiple
-              disabled={!imageEnabled}
-              onChange={(event) => {
-                onImages(event.target.files);
-                event.target.value = "";
-                setOpen(false);
-              }}
-            />
-            <b>＋</b><span><strong>图片</strong><small>{imageEnabled ? "添加一张或多张图片" : "当前 Agent 不支持图片"}</small></span>
-          </label>
-          <div className="composer-menu-section">
-            <header><span>MCP</span><small>{selectedMcp.length} 已选择</small></header>
-            {mcpItems.length === 0 && <p>暂无可用 MCP</p>}
-            {mcpItems.map((item) => renderSelection(item, selectedMcp, onMcpChange))}
-          </div>
-          <div className="composer-menu-section">
-            <header><span>Skills</span><small>{selectedSkills.length} 已选择</small></header>
-            {skillItems.length === 0 && <p>暂无可用 Skill</p>}
-            {skillItems.map((item) => renderSelection(item, selectedSkills, onSkillsChange))}
+        <section className="composer-add-popover" aria-label="添加附件和能力">
+          <header className="composer-context-header">
+            <span className="composer-context-mark" aria-hidden="true">✦</span>
+            <span><strong>添加</strong><small>为当前对话添加附件、MCP 或 Skill</small></span>
+          </header>
+          {contextTab !== "attachments" && <label className="composer-context-search">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
+            <input value={contextQuery} onChange={(event) => setContextQuery(event.target.value)} placeholder="搜索 Skill、MCP…" />
+            <kbd>⌘ K</kbd>
+          </label>}
+          <nav className="composer-context-tabs" aria-label="添加内容分类">
+            {([['attachments', '附件', null], ['mcp', 'MCP', mcpItems.length], ['skills', 'Skills', skillItems.length]] as const).map(([id, label, count]) => (
+              <button className={contextTab === id ? "active" : ""} type="button" key={id} onClick={() => setContextTab(id)}>{label}{count !== null && <small>{count}</small>}</button>
+            ))}
+          </nav>
+          <div className="composer-context-scroll">
+          {contextTab === "attachments" && <div className="composer-menu-section composer-menu-section-first">
+              <label className={`composer-menu-option composer-file-option ${mediaEnabled ? "" : "disabled"}`}>
+                <input
+                  type="file"
+                  accept={accept}
+                  multiple
+                  disabled={!mediaEnabled}
+                  onChange={(event) => {
+                    onMedia(event.target.files);
+                    event.target.value = "";
+                    setOpen(false);
+                  }}
+                />
+                <b>＋</b><span><strong>图片 / 视频</strong><small>{mediaEnabled ? `支持${acceptsImage ? "图片" : ""}${acceptsImage && acceptsVideo ? "、" : ""}${acceptsVideo ? "视频" : ""}，最多 4 个、单个 20 MB` : "当前模型不支持多模态输入"}</small></span>
+              </label>
+          </div>}
+          {contextTab === "mcp" && <div className="composer-menu-section composer-menu-section-first">
+              {visibleMcp.length === 0 && <p>没有匹配的 MCP</p>}
+              {visibleMcp.map((item) => renderSelection(item, selectedMcp, onMcpChange))}
+          </div>}
+          {contextTab === "skills" && <div className="composer-menu-section composer-menu-section-first">
+              {visibleSkills.length === 0 && <p>没有匹配的 Skill</p>}
+              {visibleSkills.map((item) => renderSelection(item, selectedSkills, onSkillsChange))}
+          </div>}
           </div>
         </section>
       )}
-      <button className="composer-add-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen((value) => !value)}>
-        <span>＋</span><strong>添加</strong>
+      <button className="composer-add-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => open ? closeMenu() : openMenu()}>
+        <svg className="composer-add-icon" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="M6 1.75v8.5M1.75 6h8.5" />
+        </svg>
+        <strong>添加</strong>
         {(selectedMcp.length + selectedSkills.length) > 0 && <i>{selectedMcp.length + selectedSkills.length}</i>}
       </button>
     </div>
@@ -3434,6 +3618,12 @@ type ReasoningModel = Pick<ModelProfile, "id" | "supportsReasoning"> &
 function isDeepSeekModel(model?: ReasoningModel) {
   const marker = `${model?.id ?? ""} ${model?.name ?? ""} ${model?.model ?? ""} ${model?.baseUrl ?? ""}`.toLowerCase();
   return marker.includes("deepseek");
+}
+
+function defaultReasoningForModel(model?: ReasoningModel): ReasoningEffort {
+  // Product default is scoped to V4 Flash; other models keep their provider default.
+  const marker = `${model?.id ?? ""} ${model?.name ?? ""} ${model?.model ?? ""}`.toLowerCase();
+  return marker.includes("deepseek") && marker.includes("v4") && marker.includes("flash") ? "high" : "none";
 }
 
 function reasoningOptionsForModel(model?: ReasoningModel) {
@@ -3625,7 +3815,10 @@ function RuntimeSettingsPicker({
         });
       }}>
         <strong>{currentAgent?.name || "K Agent"}</strong><span>{currentModel?.name ?? "选择模型"}</span>
-        {supportsReasoning && <em>{currentReasoning?.name}</em>}<i>⌃</i>
+        {supportsReasoning && <em>{currentReasoning?.name}</em>}
+        <svg className="trigger-chevron" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="m3 4.75 3 3 3-3" />
+        </svg>
       </button>
     </div>
   );
@@ -3673,7 +3866,14 @@ function ComposerPermissionPicker({ value, onChange }: {
         title={value === "full_access" ? "完全权限：已关闭沙箱和审批" : "默认权限：越权时需要审批"}
         onClick={() => setOpen((current) => !current)}
       >
-        <span aria-hidden="true">◉</span><strong>{value === "full_access" ? "完全权限" : "默认权限"}</strong><i>⌃</i>
+        <svg className="permission-mode-icon" viewBox="0 0 12 12" aria-hidden="true">
+          <circle cx="6" cy="6" r="4.25" />
+          <circle cx="6" cy="6" r="2.25" />
+        </svg>
+        <strong>{value === "full_access" ? "完全权限" : "默认权限"}</strong>
+        <svg className="trigger-chevron" viewBox="0 0 12 12" aria-hidden="true">
+          <path d="m3 4.75 3 3 3-3" />
+        </svg>
       </button>
     </div>
   );

@@ -325,3 +325,13 @@
 - MCP 保存和手动 reload 会调用运行时热重载逻辑，同时重置 prompt cache。
 - 请求执行仍使用 per-request MCP manager，避免 MCP SDK stream 绑定事件循环导致串流请求异常。
 - app-level MCP manager 只用于健康检查、配置中心预览和能力读取。
+
+## 2026-08-12 对话图片 / 视频输入
+
+- 模型配置新增 `inputModalities: (text|image|video)[]`；旧的 `multimodal: true`
+  继续解释为 `text + image`，`multimodal` 字段保留用于向后兼容。
+- `forwardedProps.attachments` 接受最多 4 个内联图片或视频，每个不超过 20 MB。
+  Access Layer 校验 MIME 与 Data URL 后，将附件写入所属 user message 的
+  `attachments` 字段，因此刷新会话及下一轮上下文仍能保留媒体归属。
+- Agent Backend 将图片转换为 OpenAI 兼容的 `image_url` 内容块，将视频转换为
+  `video_url` 内容块，并依据所选模型的 `inputModalities` 再次拒绝不支持的媒体。

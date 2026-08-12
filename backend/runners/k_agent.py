@@ -55,8 +55,12 @@ class KAgentRunner:
         try:
             await mcp_manager.connect_all()
             model = select_model(ctx.model_id, settings)
-            if ctx.attachments and not model.get("multimodal", False):
-                raise ValueError("Selected model does not support image input")
+            media = [attachment for message in ctx.messages for attachment in message.attachments]
+            modalities = set(model.get("inputModalities") or (["text", "image"] if model.get("multimodal", False) else ["text"]))
+            required = {"video" if item.type.startswith("video/") else "image" for item in media}
+            unsupported = required - modalities
+            if unsupported:
+                raise ValueError(f"Selected model does not support {', '.join(sorted(unsupported))} input")
             skills = ctx.skills
             selected_mcp_ids = {
                 str(server.get("id"))

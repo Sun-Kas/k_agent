@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "mcd-mcp": {
+      "description": "查询麦当劳门店、菜单、优惠与商品信息",
       "type": "http",
       "command": null,
       "args": [],
@@ -14,6 +15,7 @@
       "enabled": true
     },
     "flight-price-compare": {
+      "description": "搜索并比较航班行程与机票价格",
       "type": "stdio",
       "command": "uvx",
       "args": [
@@ -31,6 +33,7 @@
       "enabled": true
     },
     "12306-mcp": {
+      "description": "查询 12306 车次、时刻与余票信息",
       "type": "stdio",
       "command": "npx",
       "args": [

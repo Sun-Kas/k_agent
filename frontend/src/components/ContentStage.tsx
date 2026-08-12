@@ -392,7 +392,10 @@ function TreeNodeView({
       }}
     >
       <span className="content-stage-glyph" aria-hidden>
-        {fileGlyph(node.name)}
+        <svg viewBox="0 0 16 16">
+          <path d="M4.25 1.75h4.6l2.9 2.9v9.6h-7.5z" />
+          <path d="M8.75 1.75v3h3" />
+        </svg>
       </span>
       <span className="content-stage-item-copy">
         <strong>{node.name}</strong>
@@ -800,19 +803,6 @@ function detectPreviewKind(title: string, content: string): PreviewKind {
   }
   if (/^#{1,6}\s|^\*\*|^\-\s|^\d+\.\s/m.test(trimmed)) return "markdown";
   return "text";
-}
-
-function fileGlyph(title: string): string {
-  const extension = title.toLowerCase().includes(".")
-    ? title.toLowerCase().slice(title.lastIndexOf(".") + 1)
-    : "";
-  if (["html", "htm"].includes(extension)) return "⌂";
-  if (["md", "markdown"].includes(extension)) return "¶";
-  if (["css", "scss"].includes(extension)) return "◈";
-  if (["js", "ts", "tsx", "jsx"].includes(extension)) return "{ }";
-  if (["json", "yml", "yaml"].includes(extension)) return "{}";
-  if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(extension)) return "▣";
-  return "◇";
 }
 
 function prettyJson(content: string): string {

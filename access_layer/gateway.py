@@ -34,6 +34,7 @@ from access_layer.request_context import (
 )
 from access_layer.sessions.store import SessionStore
 from backend.agui import to_chat_messages
+from backend.api.schemas import MessageAttachment
 from backend.logging_config import log_event
 
 
@@ -66,8 +67,9 @@ class AgentAccessLayer:
                 status_code=400,
                 detail="Each run must contain exactly one new user message",
             )
-        messages = submitted
         forwarded = payload.forwarded_props or {}
+        attachments = self._attachments(forwarded.get("attachments", []))
+        messages = [submitted[0].model_copy(update={"attachments": attachments})]
         agent_kind = forwarded.get("agentKind") or "k_agent"
         if not isinstance(agent_kind, str) or not agent_kind.strip():
             agent_kind = "k_agent"
@@ -178,9 +180,10 @@ class AgentAccessLayer:
                             "mcpServers": mcp_servers,
                             "skills": skills,
                             "reasoningEffort": forwarded.get("reasoningEffort"),
-                            "attachments": self._attachments(
-                                forwarded.get("attachments", [])
-                            ),
+                            # Media is persisted on its owning user message. This
+                            # legacy run-level field stays empty to prevent the
+                            # latest turn from accidentally inheriting old media.
+                            "attachments": [],
                             "agentKind": agent_kind,
                             "agentOptions": agent_options,
                         },
@@ -267,11 +270,28 @@ class AgentAccessLayer:
         return value
 
     @staticmethod
-    def _attachments(value: Any) -> list[dict[str, Any]]:
-        """过滤附件列表，只保留 dict 项后原样转发给后端。"""
+    def _attachments(value: Any) -> list[MessageAttachment]:
+        """Validate bounded image/video Data URLs before they enter session storage."""
         if not isinstance(value, list):
             raise HTTPException(status_code=400, detail="attachments must be a list")
-        return [item for item in value if isinstance(item, dict)]
+        if len(value) > 4:
+            raise HTTPException(status_code=400, detail="A maximum of 4 attachments is allowed")
+        result: list[MessageAttachment] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail="attachment must be an object")
+            media_type = str(item.get("type") or "").lower()
+            data_url = str(item.get("dataUrl") or "")
+            if not (media_type.startswith("image/") or media_type.startswith("video/")):
+                raise HTTPException(status_code=400, detail="Only image and video attachments are supported")
+            if not data_url.startswith(f"data:{media_type};base64,"):
+                raise HTTPException(status_code=400, detail="Attachment Data URL does not match its MIME type")
+            # Base64 expands bytes by roughly 4/3; cap the request before decoding
+            # so malformed input cannot consume unbounded memory in this layer.
+            if len(data_url) > 27_000_000:
+                raise HTTPException(status_code=413, detail="Each attachment must be 20 MB or smaller")
+            result.append(MessageAttachment.model_validate(item))
+        return result
 
     @staticmethod
     def _is_approval_activity(event: dict[str, Any]) -> bool:

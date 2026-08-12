@@ -9,11 +9,18 @@ export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
+  attachments?: MediaAttachment[];
   createdAt: string;
   meta?: {
     toolName?: string;
     runId?: string;
   };
+}
+
+export interface MediaAttachment {
+  name: string;
+  dataUrl: string;
+  type: string;
 }
 
 export interface SessionSummary {
@@ -94,6 +101,7 @@ export interface ModelProfile {
   apiKey?: string;
   apiKeyEnv?: string;
   multimodal: boolean;
+  inputModalities?: Array<"text" | "image" | "video">;
   supportsReasoning: boolean;
   contextWindow?: number;
   maxOutputTokens?: number;
@@ -222,7 +230,7 @@ export interface AgUiRunInput {
     mcpServerIds?: string[];
     skillIds?: string[];
     reasoningEffort?: ReasoningEffort;
-    attachments?: Array<{ name: string; dataUrl: string; type: string }>;
+    attachments?: MediaAttachment[];
     agentKind?: AgentKind;
     agentOptions?: {
       voiceConversation?: boolean;

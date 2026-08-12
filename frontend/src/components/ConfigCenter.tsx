@@ -525,12 +525,32 @@ function ModelCard({ model, onChange, onRemove }: { model: ModelProfile; onChang
           <input type="number" min={0} step={256} value={model.contextSafetyTokens ?? 4096} onChange={(e) => onChange({ ...model, contextSafetyTokens: Number(e.target.value) })} />
         </Field>
         <div className="capability-switches">
-          <label><span><strong>多模态输入</strong><small>允许在对话中上传图片</small></span><Toggle checked={model.multimodal} onChange={(multimodal) => onChange({ ...model, multimodal })} /></label>
+          <label><span><strong>图片输入</strong><small>允许在对话中添加图片</small></span><Toggle checked={(model.inputModalities ?? (model.multimodal ? ["text", "image"] : ["text"])).includes("image")} onChange={(enabled) => onChange(updateModelInputModality(model, "image", enabled))} /></label>
+          <label><span><strong>视频输入</strong><small>仅为明确支持 video_url 的模型开启</small></span><Toggle checked={(model.inputModalities ?? []).includes("video")} onChange={(enabled) => onChange(updateModelInputModality(model, "video", enabled))} /></label>
           <label><span><strong>思考强度</strong><small>支持 reasoning_effort 参数</small></span><Toggle checked={model.supportsReasoning} onChange={(supportsReasoning) => onChange({ ...model, supportsReasoning })} /></label>
         </div>
       </div>}
     </article>
   );
+}
+
+function updateInputModality(model: ModelProfile, modality: "image" | "video", enabled: boolean): Array<"text" | "image" | "video"> {
+  const fallback: Array<"text" | "image" | "video"> = model.multimodal ? ["text", "image"] : ["text"];
+  const current = new Set<"text" | "image" | "video">(model.inputModalities ?? fallback);
+  if (enabled) current.add(modality); else current.delete(modality);
+  current.add("text");
+  return [...current];
+}
+
+function updateModelInputModality(model: ModelProfile, modality: "image" | "video", enabled: boolean): ModelProfile {
+  const inputModalities = updateInputModality(model, modality, enabled);
+  return {
+    ...model,
+    inputModalities,
+    // Keep the legacy bit in sync for older runtimes while explicit modalities
+    // remain authoritative for distinguishing image from video.
+    multimodal: inputModalities.includes("image") || inputModalities.includes("video")
+  };
 }
 
 function McpCard({ server, onChange, onRemove }: { server: McpServerConfig; onChange: (server: McpServerConfig) => void; onRemove: () => void }) {

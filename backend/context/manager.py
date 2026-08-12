@@ -276,16 +276,18 @@ def compose_api_messages(
     messages = pair_tool_messages(messages)
     for index, message in enumerate(messages):
         content: Any = message.content
-        # 附件只挂在最后一条用户消息上：它们属于本轮输入，重复挂到历史消息
-        # 会让多模态模型把旧图片当成新证据，也会成倍放大输入体积。
-        if attachments and index == len(messages) - 1 and message.role == "user":
+        # 新格式把媒体归属到具体 user turn；attachments 参数仅兼容尚未迁移的调用方。
+        message_attachments = [item.model_dump(by_alias=True) for item in message.attachments]
+        if not message_attachments and attachments and index == len(messages) - 1 and message.role == "user":
+            message_attachments = attachments
+        if message_attachments and message.role == "user":
             content = [{"type": "text", "text": message.content}]
             content.extend(
                 {
-                    "type": "image_url",
-                    "image_url": {"url": attachment["dataUrl"]},
+                    "type": "video_url" if str(attachment.get("type", "")).startswith("video/") else "image_url",
+                    ("video_url" if str(attachment.get("type", "")).startswith("video/") else "image_url"): {"url": attachment["dataUrl"]},
                 }
-                for attachment in attachments
+                for attachment in message_attachments
                 if attachment.get("dataUrl")
             )
         if message.role == "tool":

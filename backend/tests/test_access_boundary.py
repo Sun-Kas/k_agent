@@ -127,7 +127,7 @@ class AccessBoundaryTests(unittest.TestCase):
         self.assertNotIn('"/internal/config/mcp"', backend_main)
 
     def test_access_layer_builds_complete_multimodal_messages(self) -> None:
-        from backend.api.schemas import ChatMessage
+        from backend.api.schemas import ChatMessage, MessageAttachment
 
         messages = [
             ChatMessage(
@@ -135,6 +135,9 @@ class AccessBoundaryTests(unittest.TestCase):
                 role="user",
                 content="describe",
                 createdAt="2026-07-28T00:00:00+00:00",
+                attachments=[
+                    MessageAttachment(name="clip.mp4", type="video/mp4", dataUrl="data:video/mp4;base64,xyz")
+                ],
             )
         ]
         result = compose_api_messages(
@@ -148,9 +151,21 @@ class AccessBoundaryTests(unittest.TestCase):
         self.assertIn("<system-reminder>", result[1]["content"])
         self.assertEqual(result[2]["content"][0]["text"], "describe")
         self.assertEqual(
-            result[2]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,abc",
+            result[2]["content"][1]["video_url"]["url"],
+            "data:video/mp4;base64,xyz",
         )
+
+    def test_access_layer_validates_inline_media(self) -> None:
+        attachments = AgentAccessLayer._attachments([
+            {"name": "photo.png", "type": "image/png", "dataUrl": "data:image/png;base64,abc"}
+        ])
+        self.assertEqual(attachments[0].name, "photo.png")
+        self.assertEqual(attachments[0].data_url, "data:image/png;base64,abc")
+
+        with self.assertRaisesRegex(Exception, "Only image and video"):
+            AgentAccessLayer._attachments([
+                {"name": "notes.txt", "type": "text/plain", "dataUrl": "data:text/plain;base64,abc"}
+            ])
 
 
 if __name__ == "__main__":
