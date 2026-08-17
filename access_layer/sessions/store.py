@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import re
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -31,6 +33,10 @@ from backend.storage import StorageBackend
 
 
 logger = logging.getLogger("k_agent.access_layer.sessions")
+
+
+class SessionBusyError(RuntimeError):
+    """Raised when a destructive session operation races an active run."""
 
 
 @dataclass(slots=True)
@@ -418,6 +424,145 @@ class SessionStore:
         await self._ensure_loaded()
         async with self._lock:
             return self._sessions.get(session_id)
+
+    async def fork_session(self, session_id: str) -> SessionRecord | None:
+        """Clone a stable conversation and workspace into an independent branch.
+
+        Provider-native CLI resume ids are intentionally not copied: reusing them
+        would let Codex/Claude continue the source provider thread even though the
+        Access Layer created a new branch. Persisted messages remain the branch's
+        complete model context.
+        """
+
+        await self._ensure_loaded()
+        settings = await get_or_init_settings()
+        async with self._lock:
+            source = self._sessions.get(session_id)
+            if source is None:
+                return None
+            if self._session_is_active(session_id):
+                raise SessionBusyError("Cannot branch a session while it is running")
+
+            branch_id = str(uuid.uuid4())
+            branch = SessionRecord(
+                id=branch_id,
+                title=self._next_branch_title(source.title),
+                messages=[message.model_copy(deep=True) for message in source.messages],
+                trace=copy.deepcopy(source.trace),
+                tasks=copy.deepcopy(source.tasks),
+                thinking=copy.deepcopy(source.thinking),
+                events=self._events_for_branch(source.events, session_id, branch_id),
+                mcp_server_ids=(copy.deepcopy(source.mcp_server_ids) if source.mcp_server_ids is not None else None),
+                skill_ids=(copy.deepcopy(source.skill_ids) if source.skill_ids is not None else None),
+                permission_mode=source.permission_mode,
+                source="interactive",
+                source_ref=session_id,
+            )
+
+            if self._storage is not None:
+                source_workspace = self._storage.resolve(
+                    f"{settings.session_storage_prefix}/{session_id}/workspace"
+                )
+                branch_workspace = self._storage.resolve(
+                    f"{settings.session_storage_prefix}/{branch_id}/workspace"
+                )
+                await asyncio.to_thread(
+                    self._copy_workspace_tree, source_workspace, branch_workspace
+                )
+            self._sessions[branch_id] = branch
+            try:
+                await self._persist(branch)
+            except Exception:
+                self._sessions.pop(branch_id, None)
+                if self._storage is not None:
+                    branch_bundle = self._storage.resolve(
+                        f"{settings.session_storage_prefix}/{branch_id}"
+                    )
+                    await asyncio.to_thread(shutil.rmtree, branch_bundle, True)
+                raise
+            return branch
+
+    def _next_branch_title(self, source_title: str) -> str:
+        """Return a stable numeric sibling name such as title（2）, title（3）."""
+
+        base_title = re.sub(r"(?:（\d+）)+$", "", source_title).rstrip()
+        base_title = base_title or source_title
+        occupied = {1}
+        numeric_pattern = re.compile(rf"^{re.escape(base_title)}（(\d+)）$")
+        for session in self._sessions.values():
+            title = session.title.rstrip()
+            numeric_match = numeric_pattern.fullmatch(title)
+            if numeric_match:
+                occupied.add(int(numeric_match.group(1)))
+        return f"{base_title}（{max(occupied) + 1}）"
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete one complete session bundle after rejecting active-run races."""
+
+        await self._ensure_loaded()
+        settings = await get_or_init_settings()
+        async with self._lock:
+            if session_id not in self._sessions:
+                return False
+            if self._session_is_active(session_id):
+                raise SessionBusyError("Cannot delete a session while it is running")
+            if self._storage is not None:
+                bundle = self._storage.resolve(
+                    f"{settings.session_storage_prefix}/{session_id}"
+                )
+                if await asyncio.to_thread(bundle.exists):
+                    await asyncio.to_thread(shutil.rmtree, bundle)
+            self._sessions.pop(session_id, None)
+            self._drop_session_buffers(session_id)
+            self._active_run_ids.pop(session_id, None)
+            self._cancelled_active_run_ids.pop(session_id, None)
+            self._stopped_active_run_ids.pop(session_id, None)
+            self._run_input_message_ids = {
+                key: value
+                for key, value in self._run_input_message_ids.items()
+                if key[0] != session_id
+            }
+            self._cancelled_run_ids = {
+                key for key in self._cancelled_run_ids if key[0] != session_id
+            }
+            self._stopped_run_ids = {
+                key for key in self._stopped_run_ids if key[0] != session_id
+            }
+            return True
+
+    def _session_is_active(self, session_id: str) -> bool:
+        """Treat any active run or unfinished projection buffer as busy."""
+
+        return (
+            session_id in self._active_run_ids
+            or any(key[0] == session_id for key in self._text_buffers)
+            or any(key[0] == session_id for key in self._tool_call_buffers)
+        )
+
+    @staticmethod
+    def _events_for_branch(
+        events: list[dict[str, Any]], source_id: str, branch_id: str
+    ) -> list[dict[str, Any]]:
+        """Retarget only session identity fields; user/model text stays byte-for-byte."""
+
+        cloned = copy.deepcopy(events)
+        for event in cloned:
+            if event.get("threadId") == source_id:
+                event["threadId"] = branch_id
+            for field in ("value", "content"):
+                nested = event.get(field)
+                if isinstance(nested, dict) and nested.get("threadId") == source_id:
+                    nested["threadId"] = branch_id
+        return cloned
+
+    @staticmethod
+    def _copy_workspace_tree(source: Path, destination: Path) -> None:
+        """Copy the branch workspace while preserving symlinks instead of following them."""
+
+        if source.is_dir():
+            shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+        else:
+            destination.mkdir(parents=True, exist_ok=True)
 
     def _drop_session_buffers(self, session_id: str) -> None:
         """Discard partial text and tool-call state left by a finished run."""

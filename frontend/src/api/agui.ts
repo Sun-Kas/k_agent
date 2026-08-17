@@ -262,11 +262,40 @@ export async function importSkill(file: File): Promise<{ id: string; name: strin
 }
 
 export async function getSession(sessionId: string): Promise<SessionState> {
-  const response = await fetch(apiUrl(`/api/sessions/${sessionId}`));
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}`));
   if (!response.ok) {
     throw new Error(`Unable to load session (${response.status})`);
   }
   return response.json() as Promise<SessionState>;
+}
+
+export async function forkSession(sessionId: string): Promise<SessionSummary> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/fork`), {
+    method: "POST"
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法创建对话分支"));
+  }
+  return response.json() as Promise<SessionSummary>;
+}
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}`), {
+    method: "DELETE"
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法删除对话"));
+  }
+}
+
+async function sessionActionError(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json() as { detail?: string };
+    if (payload.detail?.trim()) return `${fallback}：${payload.detail}`;
+  } catch {
+    // Preserve the status fallback when an upstream proxy returned non-JSON.
+  }
+  return `${fallback}（${response.status}）`;
 }
 
 export async function cancelSessionRun(sessionId: string, runId: string): Promise<void> {

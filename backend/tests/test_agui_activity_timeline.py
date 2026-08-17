@@ -21,8 +21,9 @@ from ag_ui.core import (
 )
 
 from backend.agui import to_chat_messages, translate_agent_events
-from access_layer.sessions.store import SessionStore
+from access_layer.sessions.store import SessionBusyError, SessionStore
 from backend.api.schemas import ChatMessage
+from backend.config import get_or_init_settings
 from backend.storage import FileStorage
 
 
@@ -360,6 +361,96 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cleared.mcp_server_ids, [])
             self.assertEqual(cleared.skill_ids, [])
             self.assertEqual(cleared.permission_mode, "default")
+
+    async def test_session_branch_copies_history_capabilities_and_workspace(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = FileStorage(tmp)
+            store = SessionStore(storage)
+            source = await store.create_session(session_id="thread-source", title="Source")
+            user = ChatMessage(
+                id="user-source",
+                role="user",
+                content="keep this history",
+                createdAt=datetime.now(timezone.utc),
+            )
+            await store.save_run_start(
+                source.id,
+                [user],
+                run_id="run-source",
+                mcp_server_ids=["mcp-a"],
+                skill_ids=["skill-a"],
+                permission_mode="full_access",
+            )
+            await store.append_event(
+                source.id,
+                {"type": "RUN_STARTED", "threadId": source.id, "runId": "run-source"},
+            )
+            await store.append_event(
+                source.id,
+                {
+                    "type": "CUSTOM",
+                    "name": "cli_session",
+                    "value": {"kind": "codex", "sessionId": "provider-source"},
+                },
+            )
+            await store.append_event(
+                source.id,
+                {"type": "RUN_FINISHED", "threadId": source.id, "runId": "run-source"},
+            )
+            settings = await get_or_init_settings()
+            workspace = storage.resolve(
+                f"{settings.session_storage_prefix}/{source.id}/workspace"
+            )
+            (workspace / "note.txt").write_text("branch me", encoding="utf-8")
+
+            branch = await store.fork_session(source.id)
+
+            assert branch is not None
+            self.assertNotEqual(branch.id, source.id)
+            self.assertEqual(branch.title, "Source（2）")
+            self.assertEqual([message.content for message in branch.messages], ["keep this history"])
+            self.assertEqual(branch.mcp_server_ids, ["mcp-a"])
+            self.assertEqual(branch.skill_ids, ["skill-a"])
+            self.assertEqual(branch.permission_mode, "full_access")
+            self.assertEqual(branch.cli_sessions, {})
+            self.assertEqual(branch.source_ref, source.id)
+            self.assertTrue(all(event.get("threadId") != source.id for event in branch.events))
+            branch_workspace = storage.resolve(
+                f"{settings.session_storage_prefix}/{branch.id}/workspace/note.txt"
+            )
+            self.assertEqual(branch_workspace.read_text(encoding="utf-8"), "branch me")
+
+            second_branch = await store.fork_session(source.id)
+            assert second_branch is not None
+            self.assertEqual(second_branch.title, "Source（3）")
+            nested_branch = await store.fork_session(branch.id)
+            assert nested_branch is not None
+            self.assertEqual(nested_branch.title, "Source（4）")
+
+    async def test_delete_session_removes_bundle_and_active_runs_block_actions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            storage = FileStorage(tmp)
+            store = SessionStore(storage)
+            session = await store.create_session(session_id="thread-delete")
+            await store.append_event(
+                session.id,
+                {"type": "RUN_STARTED", "threadId": session.id, "runId": "run-active"},
+            )
+            with self.assertRaises(SessionBusyError):
+                await store.fork_session(session.id)
+            with self.assertRaises(SessionBusyError):
+                await store.delete_session(session.id)
+
+            await store.append_event(
+                session.id,
+                {"type": "RUN_FINISHED", "threadId": session.id, "runId": "run-active"},
+            )
+            settings = await get_or_init_settings()
+            bundle = storage.resolve(f"{settings.session_storage_prefix}/{session.id}")
+            self.assertTrue(bundle.is_dir())
+            self.assertTrue(await store.delete_session(session.id))
+            self.assertFalse(bundle.exists())
+            self.assertIsNone(await store.get(session.id))
 
     async def test_text_uses_standard_start_content_end_events(self) -> None:
         assistant = ChatMessage(

@@ -39,7 +39,7 @@ from access_layer.request_context import (
     reset_request_context,
     set_request_context,
 )
-from access_layer.sessions.store import SessionStore
+from access_layer.sessions.store import SessionBusyError, SessionStore
 from access_layer.sessions.workspace import (
     list_session_workspace,
     read_session_workspace_file,
@@ -54,6 +54,7 @@ from backend.api.schemas import (
     McpConfigUpdate,
     ModelsConfigUpdate,
     SessionRunCancelInput,
+    SessionSummary,
     SessionState,
     SessionCapabilities,
     SkillsConfigUpdate,
@@ -853,6 +854,35 @@ def create_app() -> FastAPI:
                 else None
             ),
         )
+
+    @app.post("/api/sessions/{session_id}/fork", response_model=SessionSummary)
+    async def fork_session(session_id: str) -> SessionSummary:
+        """复制稳定的对话历史和 workspace，创建后续运行互不影响的新分支。"""
+
+        try:
+            branch = await app.state.session_store.fork_session(session_id)
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if branch is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return SessionSummary(
+            id=branch.id,
+            title=branch.title,
+            updatedAt=branch.updated_at,
+            messageCount=len(branch.messages),
+        )
+
+    @app.delete("/api/sessions/{session_id}")
+    async def delete_session(session_id: str) -> dict[str, bool]:
+        """删除完整会话包；运行中的会话必须先停止，避免迟到事件复活数据。"""
+
+        try:
+            deleted = await app.state.session_store.delete_session(session_id)
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"deleted": True}
 
     @app.post("/api/sessions/{session_id}/runs/cancel")
     async def cancel_session_run(session_id: str, payload: SessionRunCancelInput):

@@ -13,6 +13,8 @@ import {
   useState
 } from "react";
 import {
+  deleteSession,
+  forkSession,
   getAgentsCatalog,
   getHealth,
   getModelsConfig,
@@ -321,6 +323,11 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
+  const [sessionMenuId, setSessionMenuId] = useState<string | null>(null);
+  const [sessionMenuOpensUp, setSessionMenuOpensUp] = useState(false);
+  const [sessionDeleteConfirmId, setSessionDeleteConfirmId] = useState<string | null>(null);
+  const [sessionActionBusyId, setSessionActionBusyId] = useState<string | null>(null);
+  const [sessionActionError, setSessionActionError] = useState<{ id: string; message: string } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     const saved = localStorage.getItem("k-agent-sidebar-collapsed");
@@ -468,6 +475,33 @@ export function App() {
     voiceConversationActiveRef.current = voiceConversation.active;
     voiceInputMutedRef.current = voiceConversation.inputMuted;
   }, [voiceConversation.active, voiceConversation.inputMuted]);
+
+  useEffect(() => {
+    if (!sessionMenuId) return;
+    const closeSessionMenu = (event: globalThis.PointerEvent) => {
+      const target = event.target as Element | null;
+      if (!target?.closest(`[data-session-actions-id="${CSS.escape(sessionMenuId)}"]`)) {
+        setSessionMenuId(null);
+        setSessionMenuOpensUp(false);
+        setSessionDeleteConfirmId(null);
+        setSessionActionError(null);
+      }
+    };
+    const closeSessionMenuOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSessionMenuId(null);
+        setSessionMenuOpensUp(false);
+        setSessionDeleteConfirmId(null);
+        setSessionActionError(null);
+      }
+    };
+    document.addEventListener("pointerdown", closeSessionMenu);
+    document.addEventListener("keydown", closeSessionMenuOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeSessionMenu);
+      document.removeEventListener("keydown", closeSessionMenuOnEscape);
+    };
+  }, [sessionMenuId]);
 
   useEffect(() => {
     const handleShortcut = (event: globalThis.KeyboardEvent) => {
@@ -694,6 +728,51 @@ export function App() {
     } catch {
       // A transient list failure must not erase navigation back to local runs.
       setSessions((current) => current.filter((session) => activeRunsRef.current.has(session.id)));
+    }
+  }
+
+  async function branchConversation(sourceId: string) {
+    if (runningSessionIds.has(sourceId) || sessionActionBusyId) return;
+    setSessionActionBusyId(sourceId);
+    setSessionActionError(null);
+    try {
+      const branch = await forkSession(sourceId);
+      setSessions((current) => [branch, ...current.filter((item) => item.id !== branch.id)]);
+      setSessionMenuId(null);
+      setSessionDeleteConfirmId(null);
+      setView("chat");
+      await openSession(branch.id);
+      setStatus("已创建对话分支");
+    } catch (error) {
+      setSessionActionError({
+        id: sourceId,
+        message: error instanceof Error ? error.message : "无法创建对话分支"
+      });
+    } finally {
+      setSessionActionBusyId(null);
+    }
+  }
+
+  async function removeConversation(targetId: string) {
+    if (runningSessionIds.has(targetId) || sessionActionBusyId) return;
+    setSessionActionBusyId(targetId);
+    setSessionActionError(null);
+    try {
+      await deleteSession(targetId);
+      setSessions((current) => current.filter((item) => item.id !== targetId));
+      setSessionMenuId(null);
+      setSessionDeleteConfirmId(null);
+      const removedCurrentSession = targetId === sessionId;
+      if (removedCurrentSession) startNewSession();
+      await refreshSessions();
+      if (removedCurrentSession) setStatus("对话已删除");
+    } catch (error) {
+      setSessionActionError({
+        id: targetId,
+        message: error instanceof Error ? error.message : "无法删除对话"
+      });
+    } finally {
+      setSessionActionBusyId(null);
     }
   }
 
@@ -2487,33 +2566,94 @@ export function App() {
           {filteredSessions.length === 0 && (
             <p className="empty-note">{query ? "没有匹配的会话" : "你的对话会显示在这里"}</p>
           )}
-          {filteredSessions.map((session) => (
-            <button
-              className={`session-item ${session.id === sessionId ? "active" : ""} ${runningSessionIds.has(session.id) ? "running" : ""}`}
-              key={session.id}
-              type="button"
-              onClick={() => { setView("chat"); void openSession(session.id); }}
-            >
-              {runningSessionIds.has(session.id)
-                ? (
-                  <span
-                    className="session-run-indicator"
-                    role="status"
-                    aria-label="正在流式执行"
-                    title="正在流式执行"
-                  />
-                )
-                : <span className="session-glyph">◫</span>}
-              <span className="session-copy">
-                <strong>{session.title}</strong>
-                <small>
-                  {runningSessionIds.has(session.id)
-                    ? "正在流式执行"
-                    : `${formatRelativeTime(session.updatedAt)} · ${session.messageCount} 条`}
-                </small>
-              </span>
-            </button>
-          ))}
+          {filteredSessions.map((session) => {
+            const running = runningSessionIds.has(session.id);
+            const menuOpen = sessionMenuId === session.id;
+            const confirmingDelete = sessionDeleteConfirmId === session.id;
+            const actionBusy = sessionActionBusyId === session.id;
+            return (
+              <div
+                className={`session-row ${menuOpen ? "menu-open" : ""}`}
+                data-session-actions-id={session.id}
+                key={session.id}
+              >
+                <button
+                  className={`session-item ${session.id === sessionId ? "active" : ""} ${running ? "running" : ""}`}
+                  type="button"
+                  onClick={() => { setView("chat"); void openSession(session.id); }}
+                >
+                  {running
+                    ? (
+                      <span
+                        className="session-run-indicator"
+                        role="status"
+                        aria-label="正在流式执行"
+                        title="正在流式执行"
+                      />
+                    )
+                    : <span className="session-glyph">◫</span>}
+                  <span className="session-copy">
+                    <strong>{session.title}</strong>
+                    <small>
+                      {running
+                        ? "正在流式执行"
+                        : `${formatRelativeTime(session.updatedAt)} · ${session.messageCount} 条`}
+                    </small>
+                  </span>
+                </button>
+                <button
+                  className="session-more"
+                  type="button"
+                  aria-label={`管理对话：${session.title}`}
+                  aria-expanded={menuOpen}
+                  aria-haspopup="menu"
+                  onClick={(event) => {
+                    const row = event.currentTarget.closest(".session-row");
+                    const list = event.currentTarget.closest(".session-list");
+                    const rowRect = row?.getBoundingClientRect();
+                    const listRect = list?.getBoundingClientRect();
+                    const requiredMenuHeight = 116;
+                    const roomBelow = rowRect && listRect ? listRect.bottom - rowRect.bottom : requiredMenuHeight;
+                    const roomAbove = rowRect && listRect ? rowRect.top - listRect.top : 0;
+                    setSessionMenuId(menuOpen ? null : session.id);
+                    setSessionMenuOpensUp(!menuOpen && roomBelow < requiredMenuHeight && roomAbove > roomBelow);
+                    setSessionDeleteConfirmId(null);
+                    setSessionActionError(null);
+                  }}
+                >
+                  <SessionMoreIcon />
+                </button>
+                {menuOpen && (
+                  <section className={`session-actions-menu ${sessionMenuOpensUp ? "opens-up" : ""}`} role="menu" aria-label={`对话操作：${session.title}`}>
+                    {confirmingDelete
+                      ? (
+                        <div className="session-delete-confirm" role="alert">
+                          <strong>删除这个对话？</strong>
+                          <small>历史记录和工作区文件将永久删除。</small>
+                          <div>
+                            <button type="button" disabled={actionBusy} onClick={() => setSessionDeleteConfirmId(null)}>取消</button>
+                            <button className="danger" type="button" disabled={actionBusy} onClick={() => void removeConversation(session.id)}>
+                              {actionBusy ? "删除中…" : "确认删除"}
+                            </button>
+                          </div>
+                        </div>
+                      )
+                      : (
+                        <>
+                          <button role="menuitem" type="button" disabled={running || actionBusy} onClick={() => void branchConversation(session.id)}>
+                            <SessionBranchIcon /><span><strong>创建分支</strong><small>复制历史、能力和工作区</small></span>
+                          </button>
+                          <button className="danger" role="menuitem" type="button" disabled={running || actionBusy} onClick={() => setSessionDeleteConfirmId(session.id)}>
+                            <SessionTrashIcon /><span><strong>删除对话</strong><small>{running ? "请先停止当前运行" : "永久删除此对话"}</small></span>
+                          </button>
+                        </>
+                      )}
+                    {sessionActionError?.id === session.id && <p className="session-action-error">{sessionActionError.message}</p>}
+                  </section>
+                )}
+              </div>
+            );
+          })}
         </nav>
         <button
           className="connection"
@@ -2726,7 +2866,13 @@ export function App() {
                       activity.type === "thinking"
                         ? <InlineThinking block={activity.block} key={`thinking-${activity.block.id}`} />
                         : activity.type === "tool"
-                          ? <InlineToolActivity tool={activity.tool} key={`tool-${activity.tool.id}`} />
+                          ? (
+                            <InlineToolActivity
+                              tool={activity.tool}
+                              autoOpenExternalUrl={isActiveAssistant && activity.tool.status === "running"}
+                              key={`tool-${activity.tool.id}`}
+                            />
+                          )
                           : activity.type === "approval"
                             ? (
                               <ApprovalCard
@@ -3459,6 +3605,18 @@ function ComposerSelectionRail({ items }: { items: ComposerSelectionItem[] }) {
       </div>
     </div>
   );
+}
+
+function SessionMoreIcon() {
+  return <svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="2.25" cy="6" r=".8" /><circle cx="6" cy="6" r=".8" /><circle cx="9.75" cy="6" r=".8" /></svg>;
+}
+
+function SessionBranchIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="4" cy="3.5" r="1.5" /><circle cx="12" cy="12.5" r="1.5" /><path d="M4 5v2.25A2.75 2.75 0 0 0 6.75 10H12M4 7.5h5A3 3 0 0 0 12 4.5V3" /></svg>;
+}
+
+function SessionTrashIcon() {
+  return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 5h9M6 2.75h4M5 5l.5 8h5l.5-8M6.75 7v4M9.25 7v4" /></svg>;
 }
 
 function SidebarIcon({ side }: { side: "left" | "right" }) {

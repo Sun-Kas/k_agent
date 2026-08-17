@@ -453,7 +453,9 @@ img.brand-symbol {
 .section-label { margin: 23px 7px 9px; display: flex; justify-content: space-between; color: var(--dim); font: 500 var(--type-micro) var(--mono-font); letter-spacing: .12em; text-transform: uppercase; }
 .section-label b { font-weight: 400; }
 .session-list { min-height: 0; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
-.session-item { width: 100%; padding: 9px 10px; border: 0; border-radius: 10px; display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; }
+.session-row { position: relative; flex: 0 0 auto; }
+.session-row.menu-open { z-index: 8; }
+.session-item { width: 100%; padding: 9px 38px 9px 10px; border: 0; border-radius: 10px; display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; }
 .session-item:hover { background: var(--control-hover); }
 .session-item.active {
   background: var(--control-active);
@@ -474,6 +476,36 @@ img.brand-symbol {
 .session-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .session-copy strong { overflow: hidden; color: var(--ink); font-size: var(--type-ui); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .session-copy small { color: var(--dim); font: var(--type-small) var(--mono-font); }
+.session-more { position: absolute; z-index: 2; top: 50%; right: 6px; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; display: grid; place-items: center; color: var(--muted); background: transparent; transform: translateY(-50%); }
+.session-more:hover, .session-more[aria-expanded="true"] { color: var(--ink); background: color-mix(in srgb, var(--control-active) 88%, transparent); }
+.session-more svg { width: 12px; height: 12px; fill: currentColor; }
+.session-actions-menu { position: absolute; z-index: 20; top: calc(100% - 3px); right: 0; width: 178px; max-width: min(calc(100% - 8px), calc(100vw - 16px)); max-height: calc(100vh - 16px); padding: 4px; border: 1px solid color-mix(in srgb, var(--line) 82%, transparent); border-radius: 11px; display: grid; gap: 1px; overflow-y: auto; overscroll-behavior: contain; color: var(--ink); background: color-mix(in srgb, var(--surface-raised) 94%, transparent); box-shadow: 0 14px 34px rgba(0, 0, 0, .16), 0 2px 7px rgba(0, 0, 0, .07); backdrop-filter: blur(20px) saturate(160%); transform-origin: calc(100% - 16px) top; animation: session-menu-in 140ms cubic-bezier(.2, .8, .2, 1); }
+.session-actions-menu.opens-up { top: auto; bottom: calc(100% - 3px); transform-origin: calc(100% - 16px) bottom; }
+.session-actions-menu > button { width: 100%; min-height: 42px; padding: 5px 7px; border: 0; border-radius: 7px; display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: center; gap: 7px; color: var(--ink); text-align: left; background: transparent; }
+.session-actions-menu > button:hover:not(:disabled) { background: var(--control-hover); }
+.session-actions-menu > button:active:not(:disabled) { transform: scale(.985); }
+.session-actions-menu > button:disabled { cursor: not-allowed; opacity: .45; }
+.session-actions-menu > button svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round; }
+.session-actions-menu > button span { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.session-actions-menu > button strong { font-size: var(--type-ui); font-weight: 600; line-height: 1.25; }
+.session-actions-menu > button small { overflow: hidden; color: var(--dim); font-size: var(--type-micro); line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.session-actions-menu > button.danger { color: #c24f4f; }
+.session-delete-confirm { padding: 8px; display: grid; gap: 4px; }
+.session-delete-confirm > strong { font-size: var(--type-ui); line-height: 1.3; }
+.session-delete-confirm > small { color: var(--muted); font-size: var(--type-small); line-height: 1.45; }
+.session-delete-confirm > div { margin-top: 5px; display: flex; justify-content: flex-end; gap: 6px; }
+.session-delete-confirm button { min-height: 30px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--control-bg); font-size: var(--type-small); }
+.session-delete-confirm button.danger { border-color: #bd4b4b; color: #fff; background: #bd4b4b; }
+.session-delete-confirm button:disabled { opacity: .55; }
+.session-action-error { margin: 3px 5px 5px; padding: 7px 8px; border-radius: 7px; color: #bd4b4b; background: color-mix(in srgb, #bd4b4b 9%, transparent); font-size: var(--type-micro); line-height: 1.4; }
+@keyframes session-menu-in { from { opacity: 0; transform: scale(.97) translateY(-2px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+@media (hover: hover) {
+  .session-more { opacity: 0; }
+  .session-row:hover .session-more, .session-row:focus-within .session-more, .session-more[aria-expanded="true"] { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-actions-menu { animation: none; }
+}
 .empty-note { padding: 14px 8px; color: var(--dim); font-size: var(--type-ui); }
 .connection {
   width: 100%;

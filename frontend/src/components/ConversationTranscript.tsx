@@ -189,7 +189,13 @@ function StaticThinkingActivity({ activity }: { activity: Extract<StaticTimeline
   </section>;
 }
 
-export function InlineToolActivity({ tool }: { tool: ToolActivity }) {
+export function InlineToolActivity({
+  tool,
+  autoOpenExternalUrl = false
+}: {
+  tool: ToolActivity;
+  autoOpenExternalUrl?: boolean;
+}) {
   const [open, setOpen] = useState(tool.status !== "complete");
   const attemptedUrlRef = useRef("");
   const interactive = useMemo(() => {
@@ -204,12 +210,14 @@ export function InlineToolActivity({ tool }: { tool: ToolActivity }) {
   }, [interactive, tool.liveOutput]);
   useEffect(() => { if (tool.status === "complete") setOpen(false); }, [tool.status]);
   useEffect(() => {
-    if (!externalUrl || attemptedUrlRef.current === externalUrl) return;
+    // Persisted OAuth output is replayed when a historical conversation opens.
+    // Only a caller that owns the currently running tool may cause browser navigation.
+    if (!autoOpenExternalUrl || !externalUrl || attemptedUrlRef.current === externalUrl) return;
     attemptedUrlRef.current = externalUrl;
     // Async stream events may be blocked by popup policies. The persistent
     // button below is therefore the source of truth; this is only a best effort.
     window.open(externalUrl, "_blank", "noopener,noreferrer");
-  }, [externalUrl]);
+  }, [autoOpenExternalUrl, externalUrl]);
   return <section className={`inline-tool ${tool.status} ${open ? "open" : ""}`}>
     <button type="button" className="inline-tool-summary" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <InlineToolIcon /><strong>调用工具</strong><code>{tool.name}</code>
