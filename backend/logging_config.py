@@ -252,7 +252,10 @@ def configure_agent_backend_logging(
 
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
-    """Emit a structured event. Prefer known event names so INFO stays narrative."""
+    """Emit a structured event. Prefer known event names so INFO stays narrative.
+
+    `*` 后只能关键字传参：`level=` 不会被位置参数误吃，其余 kwargs 全部进 fields。
+    """
 
     logging.getLogger(LOGGER_NAME).log(
         level,

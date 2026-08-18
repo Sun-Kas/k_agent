@@ -21,7 +21,11 @@ from backend.observability import LangfuseRuntime
 # 可扩展的字符串 kind；内置实现在 `registry.py` 注册。
 AgentKind = str
 
+'''
+frozen=True = 不能改已有字段
 
+slots=True = 不能随便加新字段 + 更省内存
+'''
 @dataclass(frozen=True, slots=True)
 class RunnerContext:
     """单次 run 的共享入参；所有后端实现只读这份上下文，不跨请求保留状态。"""

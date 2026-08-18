@@ -124,6 +124,50 @@ class RuntimeCatalog:
 
         摘要只负责选择与启用态；真实连接参数来自 mcp 配置文件，Skill 正文
         来自 content/skills/<id>/SKILL.md。后端不再二次读盘。
+
+        输入示例::
+
+            mcp_ids = ["filesystem"]
+            skill_ids = ["skill-creator"]
+
+        输出示例（``(selected_mcp, selected_skills)``）::
+
+            (
+              [{
+                "id": "filesystem",
+                "name": "Filesystem",
+                "description": "...",
+                "scope": "project",
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                "env": {},
+                "envPassthrough": [],
+                "cwd": None,
+                "url": None,
+                "bearerTokenEnv": None,
+                "headers": {},
+                "envHeaders": {},
+                "enabled": True,
+                "sourcePath": "/path/to/mcp.json",
+              }],
+              [{
+                "id": "skill-creator",
+                "name": "skill-creator",
+                "description": "...",
+                "enabled": True,
+                "instructions": "# Skill Creator\\n...",
+                "filePath": "/path/to/skills/skill-creator/SKILL.md",
+                "baseDir": "/path/to/skills/skill-creator",
+                "allowedTools": [],
+                "argumentHint": None,
+                "argumentNames": [],
+                "whenToUse": None,
+                "model": None,
+                "executionContext": "inline",
+                "hooks": {},
+              }],
+            )
         """
         mcp_summaries = self._select(self.mcp_summaries(), mcp_ids, "MCP")
         skill_summaries = self._select(self.skill_summaries(), skill_ids, "Skill")

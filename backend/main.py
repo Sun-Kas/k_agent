@@ -315,12 +315,15 @@ def create_app() -> FastAPI:
                 logging_callback=logging_callback,
                 approval_broker=app.state.approvals,
             )
+            # worksapce地址
             workspace_token = set_tool_workspace(ctx.workspace_dir)
+            # 网络访问权限
             network_token = set_tool_network_access(network_access_enabled(ctx))
+            # 权限模式
             permission_token = set_tool_permission_mode(
                 str(ctx.options.get("permissionMode") or "default")
             )
-            # 全项目一份 Node/npm 前缀，对话与 Team 共用。冲突键以
+            # 共享 runtime env，全项目一份 Node/npm 前缀，对话与 Team 共用。冲突键以
             # agentOptions.toolEnv 为准。
             runtime = ensure_shared_runtime()
             if ctx.workspace_dir is not None:
@@ -334,6 +337,8 @@ def create_app() -> FastAPI:
             env_token = set_tool_env_overrides(tool_env)
             try:
                 runner = app.state.runner_registry.get(agent_kind)
+                # 每轮 run 都要挂审批合流：无 HITL 时只是原样转发 Runner 事件；
+                # 有 HITL 时 request() 才能把卡片插入这条正在输出的 HTTP 流。
                 async for event in app.state.approvals.stream(
                     runner.run_stream(ctx),
                     thread_id=payload.thread_id,

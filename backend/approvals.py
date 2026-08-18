@@ -45,13 +45,18 @@ class ApprovalBroker:
         thread_id: str,
         run_id: str,
     ) -> AsyncIterator[dict[str, Any]]:
-        """按到达顺序合并 Runner 事件与审批生命周期事件；流结束取消未决审批。"""
+        """按到达顺序合并 Runner 事件与审批生命周期事件；流结束取消未决审批。
+
+        无审批时队列里只有 Runner 的 event + 收尾 done，等价于透传。
+        有审批时 request() 往同一队列插卡片；工具仍阻塞在 Future 上。
+        """
 
         key = (thread_id, run_id)
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         async with self._lock:
             if key in self._queues:
                 raise RuntimeError(f"Approval stream already registered for run {run_id}")
+            # 先挂号，后面工具 request() 才找得到这条 run 的活流。
             self._queues[key] = queue
 
         async def produce() -> None:
@@ -63,6 +68,7 @@ class ApprovalBroker:
             else:
                 await queue.put(("done", None))
 
+        # 独立泵：Runner 在 HITL Future 上睡着时，HTTP 仍能先把审批卡 yield 出去。
         producer = asyncio.create_task(produce())
         try:
             while True:
@@ -72,6 +78,7 @@ class ApprovalBroker:
                 elif kind == "error":
                     raise value
                 else:
+                    # done：Runner 正常结束且没有更多审批事件。
                     break
         finally:
             if not producer.done():
@@ -116,6 +123,7 @@ class ApprovalBroker:
         async with self._lock:
             queue = self._queues.get(key)
             if queue is None:
+                # 没走 stream() 挂号：卡片无处可插，HTTP 也带不走。
                 raise RuntimeError("Approval requested outside an active run stream")
             self._pending[request_id] = pending
             await queue.put((

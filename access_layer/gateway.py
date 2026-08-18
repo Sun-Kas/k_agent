@@ -67,17 +67,27 @@ class AgentAccessLayer:
                 status_code=400,
                 detail="Each run must contain exactly one new user message",
             )
+        '''
+        payload.forwarded_props 包含：
+        attachments — 附件
+        agentKind / agentOptions — 用哪个 agent、权限模式等
+        mcpServerIds / skillIds — 启用的 MCP / Skill
+        modelId / reasoningEffort — 模型与推理强度
+        '''
         forwarded = payload.forwarded_props or {}
         attachments = self._attachments(forwarded.get("attachments", []))
         messages = [submitted[0].model_copy(update={"attachments": attachments})]
+        # 获取agent类型，默认是k_agent
         agent_kind = forwarded.get("agentKind") or "k_agent"
         if not isinstance(agent_kind, str) or not agent_kind.strip():
             agent_kind = "k_agent"
         agent_kind = agent_kind.strip()
+        # 获取agent选项，默认是空字典
         raw_options = forwarded.get("agentOptions") or {}
         if not isinstance(raw_options, dict):
             raise HTTPException(status_code=400, detail="agentOptions must be an object")
         agent_options = dict(raw_options)
+        # 权限控制方式
         permission_mode = str(agent_options.get("permissionMode") or "default")
         if permission_mode not in {"default", "full_access"}:
             raise HTTPException(
@@ -103,6 +113,7 @@ class AgentAccessLayer:
             mcp_servers = []
             skills = []
         session = await self._session_store.get_or_create(payload.thread_id)
+        # cli 下创建临时会话，resume 下恢复会话
         cli_mode = str(agent_options.get("cliSessionMode") or "ephemeral").strip().lower()
         if cli_mode not in {"ephemeral", "resume"}:
             cli_mode = "ephemeral"
@@ -117,6 +128,25 @@ class AgentAccessLayer:
                 agent_options["resumeSessionId"] = stored
         context_token = update_request_context(session_id=session.id, run_id=payload.run_id)
         try:
+            # 锁：限流 + 同会话串行
+            # 为什么这个限流不在请求进入时就进行呢？
+            '''
+            因为这把锁限的是「真正要跑的 agent run」，不是「任意 HTTP 进来」。
+
+            若在请求一进门（middleware / 路由最开头）就抢：
+
+            1.廉价失败也会占槽
+            消息格式错、catalog 未知 ID 等本来直接 400；若先占全局槽/会话锁，无效请求也会挤掉正常 run，甚至同会话被一把空锁堵住。
+
+            2.只应对 /api/agent 的执行段
+            sessions、health、approvals 等不该走这套限流；middleware 统一限流会误伤。
+
+            3.锁要盖住的是写会话 + 调 backend + SSE 全程
+            当前顺序是：先校验 / 解析 catalog / get_or_create → 再 protect → 再 save_run_start → 流式。
+            拿不到锁就 429，且保证「没锁就不会落盘用户消息」。
+
+            所以限流放在「确认这是一次合法、即将执行的 run」之后、save_run_start 之前：既避免无效请求浪费槽位，又保证真正执行时同会话串行、全局有上限。
+            '''
             stream_request_context = get_request_context()
             stream_guard = self._request_limiter.protect(session.id)
             try:
@@ -126,6 +156,7 @@ class AgentAccessLayer:
 
             # 用户轮次必须在拿到会话锁之后才持久化：若并发 run 被 429 拒绝，
             # 提前落盘会留下孤立的 user 消息。
+            # 合并本轮user消息，保存到session中
             try:
                 session = await self._session_store.save_run_start(
                     session.id,
@@ -141,7 +172,10 @@ class AgentAccessLayer:
 
             async def event_generator():
                 """生成对前端输出的 SSE 事件流；落盘在后台串行，不阻塞推送。"""
-                # StreamingResponse 在独立任务中消费生成器，需把请求上下文复制进该协程。
+                # 生成器在 run() return StreamingResponse 之后才被 Starlette
+                # async for；现代 ASGI 上通常仍是同一请求 Task，不是 create_task。
+                # 但外层 finally 已 reset 掉 handler 上的 ContextVar，所以这里
+                # 必须用进生成器前拍下的快照再 set 一次。无快照则至少补 session/run。
                 stream_context_token = (
                     set_request_context(stream_request_context)
                     if stream_request_context is not None
@@ -258,6 +292,12 @@ class AgentAccessLayer:
                 },
             )
         finally:
+            # 撕掉本函数 update 叠上的 session_id/run_id，露出中间件那一层。
+            # 不是防「下一请求复用协程」：ContextVar 按 Task 隔离，下个 HTTP
+            # 本来也看不见这份便签。reset 是同一次请求里的作用域收尾——
+            # run() 在流结束前就返回 StreamingResponse，中间件随后还要
+            # get_request_context() 写 x-request-id。生成器在这次 reset 之后
+            # 才开始跑，已用 stream_request_context 自行 set/reset。
             reset_request_context(context_token)
 
     @staticmethod
