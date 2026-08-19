@@ -7,11 +7,12 @@ app-server 协议保持 stdin 打开做 JSON-RPC，因此命令/文件/MCP/elici
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uuid
 
-from backend.home import session_workspace_dir
 from backend.runners.base import RunnerContext
 from backend.runners.cli_env import build_cli_child_env
 from backend.runners.cli_process import (
@@ -34,9 +35,17 @@ from backend.runners.resolve_cli import resolve_cli
 
 
 class CodexRunner:
+    """进程内 Codex 单例；本轮状态只存在于 create_runtime 的函数作用域。"""
+
+    __slots__ = ()
     kind = "codex"
 
-    async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
+    @asynccontextmanager
+    async def create_runtime(
+        self, context: RunnerContext
+    ) -> AsyncIterator[dict[str, Any]]:
+        """只组装本轮 Codex app-server 所需参数。"""
+        ctx = context
         resolved = resolve_cli(self.kind)
         if resolved is None:
             raise RuntimeError(
@@ -44,7 +53,9 @@ class CodexRunner:
             )
         command = resolved.path
 
-        workspace = ctx.workspace_dir or session_workspace_dir(ctx.thread_id)
+        if ctx.workspace_dir is None:
+            raise RuntimeError("CodexRunner requires an Access Layer workspaceDir")
+        workspace = ctx.workspace_dir
         workspace.mkdir(parents=True, exist_ok=True)
         skill_preamble = build_codex_skill_preamble(ctx.skills)
         prompt = build_cli_prompt(ctx)
@@ -57,28 +68,41 @@ class CodexRunner:
 
         if ctx.approval_broker is None:
             raise RuntimeError("CodexRunner requires an approval broker")
-        async for event in run_codex_app_server(
-            command=command,
-            cwd=workspace,
-            prompt=prompt,
-            model=str(ctx.model_id) if ctx.model_id else None,
-            effort=ctx.reasoning_effort,
-            resume_thread_id=resume_id,
-            ephemeral=mode != "resume",
-            approval_broker=ctx.approval_broker,
-            public_thread_id=ctx.thread_id,
-            run_id=ctx.run_id,
-            network_access=network_access_enabled(ctx),
-            permission_mode=(
+        yield {
+            "command": command,
+            "cwd": workspace,
+            "prompt": prompt,
+            "model": str(ctx.model_id) if ctx.model_id else None,
+            "effort": ctx.reasoning_effort,
+            "resume_thread_id": resume_id,
+            "ephemeral": mode != "resume",
+            "approval_broker": ctx.approval_broker,
+            "public_thread_id": ctx.thread_id,
+            "run_id": ctx.run_id,
+            "network_access": network_access_enabled(ctx),
+            "permission_mode": (
                 "full_access"
                 if ctx.options.get("permissionMode") == "full_access"
                 else "default"
             ),
-            mapper=map_codex_event,
+            "resume_authorization": (
+                dict(ctx.resume_checkpoints[0])
+                if len(ctx.resume_checkpoints) == 1
+                else None
+            ),
+            "mapper": map_codex_event,
             # Codex shell inherits this process env; pin shared Node/npm here.
-            env=build_cli_child_env(ctx, workspace=workspace),
-        ):
-            yield event
+            "env": build_cli_child_env(ctx, workspace=workspace),
+        }
+
+    async def run_stream(
+        self, context: RunnerContext
+    ) -> AsyncIterator[dict[str, Any]]:
+        """加载 Runtime 参数，并在这里执行 app-server loop。"""
+
+        async with self.create_runtime(context) as runtime:
+            async for event in run_codex_app_server(**runtime):
+                yield event
 
 
 _CODEX_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
@@ -118,21 +142,19 @@ def _single_line(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
-def _write_codex_reasoning(workspace: "Path", effort: str | None) -> None:
+def _write_codex_reasoning(workspace: Path, effort: str | None) -> None:
     """Set model_reasoning_effort in .codex/config.toml via a managed marker block.
 
     Codex CLI reads reasoning effort from config.toml, not a CLI flag.
     Valid values: minimal, low, medium, high, xhigh.
     """
 
-    from pathlib import Path as _Path
-
     normalized = (effort or "").strip().lower()
     if normalized in {"", "none"}:
         normalized = "medium"
     if normalized not in _CODEX_EFFORT_VALUES:
         normalized = "medium"
-    config_dir = _Path(workspace) / ".codex"
+    config_dir = Path(workspace) / ".codex"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "config.toml"
     marker_start = "# >>> k_agent managed reasoning >>>"

@@ -13,13 +13,21 @@ from typing import Any, Iterator
 from langfuse import Langfuse, propagate_attributes
 from pydantic import BaseModel
 
-from backend.agent.callbacks import (
+from backend.agent.hooks import (
+    AgentCompletedEvent,
     AgentErrorPayload,
+    AgentEvent,
     AgentRunContext,
+    AgentStartedEvent,
     ModelCallPayload,
+    ModelCompletedEvent,
     ModelResultPayload,
+    ModelStartedEvent,
+    OperationFailedEvent,
     ToolCallPayload,
+    ToolCompletedEvent,
     ToolResultPayload,
+    ToolStartedEvent,
 )
 from backend.api.schemas import ChatMessage
 from backend.config import Settings
@@ -41,16 +49,34 @@ _SENSITIVE_KEYS = {
 }
 
 
-class LangfuseAgentCallback:
-    """Project Agent callback that creates children below one Langfuse agent span."""
+class LangfuseAgentObserver:
+    """Request observer that creates children below one Langfuse agent span."""
 
     def __init__(self, root: Any, runtime: "LangfuseRuntime") -> None:
         self._root = root
         self._runtime = runtime
         # 未收尾的子 observation 按 key 暂存，等对应的 after_* 回调来配对结束。
         # 迭代号必须进 key：同一次 run 里同一个工具可能被多轮反复调用。
-        self._generations: dict[tuple[str, int], Any] = {}
-        self._tools: dict[tuple[str, int, str, str], Any] = {}
+        self._generations: dict[str, Any] = {}
+        self._tools: dict[str, Any] = {}
+
+    async def handle(self, event: AgentEvent) -> None:
+        """Route typed events while keeping SDK failures local to this observer."""
+
+        if isinstance(event, AgentStartedEvent):
+            await self.on_agent_start(event.context, list(event.messages))
+        elif isinstance(event, ModelStartedEvent):
+            await self.before_model(event.context, event.payload)
+        elif isinstance(event, ModelCompletedEvent):
+            await self.after_model(event.context, event.payload)
+        elif isinstance(event, ToolStartedEvent):
+            await self.before_tool(event.context, event.payload)
+        elif isinstance(event, ToolCompletedEvent):
+            await self.after_tool(event.context, event.payload)
+        elif isinstance(event, OperationFailedEvent):
+            await self.on_error(event.context, event.payload)
+        elif isinstance(event, AgentCompletedEvent):
+            await self.on_agent_end(event.context, dict(event.result))
 
     async def on_agent_start(
         self,
@@ -71,7 +97,7 @@ class LangfuseAgentCallback:
         context: AgentRunContext,
         payload: ModelCallPayload,
     ) -> None:
-        key = (context.run_id, payload.iteration)
+        key = payload.operation_id
         try:
             self._generations[key] = self._root.start_observation(
                 as_type="generation",
@@ -92,7 +118,7 @@ class LangfuseAgentCallback:
         payload: ModelResultPayload,
     ) -> None:
         observation = self._generations.pop(
-            (context.run_id, payload.iteration),
+            payload.operation_id,
             None,
         )
         if observation is None:
@@ -116,7 +142,7 @@ class LangfuseAgentCallback:
         context: AgentRunContext,
         payload: ToolCallPayload,
     ) -> None:
-        key = (context.run_id, payload.iteration, payload.source, payload.name)
+        key = payload.operation_id
         try:
             self._tools[key] = self._root.start_observation(
                 as_type="tool",
@@ -137,7 +163,7 @@ class LangfuseAgentCallback:
         payload: ToolResultPayload,
     ) -> None:
         observation = self._tools.pop(
-            (context.run_id, payload.iteration, payload.source, payload.name),
+            payload.operation_id,
             None,
         )
         if observation is None:
@@ -158,6 +184,30 @@ class LangfuseAgentCallback:
         payload: AgentErrorPayload,
     ) -> None:
         error = f"{type(payload.error).__name__}: {payload.error}"
+        if payload.operation_id:
+            # A recoverable tool failure must close only its own observation.
+            # Closing every child here would corrupt parallel same-name calls.
+            observation = self._tools.pop(payload.operation_id, None)
+            if observation is None:
+                observation = self._generations.pop(payload.operation_id, None)
+            if observation is not None:
+                self._safe_update(
+                    observation,
+                    level="ERROR",
+                    status_message=error,
+                    metadata={
+                        "agentRunId": context.run_id,
+                        "errorStage": payload.stage,
+                        "errorDetail": _json_safe(payload.detail),
+                    },
+                )
+                self._safe_end(observation)
+            return
+        if payload.stage.startswith("tool_"):
+            # Resolution, argument, and permission failures happen before a
+            # physical tool observation exists and are recoverable by the model.
+            # They must not mark the whole Agent root as failed.
+            return
         self._safe_update(
             self._root,
             level="ERROR",
@@ -302,8 +352,8 @@ class LangfuseRuntime:
         model: str,
         messages: list[ChatMessage],
         metadata: dict[str, Any],
-    ) -> Iterator[list[LangfuseAgentCallback]]:
-        """Yield a callback below a request root, or no callbacks when disabled."""
+    ) -> Iterator[list[LangfuseAgentObserver]]:
+        """Yield a request observer below the root, or none when disabled."""
         if self._client is None:
             yield []
             return
@@ -336,7 +386,7 @@ class LangfuseRuntime:
             return
 
         try:
-            yield [LangfuseAgentCallback(root, self)]
+            yield [LangfuseAgentObserver(root, self)]
         except BaseException:
             # 捕 BaseException 是为了覆盖客户端断开导致的 CancelledError：
             # 这两个上下文管理器必须关掉，否则 trace 一直挂着且不会上报。

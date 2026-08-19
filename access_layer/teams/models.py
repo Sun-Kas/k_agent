@@ -95,6 +95,13 @@ class TeamCommandInput(BaseModel):
     command: Literal["pause", "resume", "cancel"]
 
 
+class TeamApprovalResumeInput(BaseModel):
+    """用户对 Team terminal Interrupt 的决定；checkpoint 始终从 SQLite 读取。"""
+
+    action: Literal["approve", "deny", "cancel"]
+    scope: Literal["once", "run"] = "once"
+
+
 class TeamMessageInput(BaseModel):
     """Persist a user or Agent mailbox message."""
 

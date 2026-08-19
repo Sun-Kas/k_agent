@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ast
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 
+from ag_ui.core import RunAgentInput
 from access_layer.gateway import AgentAccessLayer
+from access_layer.sessions.store import SessionRecord
+from backend.api.schemas import ChatMessage
 from backend.agent import AgentRunRequest
 from backend.context import compose_api_messages
 
@@ -126,6 +130,24 @@ class AccessBoundaryTests(unittest.TestCase):
         self.assertNotIn('"/internal/config/skills"', backend_main)
         self.assertNotIn('"/internal/config/mcp"', backend_main)
 
+    def test_agent_backend_runtime_does_not_derive_session_storage_paths(self) -> None:
+        """Conversation storage is an Access Layer concern, including workspace lookup."""
+
+        backend_root = Path(__file__).resolve().parents[1]
+        paths = [backend_root / "main.py", *(backend_root / "runners").glob("*.py")]
+        forbidden = {"session_bundle_dir", "session_json_path", "session_workspace_dir"}
+        violations: list[str] = []
+        for path in paths:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name in forbidden:
+                            violations.append(f"{path.name}: {alias.name}")
+                elif isinstance(node, ast.Name) and node.id in forbidden:
+                    violations.append(f"{path.name}: {node.id}")
+        self.assertEqual(violations, [])
+
     def test_access_layer_builds_complete_multimodal_messages(self) -> None:
         from backend.api.schemas import ChatMessage, MessageAttachment
 
@@ -166,6 +188,95 @@ class AccessBoundaryTests(unittest.TestCase):
             AgentAccessLayer._attachments([
                 {"name": "notes.txt", "type": "text/plain", "dataUrl": "data:text/plain;base64,abc"}
             ])
+
+
+class FullHistoryForwardingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_access_layer_forwards_complete_history_and_explicit_workspace(self) -> None:
+        now = datetime.now(timezone.utc)
+        session = SessionRecord(
+            id="session-history",
+            title="History",
+            messages=[
+                ChatMessage(id="old-user", role="user", content="first", createdAt=now),
+                ChatMessage(id="old-assistant", role="assistant", content="second", createdAt=now),
+            ],
+        )
+
+        class Store:
+            async def get_or_create(self, _session_id):
+                return session
+
+            async def ensure_accepts_new_input(self, _session_id):
+                return None
+
+            async def save_run_start(self, _session_id, messages, **_kwargs):
+                session.messages.extend(messages)
+                return session
+
+            async def append_event(self, _session_id, _event):
+                return None
+
+        class Guard:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Limiter:
+            def protect(self, _session_id):
+                return Guard()
+
+        class Catalog:
+            def selected_runtime(self, _mcp_ids, _skill_ids):
+                return [], []
+
+        class Backend:
+            def __init__(self):
+                self.payload = None
+
+            async def stream(self, payload, _request_id):
+                self.payload = payload
+                if False:
+                    yield {}
+
+        backend = Backend()
+        layer = AgentAccessLayer(
+            session_store=Store(),
+            request_limiter=Limiter(),
+            agent_backend_client=backend,
+            runtime_catalog=Catalog(),
+        )
+        payload = RunAgentInput.model_validate({
+            "threadId": session.id,
+            "runId": "run-history",
+            "state": {},
+            "messages": [{"id": "new-user", "role": "user", "content": "third"}],
+            "tools": [],
+            "context": [],
+            "forwardedProps": {},
+        })
+
+        with unittest.mock.patch(
+            "access_layer.gateway.session_workspace_dir",
+            return_value=Path("/managed/state/sessions/session-history/workspace"),
+        ), unittest.mock.patch(
+            "access_layer.gateway.to_managed_path",
+            return_value="state/sessions/session-history/workspace",
+        ):
+            response = await layer.run(payload)
+            async for _chunk in response.body_iterator:
+                pass
+
+        assert backend.payload is not None
+        self.assertEqual(
+            [message["content"] for message in backend.payload["messages"]],
+            ["first", "second", "third"],
+        )
+        self.assertEqual(
+            backend.payload["workspaceDir"],
+            "state/sessions/session-history/workspace",
+        )
 
 
 if __name__ == "__main__":

@@ -260,6 +260,7 @@ k_agent/
 | [AG-UI 协议约定](docs/ag-ui-protocol.md) | SSE 事件顺序、状态机与持久化规则 |
 | [工具系统](docs/tools.md) | 本地工具、MCP 与错误返回契约 |
 | [上下文管理](docs/context-management.md) | 指令、记忆、预算、裁剪与压缩 |
+| [Agent Hook 与 Middleware 技术方案](docs/agent-hooks-and-middleware-technical-solution.md) | 声明式 Hook、Observer/Middleware 分层、流式与安全执行管线 |
 | [权限模式与 HITL 技术方案](docs/permission-and-hitl-technical-solution.md) | 默认/完全权限、单次越权审批、沙箱与生命周期 |
 | [Agent Team 技术方案](docs/agent-team-technical-solution.md) | Supervisor、DAG、Mailbox 与 Artifact |
 | [定时任务技术方案](docs/scheduled-task-technical-solution.md) | 调度、租约、Session 隔离与运行记录 |

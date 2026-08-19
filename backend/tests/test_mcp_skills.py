@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import unittest
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from backend.agent.callbacks import AgentRunContext, CallbackManager
+from backend.agent.contracts import AgentRunRequest
 from backend.agent.react_agent import OpenAIAgent
+from backend.api.schemas import ChatMessage
 from backend.mcp_tool.client import McpClientManager, McpServerConfig, McpSession
 from backend.mcp_tool.config import McpTransport, load_scoped_mcp_servers
 from backend.permissions import check_permission
@@ -17,6 +19,22 @@ from backend.skills import clear_skill_caches, get_available_skills, activate_sk
 from backend.tools import ToolDefinition
 from backend.tools.local import build_skill_tool, invoke_skill
 from backend.watchers import PollingChangeWatcher
+
+
+def _agent_request() -> AgentRunRequest:
+    return AgentRunRequest(
+        messages=[
+            ChatMessage(
+                id="skill-test-user",
+                role="user",
+                content="test",
+                createdAt=datetime.now(timezone.utc),
+            )
+        ],
+        system_prompt="test",
+        user_context={},
+        model_config={"model": "test", "apiKey": "test"},
+    )
 
 
 class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
@@ -268,7 +286,9 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             "instructions": "Search SkillHub for $ARGUMENTS.",
             "enabled": True,
         }
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [build_skill_tool(skills=[skill])],
             McpClientManager([]),
             skills=[skill],
@@ -276,9 +296,9 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
 
         result = json.loads(
             await agent._run_tool(
-                callbacks=CallbackManager(),
-                context=AgentRunContext(run_id="test-run"),
+                runtime=runtime,
                 iteration=0,
+                call_id="call-skill",
                 tool_name="find-skill-skillhub",
                 arguments={"skill": "外卖 点餐 订餐 food delivery"},
             )
@@ -292,7 +312,9 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_unselected_direct_skill_name_returns_recoverable_error(self) -> None:
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [build_skill_tool(skills=[])],
             McpClientManager([]),
             skills=[],
@@ -300,9 +322,9 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
 
         result = json.loads(
             await agent._run_tool(
-                callbacks=CallbackManager(),
-                context=AgentRunContext(run_id="test-run"),
+                runtime=runtime,
                 iteration=0,
+                call_id="call-unknown",
                 tool_name="find-skill-skillhub",
                 arguments={"skill": "外卖"},
             )
@@ -320,7 +342,9 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         async def fail(_: dict) -> str:
             raise ValueError("path is outside workspace: /tmp/result.md")
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [
                 ToolDefinition(
                     name="Read",
@@ -339,9 +363,9 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
 
         result = json.loads(
             await agent._run_tool(
-                callbacks=CallbackManager(),
-                context=AgentRunContext(run_id="test-run"),
+                runtime=runtime,
                 iteration=0,
+                call_id="call-read",
                 tool_name="Read",
                 arguments={"file_path": "/tmp/result.md"},
             )
@@ -358,7 +382,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_malformed_tool_arguments_are_recoverable(self) -> None:
-        agent = OpenAIAgent([], McpClientManager([]))
+        agent = OpenAIAgent()
 
         with self.assertRaisesRegex(ValueError, "JSON object"):
             agent._decode_tool_arguments("[1, 2]")

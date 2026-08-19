@@ -1,8 +1,8 @@
 """OpenAI 兼容聊天 API 上的流式 React 主循环（模型 ↔ 工具交替）。
 
-pipeline 核心：`KAgentRunner` 交给本模块；产出 thinking/message/tool/trace/final
-内部事件，再由 `agui` 转 AG-UI。可变状态全部放在 `run_stream` 局部变量，
-实例可并发服务多轮而不串味。
+pipeline 核心：`KAgentRunner` 复用一个 `OpenAIAgent`，每轮调用
+`create_runtime` 拼出请求级运行信息，再由同一个 Agent 的 `run_stream`
+执行 thinking/message/tool/trace/final 循环，最后交给 `agui` 转 AG-UI。
 """
 
 from __future__ import annotations
@@ -19,17 +19,21 @@ from typing import Any, Awaitable, Callable
 
 from openai import AsyncOpenAI
 
-from backend.agent.callbacks import (
-    AgentErrorPayload,
+from backend.agent.hooks import (
+    AgentPipelineDefinition,
+    AgentPipelineRuntime,
     AgentRunContext,
-    CallbackManager,
     ContextPlanPayload,
     ContextPrunePayload,
+    ModelCallCompleted,
     ModelCallPayload,
+    ModelReasoningDelta,
     ModelResultPayload,
-    ToolCallPayload,
-    ToolResultPayload,
-    TraceCallback,
+    ModelStreamEvent,
+    ModelTextDelta,
+    ToolCallRequest,
+    ToolCallResult,
+    TraceObserver,
 )
 from backend.agent.contracts import AgentRunRequest
 from backend.context import (
@@ -42,6 +46,7 @@ from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager, McpToolDescriptor
 from backend.permissions import PermissionDecision, check_permission, check_permissions
 from backend.api.schemas import ChatMessage, ChatMeta, ChatRole
+from backend.approvals import canonical_json_sha256
 from backend.sandbox import is_domain_allowed, notice_from_tool_result
 from backend.tools import ToolDefinition, validate_tool_arguments
 from backend.tools.streaming import reset_tool_output_sink, set_tool_output_sink
@@ -52,79 +57,47 @@ _ESCALATABLE_LOCAL_TOOLS = frozenset({"Bash", "Write", "Edit", "NotebookEdit"})
 
 
 class OpenAIAgent:
-    """有界模型/工具循环；发出与传输无关的内部 run 事件。"""
+    """进程内无状态 Agent；请求状态只存在于 runtime 字典与函数局部变量。"""
 
-    def __init__(
+    __slots__ = ()
+
+    async def create_runtime(
         self,
+        request: AgentRunRequest,
         tools: list[ToolDefinition],
         mcp_client_manager: McpClientManager,
-        callbacks: list[Any] | None = None,
+        observers: list[Any] | None = None,
+        pipeline_definition: AgentPipelineDefinition | None = None,
+        run_context: AgentRunContext | None = None,
         config: Settings | None = None,
         skills: list[dict[str, Any]] | None = None,
         approval_handler: Callable[
             [str, PermissionDecision, dict[str, Any]],
             Awaitable[dict[str, Any]],
         ] | None = None,
-    ):
-        """注入本轮工具、MCP manager、回调与审批钩子；不持有会话历史。"""
-        if not config:
-            config = Settings()
-        self.config = config
-        self.tools = tools
-        self.mcp_client_manager = mcp_client_manager
-        self.callbacks = callbacks or []
-        # 只有本轮选中的 Skill 别名才能解析到规范 Skill 工具；未知函数名一律失败关闭。
-        self.skills = list(skills or [])
-        self.approval_handler = approval_handler
-        # 「本次会话记住」只覆盖本 Agent run 剩余时间；持久权限变更仍走规则文件。
-        self._approved_targets: set[str] = set()
-
-    async def run(
-        self,
-        request: AgentRunRequest,
     ) -> dict[str, Any]:
-        """消费流式 run，只返回最终 `final` 载荷（非流式调用方用）。"""
+        """准备模型循环需要的请求级数据；不执行模型或工具循环。"""
 
-        final_state = None
-        async for event in self.run_stream(request):
-            if event["type"] == "final":
-                final_state = event["payload"]
-        if final_state is None:
-            raise RuntimeError("Agent run finished without a final payload.")
-        return final_state
-
-    async def run_stream(
-        self,
-        request: AgentRunRequest,
-    ) -> AsyncIterator[dict[str, Any]]:
-        """主循环：上下文预算 → 模型调用 → 权限/工具 → 直到无工具或达迭代上限。"""
-
-        # 本次 run 的全部可变状态都是这里的局部变量，不挂在 self 上：
-        # 同一个 OpenAIAgent 实例可能被并发调用，实例级状态会导致会话串味。
+        runtime_config = config or Settings()
+        runtime_tools = list(tools)
         trace: list[str] = []
         thinking: list[dict[str, Any]] = []
-        selected_model = request.model_config.get("model", self.config.openai_model)
-        # 凭据优先取本次请求选中的模型档案，缺失时才回落到进程级默认配置。
-        client = AsyncOpenAI(
-            api_key=request.model_config.get("apiKey") or self.config.openai_api_key,
-            base_url=request.model_config.get("baseUrl") or self.config.openai_base_url,
-        )
-        context = AgentRunContext()
+        context = run_context or AgentRunContext()
         context.metadata["permission_mode"] = request.permission_mode
-        callbacks = CallbackManager([TraceCallback(trace), *self.callbacks])
-
+        pipeline = (pipeline_definition or AgentPipelineDefinition.compile()).bind_runtime(
+            context=context,
+            observers=[TraceObserver(trace), *list(observers or [])],
+        )
         try:
-            mcp_tools = await self.mcp_client_manager.list_tools()
-            # 未选中的 MCP server 的工具不能进入 tool specs，否则模型可能调用
-            # 用户本次并未授权的服务。空集合表示不限制（沿用 manager 已连接的全部）。
+            mcp_tools = await mcp_client_manager.list_tools()
+            # manager 可能复用连接池，但本轮只能暴露 Access Layer 选中的 server。
             if request.mcp_server_ids:
                 mcp_tools = [
-                    tool for tool in mcp_tools
+                    tool
+                    for tool in mcp_tools
                     if tool.server_id in request.mcp_server_ids
                 ]
-            tool_specs = self._build_tool_specs(mcp_tools)
-            # 工具定义会随每次请求发给模型，属于不可裁剪的固定开销，
-            # 必须计入预算，否则工具一多就会在 provider 侧超长。
+            tool_specs = self._build_tool_specs(mcp_tools, runtime_tools)
             tool_definition_tokens = estimate_text_tokens(
                 json.dumps(tool_specs, ensure_ascii=False, separators=(",", ":"))
             )
@@ -142,9 +115,6 @@ class OpenAIAgent:
                     "Treat it as continuity context, not a new user request.\n\n"
                     + context_plan.summary
                 )
-            # working_messages 是要回传给 Access Layer 持久化的会话消息，
-            # api_messages 是发给 provider 的载荷（含 system、上下文提醒、tool_calls）。
-            # 两者刻意分开：持久化不应污染成 provider 的私有格式。
             working_messages = list(context_plan.messages)
             api_messages = compose_api_messages(
                 context_plan.messages,
@@ -152,9 +122,84 @@ class OpenAIAgent:
                 user_context=user_context,
                 attachments=request.attachments,
             )
-            await callbacks.on_agent_start(context, working_messages)
-            await callbacks.on_context_built(
-                context,
+            selected_model = request.model_config.get(
+                "model", runtime_config.openai_model
+            )
+            client = AsyncOpenAI(
+                api_key=(
+                    request.model_config.get("apiKey")
+                    or runtime_config.openai_api_key
+                ),
+                base_url=(
+                    request.model_config.get("baseUrl")
+                    or runtime_config.openai_base_url
+                ),
+            )
+        except Exception as exc:
+            # Runtime 准备失败发生在流开始前，仍应通知观测回调后再交给上层转 RUN_ERROR。
+            await pipeline.emit_failure(exc, stage="runtime_create")
+            raise
+
+        return {
+            "request": request,
+            "config": runtime_config,
+            "tools": runtime_tools,
+            "mcp_client_manager": mcp_client_manager,
+            "skills": list(skills or []),
+            "approval_handler": approval_handler,
+            "approved_targets": set(),
+            "pipeline": pipeline,
+            "context": context,
+            "trace": trace,
+            "thinking": thinking,
+            "mcp_tools": mcp_tools,
+            "tool_specs": tool_specs,
+            "context_plan": context_plan,
+            "working_messages": working_messages,
+            "api_messages": api_messages,
+            "selected_model": selected_model,
+            "client": client,
+        }
+
+    async def run(
+        self,
+        runtime: dict[str, Any],
+    ) -> dict[str, Any]:
+        """消费流式 run，只返回最终 `final` 载荷（非流式调用方用）。"""
+
+        final_state = None
+        async for event in self.run_stream_react(runtime):
+            if event["type"] == "final":
+                final_state = event["payload"]
+        if final_state is None:
+            raise RuntimeError("Agent run finished without a final payload.")
+        return final_state
+
+    async def run_stream_react(
+        self,
+        runtime: dict[str, Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """驱动 ReAct 循环：模型推理 → 工具执行 → 观察结果，直到完成或达到上限。"""
+
+        # create_runtime 已完成所有循环前准备；这里仅加载并驱动执行。
+        request: AgentRunRequest = runtime["request"]  # 本轮已拼好的 prompt/消息/权限入参
+        config: Settings = runtime["config"]  # 进程配置（迭代上限、默认模型、状态文案等）
+        trace: list[str] = runtime["trace"]  # 本轮内部轨迹字符串，最终打进 final.payload
+        thinking: list[dict[str, Any]] = runtime["thinking"]  # UI 思考步骤累计，供 thinking 事件
+        selected_model: str = runtime["selected_model"]  # 实际发给 provider 的模型 id
+        client: AsyncOpenAI = runtime["client"]  # 本轮专用 OpenAI 兼容客户端（含 apiKey/baseUrl）
+        context: AgentRunContext = runtime["context"]  # 回调共享的 run 元数据（含 permission_mode）
+        pipeline: AgentPipelineRuntime = runtime["pipeline"]  # 本轮 Observer/Middleware 执行管线
+        mcp_tools: list[McpToolDescriptor] = runtime["mcp_tools"]  # 本轮已过滤的 MCP 工具描述
+        tool_specs: list[dict[str, Any]] = runtime["tool_specs"]  # 发给 chat.completions 的 tools schema
+        context_plan = runtime["context_plan"]  # 裁剪/摘要后的上下文预算方案
+        working_messages: list[ChatMessage] = runtime["working_messages"]  # 回写 Access Layer 的会话消息
+        api_messages: list[dict[str, Any]] = runtime["api_messages"]  # 发给 provider 的原生消息（含 system）
+
+        agent_scope = pipeline.agent_run(working_messages)
+        try:
+            await agent_scope.__aenter__()
+            await pipeline.emit_context_built(
                 ContextPlanPayload(
                     input_message_count=len(request.messages),
                     active_message_count=len(context_plan.messages),
@@ -194,11 +239,104 @@ class OpenAIAgent:
                 iteration=0,
             )
             yield {"type": "thinking", "payload": preparation}
-            yield {"type": "status", "payload": {"message": self.config.status_model_started}}
+            yield {"type": "status", "payload": {"message": config.status_model_started}}
+
+            start_iteration = 0
+            resume_checkpoint = runtime.get("resume_checkpoint")
+            if isinstance(resume_checkpoint, dict):
+                if resume_checkpoint.get("kind") != "react_tool_boundary":
+                    raise RuntimeError("K Agent checkpoint is not a ReAct tool boundary")
+                checkpoint_messages = resume_checkpoint.get("apiMessages")
+                pending_calls = resume_checkpoint.get("pendingCalls")
+                pending_index = resume_checkpoint.get("pendingIndex")
+                checkpoint_iteration = resume_checkpoint.get("iteration")
+                if (
+                    not isinstance(checkpoint_messages, list)
+                    or not isinstance(pending_calls, list)
+                    or not isinstance(pending_index, int)
+                    or not isinstance(checkpoint_iteration, int)
+                    or pending_index < 0
+                    or pending_index >= len(pending_calls)
+                ):
+                    raise RuntimeError("K Agent ReAct checkpoint is incomplete")
+                api_messages = [dict(message) for message in checkpoint_messages]
+                resume_decision = runtime.get("resume_decision")
+                if not isinstance(resume_decision, dict):
+                    raise RuntimeError("K Agent resume decision is missing")
+                decision_payload = resume_decision.get("payload")
+                approved = (
+                    resume_decision.get("status") == "resolved"
+                    and isinstance(decision_payload, dict)
+                    and decision_payload.get("approved") is True
+                )
+
+                for index in range(pending_index, len(pending_calls)):
+                    tc = pending_calls[index]
+                    if not isinstance(tc, dict):
+                        raise RuntimeError("K Agent checkpoint contains an invalid tool call")
+                    call_id = str(tc.get("id") or "")
+                    tool_name = str(tc.get("name") or "")
+                    if not call_id or not tool_name:
+                        raise RuntimeError("K Agent checkpoint tool identity is missing")
+                    raw_arguments = self._decode_tool_arguments(str(tc.get("arguments") or "{}"))
+                    # 首个调用在旧 run 已显示过卡片，但 SessionStore 已在 terminal
+                    # 边界清掉未完成 buffer。Resume 必须重发同 id START/ARGS/END，
+                    # 前端按 id 原位更新，持久层则重新建立完整 tool-call 配对。
+                    yield {
+                        "type": "tool_start",
+                        "payload": {
+                            "toolCallId": call_id,
+                            "toolCallName": tool_name,
+                            "arguments": str(tc.get("arguments") or "{}"),
+                        },
+                    }
+                    if index == pending_index and not approved:
+                        tool_result = (
+                            f"Tool {tool_name} was not executed because the user denied "
+                            "or cancelled the approval request."
+                        )
+                    else:
+                        if index == pending_index:
+                            runtime["_resume_authorization"] = {
+                                "callId": call_id,
+                                "requestHash": runtime.get("resume_request_hash"),
+                            }
+                        runtime["_react_tool_boundary"] = {
+                            "version": 1,
+                            "kind": "react_tool_boundary",
+                            "iteration": checkpoint_iteration,
+                            "pendingIndex": index,
+                            "pendingCalls": [dict(item) for item in pending_calls],
+                            "apiMessages": [dict(item) for item in api_messages],
+                        }
+                        tool_result = await self._run_tool(
+                            runtime=runtime,
+                            iteration=checkpoint_iteration,
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            arguments=raw_arguments,
+                        )
+                    tool_message = self._message("tool", tool_result, tool_name=tool_name)
+                    working_messages.append(tool_message)
+                    yield {
+                        "type": "tool_result",
+                        "payload": {
+                            "toolCallId": call_id,
+                            "messageId": tool_message.id,
+                            "content": tool_result,
+                        },
+                    }
+                    api_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": tool_result,
+                    })
+                start_iteration = checkpoint_iteration + 1
+                yield {"type": "status", "payload": {"message": config.status_model_started}}
 
             # 循环的正常出口是下面「模型不再请求工具」的分支；跑满迭代次数属于
             # 异常兜底，会在循环后返回一条上限提示，而不是让 run 无限继续。
-            for iteration in range(self.config.max_model_iterations + 1):
+            for iteration in range(start_iteration, config.max_model_iterations + 1):
                 # 每轮开头裁剪一次：工具结果是上下文增长最快的来源，
                 # 若等到超预算再处理，本轮请求已经发不出去了。
                 before_tool_chars = self._tool_output_chars(api_messages)
@@ -214,8 +352,7 @@ class OpenAIAgent:
                     )
                 )
                 if pruned_output_count:
-                    await callbacks.on_context_pruned(
-                        context,
+                    await pipeline.emit_context_pruned(
                         ContextPrunePayload(
                             iteration=iteration,
                             pruned_output_count=pruned_output_count,
@@ -232,57 +369,37 @@ class OpenAIAgent:
                     iteration=iteration,
                 )
                 yield {"type": "thinking", "payload": model_step}
-                await callbacks.before_model(
-                    context,
-                    ModelCallPayload(
-                        iteration=iteration,
-                        model=selected_model,
-                        messages=[dict(message) for message in api_messages],
-                        tools=tool_specs,
-                    ),
+                model_request = ModelCallPayload(
+                    iteration=iteration,
+                    model=selected_model,
+                    messages=tuple(dict(message) for message in api_messages),
+                    tools=tuple(tool_specs),
+                    reasoning_effort=request.reasoning_effort,
                 )
-                started_at = time.perf_counter()
-
-                kwargs: dict[str, Any] = {
-                    "model": selected_model,
-                    "messages": api_messages,
-                    "stream": True,
-                    "max_tokens": int(request.model_config.get("maxOutputTokens") or 8192),
-                    "timeout": self.config.model_request_timeout_seconds,
-                }
-                # 没有可用工具时连 tools 字段都不传：部分 OpenAI 兼容服务
-                # 收到空数组会直接报错。
-                if tool_specs:
-                    kwargs["tools"] = tool_specs
-                    kwargs["tool_choice"] = "auto"
-                # 同理，reasoning_effort 只在模型确实支持且用户选了非 none 时下发。
-                if request.reasoning_effort and request.reasoning_effort != "none":
-                    kwargs["reasoning_effort"] = request.reasoning_effort
-
-                # Stream the response
-                stream = await client.chat.completions.create(**kwargs)
-
-                # Accumulate streamed content and tool calls
-                content_buffer = ""
-                reasoning_buffer = ""
-                tool_call_buffers: dict[int, dict[str, Any]] = {}
-                response_id = ""
                 assistant_draft_id = str(uuid.uuid4())
                 message_started = False
                 reasoning_status_sent = False
+                content_buffer = ""
+                reasoning_buffer = ""
+                model_result: ModelResultPayload | None = None
 
-                async for chunk in self._iter_stream_with_idle_timeout(stream):
-                    if chunk.id:
-                        response_id = chunk.id
+                async def provider_terminal(current: ModelCallPayload):
+                    async for item in self._provider_model_stream(
+                        current,
+                        client=client,
+                        config=config,
+                        max_output_tokens=int(
+                            request.model_config.get("maxOutputTokens") or 8192
+                        ),
+                    ):
+                        yield item
 
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta is None:
-                        continue
-
-                    # Handle reasoning_content (DeepSeek thinking models)
-                    reasoning_content = getattr(delta, "reasoning_content", None)
-                    if reasoning_content:
-                        reasoning_buffer += reasoning_content
+                async for model_event in pipeline.stream_model(
+                    model_request,
+                    provider_terminal,
+                ):
+                    if isinstance(model_event, ModelReasoningDelta):
+                        reasoning_buffer += model_event.content
                         # DeepSeek 会通过 reasoning_content 流式返回思考文本，这里同步到前端“思考过程”面板。
                         model_step["detail"] = reasoning_buffer
                         yield {"type": "thinking", "payload": model_step}
@@ -290,49 +407,29 @@ class OpenAIAgent:
                             reasoning_status_sent = True
                             yield {"type": "status", "payload": {"message": "正在思考..."}}
 
-                    # Stream text content token by token
-                    if delta.content:
+                    elif isinstance(model_event, ModelTextDelta):
                         if not message_started:
                             message_started = True
                             yield {"type": "message_start", "payload": {"messageId": assistant_draft_id}}
-                        content_buffer += delta.content
+                        content_buffer += model_event.content
                         yield {
                             "type": "delta",
-                            "payload": {"messageId": assistant_draft_id, "content": delta.content},
+                            "payload": {
+                                "messageId": assistant_draft_id,
+                                "content": model_event.content,
+                            },
                         }
+                    elif isinstance(model_event, ModelCallCompleted):
+                        model_result = model_event.result
 
-                    # Accumulate tool calls
-                    # 工具调用是分片到达的：id 和函数名通常只在第一个分片里出现，
-                    # 参数 JSON 则跨多个分片拼接。必须按 index 归档累积，
-                    # 攒齐整个流之后才能解析，中途的参数串是不完整的 JSON。
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in tool_call_buffers:
-                                tool_call_buffers[idx] = {
-                                    "id": tc_delta.id or "",
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            if tc_delta.id:
-                                tool_call_buffers[idx]["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    tool_call_buffers[idx]["name"] = tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    tool_call_buffers[idx]["arguments"] += tc_delta.function.arguments
-
-                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                if model_result is None:
+                    raise RuntimeError("Model pipeline finished without a result")
+                tool_calls = [dict(item) for item in model_result.tool_calls]
 
                 # End message if text was streamed
                 if message_started:
                     yield {"type": "message_end", "payload": {"messageId": assistant_draft_id}}
 
-                # Build tool_calls list from buffers
-                tool_calls = [
-                    tool_call_buffers[idx]
-                    for idx in sorted(tool_call_buffers.keys())
-                ]
                 model_step["status"] = "complete"
                 if reasoning_buffer:
                     model_step["detail"] = reasoning_buffer
@@ -344,26 +441,14 @@ class OpenAIAgent:
                     )
                 yield {"type": "thinking", "payload": model_step}
 
-                await callbacks.after_model(
-                    context,
-                    ModelResultPayload(
-                        iteration=iteration,
-                        model=selected_model,
-                        response_id=response_id,
-                        output_text=content_buffer.strip(),
-                        function_call_count=len(tool_calls),
-                        elapsed_ms=elapsed_ms,
-                        tool_calls=tool_calls,
-                    ),
-                )
-
                 # No tool calls — we're done
                 if not tool_calls:
                     if content_buffer.strip():
                         assistant_message = self._message("assistant", content_buffer.strip())
                         working_messages.append(assistant_message)
                     result = self._final_state(working_messages, trace, thinking)
-                    await callbacks.on_agent_end(context, result)
+                    agent_scope.complete(result)
+                    await agent_scope.__aexit__(None, None, None)
                     yield {"type": "trace", "payload": {"entry": trace[-1]}}
                     yield {"type": "final", "payload": result}
                     return
@@ -390,7 +475,7 @@ class OpenAIAgent:
                 }
                 api_messages.append(assistant_api_msg)
 
-                for tc in tool_calls:
+                for tool_call_index, tc in enumerate(tool_calls):
                     tool_name = tc["name"]
                     argument_error: Exception | None = None
                     try:
@@ -423,14 +508,26 @@ class OpenAIAgent:
                         "payload": {"message": f"调用工具 {tool_name}"},
                     }
                     if argument_error is not None:
-                        tool_result = await self._recoverable_tool_error(
-                            callbacks=callbacks,
-                            context=context,
+                        await pipeline.emit_failure(
+                            argument_error,
+                            stage="tool_arguments",
+                            detail={"toolName": tool_name, "callId": tc["id"]},
+                        )
+                        tool_result = self._recoverable_tool_error(
                             tool_name=tool_name,
-                            arguments=raw_arguments,
                             error=argument_error,
                         )
                     else:
+                        # 若权限层在工具真正执行前产生 terminal Interrupt，恢复所需
+                        # 的 provider 消息与剩余调用列表必须精确停在这个边界。
+                        runtime["_react_tool_boundary"] = {
+                            "version": 1,
+                            "kind": "react_tool_boundary",
+                            "iteration": iteration,
+                            "pendingIndex": tool_call_index,
+                            "pendingCalls": [dict(item) for item in tool_calls],
+                            "apiMessages": [dict(item) for item in api_messages],
+                        }
                         # A long-running interactive CLI can print an OAuth URL
                         # and then wait. Run the tool in a sibling task so its
                         # ContextVar output sink can feed AG-UI before completion.
@@ -438,9 +535,9 @@ class OpenAIAgent:
                         sink_token = set_tool_output_sink(output_queue.put_nowait)
                         try:
                             tool_task = asyncio.create_task(self._run_tool(
-                                callbacks=callbacks,
-                                context=context,
+                                runtime=runtime,
                                 iteration=iteration,
+                                call_id=tc["id"],
                                 tool_name=tool_name,
                                 arguments=raw_arguments,
                             ))
@@ -500,7 +597,9 @@ class OpenAIAgent:
                         },
                     }
                     yield {"type": "trace", "payload": {"entry": trace[-1], "output": tool_result}}
-                    notice = self._sandbox_user_notice(context, tool_name, tool_result)
+                    notice = self._sandbox_user_notice(
+                        context, tool_name, tool_result, config
+                    )
                     if notice is not None:
                         yield {"type": "status", "payload": {"message": notice}}
                     # Append tool result to api_messages
@@ -511,10 +610,10 @@ class OpenAIAgent:
                         "tool_call_id": tc["id"],
                         "content": tool_result,
                     })
-                yield {"type": "status", "payload": {"message": self.config.status_model_started}}
+                yield {"type": "status", "payload": {"message": config.status_model_started}}
 
             # Reached iteration limit
-            limit_message = self.config.tool_iteration_limit_message
+            limit_message = config.tool_iteration_limit_message
             assistant_message = self._message("assistant", limit_message)
             working_messages.append(assistant_message)
             yield {"type": "message_start", "payload": {"messageId": assistant_message.id}}
@@ -526,17 +625,23 @@ class OpenAIAgent:
                 title="达到执行上限",
                 detail="已停止继续调用工具并返回当前结果。",
                 status="complete",
-                iteration=self.config.max_model_iterations,
+                iteration=config.max_model_iterations,
             )
             yield {"type": "thinking", "payload": limit_step}
             result = self._final_state(working_messages, trace, thinking)
-            await callbacks.on_agent_end(context, result)
+            agent_scope.complete(result)
+            await agent_scope.__aexit__(None, None, None)
             yield {"type": "trace", "payload": {"entry": trace[-1]}}
             yield {"type": "final", "payload": result}
+        except (asyncio.CancelledError, GeneratorExit) as exc:
+            # Cancellation must close model/agent observations but must never be
+            # converted to a model-visible tool error or an AG-UI success event.
+            await agent_scope.__aexit__(type(exc), exc, exc.__traceback__)
+            raise
         except Exception as exc:
             # Agent 级异常（模型不可达、上下文构建失败等）不像工具失败那样可恢复，
             # 记录后继续上抛，由 agui 层转成 RUN_ERROR 告知前端。
-            await callbacks.on_error(context, AgentErrorPayload(error=exc, stage="agent_run"))
+            await agent_scope.__aexit__(type(exc), exc, exc.__traceback__)
             # MCP discovery and context planning run before the first trace entry
             # exists, so indexing blindly would raise an IndexError that replaces
             # the failure the operator actually needs to see.
@@ -548,7 +653,84 @@ class OpenAIAgent:
             }
             raise
 
-    async def _iter_stream_with_idle_timeout(self, stream: Any) -> AsyncIterator[Any]:
+    async def _provider_model_stream(
+        self,
+        request: ModelCallPayload,
+        *,
+        client: AsyncOpenAI,
+        config: Settings,
+        max_output_tokens: int,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """Adapt provider chunks to a typed stream without buffering visible deltas."""
+
+        kwargs: dict[str, Any] = {
+            "model": request.model,
+            "messages": [dict(message) for message in request.messages],
+            "stream": True,
+            "max_tokens": max_output_tokens,
+            "timeout": config.model_request_timeout_seconds,
+        }
+        if request.tools:
+            kwargs["tools"] = [dict(tool) for tool in request.tools]
+            kwargs["tool_choice"] = "auto"
+        if request.reasoning_effort and request.reasoning_effort != "none":
+            kwargs["reasoning_effort"] = request.reasoning_effort
+
+        started_at = time.perf_counter()
+        stream = await client.chat.completions.create(**kwargs)
+        content_buffer = ""
+        tool_call_buffers: dict[int, dict[str, Any]] = {}
+        response_id = ""
+        async for chunk in self._iter_stream_with_idle_timeout(stream, config):
+            if chunk.id:
+                response_id = chunk.id
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            if reasoning_content:
+                yield ModelReasoningDelta(reasoning_content)
+            if delta.content:
+                content_buffer += delta.content
+                yield ModelTextDelta(delta.content)
+            # Tool arguments arrive across chunks. Preserve provider indexes and
+            # aggregate only the protocol data that has no user-visible delta.
+            if delta.tool_calls:
+                for tool_delta in delta.tool_calls:
+                    index = tool_delta.index
+                    target = tool_call_buffers.setdefault(
+                        index,
+                        {"id": tool_delta.id or "", "name": "", "arguments": ""},
+                    )
+                    if tool_delta.id:
+                        target["id"] = tool_delta.id
+                    if tool_delta.function:
+                        if tool_delta.function.name:
+                            target["name"] = tool_delta.function.name
+                        if tool_delta.function.arguments:
+                            target["arguments"] += tool_delta.function.arguments
+
+        tool_calls = tuple(
+            tool_call_buffers[index] for index in sorted(tool_call_buffers)
+        )
+        yield ModelCallCompleted(
+            ModelResultPayload(
+                iteration=request.iteration,
+                model=request.model,
+                response_id=response_id,
+                output_text=content_buffer.strip(),
+                function_call_count=len(tool_calls),
+                elapsed_ms=(time.perf_counter() - started_at) * 1000,
+                tool_calls=tool_calls,
+                operation_id=request.operation_id,
+            )
+        )
+
+    async def _iter_stream_with_idle_timeout(
+        self,
+        stream: Any,
+        config: Settings,
+    ) -> AsyncIterator[Any]:
         """Yield provider chunks, aborting when the stream stalls mid-response.
 
         The request-level timeout only bounds the initial response. A provider
@@ -556,7 +738,7 @@ class OpenAIAgent:
         an access-layer concurrency slot, and the session lock indefinitely.
         """
 
-        idle_timeout = self.config.model_stream_idle_timeout_seconds
+        idle_timeout = config.model_stream_idle_timeout_seconds
         iterator = stream.__aiter__()
         while True:
             try:
@@ -588,50 +770,51 @@ class OpenAIAgent:
 
     async def _run_tool(
         self,
-        callbacks: CallbackManager,
-        context: AgentRunContext,
+        runtime: dict[str, Any],
         iteration: int,
+        call_id: str,
         tool_name: str,
         arguments: dict[str, Any],
     ) -> str:
         """执行单个工具；异常转成模型可见结果，避免整轮 run 中断。"""
 
         try:
-            return await self._execute_tool(
-                callbacks=callbacks,
-                context=context,
+            result = await self._execute_tool(
+                runtime=runtime,
                 iteration=iteration,
+                call_id=call_id,
                 tool_name=tool_name,
                 arguments=arguments,
             )
+            return result.output
         except Exception as exc:
             # Tool failures must not abort the whole run. Cancellation and
             # process-level BaseException subclasses still propagate normally.
-            return await self._recoverable_tool_error(
-                callbacks=callbacks,
-                context=context,
-                tool_name=tool_name,
-                arguments=arguments,
-                error=exc,
-            )
+            return self._recoverable_tool_error(tool_name=tool_name, error=exc)
 
     async def _execute_tool(
         self,
-        callbacks: CallbackManager,
-        context: AgentRunContext,
+        runtime: dict[str, Any],
         iteration: int,
+        call_id: str,
         tool_name: str,
         arguments: dict[str, Any],
-    ) -> str:
-        """执行已校验的本地或 MCP 工具；调用方负责可恢复错误包装。"""
+    ) -> ToolCallResult:
+        """Resolve one logical call and pass it through the sealed Tool Pipeline."""
 
-        local_tool = next((tool for tool in self.tools if tool.name == tool_name), None)
-        selected_skill = self._selected_skill(tool_name)
+        config: Settings = runtime["config"]
+        tools: list[ToolDefinition] = runtime["tools"]
+        mcp_client_manager: McpClientManager = runtime["mcp_client_manager"]
+        skills: list[dict[str, Any]] = runtime["skills"]
+        pipeline: AgentPipelineRuntime = runtime["pipeline"]
+        context = pipeline.context
+        local_tool = next((tool for tool in tools if tool.name == tool_name), None)
+        selected_skill = self._selected_skill(tool_name, skills)
         # 本地工具优先。只有名字对不上任何本地工具时，才考虑它是不是
         # provider 把 Skill 名当成函数名直接调用了。
         if local_tool is None and selected_skill is not None:
             local_tool = next(
-                (tool for tool in self.tools if tool.name == "Skill"),
+                (tool for tool in tools if tool.name == "Skill"),
                 None,
             )
             if local_tool is not None:
@@ -647,162 +830,217 @@ class OpenAIAgent:
                     for key, value in arguments.items()
                     if key not in {"sandbox_permissions", "escalation_scope", "escalation_resource"}
                 }
-            if context.metadata.get("permission_mode") != "full_access":
-                self._enforce_skill_allowlist(context, permission_tool_name)
-            decision = check_permissions(
-                permission_tool_name,
-                self._permission_subjects(permission_tool_name, arguments),
-            )
-            # Explicit deny rules remain authoritative, but read-only tools do not
-            # turn an `ask` rule into a misleading write/sandbox escalation card.
-            if permission_tool_name in _READ_ONLY_LOCAL_TOOLS and decision.behavior == "ask":
-                decision = PermissionDecision("allow", "read-only local access does not require HITL")
-            if context.metadata.get("permission_mode") == "full_access":
-                decision = PermissionDecision("allow", "full access selected for this run")
-            elif (
-                permission_tool_name in _ESCALATABLE_LOCAL_TOOLS
-                and context.metadata.get("permission_mode") != "full_access"
-                and arguments.get("sandbox_permissions") == "require_escalated"
-            ):
-                # Bash escalation is narrower than "run without srt for any
-                # reason". Network requests are checked against the effective
-                # allowlist so only a new destination can reach HITL; transport
-                # failures on an existing destination stay ordinary failures.
-                if permission_tool_name == "Bash":
-                    scope = arguments.get("escalation_scope")
-                    resource = str(arguments.get("escalation_resource") or "").strip()
-                    valid_scope = scope in {
-                        "outside_workspace_write",
-                        "host_resource",
-                        "network_destination",
-                    }
-                    if not valid_scope or not resource:
-                        decision = PermissionDecision(
-                            "deny",
-                            "Bash escalation requires escalation_scope and a concrete "
-                            "escalation_resource.",
-                        )
-                    elif scope == "network_destination" and is_domain_allowed(
-                        resource, self.config.bash_sandbox_allowed_domains
-                    ):
-                        decision = PermissionDecision(
-                            "deny",
-                            f"Network destination {resource!r} is already allowed by the "
-                            "Bash sandbox; retry normally or adjust timeout_seconds "
-                            "timeout_seconds instead of requesting escalation.",
-                        )
-                    else:
-                        decision = PermissionDecision(
-                            "ask",
-                            (
-                                f"该命令请求访问网络白名单外的目标：{resource}"
-                                if scope == "network_destination"
-                                else f"该命令请求访问默认沙箱外的本机资源：{resource}"
-                            ),
-                        )
-                else:
-                    decision = PermissionDecision(
-                        "ask",
-                        "该工具请求访问默认沙箱范围之外的本机资源。",
-                    )
-            await self._enforce_permission(
-                permission_tool_name,
-                decision,
-                {"toolName": tool_name, "arguments": arguments, "source": "local"},
-            )
-            before_payload = ToolCallPayload(
+            request = ToolCallRequest(
+                call_id=call_id or str(uuid.uuid4()),
                 iteration=iteration,
-                name=tool_name,
+                requested_name=tool_name,
+                canonical_name=permission_tool_name,
                 arguments=arguments,
                 source="local",
             )
-            await callbacks.before_tool(context, before_payload)
-            # 校验放在权限之后、执行之前：先确认这次调用被允许，再检查参数合法性，
-            # 避免为一次注定被拒的调用暴露参数结构细节。
-            validate_tool_arguments(local_tool.parameters, arguments)
-            started_at = time.perf_counter()
-            result = await local_tool.execute(arguments)
-            await callbacks.after_tool(
-                context,
-                ToolResultPayload(
-                    iteration=iteration,
-                    name=tool_name,
-                    arguments=arguments,
-                    output=result,
-                    source="local",
-                    elapsed_ms=(time.perf_counter() - started_at) * 1000,
-                ),
+
+            async def preflight(current: ToolCallRequest) -> None:
+                if context.metadata.get("permission_mode") != "full_access":
+                    self._enforce_skill_allowlist(context, current.canonical_name)
+                decision = self._local_permission_decision(
+                    config,
+                    context,
+                    current.canonical_name,
+                    dict(current.arguments),
+                )
+                await self._enforce_permission(
+                    runtime,
+                    current.canonical_name,
+                    decision,
+                    {
+                        "toolName": current.requested_name,
+                        "callId": current.call_id,
+                        "iteration": current.iteration,
+                        "arguments": dict(current.arguments),
+                        "source": "local",
+                    },
+                )
+
+            async def execute(current: ToolCallRequest) -> str:
+                resolved = next(
+                    (tool for tool in tools if tool.name == current.canonical_name),
+                    None,
+                )
+                if resolved is None:
+                    raise RuntimeError(
+                        f"Unknown local tool requested: {current.canonical_name}"
+                    )
+                current_arguments = dict(current.arguments)
+                # Validation remains after permission and ToolStarted to preserve
+                # the existing security/observability ordering contract.
+                validate_tool_arguments(resolved.parameters, current_arguments)
+                output = await resolved.execute(current_arguments)
+                if current.canonical_name == "Skill":
+                    self._activate_skill_allowlist(context, output)
+                return output
+
+            return await pipeline.run_tool(
+                request,
+                preflight=preflight,
+                execute=execute,
             )
-            if permission_tool_name == "Skill":
-                self._activate_skill_allowlist(context, result)
-            return result
 
         target = self._parse_mcp_tool(tool_name)
         # 既不是本地工具也不符合 MCP 命名约定：可能是模型幻觉出的函数名，
         # 直接拒绝执行，错误会作为工具结果回给模型让它改用真实工具。
         if target is None:
+            await pipeline.emit_failure(
+                RuntimeError(f"Unknown tool requested: {tool_name}"),
+                stage="tool_resolve",
+                detail={"toolName": tool_name, "callId": call_id},
+            )
             raise RuntimeError(f"Unknown tool requested: {tool_name}")
 
         server_id, name = target
-        if context.metadata.get("permission_mode") != "full_access":
-            self._enforce_skill_allowlist(context, tool_name)
-        await self._enforce_permission(
-            f"MCP tool {server_id}:{name}",
+        request = ToolCallRequest(
+            call_id=call_id or str(uuid.uuid4()),
+            iteration=iteration,
+            requested_name=tool_name,
+            canonical_name=name,
+            arguments=arguments,
+            source="mcp",
+            server_id=server_id,
+        )
+
+        async def preflight(current: ToolCallRequest) -> None:
+            if current.server_id is None:
+                raise RuntimeError("MCP tool request is missing server_id")
+            if context.metadata.get("permission_mode") != "full_access":
+                self._enforce_skill_allowlist(context, current.requested_name)
+            await self._enforce_permission(
+                runtime,
+                f"MCP tool {current.server_id}:{current.canonical_name}",
+                (
+                    PermissionDecision("allow", "full access selected for this run")
+                    if context.metadata.get("permission_mode") == "full_access"
+                    else check_permission(
+                        "mcp", f"{current.server_id}:{current.canonical_name}"
+                    )
+                ),
+                {
+                    "toolName": current.canonical_name,
+                    "callId": current.call_id,
+                    "iteration": current.iteration,
+                    "serverId": current.server_id,
+                    "arguments": dict(current.arguments),
+                    "source": "mcp",
+                },
+            )
+
+        async def execute(current: ToolCallRequest) -> str:
+            if current.server_id is None:
+                raise RuntimeError("MCP tool request is missing server_id")
+            return await mcp_client_manager.call_tool(
+                current.server_id,
+                current.canonical_name,
+                dict(current.arguments),
+            )
+
+        return await pipeline.run_tool(
+            request,
+            preflight=preflight,
+            execute=execute,
+        )
+
+    @staticmethod
+    def _local_permission_decision(
+        config: Settings,
+        context: AgentRunContext,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> PermissionDecision:
+        """Resolve local-tool policy after middleware has finalized the request."""
+
+        decision = check_permissions(
+            tool_name,
+            OpenAIAgent._permission_subjects(tool_name, arguments),
+        )
+        if tool_name in _READ_ONLY_LOCAL_TOOLS and decision.behavior == "ask":
+            decision = PermissionDecision(
+                "allow", "read-only local access does not require HITL"
+            )
+        if context.metadata.get("permission_mode") == "full_access":
+            return PermissionDecision("allow", "full access selected for this run")
+        if (
+            tool_name not in _ESCALATABLE_LOCAL_TOOLS
+            or arguments.get("sandbox_permissions") != "require_escalated"
+        ):
+            return decision
+        if tool_name != "Bash":
+            return PermissionDecision(
+                "ask", "该工具请求访问默认沙箱范围之外的本机资源。"
+            )
+
+        scope = arguments.get("escalation_scope")
+        resource = str(arguments.get("escalation_resource") or "").strip()
+        if scope not in {
+            "outside_workspace_write",
+            "host_resource",
+            "network_destination",
+        } or not resource:
+            return PermissionDecision(
+                "deny",
+                "Bash escalation requires escalation_scope and a concrete "
+                "escalation_resource.",
+            )
+        if scope == "network_destination" and is_domain_allowed(
+            resource, config.bash_sandbox_allowed_domains
+        ):
+            return PermissionDecision(
+                "deny",
+                f"Network destination {resource!r} is already allowed by the "
+                "Bash sandbox; retry normally or adjust timeout_seconds instead "
+                "of requesting escalation.",
+            )
+        return PermissionDecision(
+            "ask",
             (
-                PermissionDecision("allow", "full access selected for this run")
-                if context.metadata.get("permission_mode") == "full_access"
-                else check_permission("mcp", f"{server_id}:{name}")
-            ),
-            {
-                "toolName": name,
-                "serverId": server_id,
-                "arguments": arguments,
-                "source": "mcp",
-            },
-        )
-        await callbacks.before_tool(
-            context,
-            ToolCallPayload(
-                iteration=iteration,
-                name=name,
-                arguments=arguments,
-                source="mcp",
-                server_id=server_id,
+                f"该命令请求访问网络白名单外的目标：{resource}"
+                if scope == "network_destination"
+                else f"该命令请求访问默认沙箱外的本机资源：{resource}"
             ),
         )
-        started_at = time.perf_counter()
-        result = await self.mcp_client_manager.call_tool(server_id, name, arguments)
-        await callbacks.after_tool(
-            context,
-            ToolResultPayload(
-                iteration=iteration,
-                name=name,
-                arguments=arguments,
-                output=result,
-                source="mcp",
-                server_id=server_id,
-                elapsed_ms=(time.perf_counter() - started_at) * 1000,
-            ),
-        )
-        return result
 
     async def _enforce_permission(
         self,
+        runtime: dict[str, Any],
         target: str,
         decision: PermissionDecision,
         detail: dict[str, Any],
     ) -> None:
         """执行权限：deny 立即失败；ask 经 approval_handler 挂起等人决策。"""
 
-        if decision.behavior == "allow" or target in self._approved_targets:
+        approved_targets: set[str] = runtime["approved_targets"]
+        approval_handler = runtime["approval_handler"]
+        resume_authorization = runtime.get("_resume_authorization")
+        if isinstance(resume_authorization, dict):
+            detail_hash = canonical_json_sha256({
+                "target": detail.get("toolName") or target,
+                "source": detail.get("source"),
+                "serverId": detail.get("serverId"),
+                "arguments": detail.get("arguments", detail.get("input", {})),
+            })
+            if (
+                detail.get("callId") == resume_authorization.get("callId")
+                and detail_hash == resume_authorization.get("requestHash")
+            ):
+                # 一次性授权在进入 execute 前消费；同 run 后续相同工具仍需重新判定。
+                runtime.pop("_resume_authorization", None)
+                return
+        if decision.behavior == "allow" or target in approved_targets:
             return
         if decision.behavior == "ask":
-            if self.approval_handler is None:
+            if approval_handler is None:
                 raise RuntimeError(f"{target} requires manual approval")
-            response = await self.approval_handler(target, decision, detail)
+            response = await approval_handler(target, decision, detail)
             if response.get("action") == "approve":
-                if response.get("remember"):
-                    self._approved_targets.add(target)
+                if response.get("scope") == "run":
+                    approved_targets.add(target)
                 return
             raise RuntimeError(f"User denied approval for {target}")
         raise RuntimeError(decision.reason or f"Permission denied for {target}")
@@ -841,30 +1079,10 @@ class OpenAIAgent:
         context.skill_allowlist = {str(item) for item in allowed} | {"Skill"}
         context.skill_allowlist_owner = str(payload.get("commandName") or "skill")
 
-    async def _recoverable_tool_error(
-        self,
-        *,
-        callbacks: CallbackManager,
-        context: AgentRunContext,
-        tool_name: str,
-        arguments: dict[str, Any],
-        error: Exception,
-    ) -> str:
-        """Record a tool failure without allowing observability to break recovery."""
+    @staticmethod
+    def _recoverable_tool_error(*, tool_name: str, error: Exception) -> str:
+        """Convert an already-observed ordinary tool failure for model recovery."""
 
-        try:
-            await callbacks.on_error(
-                context,
-                AgentErrorPayload(
-                    error=error,
-                    stage="tool_run",
-                    detail={"toolName": tool_name, "arguments": arguments},
-                ),
-            )
-        except Exception:
-            # Error reporting is fail-open: the model must still receive the
-            # original tool failure even if an observability callback fails.
-            pass
         message = str(error).strip() or "Tool execution failed without an error message."
         return json.dumps(
             {
@@ -895,11 +1113,12 @@ class OpenAIAgent:
         context: AgentRunContext,
         tool_name: str,
         tool_result: str,
+        config: Settings,
     ) -> str | None:
         """Surface sandbox install/degrade messages once (install outcomes always)."""
 
         message = notice_from_tool_result(
-            tool_name, tool_result, settings=self.config
+            tool_name, tool_result, settings=config
         )
         if message is None:
             return None
@@ -932,13 +1151,17 @@ class OpenAIAgent:
             )
         )
 
-    def _selected_skill(self, tool_name: str) -> dict[str, Any] | None:
+    def _selected_skill(
+        self,
+        tool_name: str,
+        skills: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
         """Resolve a direct function name only against this request's Skills."""
 
         return next(
             (
                 skill
-                for skill in self.skills
+                for skill in skills
                 if skill.get("enabled", True)
                 and tool_name
                 in {
@@ -1007,7 +1230,11 @@ class OpenAIAgent:
         segments = re.split(r"&&|\|\||;|\||\n", command)
         return [segment.strip() for segment in segments if segment.strip()]
 
-    def _build_tool_specs(self, mcp_tools: list[McpToolDescriptor]) -> list[dict[str, Any]]:
+    def _build_tool_specs(
+        self,
+        mcp_tools: list[McpToolDescriptor],
+        tools: list[ToolDefinition],
+    ) -> list[dict[str, Any]]:
         """把本地工具和 MCP 工具转成模型 tool schema。"""
         local_specs = [
             {
@@ -1018,7 +1245,7 @@ class OpenAIAgent:
                     "parameters": tool.parameters,
                 },
             }
-            for tool in self.tools
+            for tool in tools
         ]
         mcp_specs = [
             {

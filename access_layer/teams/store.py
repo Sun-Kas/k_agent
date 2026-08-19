@@ -514,6 +514,9 @@ class TeamStore:
                 WHERE id=? AND team_id=? AND EXISTS (
                     SELECT 1 FROM team_tasks
                     WHERE id=? AND team_id=? AND owner_agent_id=? AND status='running'
+                    UNION ALL
+                    SELECT 1 FROM supervisor_jobs
+                    WHERE id=? AND team_id=? AND status='running'
                 )
                 """,
                 (
@@ -524,9 +527,25 @@ class TeamStore:
                     task_id,
                     team_id,
                     agent_id,
+                    task_id,
+                    team_id,
                 ),
             )
             db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+            resume_run_id = payload.get("resumeRunId")
+            if event_type == "approval.resolved" and isinstance(resume_run_id, str):
+                # Resume 保留逻辑 attempt，但采用新的 AG-UI runId；再次中断时
+                # hold 操作必须对准这个新 run，不能重放旧 attempt。
+                db.execute(
+                    "UPDATE team_tasks SET run_id=?, updated_at=? "
+                    "WHERE id=? AND team_id=? AND owner_agent_id=? AND status='running'",
+                    (resume_run_id, timestamp, task_id, team_id, agent_id),
+                )
+                db.execute(
+                    "UPDATE supervisor_jobs SET run_id=?, updated_at=? "
+                    "WHERE id=? AND team_id=? AND status='running'",
+                    (resume_run_id, timestamp, task_id, team_id),
+                )
             event = self._append_event_sync(db, team_id, event_type, payload)
             db.commit()
             return event
@@ -1529,6 +1548,40 @@ class TeamStore:
             db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
             db.commit()
 
+    async def hold_supervisor_for_approval(
+        self, team_id: str, job_id: str, supervisor_id: str, run_id: str
+    ) -> None:
+        """释放 supervisor lease，但保留当前 attempt，等待新的 Resume Run。"""
+
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._hold_supervisor_for_approval_sync,
+                team_id, job_id, supervisor_id, run_id,
+            )
+
+    def _hold_supervisor_for_approval_sync(
+        self, team_id: str, job_id: str, supervisor_id: str, run_id: str
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE supervisor_jobs SET lease_until=NULL, updated_at=? "
+                "WHERE id=? AND team_id=? AND status='running' AND run_id=?",
+                (timestamp, job_id, team_id, run_id),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='waiting', updated_at=? "
+                "WHERE id=? AND team_id=?",
+                (timestamp, supervisor_id, team_id),
+            )
+            self._append_event_sync(db, team_id, "supervisor.interrupted", {
+                "jobId": job_id, "agentId": supervisor_id, "runId": run_id,
+                "reason": "waiting_for_approval", "requeued": False,
+            })
+            db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+            db.commit()
+
     async def fail_task(self, team_id: str, task_id: str, agent_id: str, error: str) -> None:
         async with self._write_lock:
             await asyncio.to_thread(self._fail_task_sync, team_id, task_id, agent_id, error)
@@ -1557,6 +1610,41 @@ class TeamStore:
                     "taskId": task_id,
                     "agentId": agent_id,
                 })
+            db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
+            db.commit()
+
+    async def hold_task_for_approval(
+        self, team_id: str, task_id: str, agent_id: str, run_id: str
+    ) -> None:
+        """释放任务 lease，保持 running/run_id 作为等待恢复的 durable attempt。"""
+
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._hold_task_for_approval_sync,
+                team_id, task_id, agent_id, run_id,
+            )
+
+    def _hold_task_for_approval_sync(
+        self, team_id: str, task_id: str, agent_id: str, run_id: str
+    ) -> None:
+        timestamp = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE team_tasks SET lease_until=NULL, updated_at=? "
+                "WHERE id=? AND team_id=? AND owner_agent_id=? "
+                "AND status='running' AND run_id=?",
+                (timestamp, task_id, team_id, agent_id, run_id),
+            )
+            db.execute(
+                "UPDATE team_agents SET status='waiting', updated_at=? "
+                "WHERE id=? AND team_id=?",
+                (timestamp, agent_id, team_id),
+            )
+            self._append_event_sync(db, team_id, "run.interrupted", {
+                "taskId": task_id, "agentId": agent_id, "runId": run_id,
+                "reason": "waiting_for_approval", "requeued": False,
+            })
             db.execute("UPDATE teams SET updated_at=? WHERE id=?", (timestamp, team_id))
             db.commit()
 

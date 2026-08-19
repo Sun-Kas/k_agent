@@ -5,25 +5,31 @@ import logging
 import unittest
 from datetime import datetime, timezone
 
-from backend.agent.callbacks import (
+from backend.agent.hooks import (
+    AgentStartedEvent,
     AgentErrorPayload,
     AgentRunContext,
+    ContextBuiltEvent,
     ContextPlanPayload,
+    ContextPrunedEvent,
     ContextPrunePayload,
     ModelCallPayload,
+    ModelStartedEvent,
+    OperationFailedEvent,
     ToolCallPayload,
+    ToolStartedEvent,
 )
 from backend.api.schemas import ChatMessage
 from backend.logging_config import configure_agent_backend_logging
 from backend.mcp_tool.client import McpClientManager, McpServerConfig
-from backend.observability.logging import AgentBackendLoggingCallback
+from backend.observability.logging import AgentBackendLoggingObserver
 
 
 class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.output = io.StringIO()
         configure_agent_backend_logging("INFO", stream=self.output)
-        self.callback = AgentBackendLoggingCallback(
+        self.observer = AgentBackendLoggingObserver(
             request_id="request-1",
             thread_id="thread-1",
             run_id="run-1",
@@ -37,23 +43,30 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
             content="TOP SECRET USER CONTENT",
             createdAt=datetime.now(timezone.utc),
         )
-        await self.callback.on_agent_start(self.context, [message])
-        await self.callback.before_model(
-            self.context,
+        await self.observer.handle(AgentStartedEvent(self.context, (message,)))
+        await self.observer.handle(
+            ModelStartedEvent(
+                self.context,
             ModelCallPayload(
                 iteration=0,
                 model="test-model",
-                messages=[{"role": "user", "content": message.content}],
-                tools=[],
+                    messages=({"role": "user", "content": message.content},),
+                    tools=(),
+                    operation_id="model-op",
+                ),
             ),
         )
-        await self.callback.before_tool(
-            self.context,
-            ToolCallPayload(
+        await self.observer.handle(
+            ToolStartedEvent(
+                self.context,
+                ToolCallPayload(
                 iteration=0,
                 name="lookup",
                 arguments={"token": "TOP SECRET TOOL ARGUMENT"},
                 source="local",
+                    operation_id="tool-op",
+                    call_id="call-1",
+                ),
             ),
         )
 
@@ -70,11 +83,13 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("TOP SECRET", serialized)
 
     async def test_error_logs_type_without_exception_message(self) -> None:
-        await self.callback.on_error(
-            self.context,
-            AgentErrorPayload(
+        await self.observer.handle(
+            OperationFailedEvent(
+                self.context,
+                AgentErrorPayload(
                 error=RuntimeError("secret provider payload"),
                 stage="agent_run",
+                ),
             ),
         )
 
@@ -85,9 +100,10 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret provider payload", line)
 
     async def test_context_logs_budget_and_pruning_without_summary_content(self) -> None:
-        await self.callback.on_context_built(
-            self.context,
-            ContextPlanPayload(
+        await self.observer.handle(
+            ContextBuiltEvent(
+                self.context,
+                ContextPlanPayload(
                 input_message_count=12,
                 active_message_count=6,
                 provider_message_count=8,
@@ -110,16 +126,19 @@ class AgentBackendLoggingTests(unittest.IsolatedAsyncioTestCase):
                     "estimatedInput": 1_210,
                     "remaining": 80_790,
                 },
-            ),
+                ),
+            )
         )
-        await self.callback.on_context_pruned(
-            self.context,
-            ContextPrunePayload(
+        await self.observer.handle(
+            ContextPrunedEvent(
+                self.context,
+                ContextPrunePayload(
                 iteration=2,
                 pruned_output_count=3,
                 before_chars=75_000,
                 after_chars=12_000,
-            ),
+                ),
+            )
         )
 
         lines = self.output.getvalue().splitlines()

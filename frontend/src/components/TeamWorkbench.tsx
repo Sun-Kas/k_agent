@@ -15,8 +15,7 @@ import {
 import {
   getAgentsCatalog,
   getModelsConfig,
-  getRuntimeCatalog,
-  resolveApproval
+  getRuntimeCatalog
 } from "../api/agui";
 import { MarkdownContent } from "./MarkdownContent";
 import {
@@ -32,6 +31,7 @@ import {
   getTeamWorkspace,
   getTeamWorkspaceFile,
   listTeams,
+  resumeTeamApproval,
   sendTeamMessage,
   subscribeTeamEvents
 } from "../team/api";
@@ -1015,7 +1015,7 @@ type ConversationItem =
   | { kind: "message"; id: string; content: string; occurredAt: string }
   | { kind: "reasoning"; id: string; content: string; occurredAt: string }
   | { kind: "tool"; id: string; name: string; arguments: string; result: string; status: "running" | "waiting" | "complete" | "error"; occurredAt: string }
-  | { kind: "approval"; id: string; threadId: string; runId: string; agentKind: AgentKind; category: string; title: string; message: string; detail: Record<string, unknown>; status: "pending" | "approved" | "denied" | "cancelled"; action?: string; occurredAt: string }
+  | { kind: "approval"; id: string; teamId: string; threadId: string; runId: string; agentKind: AgentKind; category: string; title: string; message: string; detail: Record<string, unknown>; status: "pending" | "approved" | "denied" | "cancelled"; action?: string; occurredAt: string }
   | { kind: "notice"; id: string; label: string; tone: "normal" | "error" | "success"; occurredAt: string };
 
 
@@ -1243,15 +1243,10 @@ function ConversationApproval({ item }: { item: Extract<ConversationItem, { kind
     if (item.status !== "pending") setSubmission("idle");
   }, [item.status]);
 
-  async function decide(action: "approve" | "deny" | "cancel", remember = false) {
+  async function decide(action: "approve" | "deny" | "cancel", scope: "once" | "run" = "once") {
     setSubmission("submitting");
     try {
-      await resolveApproval(item.id, {
-        threadId: item.threadId,
-        runId: item.runId,
-        action,
-        remember,
-      });
+      await resumeTeamApproval(item.teamId, item.id, action, scope);
       setOptimisticAction(action);
       setSubmission("idle");
     } catch {
@@ -1274,7 +1269,7 @@ function ConversationApproval({ item }: { item: Extract<ConversationItem, { kind
       <p>{item.message}</p>
       {preview && <pre>{preview}</pre>}
       {submission === "error" && <p className="team-approval-error">审批提交失败或请求已失效，请刷新后重试。</p>}
-      {pending && <footer><button type="button" disabled={submission === "submitting"} onClick={() => void decide("deny")}>拒绝</button><button type="button" disabled={submission === "submitting"} onClick={() => void decide("approve")}>允许一次</button><button className="primary" type="button" disabled={submission === "submitting"} onClick={() => void decide("approve", true)}>本任务始终允许</button></footer>}
+      {pending && <footer><button type="button" disabled={submission === "submitting"} onClick={() => void decide("deny")}>拒绝</button><button type="button" disabled={submission === "submitting"} onClick={() => void decide("approve")}>允许一次</button><button className="primary" type="button" disabled={submission === "submitting"} onClick={() => void decide("approve", "run")}>本任务始终允许</button></footer>}
     </section>
   );
 }
@@ -1375,6 +1370,7 @@ function appendApprovalRequest(
   const approval: Extract<ConversationItem, { kind: "approval" }> = {
     kind: "approval",
     id,
+    teamId: event.teamId,
     threadId: String(value.threadId ?? ""),
     runId: String(value.runId ?? ""),
     agentKind: String(value.agentKind ?? "k_agent") as AgentKind,

@@ -1,10 +1,10 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   createScheduledTask, deleteScheduledTask, getScheduledRunSession, listScheduledRuns, listScheduledTasks,
-  pauseScheduledTask, resumeScheduledTask, runScheduledTaskNow, updateScheduledTask
+  pauseScheduledTask, resumeScheduledRunApproval, resumeScheduledTask, runScheduledTaskNow, updateScheduledTask
 } from "../scheduled-tasks/api";
 import type { ScheduledRun, ScheduledTask, ScheduledTaskInput } from "../scheduled-tasks/types";
-import type { DetectedAgent, ModelProfile, RuntimeOption, SessionState } from "../types";
+import type { ApprovalActivity, DetectedAgent, ModelProfile, RuntimeOption, SessionState } from "../types";
 import { StaticConversationTranscript } from "./ConversationTranscript";
 import { PermissionModeField } from "./PermissionModeField";
 
@@ -98,6 +98,19 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
     } finally { setBusy(false); }
   }
 
+  async function resumeScheduledApproval(
+    approval: ApprovalActivity,
+    action: "approve" | "deny",
+    scope: "once" | "run"
+  ) {
+    if (!selected || !selectedId || !openedRunId) return;
+    await resumeScheduledRunApproval(
+      selectedId, openedRunId, approval.id, action, scope
+    );
+    setOpenedRunSession(await getScheduledRunSession(selectedId, openedRunId));
+    await refresh();
+  }
+
   const availableModels = useMemo(() => {
     if (draft.agentKind === "k_agent") return models.filter((item) => item.enabled);
     return agents.find((item) => item.kind === draft.agentKind)?.models ?? [];
@@ -174,7 +187,7 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
             {selected.permissionMode === "full_access" && <p className="scheduled-permission-warning"><b>完全权限持续生效：</b>每次计划或手动触发都不会启用沙箱或等待审批，可直接访问和修改宿主机资源。</p>}
             <article className="scheduled-prompt"><small>任务提示词</small><p>{selected.prompt}</p></article>
             <h3>执行记录</h3>
-            <div className="scheduled-runs">{!runs.length && <p className="empty-note">还没有执行记录</p>}{runs.map((run) => <div className="scheduled-run-entry" key={run.id}><div className="scheduled-run-row"><span className={`scheduled-dot ${run.status}`} /><span><strong>{runStatus(run.status)}</strong><small>{formatDate(run.scheduledFor)} · {run.triggerType === "manual" ? "手动" : "计划"}{run.errorMessage ? ` · ${run.errorMessage}` : ""}</small></span>{run.sessionId && <button type="button" disabled={busy} onClick={() => void toggleRunResult(run)}>{openedRunId === run.id ? "收起结果" : "查看结果"}</button>}</div>{openedRunId === run.id && openedRunSession && <section className="scheduled-run-result" aria-label="定时任务执行结果"><StaticConversationTranscript session={openedRunSession} /></section>}</div>)}</div>
+            <div className="scheduled-runs">{!runs.length && <p className="empty-note">还没有执行记录</p>}{runs.map((run) => <div className="scheduled-run-entry" key={run.id}><div className="scheduled-run-row"><span className={`scheduled-dot ${run.status}`} /><span><strong>{runStatus(run.status)}</strong><small>{formatDate(run.scheduledFor)} · {run.triggerType === "manual" ? "手动" : "计划"}{run.errorMessage ? ` · ${run.errorMessage}` : ""}</small></span>{run.sessionId && <button type="button" disabled={busy} onClick={() => void toggleRunResult(run)}>{openedRunId === run.id ? "收起结果" : "查看结果"}</button>}</div>{openedRunId === run.id && openedRunSession && <section className="scheduled-run-result" aria-label="定时任务执行结果"><StaticConversationTranscript session={openedRunSession} onApprovalDecision={resumeScheduledApproval} /></section>}</div>)}</div>
           </>
         </section>}
       </div>

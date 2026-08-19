@@ -146,9 +146,15 @@ _SUMMARIES: dict[str, SummaryBuilder] = {
             else f"文本 {f.get('outputChars')}字"
         )
     ),
+    "model.call.failed": lambda f: (
+        f"模型#{_iter_label(f)} 失败 · {f.get('errorType')}"
+    ),
     "tool.call.started": lambda f: f"工具 {_tool_label(f)} 开始",
     "tool.call.completed": lambda f: (
         f"工具 {_tool_label(f)} 完成 · {_sec(f)} 输出={f.get('outputChars')}字"
+    ),
+    "tool.call.failed": lambda f: (
+        f"工具 {_tool_label(f)} 失败 · {f.get('errorType')}"
     ),
     "context.plan.completed": lambda f: (
         f"上下文规划 · 输入≈{f.get('estimatedInput')}token "

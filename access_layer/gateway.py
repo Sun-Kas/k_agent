@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -32,9 +33,14 @@ from access_layer.request_context import (
     set_request_context,
     update_request_context,
 )
-from access_layer.sessions.store import SessionStore
+from access_layer.sessions.store import (
+    OpenInterruptError,
+    ResumeConflictError,
+    SessionStore,
+)
 from backend.agui import to_chat_messages
 from backend.api.schemas import MessageAttachment
+from backend.home import session_workspace_dir, to_managed_path
 from backend.logging_config import log_event
 
 
@@ -62,7 +68,18 @@ class AgentAccessLayer:
         发给后端，避免浏览器重报导致重复或丢失。
         """
         submitted = to_chat_messages(payload.messages)
-        if len(submitted) != 1 or submitted[0].role != "user":
+        resume_entries = [
+            entry.model_dump(by_alias=True, mode="json")
+            for entry in (payload.resume or [])
+        ]
+        is_resume = bool(resume_entries)
+        if is_resume:
+            if submitted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A resume run must not contain a new chat message",
+                )
+        elif len(submitted) != 1 or submitted[0].role != "user":
             raise HTTPException(
                 status_code=400,
                 detail="Each run must contain exactly one new user message",
@@ -76,7 +93,11 @@ class AgentAccessLayer:
         '''
         forwarded = payload.forwarded_props or {}
         attachments = self._attachments(forwarded.get("attachments", []))
-        messages = [submitted[0].model_copy(update={"attachments": attachments})]
+        messages = (
+            []
+            if is_resume
+            else [submitted[0].model_copy(update={"attachments": attachments})]
+        )
         # 获取agent类型，默认是k_agent
         agent_kind = forwarded.get("agentKind") or "k_agent"
         if not isinstance(agent_kind, str) or not agent_kind.strip():
@@ -112,7 +133,12 @@ class AgentAccessLayer:
             )
             mcp_servers = []
             skills = []
-        session = await self._session_store.get_or_create(payload.thread_id)
+        if is_resume:
+            session = await self._session_store.get(payload.thread_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+        else:
+            session = await self._session_store.get_or_create(payload.thread_id)
         # cli 下创建临时会话，resume 下恢复会话
         cli_mode = str(agent_options.get("cliSessionMode") or "ephemeral").strip().lower()
         if cli_mode not in {"ephemeral", "resume"}:
@@ -154,18 +180,37 @@ class AgentAccessLayer:
             except ConcurrencyLimitExceeded as exc:
                 raise HTTPException(status_code=429, detail=str(exc)) from exc
 
-            # 用户轮次必须在拿到会话锁之后才持久化：若并发 run 被 429 拒绝，
-            # 提前落盘会留下孤立的 user 消息。
-            # 合并本轮user消息，保存到session中
+            # 用户轮次与 Resume 认领都必须在会话锁之后发生。前者避免 429
+            # 留下孤立消息，后者保证同一 Interrupt 只有一个新 run 能拿到执行权。
+            resume_records: list[dict[str, Any]] = []
             try:
-                session = await self._session_store.save_run_start(
-                    session.id,
-                    messages,
-                    run_id=payload.run_id,
-                    mcp_server_ids=mcp_ids,
-                    skill_ids=skill_ids,
-                    permission_mode=permission_mode,
-                )
+                if is_resume:
+                    resume_records = await self._session_store.prepare_resume(
+                        session.id,
+                        resume_entries,
+                        resume_run_id=payload.run_id,
+                        resume_context={
+                            "modelId": forwarded.get("modelId"),
+                            "mcpServerIds": list(mcp_ids),
+                            "skillIds": list(skill_ids),
+                            "reasoningEffort": forwarded.get("reasoningEffort"),
+                            "agentKind": agent_kind,
+                            "agentOptions": copy.deepcopy(agent_options),
+                        },
+                    )
+                else:
+                    await self._session_store.ensure_accepts_new_input(session.id)
+                    session = await self._session_store.save_run_start(
+                        session.id,
+                        messages,
+                        run_id=payload.run_id,
+                        mcp_server_ids=mcp_ids,
+                        skill_ids=skill_ids,
+                        permission_mode=permission_mode,
+                    )
+            except (OpenInterruptError, ResumeConflictError) as exc:
+                await stream_guard.__aexit__(None, None, None)
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             except BaseException:
                 await stream_guard.__aexit__(None, None, None)
                 raise
@@ -220,6 +265,16 @@ class AgentAccessLayer:
                             "attachments": [],
                             "agentKind": agent_kind,
                             "agentOptions": agent_options,
+                            "resume": resume_entries,
+                            # checkpoint 只从 SessionStore 读取并走内部边界，前端提交
+                            # 的 resume payload 无法覆盖工具名、参数或 request hash。
+                            "resumeCheckpoints": resume_records,
+                            # Access Layer owns the session layout. Backend only
+                            # receives this run's explicit working directory and
+                            # must never derive a session/history path from threadId.
+                            "workspaceDir": to_managed_path(
+                                session_workspace_dir(session.id)
+                            ),
                         },
                         request_id,
                     )
@@ -242,18 +297,56 @@ class AgentAccessLayer:
                                 )
 
                     persist_task = asyncio.create_task(_persist_worker())
+                    resume_succeeded = False
+                    resume_known_failure = False
                     try:
                         async for event in backend_events:
-                            # 先写出 SSE，再入落盘队列：HITL 空闲前最后一帧
-                            # 不能被磁盘 I/O 抢占事件循环，否则浏览器读不到审批卡。
-                            yield self._encode_sse(event)
-                            if self._is_approval_activity(event):
+                            public_event = event
+                            if self._is_durable_interrupt_activity(event):
+                                event = copy.deepcopy(event)
+                                private_content = event.get("content")
+                                private_checkpoint = (
+                                    private_content.get("_checkpoint")
+                                    if isinstance(private_content, dict)
+                                    else None
+                                )
+                                if isinstance(private_checkpoint, dict):
+                                    # 恢复必须沿用产生工具调用时的运行选择，不能信任
+                                    # 若干小时后浏览器当前下拉框里的模型或 MCP。
+                                    private_checkpoint["resumeContext"] = {
+                                        "modelId": forwarded.get("modelId"),
+                                        "mcpServerIds": list(mcp_ids),
+                                        "skillIds": list(skill_ids),
+                                        "reasoningEffort": forwarded.get("reasoningEffort"),
+                                        "agentKind": agent_kind,
+                                        "agentOptions": copy.deepcopy(agent_options),
+                                    }
+                                # durable-before-visible：卡片一旦可点击，其 checkpoint
+                                # 已经存在；同时剥离私有执行状态后再交给浏览器。
+                                public_event = await self._session_store.persist_interrupt(
+                                    session.id, event
+                                )
+                            yield self._encode_sse(public_event)
+                            if self._is_approval_activity(public_event):
                                 yield self._encode_sse_comment("flush", pad_bytes=2048)
                                 await asyncio.sleep(0)
-                            persist_queue.put_nowait(event)
+                            persist_queue.put_nowait(public_event)
+                            if event.get("type") == "RUN_FINISHED":
+                                resume_succeeded = True
+                            elif event.get("type") == "RUN_ERROR":
+                                resume_known_failure = True
                     finally:
                         await persist_queue.put(None)
                         await persist_task
+                        if is_resume:
+                            await self._session_store.finish_resume(
+                                session.id,
+                                [str(item["id"]) for item in resume_records],
+                                succeeded=resume_succeeded,
+                                unknown_outcome=(
+                                    not resume_succeeded and not resume_known_failure
+                                ),
+                            )
                     log_event(
                         "access.run.finished",
                         requestId=request_id,
@@ -339,6 +432,17 @@ class AgentAccessLayer:
         return (
             event.get("type") == "ACTIVITY_SNAPSHOT"
             and event.get("activityType") == "approval"
+        )
+
+    @staticmethod
+    def _is_durable_interrupt_activity(event: dict[str, Any]) -> bool:
+        """只对携带 Backend 私有 checkpoint 的 pending Activity 建立持久化屏障。"""
+
+        content = event.get("content")
+        return (
+            AgentAccessLayer._is_approval_activity(event)
+            and isinstance(content, dict)
+            and isinstance(content.get("_checkpoint"), dict)
         )
 
     @staticmethod

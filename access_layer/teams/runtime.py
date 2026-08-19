@@ -38,6 +38,10 @@ from backend.home import (
 
 logger = logging.getLogger("k_agent.access.team_runtime")
 
+
+class TeamApprovalInterrupted(RuntimeError):
+    """Backend 已输出 terminal Interrupt，Team 运行应进入持久等待而非完成。"""
+
 # 交付树是源码快照：依赖安装与工具缓存不得随 Artifact 发布。
 # dist/ 等构建产物在明确作为交付物时可保留。共享工具在 `.runtime/`
 #（与 output/ 同级），永不进入已发布树。
@@ -113,6 +117,236 @@ class TeamRuntime:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
         self._active.clear()
+
+    async def resume_approval(
+        self,
+        team_id: str,
+        approval_id: str,
+        *,
+        action: str,
+        scope: str = "once",
+    ) -> dict[str, Any]:
+        """以标准 Resume Run 继续一个持久化的 worker-task Interrupt。
+
+        Team 事件日志保存服务端 checkpoint；浏览器只提交 approval id 与决定，
+        因而不能替换工具参数。Supervisor 恢复需要控制决策专用收尾，当前明确拒绝。
+        """
+
+        team = await self.store.get_team(team_id)
+        if team is None:
+            raise KeyError(team_id)
+        requested = next((
+            event
+            for event in reversed(await self.store.events_tail(team_id, limit=5000))
+            if event.get("type") == "approval.requested"
+            and str(event.get("payload", {}).get("id") or "") == approval_id
+        ), None)
+        if requested is None:
+            raise ValueError("Approval interrupt was not found")
+        if any(
+            event.get("type") == "approval.resolved"
+            and str(event.get("payload", {}).get("id") or "") == approval_id
+            for event in await self.store.events_tail(team_id, limit=5000)
+        ):
+            raise ValueError("Approval interrupt is already resolved")
+        value = requested.get("payload") or {}
+        checkpoint = value.get("_checkpoint")
+        task_id = str(value.get("taskId") or "")
+        agent_id = str(value.get("agentId") or "")
+        if not isinstance(checkpoint, dict) or not task_id or not agent_id:
+            raise ValueError("Approval interrupt has no durable Team checkpoint")
+        task = next((item for item in team["tasks"] if item["id"] == task_id), None)
+        agent = next((item for item in team["agents"] if item["id"] == agent_id), None)
+        if task is None:
+            supervisor_state = team.get("supervisorState")
+            if (
+                agent is not None
+                and isinstance(supervisor_state, dict)
+                and supervisor_state.get("id") == task_id
+                and supervisor_state.get("status") == "running"
+            ):
+                return await self._resume_supervisor_approval(
+                    team=team,
+                    job_id=task_id,
+                    supervisor=agent,
+                    approval_id=approval_id,
+                    value=value,
+                    checkpoint=checkpoint,
+                    action=action,
+                    scope=scope,
+                )
+            raise ValueError("Team task for this approval no longer exists")
+        if agent is None:
+            raise ValueError("Team agent for this approval no longer exists")
+        if task.get("status") != "running" or agent.get("status") != "waiting":
+            raise ValueError("Team task is no longer waiting for this approval")
+        if task_id in self._active:
+            raise ValueError("Team task already has an active run")
+
+        run_id = f"team-resume-{uuid.uuid4().hex}"
+        decision = {
+            "interruptId": approval_id,
+            "status": "cancelled" if action == "cancel" else "resolved",
+            **(
+                {}
+                if action == "cancel"
+                else {"payload": {"approved": action == "approve", "scope": scope}}
+            ),
+        }
+        resume_record = {
+            "id": approval_id,
+            "requestHash": value.get("requestHash"),
+            "checkpoint": checkpoint,
+            "decision": decision,
+        }
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active[task_id] = current_task
+        task_dir = self.store.database_path.parent / team_id / "tasks" / task_id
+        try:
+            context = await self.store.task_context(team_id, task_id)
+            runtime = ensure_shared_runtime()
+            mcp_ids = list(agent["capabilities"].get("mcpServerIds", []))
+            skill_ids = list(agent["capabilities"].get("skillIds", []))
+            mcp_servers, skills = self._runtime_catalog.selected_runtime(mcp_ids, skill_ids)
+            await self.store.record_approval(
+                team_id, task_id, agent_id, "approval.resolved", {
+                    **{key: item for key, item in value.items() if key != "_checkpoint"},
+                    "status": "approved" if action == "approve" else "denied",
+                    "action": action,
+                    "scope": scope,
+                    "resumeRunId": run_id,
+                },
+            )
+            text = await self._stream_agent(
+                team_id=team_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                run_id=run_id,
+                request_id=f"team-resume-{uuid.uuid4().hex}",
+                prompt=self._task_prompt(context, agent, runtime=runtime),
+                agent=agent,
+                permission_mode=str(context["team"].get("permissionMode") or "default"),
+                mcp_servers=mcp_servers,
+                skills=skills,
+                workspace=task_dir,
+                tool_env=shared_runtime_tool_env(runtime),
+                run_log=task_dir / "logs" / f"{run_id}.ndjson",
+                resume_record=resume_record,
+            )
+            if not text.strip():
+                text = "Agent 已完成恢复运行，但没有返回可保存的文本成果。"
+            artifact_id = await self.store.submit_task(
+                team_id, task_id, agent_id, text.strip()
+            )
+            self._write_task_result(task_dir, artifact_id, text.strip())
+            return {"ok": True, "status": "completed", "runId": run_id}
+        except TeamApprovalInterrupted:
+            await self.store.hold_task_for_approval(
+                team_id, task_id, agent_id, run_id
+            )
+            return {"ok": True, "status": "interrupted", "runId": run_id}
+        except Exception as exc:
+            await self.store.fail_task(team_id, task_id, agent_id, str(exc))
+            raise
+        finally:
+            if self._active.get(task_id) is current_task:
+                self._active.pop(task_id, None)
+
+    async def _resume_supervisor_approval(
+        self,
+        *,
+        team: dict[str, Any],
+        job_id: str,
+        supervisor: dict[str, Any],
+        approval_id: str,
+        value: dict[str, Any],
+        checkpoint: dict[str, Any],
+        action: str,
+        scope: str,
+    ) -> dict[str, Any]:
+        """恢复主管控制 run，并沿用原 job/attempt 应用结构化决策。"""
+
+        team_id = str(team["id"])
+        supervisor_id = str(supervisor["id"])
+        active_key = f"supervisor:{job_id}"
+        if active_key in self._active:
+            raise ValueError("Supervisor already has an active resume run")
+        run_id = f"team-supervisor-resume-{uuid.uuid4().hex}"
+        decision = {
+            "interruptId": approval_id,
+            "status": "cancelled" if action == "cancel" else "resolved",
+            **(
+                {}
+                if action == "cancel"
+                else {"payload": {"approved": action == "approve", "scope": scope}}
+            ),
+        }
+        resume_record = {
+            "id": approval_id,
+            "requestHash": value.get("requestHash"),
+            "checkpoint": checkpoint,
+            "decision": decision,
+        }
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active[active_key] = current_task
+        control_dir = self.store.database_path.parent / team_id / "supervisor" / job_id
+        staged_publications: list[tuple[str, Path, Path]] = []
+        try:
+            context = await self.store.supervisor_context(team_id, job_id)
+            await self.store.record_approval(
+                team_id, job_id, supervisor_id, "approval.resolved", {
+                    **{key: item for key, item in value.items() if key != "_checkpoint"},
+                    "status": "approved" if action == "approve" else "denied",
+                    "action": action,
+                    "scope": scope,
+                    "resumeRunId": run_id,
+                },
+            )
+            text = await self._stream_agent(
+                team_id=team_id,
+                task_id=job_id,
+                agent_id=supervisor_id,
+                run_id=run_id,
+                request_id=f"team-supervisor-resume-{uuid.uuid4().hex}",
+                prompt=self._supervisor_prompt(
+                    context,
+                    trigger_type=str(context.get("job", {}).get("triggerType") or "approval.resume"),
+                    trigger_payload={},
+                    previous_error=None,
+                ),
+                agent=supervisor,
+                permission_mode=str(context["team"].get("permissionMode") or "default"),
+                mcp_servers=[],
+                skills=[],
+                workspace=control_dir,
+                run_log=control_dir / "resume.ndjson",
+                resume_record=resume_record,
+            )
+            supervisor_decision = self._parse_supervisor_decision(text)
+            staged_publications = self._stage_decision_artifacts(
+                context["team"], supervisor_decision, job_id
+            )
+            await self.store.apply_supervisor_decision(
+                team_id, job_id, supervisor_id, supervisor_decision
+            )
+            await self._finalize_artifact_publications(team_id, staged_publications)
+            return {"ok": True, "status": "completed", "runId": run_id}
+        except TeamApprovalInterrupted:
+            await self.store.hold_supervisor_for_approval(
+                team_id, job_id, supervisor_id, run_id
+            )
+            return {"ok": True, "status": "interrupted", "runId": run_id}
+        except Exception as exc:
+            self._discard_staged_publications(staged_publications)
+            await self.store.fail_supervisor_job(
+                team_id, job_id, supervisor_id, str(exc)
+            )
+            raise
+        finally:
+            if self._active.get(active_key) is current_task:
+                self._active.pop(active_key, None)
 
     async def _scheduler_loop(self) -> None:
         """轮询持久状态；SQLite lease 使循环在进程重启后可安全恢复。"""
@@ -223,6 +457,10 @@ class TeamRuntime:
                     f"任务《{task['title']}》已提交，成果见待验收 Artifact。",
                     [artifact_id],
                 )
+            except TeamApprovalInterrupted:
+                await self.store.hold_task_for_approval(
+                    team_id, task_id, agent_id, run_id
+                )
             except asyncio.CancelledError:
                 self._update_manifest(task_dir, status="pending", error="Team Runtime stopped during this run")
                 await self.store.interrupt_task(
@@ -299,6 +537,10 @@ class TeamRuntime:
                         team_id,
                         job_id,
                     )
+            except TeamApprovalInterrupted:
+                await self.store.hold_supervisor_for_approval(
+                    team_id, job_id, supervisor_id, run_id
+                )
             except asyncio.CancelledError:
                 await self.store.interrupt_supervisor_job(
                     team_id, job_id, supervisor_id, "Team Runtime stopped during supervisor decision"
@@ -823,6 +1065,7 @@ class TeamRuntime:
         permission_mode: str = "default",
         tool_env: dict[str, str] | None = None,
         run_log: Path | None = None,
+        resume_record: dict[str, Any] | None = None,
     ) -> str:
         chunks: list[str] = []
         pending_output: list[str] = []
@@ -862,6 +1105,12 @@ class TeamRuntime:
             "attemptId": run_id,
             "workspaceDir": to_managed_path(workspace),
         }
+        if resume_record is not None:
+            decision = resume_record.get("decision")
+            if not isinstance(decision, dict):
+                raise ValueError("Team resume record is missing its decision")
+            payload["resume"] = [decision]
+            payload["resumeCheckpoints"] = [resume_record]
 
         async def flush_stream_activity(*, force: bool = False) -> None:
             """Persist readable batches, not one SQLite event per provider token."""
@@ -905,6 +1154,15 @@ class TeamRuntime:
             elif event_type == "RUN_ERROR":
                 await flush_stream_activity(force=True)
                 raise RuntimeError(str(event.get("message") or "Agent run failed"))
+            elif (
+                event_type == "RUN_FINISHED"
+                and isinstance(event.get("outcome"), dict)
+                and event["outcome"].get("type") == "interrupt"
+            ):
+                await flush_stream_activity(force=True)
+                raise TeamApprovalInterrupted(
+                    "Team run is waiting for human approval"
+                )
             elif (
                 event_type == "ACTIVITY_SNAPSHOT"
                 and str(event.get("activityType") or "") == "approval"

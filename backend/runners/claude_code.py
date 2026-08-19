@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from backend.home import session_workspace_dir
 from backend.runners.claude_approval_bridge import (
     APPROVAL_TOOL_NAME,
     ClaudeApprovalBridge,
@@ -43,9 +42,17 @@ from backend.runners.network_policy import network_access_enabled
 
 
 class ClaudeCodeRunner:
+    """进程内 Claude 单例；本轮状态只存在于 create_runtime 的函数作用域。"""
+
+    __slots__ = ()
     kind = "claude_code"
 
-    async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
+    @asynccontextmanager
+    async def create_runtime(
+        self, context: RunnerContext
+    ) -> AsyncIterator[dict[str, Any]]:
+        """只组装本轮 Claude CLI 参数，并维持审批 bridge 生命周期。"""
+        ctx = context
         resolved = resolve_cli(self.kind)
         if resolved is None:
             raise RuntimeError(
@@ -54,7 +61,9 @@ class ClaudeCodeRunner:
             )
         command = resolved.path
 
-        workspace = ctx.workspace_dir or session_workspace_dir(ctx.thread_id)
+        if ctx.workspace_dir is None:
+            raise RuntimeError("ClaudeCodeRunner requires an Access Layer workspaceDir")
+        workspace = ctx.workspace_dir
         workspace.mkdir(parents=True, exist_ok=True)
         skill_preamble = build_claude_skill_preamble(ctx.skills)
         prompt = build_cli_prompt(ctx)
@@ -136,14 +145,22 @@ class ClaudeCodeRunner:
             inject_claude_mcp_secrets(env, ctx.mcp_servers)
             if approval_bridge is not None:
                 env.update(approval_bridge.child_env())
-            async for event in run_cli_jsonl(
-                argv=argv,
-                cwd=workspace,
-                env=env,
-                mapper=map_claude_event,
-                kind=self.kind,
-                state_factory=ClaudeCodeStreamState,
-            ):
+            yield {
+                "argv": argv,
+                "cwd": workspace,
+                "env": env,
+                "mapper": map_claude_event,
+                "kind": self.kind,
+                "state_factory": ClaudeCodeStreamState,
+            }
+
+    async def run_stream(
+        self, context: RunnerContext
+    ) -> AsyncIterator[dict[str, Any]]:
+        """加载 Runtime 参数，并在这里执行 Claude JSONL loop。"""
+
+        async with self.create_runtime(context) as runtime:
+            async for event in run_cli_jsonl(**runtime):
                 yield event
 
 
@@ -269,10 +286,10 @@ def map_claude_event(payload: dict[str, Any], state: _CliStreamState) -> list[di
 
     # ── Complete assistant message (includes thinking, text, tool_use blocks) ─
     if event_type == "assistant":
-        message = payload.get("message")
-        if not isinstance(message, dict):
+        message_payload = payload.get("message")
+        if not isinstance(message_payload, dict):
             return events
-        content = message.get("content")
+        content = message_payload.get("content")
         if isinstance(content, str) and content:
             events.extend(close_thinking(state))
             events.extend(_complete_claude_text(state, content))
@@ -309,9 +326,9 @@ def map_claude_event(payload: dict[str, Any], state: _CliStreamState) -> list[di
 
     # ── Tool results (user-role messages carrying tool_result blocks) ─────
     if event_type == "user":
-        message = payload.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
+        message_payload = payload.get("message")
+        if isinstance(message_payload, dict):
+            content = message_payload.get("content")
             if isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
@@ -351,10 +368,10 @@ def map_claude_event(payload: dict[str, Any], state: _CliStreamState) -> list[di
         if isinstance(session_id, str) and session_id:
             state.provider_session_id = session_id
         events.extend(close_thinking(state))
-        result_text = payload.get("result")
-        if isinstance(result_text, str) and result_text and not state.saw_final_text:
+        final_result = payload.get("result")
+        if isinstance(final_result, str) and final_result and not state.saw_final_text:
             events.extend(close_text_message(state))
-            events.extend(append_text(state, result_text))
+            events.extend(append_text(state, final_result))
             events.extend(close_text_message(state))
         else:
             events.extend(close_text_message(state))
@@ -460,6 +477,11 @@ async def _approval_bridge(ctx: RunnerContext):
         broker=ctx.approval_broker,
         thread_id=ctx.thread_id,
         run_id=ctx.run_id,
+        resume_authorization=(
+            dict(ctx.resume_checkpoints[0])
+            if len(ctx.resume_checkpoints) == 1
+            else None
+        ),
     ) as bridge:
         yield bridge
 

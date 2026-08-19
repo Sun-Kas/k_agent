@@ -82,6 +82,14 @@ class ScheduledRunOutput(BaseModel):
     error_message: str | None = Field(default=None, alias="errorMessage")
 
 
+class ScheduledApprovalResumeInput(BaseModel):
+    """恢复某次 scheduled run 的 terminal Interrupt。"""
+
+    interrupt_id: str = Field(alias="interruptId", min_length=1)
+    action: Literal["approve", "deny", "cancel"]
+    scope: Literal["once", "run"] = "once"
+
+
 class ScheduledTaskOutput(BaseModel):
     """Task representation returned by list and detail APIs."""
 

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from typing import Any
 
-from backend.agent.callbacks import (
+from backend.agent.hooks import (
     AgentRunContext,
     ModelCallPayload,
     ModelResultPayload,
@@ -13,7 +13,7 @@ from backend.agent.callbacks import (
 )
 from backend.api.schemas import ChatMessage
 from backend.observability.langfuse import (
-    LangfuseAgentCallback,
+    LangfuseAgentObserver,
     LangfuseRuntime,
     _json_safe,
     _mask_sensitive_data,
@@ -54,10 +54,10 @@ class _FakeRuntime:
 
 
 class LangfuseObservabilityTests(unittest.IsolatedAsyncioTestCase):
-    async def test_callback_records_agent_generation_and_tool_hierarchy(self) -> None:
+    async def test_observer_records_agent_generation_and_tool_hierarchy(self) -> None:
         root = _FakeRoot()
         runtime = _FakeRuntime()
-        callback = LangfuseAgentCallback(root, runtime)  # type: ignore[arg-type]
+        observer = LangfuseAgentObserver(root, runtime)  # type: ignore[arg-type]
         context = AgentRunContext(run_id="agent-run")
         message = ChatMessage(
             id="user-1",
@@ -66,17 +66,18 @@ class LangfuseObservabilityTests(unittest.IsolatedAsyncioTestCase):
             createdAt=datetime.now(timezone.utc),
         )
 
-        await callback.on_agent_start(context, [message])
-        await callback.before_model(
+        await observer.on_agent_start(context, [message])
+        await observer.before_model(
             context,
             ModelCallPayload(
                 iteration=0,
                 model="test-model",
-                messages=[{"role": "user", "content": "hello"}],
-                tools=[],
+                messages=({"role": "user", "content": "hello"},),
+                tools=(),
+                operation_id="model-op",
             ),
         )
-        await callback.after_model(
+        await observer.after_model(
             context,
             ModelResultPayload(
                 iteration=0,
@@ -85,19 +86,22 @@ class LangfuseObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 output_text="calling a tool",
                 function_call_count=1,
                 elapsed_ms=12.5,
-                tool_calls=[{"name": "lookup", "arguments": {"query": "hello"}}],
+                tool_calls=({"name": "lookup", "arguments": {"query": "hello"}},),
+                operation_id="model-op",
             ),
         )
-        await callback.before_tool(
+        await observer.before_tool(
             context,
             ToolCallPayload(
                 iteration=0,
                 name="lookup",
                 arguments={"query": "hello"},
                 source="local",
+                call_id="call-lookup",
+                operation_id="tool-op",
             ),
         )
-        await callback.after_tool(
+        await observer.after_tool(
             context,
             ToolResultPayload(
                 iteration=0,
@@ -106,9 +110,11 @@ class LangfuseObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 output="result",
                 source="local",
                 elapsed_ms=4.0,
+                call_id="call-lookup",
+                operation_id="tool-op",
             ),
         )
-        await callback.on_agent_end(context, {"messages": [message]})
+        await observer.on_agent_end(context, {"messages": [message]})
 
         self.assertEqual(
             [child.created["as_type"] for child in root.children],

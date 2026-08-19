@@ -4,12 +4,15 @@ import asyncio
 import json
 import os
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from backend.agent.callbacks import AgentRunContext, CallbackManager
+from backend.agent.contracts import AgentRunRequest
 from backend.agent.react_agent import OpenAIAgent
+from backend.api.schemas import ChatMessage
+from backend.mcp_tool import McpClientManager
 from backend.permissions import check_permissions, default_behavior
 from backend.permissions import rules as permission_rules
 from backend.tools import ToolDefinition
@@ -21,6 +24,24 @@ from backend.tools.workspace import (
     set_tool_network_access,
     set_tool_workspace,
 )
+
+
+def _agent_request() -> AgentRunRequest:
+    """Minimal request used to exercise request-scoped OpenAIAgent runtimes."""
+
+    return AgentRunRequest(
+        messages=[
+            ChatMessage(
+                id="permission-test-user",
+                role="user",
+                content="test",
+                createdAt=datetime.now(timezone.utc),
+            )
+        ],
+        system_prompt="test",
+        user_context={},
+        model_config={"model": "test", "apiKey": "test"},
+    )
 
 
 class PermissionRuleTests(unittest.TestCase):
@@ -82,6 +103,23 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         permission_rules._RULE_CACHE = None
 
+    async def test_single_agent_creates_isolated_request_runtimes(self) -> None:
+        agent = OpenAIAgent()
+        first = await agent.create_runtime(
+            _agent_request(), [], McpClientManager([])
+        )
+        second = await agent.create_runtime(
+            _agent_request(), [], McpClientManager([])
+        )
+
+        self.assertIsInstance(first, dict)
+        self.assertFalse(hasattr(agent, "__dict__"))
+        first["approved_targets"].add("Bash")
+
+        self.assertIsNot(first, second)
+        self.assertEqual(first["approved_targets"], {"Bash"})
+        self.assertEqual(second["approved_targets"], set())
+
     async def test_ask_is_refused_with_an_actionable_message(self) -> None:
         async def execute(_: dict) -> str:
             return "ran"
@@ -92,7 +130,10 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             parameters={"type": "object", "properties": {}},
             execute=execute,
         )
-        agent = OpenAIAgent([tool], mcp_client_manager=None)
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(), [tool], McpClientManager([])
+        )
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "permissions.json"
             path.write_text(
@@ -101,9 +142,9 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             )
             with patch.dict(os.environ, {"K_AGENT_PERMISSION_RULES": str(path)}):
                 result = await agent._run_tool(
-                    callbacks=CallbackManager([]),
-                    context=AgentRunContext(),
+                    runtime=runtime,
                     iteration=0,
+                    call_id="call-bash",
                     tool_name="Bash",
                     arguments={"command": "ls"},
                 )
@@ -120,17 +161,18 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         async def approve(*_args):
             calls.append("approval")
-            return {"action": "approve", "remember": False}
+            return {"action": "approve", "scope": "once"}
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Read", "", {"type": "object", "properties": {}}, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
             approval_handler=approve,
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "default"
         result = await agent._run_tool(
-            callbacks=CallbackManager([]), context=context, iteration=0,
+            runtime=runtime,
+            iteration=0, call_id="call-read",
             tool_name="Read",
             arguments={"file_path": "/outside/file", "sandbox_permissions": "require_escalated"},
         )
@@ -168,19 +210,19 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         async def approve(_target, decision, _detail):
             calls.append(f"approval:{decision.behavior}")
-            return {"action": "approve", "remember": False}
+            return {"action": "approve", "scope": "once"}
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Write", "", {"type": "object", "properties": {}}, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
             approval_handler=approve,
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "default"
         result = await agent._run_tool(
-            callbacks=CallbackManager([]),
-            context=context,
+            runtime=runtime,
             iteration=0,
+            call_id="call-write",
             tool_name="Write",
             arguments={"file_path": "/outside/file", "sandbox_permissions": "require_escalated"},
         )
@@ -199,15 +241,16 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             calls.append("approval")
             return {"action": "approve"}
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
             approval_handler=approve,
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "default"
         result = await agent._run_tool(
-            callbacks=CallbackManager([]), context=context, iteration=0,
+            runtime=runtime,
+            iteration=0, call_id="call-bash",
             tool_name="Bash",
             arguments={
                 "command": "curl https://store.steampowered.com",
@@ -232,15 +275,16 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             calls.append("approval")
             return {"action": "approve"}
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
             approval_handler=approve,
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "default"
         result = await agent._run_tool(
-            callbacks=CallbackManager([]), context=context, iteration=0,
+            runtime=runtime,
+            iteration=0, call_id="call-bash",
             tool_name="Bash",
             arguments={
                 "command": "curl https://store.steampowered.com",
@@ -264,7 +308,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         async def approve(_target, decision, _detail):
             calls.append(f"approval:{decision.behavior}")
-            return {"action": "approve", "remember": False}
+            return {"action": "approve", "scope": "once"}
 
         parameters = {
             "type": "object",
@@ -277,15 +321,16 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "required": ["command"],
             "additionalProperties": False,
         }
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Bash", "", parameters, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
             approval_handler=approve,
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "default"
         result = await agent._run_tool(
-            callbacks=CallbackManager([]), context=context, iteration=0,
+            runtime=runtime,
+            iteration=0, call_id="call-bash",
             tool_name="Bash",
             arguments={
                 "command": "curl https://outside.example",
@@ -307,7 +352,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         async def approve(_target, decision, _detail):
             calls.append(f"approval:{decision.behavior}")
-            return {"action": "approve", "remember": False}
+            return {"action": "approve", "scope": "once"}
 
         parameters = {
             "type": "object",
@@ -320,15 +365,16 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "required": ["command"],
             "additionalProperties": False,
         }
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Bash", "", parameters, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
             approval_handler=approve,
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "default"
         result = await agent._run_tool(
-            callbacks=CallbackManager([]), context=context, iteration=0,
+            runtime=runtime,
+            iteration=0, call_id="call-bash",
             tool_name="Bash",
             arguments={
                 "command": "touch /etc/example",
@@ -345,18 +391,20 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_: dict) -> str:
             return "ran"
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
-            mcp_client_manager=None,
+            McpClientManager([]),
         )
-        context = AgentRunContext()
-        context.metadata["permission_mode"] = "full_access"
+        runtime["pipeline"].context.metadata["permission_mode"] = "full_access"
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "permissions.json"
             path.write_text(json.dumps({"rules": [{"tool": "Bash", "pattern": "*", "behavior": "deny"}]}), encoding="utf-8")
             with patch.dict(os.environ, {"K_AGENT_PERMISSION_RULES": str(path)}):
                 result = await agent._run_tool(
-                    callbacks=CallbackManager([]), context=context, iteration=0,
+                    runtime=runtime,
+                    iteration=0, call_id="call-bash",
                     tool_name="Bash", arguments={"command": "whoami"},
                 )
         self.assertEqual(result, "ran")
@@ -375,28 +423,31 @@ class SkillAllowlistTests(unittest.IsolatedAsyncioTestCase):
         async def bash_execute(_: dict) -> str:
             return "ran"
 
-        agent = OpenAIAgent(
+        agent = OpenAIAgent()
+        runtime = await agent.create_runtime(
+            _agent_request(),
             [
                 ToolDefinition("Skill", "", {"type": "object", "properties": {}}, skill_execute),
                 ToolDefinition("Bash", "", {"type": "object", "properties": {}}, bash_execute),
             ],
-            mcp_client_manager=None,
+            McpClientManager([]),
         )
-        context = AgentRunContext()
-        callbacks = CallbackManager([])
         await agent._run_tool(
-            callbacks=callbacks,
-            context=context,
+            runtime=runtime,
             iteration=0,
+            call_id="call-skill",
             tool_name="Skill",
             arguments={"skill": "reviewer"},
         )
-        self.assertEqual(context.skill_allowlist, {"Read", "Skill"})
+        self.assertEqual(
+            runtime["pipeline"].context.skill_allowlist,
+            {"Read", "Skill"},
+        )
         blocked = json.loads(
             await agent._run_tool(
-                callbacks=callbacks,
-                context=context,
+                runtime=runtime,
                 iteration=1,
+                call_id="call-bash",
                 tool_name="Bash",
                 arguments={"command": "ls"},
             )

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import json
 import logging
 import re
 import shutil
@@ -39,6 +41,14 @@ class SessionBusyError(RuntimeError):
     """Raised when a destructive session operation races an active run."""
 
 
+class OpenInterruptError(RuntimeError):
+    """线程存在未解决 Interrupt，普通用户输入不能越过该恢复边界。"""
+
+
+class ResumeConflictError(RuntimeError):
+    """Resume 未完整覆盖开放 Interrupt，或与已经认领的决定冲突。"""
+
+
 @dataclass(slots=True)
 class SessionRecord:
     """由已接受 AG-UI 事件重建的持久化会话状态（messages / events / 能力选择等）。"""
@@ -55,6 +65,8 @@ class SessionRecord:
     permission_mode: str = "default"
     # Provider-native CLI session ids (codex / claude_code) for optional resume.
     cli_sessions: dict[str, str] = field(default_factory=dict)
+    # 主会话文件只保存开放 ID 索引；完整审批与 checkpoint 独立原子落盘。
+    open_interrupt_ids: list[str] = field(default_factory=list)
     # 来源是持久化边界：自动任务仍有完整 session/workspace，但不进入普通会话目录。
     source: str = "interactive"
     source_ref: str | None = None
@@ -72,6 +84,9 @@ class SessionStore:
         """绑定存储后端，并初始化内存索引、缓冲与取消标记表。"""
         self._storage = storage
         self._sessions: dict[str, SessionRecord] = {}
+        # 无 StorageBackend 的单元测试也需要同一状态机；生产环境同时写独立文件。
+        self._approval_records: dict[tuple[str, str], dict[str, Any]] = {}
+        self._resume_intents: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_run_ids: dict[str, str] = {}
         self._run_input_message_ids: dict[tuple[str, str], set[str]] = {}
         self._cancelled_run_ids: set[tuple[str, str]] = set()
@@ -425,6 +440,306 @@ class SessionStore:
         async with self._lock:
             return self._sessions.get(session_id)
 
+    async def persist_interrupt(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """在审批卡对浏览器可见前，原子保存其服务端 checkpoint。
+
+        ``_checkpoint`` 是 Backend 与 Access Layer 的私有字段。它不会进入 SSE
+        或普通 events，避免浏览器成为可执行恢复状态的信任来源。
+        """
+
+        content = event.get("content")
+        if not isinstance(content, dict):
+            raise ValueError("Approval activity content must be an object")
+        interrupt_id = content.get("id")
+        if not isinstance(interrupt_id, str) or not interrupt_id:
+            raise ValueError("Approval activity is missing interrupt id")
+        checkpoint = content.get("_checkpoint")
+        if not isinstance(checkpoint, dict):
+            raise ValueError("Approval activity is missing durable checkpoint")
+
+        public_content = copy.deepcopy(content)
+        public_content.pop("_checkpoint", None)
+        public_event = copy.deepcopy(event)
+        public_event["content"] = public_content
+        now = datetime.now(timezone.utc).isoformat()
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            record = {
+                "version": 1,
+                "id": interrupt_id,
+                "threadId": session_id,
+                "runId": str(content.get("runId") or ""),
+                "agentKind": str(content.get("agentKind") or "k_agent"),
+                "category": str(content.get("category") or "tool"),
+                "title": str(content.get("title") or "需要确认"),
+                "message": str(content.get("message") or "请确认是否继续。"),
+                "detail": copy.deepcopy(content.get("detail") or {}),
+                "toolCallId": str(content.get("toolCallId") or interrupt_id),
+                "requestHash": str(content.get("requestHash") or ""),
+                "status": "pending",
+                "checkpoint": copy.deepcopy(checkpoint),
+                "createdAt": now,
+                "updatedAt": now,
+                "resumeRunId": None,
+                "decision": None,
+            }
+            existing = await self._read_approval_locked(session_id, interrupt_id)
+            if existing is not None and existing.get("requestHash") != record["requestHash"]:
+                raise ResumeConflictError("Interrupt id was reused with different arguments")
+            if existing is None:
+                await self._write_approval_locked(session_id, interrupt_id, record)
+            if interrupt_id not in session.open_interrupt_ids:
+                session.open_interrupt_ids.append(interrupt_id)
+            session.updated_at = datetime.now(timezone.utc)
+            await self._persist(session)
+        return public_event
+
+    async def list_open_interrupts(self, session_id: str) -> list[dict[str, Any]]:
+        """返回前端可展示的开放审批；checkpoint 永远不离开 Access Layer。"""
+
+        await self._ensure_loaded()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return []
+            result: list[dict[str, Any]] = []
+            for interrupt_id in session.open_interrupt_ids:
+                record = await self._read_approval_locked(session_id, interrupt_id)
+                if record is None:
+                    continue
+                result.append({
+                    key: copy.deepcopy(value)
+                    for key, value in record.items()
+                    if key != "checkpoint"
+                })
+            return result
+
+    async def prepare_resume(
+        self,
+        session_id: str,
+        resume_entries: list[dict[str, Any]],
+        *,
+        resume_run_id: str,
+        resume_context: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """完整校验并一次性认领开放 Interrupt，返回仅供 Backend 使用的记录。
+
+        单 Access Layer worker 下，内存锁加独立文件原子替换构成 CAS。未来启用
+        多 worker 前必须把这段认领迁到 SQLite/数据库事务。
+        """
+
+        await self._ensure_loaded()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            supplied = {
+                str(entry.get("interruptId") or ""): entry for entry in resume_entries
+            }
+            expected = set(session.open_interrupt_ids)
+            if not expected or set(supplied) != expected or "" in supplied:
+                raise ResumeConflictError(
+                    "Resume must resolve every open interrupt for this thread"
+                )
+
+            canonical = json.dumps(
+                resume_entries,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            input_hash = "sha256:" + hashlib.sha256(canonical).hexdigest()
+            intent_id = input_hash.removeprefix("sha256:")[:32]
+            prior_intent = self._resume_intents.get((session_id, intent_id))
+            if prior_intent is None and self._storage is not None:
+                settings = await get_or_init_settings()
+                raw = await self._storage.read_json(
+                    f"{settings.session_storage_prefix}/{session_id}/resume-intents/{intent_id}.json"
+                )
+                prior_intent = raw if isinstance(raw, dict) else None
+            if prior_intent is not None:
+                if prior_intent.get("resumeRunId") != resume_run_id:
+                    raise ResumeConflictError(
+                        "This resume decision was already claimed by another run"
+                    )
+                return copy.deepcopy(prior_intent.get("interrupts") or [])
+
+            records: list[dict[str, Any]] = []
+            now = datetime.now(timezone.utc).isoformat()
+            for interrupt_id in session.open_interrupt_ids:
+                record = await self._read_approval_locked(session_id, interrupt_id)
+                if record is None or record.get("status") not in {
+                    "pending", "unknown_outcome", "resume_failed",
+                }:
+                    raise ResumeConflictError("Interrupt is no longer pending")
+                checkpoint = record.get("checkpoint")
+                stored_context = (
+                    checkpoint.get("resumeContext")
+                    if isinstance(checkpoint, dict)
+                    else None
+                )
+                if stored_context is not None and stored_context != (resume_context or {}):
+                    raise ResumeConflictError(
+                        "Resume runtime differs from the interrupted run"
+                    )
+                entry = supplied[interrupt_id]
+                status = entry.get("status")
+                payload = entry.get("payload")
+                if status not in {"resolved", "cancelled"}:
+                    raise ResumeConflictError("Unsupported resume status")
+                if status == "resolved" and (
+                    not isinstance(payload, dict)
+                    or not isinstance(payload.get("approved"), bool)
+                ):
+                    raise ResumeConflictError(
+                        "Resolved approval payload must contain approved:boolean"
+                    )
+                if (
+                    record.get("status") in {"unknown_outcome", "resume_failed"}
+                    and (
+                        not isinstance(payload, dict)
+                        or payload.get("reconfirm") is not True
+                    )
+                ):
+                    raise ResumeConflictError(
+                        "Unknown tool outcome requires explicit reconfirmation"
+                    )
+                updated = copy.deepcopy(record)
+                updated.update({
+                    "status": "resuming",
+                    "resumeRunId": resume_run_id,
+                    "decision": copy.deepcopy(entry),
+                    "updatedAt": now,
+                })
+                records.append(updated)
+
+            intent = {
+                "version": 1,
+                "id": intent_id,
+                "threadId": session_id,
+                "resumeRunId": resume_run_id,
+                "inputHash": input_hash,
+                "status": "resuming",
+                "interrupts": copy.deepcopy(records),
+                "createdAt": now,
+            }
+            # Intent 先落盘，进程崩溃后仍能判断“是否已经认领”，不会重复执行。
+            await self._write_resume_intent_locked(session_id, intent_id, intent)
+            for record in records:
+                await self._write_approval_locked(session_id, record["id"], record)
+            return records
+
+    async def finish_resume(
+        self,
+        session_id: str,
+        interrupt_ids: list[str],
+        *,
+        succeeded: bool,
+        unknown_outcome: bool = False,
+    ) -> None:
+        """在 Resume Run 落下终态后关闭索引；失败保留卡片但标为可诊断状态。"""
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            now = datetime.now(timezone.utc).isoformat()
+            for interrupt_id in interrupt_ids:
+                record = await self._read_approval_locked(session_id, interrupt_id)
+                if record is None:
+                    continue
+                decision = record.get("decision") or {}
+                payload = decision.get("payload") if isinstance(decision, dict) else {}
+                if unknown_outcome:
+                    final_status = "unknown_outcome"
+                elif not succeeded:
+                    final_status = "resume_failed"
+                elif decision.get("status") == "cancelled":
+                    final_status = "cancelled"
+                elif isinstance(payload, dict) and payload.get("approved") is True:
+                    final_status = "approved"
+                else:
+                    final_status = "denied"
+                record.update({"status": final_status, "updatedAt": now})
+                await self._write_approval_locked(session_id, interrupt_id, record)
+                session.events.append({
+                    "type": "ACTIVITY_SNAPSHOT",
+                    "messageId": interrupt_id,
+                    "activityType": "approval",
+                    "replace": True,
+                    "content": {
+                        key: copy.deepcopy(value)
+                        for key, value in record.items()
+                        if key not in {"checkpoint", "decision"}
+                    },
+                })
+            if succeeded:
+                closed = set(interrupt_ids)
+                session.open_interrupt_ids = [
+                    item for item in session.open_interrupt_ids if item not in closed
+                ]
+            session.updated_at = datetime.now(timezone.utc)
+            await self._persist(session)
+
+    async def ensure_accepts_new_input(self, session_id: str) -> None:
+        """阻止用户消息跨过一个仍需决定的工具边界。"""
+
+        await self._ensure_loaded()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is not None and session.open_interrupt_ids:
+                raise OpenInterruptError(
+                    "Resolve the pending approval before sending another message"
+                )
+
+    async def _read_approval_locked(
+        self, session_id: str, interrupt_id: str
+    ) -> dict[str, Any] | None:
+        cached = self._approval_records.get((session_id, interrupt_id))
+        if cached is not None:
+            return copy.deepcopy(cached)
+        if self._storage is None:
+            return None
+        settings = await get_or_init_settings()
+        raw = await self._storage.read_json(
+            f"{settings.session_storage_prefix}/{session_id}/approvals/{interrupt_id}.json"
+        )
+        if not isinstance(raw, dict):
+            return None
+        self._approval_records[(session_id, interrupt_id)] = copy.deepcopy(raw)
+        return copy.deepcopy(raw)
+
+    async def _write_approval_locked(
+        self, session_id: str, interrupt_id: str, record: dict[str, Any]
+    ) -> None:
+        self._approval_records[(session_id, interrupt_id)] = copy.deepcopy(record)
+        if self._storage is None:
+            return
+        settings = await get_or_init_settings()
+        await self._storage.write_json(
+            f"{settings.session_storage_prefix}/{session_id}/approvals/{interrupt_id}.json",
+            record,
+        )
+
+    async def _write_resume_intent_locked(
+        self, session_id: str, intent_id: str, intent: dict[str, Any]
+    ) -> None:
+        self._resume_intents[(session_id, intent_id)] = copy.deepcopy(intent)
+        if self._storage is None:
+            return
+        settings = await get_or_init_settings()
+        await self._storage.write_json(
+            f"{settings.session_storage_prefix}/{session_id}/resume-intents/{intent_id}.json",
+            intent,
+        )
+
     async def fork_session(self, session_id: str) -> SessionRecord | None:
         """Clone a stable conversation and workspace into an independent branch.
 
@@ -527,6 +842,16 @@ class SessionStore:
             }
             self._stopped_run_ids = {
                 key for key in self._stopped_run_ids if key[0] != session_id
+            }
+            self._approval_records = {
+                key: value
+                for key, value in self._approval_records.items()
+                if key[0] != session_id
+            }
+            self._resume_intents = {
+                key: value
+                for key, value in self._resume_intents.items()
+                if key[0] != session_id
             }
             return True
 
@@ -686,6 +1011,18 @@ class SessionStore:
                     # One unreadable session file must not take down the whole
                     # session index and, with it, every other conversation.
                     logger.error("Skipping unreadable session file %s", path, exc_info=True)
+            # 单 worker 重启意味着旧的 resuming 进程已经不存在；工具可能在崩溃前
+            # 执行过，不能自动重试。转成 unknown_outcome，等待用户显式二次确认。
+            for session in self._sessions.values():
+                for interrupt_id in session.open_interrupt_ids:
+                    record = await self._read_approval_locked(session.id, interrupt_id)
+                    if record is None or record.get("status") != "resuming":
+                        continue
+                    record.update({
+                        "status": "unknown_outcome",
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
+                    })
+                    await self._write_approval_locked(session.id, interrupt_id, record)
             self._loaded = True
 
     async def _migrate_flat_sessions(self, _prefix: str, root: Path) -> None:
@@ -756,6 +1093,7 @@ class SessionStore:
                 else None
             ),
             "cliSessions": dict(session.cli_sessions),
+            "openInterruptIds": list(session.open_interrupt_ids),
             "source": session.source,
             "sourceRef": session.source_ref,
             "updatedAt": session.updated_at.isoformat(),
@@ -798,6 +1136,11 @@ class SessionStore:
                 else "default"
             ),
             cli_sessions=cli_sessions,
+            open_interrupt_ids=[
+                str(item)
+                for item in payload.get("openInterruptIds", [])
+                if isinstance(item, str) and item
+            ],
             source=str(payload.get("source") or "interactive"),
             source_ref=(str(payload["sourceRef"]) if payload.get("sourceRef") is not None else None),
             updated_at=datetime.fromisoformat(updated_at) if updated_at else datetime.now(timezone.utc),

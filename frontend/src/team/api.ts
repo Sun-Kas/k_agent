@@ -111,6 +111,16 @@ export const commandTeam = (teamId: string, command: "pause" | "resume" | "cance
     body: JSON.stringify({ command })
   });
 
+export const resumeTeamApproval = (
+  teamId: string,
+  approvalId: string,
+  action: "approve" | "deny" | "cancel",
+  scope: "once" | "run" = "once"
+) => teamFetch<{ ok: boolean; status: string; runId: string }>(
+  `/${encodeURIComponent(teamId)}/approvals/${encodeURIComponent(approvalId)}/resume`,
+  { method: "POST", body: JSON.stringify({ action, scope }) }
+);
+
 export const sendTeamMessage = (teamId: string, recipientId: string, content: string) =>
   teamFetch<TeamSnapshot>(`/${encodeURIComponent(teamId)}/messages`, {
     method: "POST",

@@ -32,7 +32,7 @@ from backend.home import (
     link_shared_runtime,
     memory_dir,
     resolve_managed_path,
-    session_workspace_dir,
+    sessions_dir,
     shared_runtime_tool_env,
     teams_dir,
 )
@@ -42,13 +42,13 @@ from backend.sandbox import (
     sandbox_runtime_status,
     set_tool_env_overrides,
 )
-from backend.observability import AgentBackendLoggingCallback, LangfuseRuntime
+from backend.observability import AgentBackendLoggingObserver, LangfuseRuntime
 from backend.prompts import (
     build_prompt_bundle,
     prompt_lifecycle_state,
     reset_prompt_caches,
 )
-from backend.runners import RunnerContext, build_default_registry
+from backend.runners import RunnerContext, get_default_registry
 from backend.runners.network_policy import network_access_enabled
 from backend.runners.detect import detect_agents_payload
 from backend.tools import load_local_tools
@@ -74,48 +74,45 @@ class AgentBackendRunInput(BaseModel):
     skills: list[dict[str, Any]] = Field(default_factory=list)
     reasoning_effort: str | None = Field(default=None, alias="reasoningEffort")
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    resume: list[dict[str, Any]] = Field(default_factory=list)
+    resume_checkpoints: list[dict[str, Any]] = Field(
+        default_factory=list, alias="resumeCheckpoints"
+    )
     agent_kind: str | None = Field(default="k_agent", alias="agentKind")
     agent_options: dict[str, Any] = Field(default_factory=dict, alias="agentOptions")
     team_id: str | None = Field(default=None, alias="teamId")
     task_id: str | None = Field(default=None, alias="taskId")
     team_agent_id: str | None = Field(default=None, alias="teamAgentId")
     attempt_id: str | None = Field(default=None, alias="attemptId")
-    workspace_dir: str | None = Field(default=None, alias="workspaceDir")
+    workspace_dir: str = Field(alias="workspaceDir", min_length=1)
 
 
-def _team_workspace(raw_path: str | None) -> Path | None:
-    """校验 Team 传入的 cwd 必须落在 `$K_AGENT_HOME/state/teams` 内，防止越权写盘。"""
+def _resolve_run_workspace(raw_path: str, *, is_team_run: bool) -> Path:
+    """只接受 Access Layer 下发的工作区，不用 threadId 推导任何会话路径。"""
 
-    if not raw_path:
-        return None
     # Access Layer sends `$K_AGENT_HOME`-relative paths via to_managed_path().
     # Resolve against the home, not process cwd, or LAN/deploy cwd mismatches
-    # reject every Team run with "workspaceDir must be inside…".
+    # reject valid run workspaces after the two services start from different cwd.
     resolved = resolve_managed_path(raw_path)
+    allowed_root = teams_dir().resolve() if is_team_run else sessions_dir().resolve()
     try:
-        resolved.relative_to(teams_dir().resolve())
+        relative = resolved.relative_to(allowed_root)
     except ValueError as exc:
-        raise ValueError("workspaceDir must be inside the Team Runtime state root") from exc
+        scope = "Team Runtime" if is_team_run else "session"
+        raise ValueError(f"workspaceDir must be inside the {scope} workspace root") from exc
+    if not is_team_run and (len(relative.parts) != 2 or relative.parts[-1] != "workspace"):
+        # A normal run may access only sessions/{id}/workspace, never the sibling
+        # sessions/{id}/{id}.json conversation record owned by Access Layer.
+        raise ValueError("workspaceDir must identify a session workspace")
     resolved.mkdir(parents=True, exist_ok=True)
     return resolved
-
-
-def _resolve_run_workspace(thread_id: str, raw_path: str | None) -> Path:
-    """优先用 Team 任务目录；普通对话则回落到 session workspace。"""
-
-    team_workspace = _team_workspace(raw_path)
-    if team_workspace is not None:
-        return team_workspace
-    workspace = session_workspace_dir(thread_id)
-    workspace.mkdir(parents=True, exist_ok=True)
-    return workspace
 
 
 def create_app() -> FastAPI:
     """组装 Agent Backend：内部健康/能力探测 + `/internal/agent/run` AG-UI 流。"""
     settings = Settings()
     configure_agent_backend_logging(settings.agent_backend_log_level)
-    runner_registry = build_default_registry()
+    runner_registry = get_default_registry()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -277,7 +274,7 @@ def create_app() -> FastAPI:
             """绑定 workspace/网络/共享 runtime env，驱动 Runner 并产出内部事件。"""
             request_id = request.headers.get("x-request-id", "")
             stream_started_at = time.perf_counter()
-            logging_callback = AgentBackendLoggingCallback(
+            logging_observer = AgentBackendLoggingObserver(
                 request_id=request_id,
                 thread_id=payload.thread_id,
                 run_id=payload.run_id,
@@ -294,7 +291,7 @@ def create_app() -> FastAPI:
                 selectedSkillCount=len(payload.skills),
                 attachmentCount=len(payload.attachments),
             )
-            ctx = RunnerContext(
+            request_context = RunnerContext(
                 thread_id=payload.thread_id,
                 run_id=payload.run_id,
                 request_id=request_id,
@@ -304,32 +301,39 @@ def create_app() -> FastAPI:
                 skills=payload.skills,
                 reasoning_effort=payload.reasoning_effort,
                 attachments=payload.attachments,
+                resume=payload.resume,
+                resume_checkpoints=payload.resume_checkpoints,
                 workspace_dir=_resolve_run_workspace(
-                    payload.thread_id, payload.workspace_dir
+                    payload.workspace_dir,
+                    is_team_run=bool(payload.team_id),
                 ),
                 team_id=payload.team_id,
                 options=dict(payload.agent_options or {}),
                 settings=settings,
                 mcp_pool=app.state.mcp_pool,
                 langfuse=app.state.langfuse,
-                logging_callback=logging_callback,
+                logging_observer=logging_observer,
                 approval_broker=app.state.approvals,
             )
             # worksapce地址
-            workspace_token = set_tool_workspace(ctx.workspace_dir)
+            workspace_token = set_tool_workspace(request_context.workspace_dir)
             # 网络访问权限
-            network_token = set_tool_network_access(network_access_enabled(ctx))
+            network_token = set_tool_network_access(network_access_enabled(request_context))
             # 权限模式
             permission_token = set_tool_permission_mode(
-                str(ctx.options.get("permissionMode") or "default")
+                str(request_context.options.get("permissionMode") or "default")
             )
             # 共享 runtime env，全项目一份 Node/npm 前缀，对话与 Team 共用。冲突键以
             # agentOptions.toolEnv 为准。
-            runtime = ensure_shared_runtime()
-            if ctx.workspace_dir is not None:
-                link_shared_runtime(ctx.workspace_dir, runtime)
-            tool_env = shared_runtime_tool_env(runtime)
-            option_env = ctx.options.get("toolEnv") if isinstance(ctx.options, dict) else None
+            shared_runtime = ensure_shared_runtime()
+            if request_context.workspace_dir is not None:
+                link_shared_runtime(request_context.workspace_dir, shared_runtime)
+            tool_env = shared_runtime_tool_env(shared_runtime)
+            option_env = (
+                request_context.options.get("toolEnv")
+                if isinstance(request_context.options, dict)
+                else None
+            )
             if isinstance(option_env, dict):
                 tool_env.update(
                     {str(k): str(v) for k, v in option_env.items() if v is not None}
@@ -340,7 +344,7 @@ def create_app() -> FastAPI:
                 # 每轮 run 都要挂审批合流：无 HITL 时只是原样转发 Runner 事件；
                 # 有 HITL 时 request() 才能把卡片插入这条正在输出的 HTTP 流。
                 async for event in app.state.approvals.stream(
-                    runner.run_stream(ctx),
+                    runner.run_stream(request_context),
                     thread_id=payload.thread_id,
                     run_id=payload.run_id,
                 ):

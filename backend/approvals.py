@@ -1,42 +1,91 @@
-"""按 run 挂起人类审批：把 approval 事件并入 live 流，决策后再唤醒工具调用。
+"""把工具权限请求转换为 AG-UI terminal interrupt。
 
-所有 Runner（k_agent / Codex / Claude Code）共用本经纪。`stream` 用独立 producer
-泵事件，使 HTTP 流能先下发审批卡片，而请求方仍阻塞在 Future 上。
+当前模块只管理一次 HTTP run 内的控制流，不保存跨请求状态。权限请求通过
+``ApprovalInterrupt`` 终止原 Runner，随后由 ``backend.agui`` 输出标准
+``RUN_FINISHED.outcome.interrupt``。持久化和 Resume 认领属于 Access Layer。
 """
 
 from __future__ import annotations
 
+import hashlib
 import asyncio
+import json
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass(slots=True)
-class _PendingApproval:
-    """待决审批：保存完整 activity 快照，resolve 时原位更新同一张卡片。"""
+def canonical_json_sha256(value: Any) -> str:
+    """返回稳定 JSON 哈希，用于把用户决定绑定到准确的工具参数。"""
 
-    request_id: str
-    thread_id: str
-    run_id: str
-    future: asyncio.Future[dict[str, Any]]
-    payload: dict[str, Any]
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def consume_resume_authorization(
+    authorization: dict[str, Any] | None,
+    *,
+    title: str,
+    detail: dict[str, Any],
+) -> dict[str, Any] | None:
+    """按原请求 hash 消费一次 provider 重放授权；参数变化时返回 None。"""
+
+    if not isinstance(authorization, dict) or authorization.get("consumed"):
+        return None
+    actual_hash = canonical_json_sha256({
+        "target": detail.get("toolName") or title,
+        "source": detail.get("source"),
+        "serverId": detail.get("serverId"),
+        "arguments": detail.get("arguments", detail.get("input", {})),
+    })
+    if actual_hash != authorization.get("requestHash"):
+        return None
+    decision = authorization.get("decision")
+    if not isinstance(decision, dict):
+        return None
+    authorization["consumed"] = True
+    payload = decision.get("payload")
+    if decision.get("status") == "cancelled":
+        return {"action": "cancel", "scope": "once"}
+    if not isinstance(payload, dict) or not isinstance(payload.get("approved"), bool):
+        return None
+    return {
+        "action": "approve" if payload["approved"] else "deny",
+        "scope": payload.get("scope") if payload.get("scope") in {"once", "run"} else "once",
+    }
+
+
+class ApprovalInterrupt(BaseException):
+    """Runner 在工具执行前抛出的非错误终止信号。
+
+    它刻意不继承 ``Exception``：普通工具错误恢复层会捕获 Exception 并把它
+    转成模型可见结果，而控制流 Interrupt 必须穿透该层到 ApprovalBroker。
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__(str(payload.get("message") or "Agent run interrupted for approval"))
+        self.payload = payload
 
 
 class ApprovalBroker:
-    """把审批请求复用进正在进行的 run，并在决策后恢复被挂起的工具调用。
+    """创建 run-scoped Interrupt，并把控制流转换为内部事件。
 
-    请求审批的 Runner 刻意阻塞在 Future 上；独立 producer 继续泵事件，
-    这样 HTTP 流能先把审批卡交给前端，工具调用本身仍保持暂停。
+    该类保留原名称以降低 Runner 注入面的改动，但不再维护 Future、队列或
+    ``requestId -> pending`` 内存表，因此 Backend 多 worker 不会导致 Resume
+    请求命中错误进程。
     """
 
-    def __init__(self, *, timeout_seconds: float = 600.0) -> None:
-        self._timeout_seconds = timeout_seconds
-        # (thread_id, run_id) → 合流队列；同 run 重复注册会拒绝，防止串流。
-        self._queues: dict[tuple[str, str], asyncio.Queue[tuple[str, Any]]] = {}
-        self._pending: dict[str, _PendingApproval] = {}
-        self._lock = asyncio.Lock()
+    def __init__(self) -> None:
+        self._active_runs: dict[
+            tuple[str, str], asyncio.Queue[dict[str, Any]]
+        ] = {}
+        self._run_closed: dict[tuple[str, str], asyncio.Event] = {}
 
     async def stream(
         self,
@@ -45,51 +94,65 @@ class ApprovalBroker:
         thread_id: str,
         run_id: str,
     ) -> AsyncIterator[dict[str, Any]]:
-        """按到达顺序合并 Runner 事件与审批生命周期事件；流结束取消未决审批。
-
-        无审批时队列里只有 Runner 的 event + 收尾 done，等价于透传。
-        有审批时 request() 往同一队列插卡片；工具仍阻塞在 Future 上。
-        """
+        """透传 Runner；捕获审批中断后依次输出卡片和 terminal interrupt。"""
 
         key = (thread_id, run_id)
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        async with self._lock:
-            if key in self._queues:
-                raise RuntimeError(f"Approval stream already registered for run {run_id}")
-            # 先挂号，后面工具 request() 才找得到这条 run 的活流。
-            self._queues[key] = queue
+        if key in self._active_runs:
+            raise RuntimeError(f"Approval stream already registered for run {run_id}")
+        interrupt_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        run_closed = asyncio.Event()
+        event_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self._active_runs[key] = interrupt_queue
+        self._run_closed[key] = run_closed
 
-        async def produce() -> None:
+        async def pump() -> None:
             try:
                 async for event in events:
-                    await queue.put(("event", event))
+                    await event_queue.put(("event", event))
+            except ApprovalInterrupt as interrupt:
+                # 兼容直接抛出控制信号的 Runner；request() 的队列路径通常已先到达。
+                if interrupt_queue.empty():
+                    interrupt_queue.put_nowait(interrupt.payload)
             except BaseException as exc:
-                await queue.put(("error", exc))
-            else:
-                await queue.put(("done", None))
+                await event_queue.put(("error", exc))
+            finally:
+                await event_queue.put(("done", None))
 
-        # 独立泵：Runner 在 HITL Future 上睡着时，HTTP 仍能先把审批卡 yield 出去。
-        producer = asyncio.create_task(produce())
+        pump_task = asyncio.create_task(pump())
         try:
             while True:
-                kind, value = await queue.get()
+                event_task = asyncio.create_task(event_queue.get())
+                interrupt_task = asyncio.create_task(interrupt_queue.get())
+                done, pending = await asyncio.wait(
+                    {event_task, interrupt_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if interrupt_task in done:
+                    payload = interrupt_task.result()
+                    pump_task.cancel()
+                    await asyncio.gather(pump_task, return_exceptions=True)
+                    # Provider bridges waiting inside request() must be released
+                    # before the consumer pauses on the terminal SSE frames.
+                    run_closed.set()
+                    yield {"type": "approval_request", "payload": payload}
+                    yield {"type": "interrupt", "payload": payload}
+                    return
+                kind, value = event_task.result()
                 if kind == "event":
                     yield value
                 elif kind == "error":
                     raise value
                 else:
-                    # done：Runner 正常结束且没有更多审批事件。
-                    break
+                    return
         finally:
-            if not producer.done():
-                producer.cancel()
-                try:
-                    await producer
-                except asyncio.CancelledError:
-                    pass
-            await self.cancel_run(thread_id=thread_id, run_id=run_id)
-            async with self._lock:
-                self._queues.pop(key, None)
+            pump_task.cancel()
+            await asyncio.gather(pump_task, return_exceptions=True)
+            self._active_runs.pop(key, None)
+            run_closed.set()
+            self._run_closed.pop(key, None)
 
     async def request(
         self,
@@ -101,12 +164,27 @@ class ApprovalBroker:
         title: str,
         message: str,
         detail: dict[str, Any] | None = None,
+        checkpoint: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """向当前 run 流发布 `approval_request`，阻塞直到公开 API resolve 或超时。"""
+        """在已注册 run 内创建 Interrupt；本方法不会等待或执行工具。"""
 
+        interrupt_queue = self._active_runs.get((thread_id, run_id))
+        run_closed = self._run_closed.get((thread_id, run_id))
+        if interrupt_queue is None or run_closed is None:
+            raise RuntimeError("Approval requested outside an active run stream")
+        request_detail = dict(detail or {})
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        tool_call_id = str(
+            request_detail.get("callId")
+            or request_detail.get("toolCallId")
+            or request_id
+        )
+        request_hash = canonical_json_sha256({
+            "target": request_detail.get("toolName") or title,
+            "source": request_detail.get("source"),
+            "serverId": request_detail.get("serverId"),
+            "arguments": request_detail.get("arguments", request_detail.get("input", {})),
+        })
         payload = {
             "id": request_id,
             "threadId": thread_id,
@@ -115,109 +193,38 @@ class ApprovalBroker:
             "category": category,
             "title": title,
             "message": message,
-            "detail": detail or {},
+            "detail": request_detail,
             "status": "pending",
+            "toolCallId": tool_call_id,
+            "requestHash": request_hash,
+            # 下划线字段只走 Backend -> Access Layer 内部流；Gateway 落盘后剥离。
+            "_checkpoint": {
+                "version": 1,
+                "kind": "restart_from_context",
+                **dict(checkpoint or {}),
+                "requestHash": request_hash,
+            },
         }
-        pending = _PendingApproval(request_id, thread_id, run_id, future, payload)
-        key = (thread_id, run_id)
-        async with self._lock:
-            queue = self._queues.get(key)
-            if queue is None:
-                # 没走 stream() 挂号：卡片无处可插，HTTP 也带不走。
-                raise RuntimeError("Approval requested outside an active run stream")
-            self._pending[request_id] = pending
-            await queue.put((
-                "event",
-                {
-                    "type": "approval_request",
-                    "payload": payload,
-                },
-            ))
         try:
-            return await asyncio.wait_for(future, timeout=self._timeout_seconds)
-        except TimeoutError as exc:
-            # Timeout is a lifecycle transition, not merely an exception. Emit
-            # it before removing the pending entry so streamed and persisted UI
-            # state cannot leave an actionable card behind forever.
-            async with self._lock:
-                queue = self._queues.get(key)
-                if queue is not None:
-                    await queue.put((
-                        "event",
-                        {
-                            "type": "approval_resolved",
-                            "payload": {
-                                **pending.payload,
-                                "action": "expired",
-                                "status": "expired",
-                            },
-                        },
-                    ))
-            raise RuntimeError("Human approval timed out") from exc
-        finally:
-            async with self._lock:
-                self._pending.pop(request_id, None)
+            interrupt_queue.put_nowait(payload)
+        except asyncio.QueueFull as exc:
+            raise RuntimeError("Run already has a pending interrupt") from exc
+        # 原 Runner 必须停在工具执行前，直到 stream 观察到队列并取消它；这里不
+        # 返回临时决定，也不保存跨请求 Future。
+        await run_closed.wait()
+        return {"action": "cancel", "scope": "once"}
 
-    async def resolve(
-        self,
-        request_id: str,
-        *,
-        thread_id: str,
-        run_id: str,
-        decision: dict[str, Any],
-    ) -> bool:
-        """仅当 requestId + threadId + runId 全匹配时完成 Future，防止跨 run 误唤醒。"""
+    async def resolve(self, *_args: Any, **_kwargs: Any) -> bool:
+        """旧在线审批入口不再可用；迁移期统一返回不再 pending。"""
 
-        async with self._lock:
-            pending = self._pending.get(request_id)
-            if pending is None:
-                return False
-            if pending.thread_id != thread_id or pending.run_id != run_id:
-                return False
-            if pending.future.done():
-                return False
-            pending.future.set_result(decision)
-            queue = self._queues.get((thread_id, run_id))
-            if queue is not None:
-                await queue.put((
-                    "event",
-                    {
-                        "type": "approval_resolved",
-                        "payload": {
-                            **pending.payload,
-                            "action": decision.get("action"),
-                            "status": (
-                                "approved"
-                                if decision.get("action") == "approve"
-                                else "denied"
-                                if decision.get("action") == "deny"
-                                else "cancelled"
-                            ),
-                        },
-                    },
-                ))
-            return True
+        return False
 
-    async def is_pending(
-        self, request_id: str, *, thread_id: str, run_id: str
-    ) -> bool:
-        """Check the exact run-scoped request without exposing another run's state."""
+    async def is_pending(self, *_args: Any, **_kwargs: Any) -> bool:
+        """标准 Interrupt 已结束原 Run，Backend 不再持有 pending 状态。"""
 
-        async with self._lock:
-            pending = self._pending.get(request_id)
-            return bool(
-                pending is not None
-                and pending.thread_id == thread_id
-                and pending.run_id == run_id
-                and not pending.future.done()
-            )
+        return False
 
-    async def cancel_run(self, *, thread_id: str, run_id: str) -> None:
-        """HTTP 流关闭时取消该 run 上仍在等待的审批，避免 Future 泄漏。"""
+    async def cancel_run(self, **_kwargs: Any) -> None:
+        """无进程内 Future 需要清理；兼容旧生命周期调用。"""
 
-        async with self._lock:
-            for pending in tuple(self._pending.values()):
-                if pending.thread_id != thread_id or pending.run_id != run_id:
-                    continue
-                if not pending.future.done():
-                    pending.future.cancel()
+        return None

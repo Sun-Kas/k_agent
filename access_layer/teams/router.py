@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 
 from access_layer.teams.models import (
     TeamCommandInput,
+    TeamApprovalResumeInput,
     TeamCreateInput,
     TeamMessageInput,
     TeamTaskCreateInput,
@@ -29,6 +30,13 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
     """把 `/api/teams*` 处理器绑定到应用拥有的 TeamRuntime（实际多用其 store）。"""
 
     router = APIRouter(prefix="/api/teams", tags=["agent-teams"])
+
+    def public_event(event: dict) -> dict:
+        """Team checkpoint 留在 SQLite；事件 API 只返回审批卡展示字段。"""
+
+        payload = dict(event.get("payload") or {})
+        payload.pop("_checkpoint", None)
+        return {**event, "payload": payload}
 
     @router.get("")
     async def list_teams() -> list[dict]:
@@ -105,11 +113,22 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
             raise HTTPException(status_code=404, detail="Team not found")
         bounded = max(1, min(limit, 5000))
         if taskId:
-            return await runtime.store.events_for_task(team_id, taskId, limit=bounded)
+            return [
+                public_event(event)
+                for event in await runtime.store.events_for_task(team_id, taskId, limit=bounded)
+            ]
         if afterSeq <= 0:
             # Initial hydration wants the newest window, not the oldest page.
-            return await runtime.store.events_tail(team_id, limit=bounded)
-        return await runtime.store.events_after(team_id, max(0, afterSeq), limit=min(bounded, 200))
+            return [
+                public_event(event)
+                for event in await runtime.store.events_tail(team_id, limit=bounded)
+            ]
+        return [
+            public_event(event)
+            for event in await runtime.store.events_after(
+                team_id, max(0, afterSeq), limit=min(bounded, 200)
+            )
+        ]
 
     @router.get("/{team_id}/stream")
     async def stream_events(team_id: str, request: Request, afterSeq: int = 0) -> StreamingResponse:
@@ -126,7 +145,7 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
                     idle_ticks = 0
                     for event in events:
                         cursor = int(event["seq"])
-                        yield f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                        yield f"data: {json.dumps(public_event(event), ensure_ascii=False, separators=(',', ':'))}\n\n"
                 else:
                     idle_ticks += 1
                     if idle_ticks >= 15:
@@ -146,6 +165,19 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
         if team is None:
             raise HTTPException(status_code=404, detail="Team not found")
         return team
+
+    @router.post("/{team_id}/approvals/{approval_id}/resume")
+    async def resume_approval(
+        team_id: str, approval_id: str, payload: TeamApprovalResumeInput
+    ) -> dict:
+        try:
+            return await runtime.resume_approval(
+                team_id, approval_id, action=payload.action, scope=payload.scope
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Team not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/{team_id}/tasks")
     async def create_task(team_id: str, payload: TeamTaskCreateInput) -> dict:

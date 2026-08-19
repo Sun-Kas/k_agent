@@ -17,6 +17,8 @@ from ag_ui.core import (
     ActivitySnapshotEvent,
     CustomEvent,
     EventType,
+    Interrupt,
+    MessagesSnapshotEvent,
     ReasoningEndEvent,
     ReasoningMessageContentEvent,
     ReasoningMessageEndEvent,
@@ -24,7 +26,9 @@ from ag_ui.core import (
     ReasoningStartEvent,
     RunErrorEvent,
     RunFinishedEvent,
+    RunFinishedInterruptOutcome,
     RunStartedEvent,
+    StateSnapshotEvent,
     TextMessageContentEvent,
     TextMessageEndEvent,
     TextMessageStartEvent,
@@ -321,6 +325,53 @@ async def translate_agent_events(
                     content=payload,
                     replace=True,
                 )
+            elif event_type == "interrupt":
+                # AG-UI Interrupt 是 terminal run outcome。Activity 负责富卡片，
+                # State/Messages Snapshot 提供恢复边界，随后原 Run 正常结束。
+                checkpoint = payload.get("_checkpoint")
+                if not isinstance(checkpoint, dict):
+                    checkpoint = {}
+                snapshot_messages = checkpoint.get("messages")
+                if not isinstance(snapshot_messages, list):
+                    snapshot_messages = []
+                yield StateSnapshotEvent(snapshot={
+                    "openInterrupts": [{
+                        "id": payload["id"],
+                        "requestHash": payload.get("requestHash"),
+                        "checkpointVersion": checkpoint.get("version", 1),
+                    }]
+                })
+                yield MessagesSnapshotEvent(messages=snapshot_messages)
+                yield RunFinishedEvent(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    outcome=RunFinishedInterruptOutcome(interrupts=[Interrupt(
+                        id=payload["id"],
+                        reason=(
+                            "input_required"
+                            if payload.get("category") in {"user_input", "mcp_elicitation"}
+                            else "tool_call"
+                        ),
+                        message=str(payload.get("message") or "请确认是否继续。"),
+                        tool_call_id=str(payload.get("toolCallId") or payload["id"]),
+                        response_schema={
+                            "type": "object",
+                            "properties": {
+                                "approved": {"type": "boolean"},
+                                "scope": {"enum": ["once", "run"]},
+                            },
+                            "required": ["approved"],
+                            "additionalProperties": True,
+                        },
+                        metadata={
+                            "agentKind": payload.get("agentKind"),
+                            "category": payload.get("category"),
+                            "requestHash": payload.get("requestHash"),
+                            "checkpointVersion": checkpoint.get("version", 1),
+                        },
+                    )]),
+                )
+                return
             elif event_type == "thinking":
                 for reasoning_event in reasoning_events(payload):
                     yield reasoning_event

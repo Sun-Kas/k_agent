@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from backend.api.schemas import SessionCapabilities, SessionState
 
 from access_layer.scheduled_tasks.models import (
+    ScheduledApprovalResumeInput,
     ScheduledRunOutput,
     ScheduledTaskInput,
     ScheduledTaskOutput,
@@ -93,9 +94,11 @@ def build_scheduled_task_router(runtime) -> APIRouter:
         session = await runtime._session_store.get(run["sessionId"])
         if session is None:
             raise HTTPException(status_code=404, detail="Scheduled run session not found")
+        open_interrupts = await runtime._session_store.list_open_interrupts(session.id)
         return SessionState(
             sessionId=session.id, messages=session.messages, trace=session.trace,
             tasks=session.tasks, thinking=session.thinking, events=session.events,
+            openInterrupts=open_interrupts,
             capabilities=(
                 SessionCapabilities(
                     mcpServerIds=session.mcp_server_ids,
@@ -105,6 +108,22 @@ def build_scheduled_task_router(runtime) -> APIRouter:
                 else None
             ),
         )
+
+    @router.post("/{task_id}/runs/{run_id}/resume")
+    async def resume_run(
+        task_id: str, run_id: str, payload: ScheduledApprovalResumeInput
+    ) -> dict:
+        try:
+            return await runtime.resume_approval(
+                task_id, run_id,
+                interrupt_id=payload.interrupt_id,
+                action=payload.action,
+                scope=payload.scope,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Scheduled run not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post("/{task_id}/run-now", status_code=202)
     async def run_now(task_id: str):

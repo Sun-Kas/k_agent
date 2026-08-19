@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -31,19 +32,58 @@ from backend.runners.codex_app_server import CodexStreamState
 from backend.runners.network_policy import network_access_enabled
 from backend.runners.codex_config import write_codex_mcp_config
 from backend.runners.detect import detect_agents
-from backend.runners.registry import build_default_registry
+from backend.runners.registry import RunnerRegistry, get_default_registry
 from backend.api.schemas import ChatMessage
 from datetime import datetime, timezone
 
 
 class RunnerRegistryTests(unittest.TestCase):
     def test_default_registry_includes_builtin_and_cli_kinds(self) -> None:
-        registry = build_default_registry()
+        registry = get_default_registry()
+        self.assertIs(get_default_registry(), registry)
         self.assertEqual(registry.kinds(), ["claude_code", "codex", "k_agent"])
-        self.assertEqual(registry.get(None).kind, "k_agent")
-        self.assertEqual(registry.get("codex").kind, "codex")
+        k_agent = registry.get(None)
+        self.assertEqual(k_agent.kind, "k_agent")
+        self.assertIs(registry.get("k_agent"), k_agent)
+        codex = registry.get("codex")
+        self.assertEqual(codex.kind, "codex")
+        self.assertIs(registry.get("codex"), codex)
         with self.assertRaises(ValueError):
             registry.get("unknown_agent")
+
+    def test_registry_loads_once_on_first_get_and_rejects_overwrite(self) -> None:
+        calls: list[str] = []
+
+        class TestRunner:
+            kind = "test"
+
+            async def run_stream(self, runtime):
+                if False:
+                    yield runtime
+
+        def load_test_runner():
+            calls.append("loaded")
+            return TestRunner()
+
+        registry = RunnerRegistry()
+        registry.register("test", load_test_runner)
+
+        self.assertEqual(registry.kinds(), ["test"])
+        self.assertEqual(calls, [])
+        first = registry.get("test")
+        self.assertIs(registry.get("test"), first)
+        self.assertEqual(calls, ["loaded"])
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            registry.register("test", load_test_runner)
+
+    def test_singleton_runners_expose_runtime_builder(self) -> None:
+        registry = get_default_registry()
+
+        for kind in registry.kinds():
+            with self.subTest(kind=kind):
+                runner = registry.get(kind)
+                self.assertIs(registry.get(kind), runner)
+                self.assertTrue(callable(getattr(runner, "create_runtime", None)))
 
 
 class ClaudeApprovalMcpTests(unittest.IsolatedAsyncioTestCase):
@@ -340,13 +380,14 @@ class CodexRunnerTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "backend.runners.codex.resolve_cli",
             return_value=type("Resolved", (), {"path": "/usr/local/bin/codex"})(),
-        ), patch(
-            "backend.runners.codex.session_workspace_dir", return_value=Path(tmp)
         ), patch("backend.runners.codex.run_codex_app_server", fake_run_app_server):
             from backend.home import reset_home_cache
 
             reset_home_cache()
             try:
+                # The workspace is a request input; Codex must not derive it
+                # from thread_id or inspect the Access Layer session bundle.
+                ctx = replace(ctx, workspace_dir=Path(tmp))
                 events = [event async for event in CodexRunner().run_stream(ctx)]
             finally:
                 reset_home_cache()

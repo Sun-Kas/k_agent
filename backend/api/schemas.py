@@ -88,6 +88,10 @@ class SessionState(BaseModel):
     tasks: list[str]
     thinking: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
+    # 开放审批是服务端恢复真相源的只读投影，不包含可执行 checkpoint。
+    open_interrupts: list[dict[str, Any]] = Field(
+        default_factory=list, alias="openInterrupts"
+    )
     capabilities: SessionCapabilities | None = None
 
 
@@ -231,10 +235,12 @@ class SkillCreateInput(BaseModel):
 class ApprovalResolutionInput(BaseModel):
     """User decision for a run-scoped approval request."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    # Approval decisions are security-sensitive. Reject stale/unknown fields
+    # instead of silently degrading an old `remember` request to scope=once.
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
     thread_id: str = Field(alias="threadId", min_length=1)
     run_id: str = Field(alias="runId", min_length=1)
     action: Literal["approve", "deny", "cancel"]
-    remember: bool = False
+    scope: Literal["once", "run"] = "once"
     answers: dict[str, list[str]] = Field(default_factory=dict)
     content: dict[str, Any] = Field(default_factory=dict)

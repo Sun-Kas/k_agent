@@ -1,32 +1,30 @@
-"""Local operational logging callback for Agent, model, and tool lifecycles."""
+"""Local fail-open observer for Agent, model, context, and tool lifecycles."""
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any
 
-from backend.agent.callbacks import (
-    AgentErrorPayload,
-    AgentRunContext,
-    ContextPlanPayload,
-    ContextPrunePayload,
-    ModelCallPayload,
-    ModelResultPayload,
-    ToolCallPayload,
-    ToolResultPayload,
+from backend.agent.hooks import (
+    AgentCompletedEvent,
+    AgentEvent,
+    AgentStartedEvent,
+    ContextBuiltEvent,
+    ContextPrunedEvent,
+    ModelCompletedEvent,
+    ModelStartedEvent,
+    OperationFailedEvent,
+    ToolCompletedEvent,
+    ToolStartedEvent,
 )
-from backend.api.schemas import ChatMessage
 from backend.logging_config import log_event
 
 
-class AgentBackendLoggingCallback:
+class AgentBackendLoggingObserver:
     """Log lifecycle metadata while excluding prompts, arguments, and outputs."""
 
-    # 本地终端日志的取舍：只记关联 ID、计数、长度和耗时，不记任何正文。
-    # 因此工具参数只记 key 名（见 before_tool），输出只记字符数（见 after_tool）。
-    # 需要看正文时用 Langfuse，那条链路有独立的脱敏处理。
-
+    # Local logs intentionally contain only correlation IDs, counts, names,
+    # lengths, and timings. Langfuse owns the separately-redacted content path.
     def __init__(self, *, request_id: str, thread_id: str, run_id: str) -> None:
         self._identity = {
             "requestId": request_id or "-",
@@ -34,150 +32,135 @@ class AgentBackendLoggingCallback:
             "runId": run_id,
         }
 
-    async def on_agent_start(
-        self,
-        context: AgentRunContext,
-        messages: list[ChatMessage],
-    ) -> None:
-        log_event(
-            "agent.run.started",
-            **self._identity,
-            agentRunId=context.run_id,
-            messageCount=len(messages),
-        )
+    async def handle(self, event: AgentEvent) -> None:
+        """Translate typed observer events into the existing process log schema."""
 
-    async def before_model(
-        self,
-        context: AgentRunContext,
-        payload: ModelCallPayload,
-    ) -> None:
-        log_event(
-            "model.call.started",
-            **self._identity,
-            agentRunId=context.run_id,
-            iteration=payload.iteration,
-            model=payload.model,
-            messageCount=len(payload.messages),
-            toolDefinitionCount=len(payload.tools),
-        )
-
-    async def on_context_built(
-        self,
-        context: AgentRunContext,
-        payload: ContextPlanPayload,
-    ) -> None:
-        log_event(
-            "context.plan.completed",
-            **self._identity,
-            agentRunId=context.run_id,
-            inputMessageCount=payload.input_message_count,
-            activeMessageCount=payload.active_message_count,
-            providerMessageCount=payload.provider_message_count,
-            compactedMessageCount=payload.compacted_message_count,
-            summaryChars=payload.summary_chars,
-            attachmentCount=payload.attachment_count,
-            autoCompacted=payload.auto_compacted,
-            contextWindow=payload.budget.get("context_window"),
-            inputBudget=payload.budget.get("input_budget"),
-            estimatedInput=payload.breakdown.get("estimatedInput"),
-            remainingTokens=payload.breakdown.get("remaining"),
-            systemTokens=payload.breakdown.get("system"),
-            memoryTokens=payload.breakdown.get("memory"),
-            skillsAndToolsTokens=payload.breakdown.get("skillsAndTools"),
-            messageTokens=payload.breakdown.get("messages"),
-            summaryTokens=payload.breakdown.get("summary"),
-        )
-
-    async def on_context_pruned(
-        self,
-        context: AgentRunContext,
-        payload: ContextPrunePayload,
-    ) -> None:
-        log_event(
-            "context.tool_outputs.pruned",
-            **self._identity,
-            agentRunId=context.run_id,
-            iteration=payload.iteration,
-            prunedOutputCount=payload.pruned_output_count,
-            beforeChars=payload.before_chars,
-            afterChars=payload.after_chars,
-        )
-
-    async def after_model(
-        self,
-        context: AgentRunContext,
-        payload: ModelResultPayload,
-    ) -> None:
-        log_event(
-            "model.call.completed",
-            **self._identity,
-            agentRunId=context.run_id,
-            iteration=payload.iteration,
-            model=payload.model,
-            responseId=payload.response_id or None,
-            elapsedMs=round(payload.elapsed_ms, 3),
-            outputChars=len(payload.output_text),
-            toolCallCount=payload.function_call_count,
-        )
-
-    async def before_tool(
-        self,
-        context: AgentRunContext,
-        payload: ToolCallPayload,
-    ) -> None:
-        log_event(
-            "tool.call.started",
-            **self._identity,
-            agentRunId=context.run_id,
-            iteration=payload.iteration,
-            source=payload.source,
-            serverId=payload.server_id,
-            tool=payload.name,
-            argumentKeys=sorted(str(key) for key in payload.arguments),
-        )
-
-    async def after_tool(
-        self,
-        context: AgentRunContext,
-        payload: ToolResultPayload,
-    ) -> None:
-        log_event(
-            "tool.call.completed",
-            **self._identity,
-            agentRunId=context.run_id,
-            iteration=payload.iteration,
-            source=payload.source,
-            serverId=payload.server_id,
-            tool=payload.name,
-            elapsedMs=round(payload.elapsed_ms, 3),
-            outputChars=len(payload.output),
-        )
-
-    async def on_error(
-        self,
-        context: AgentRunContext,
-        payload: AgentErrorPayload,
-    ) -> None:
-        # Exception text may contain provider payloads or user-controlled values.
-        # Keep the local error event useful and safe by logging only its class.
-        log_event(
-            "agent.run.failed",
-            level=logging.ERROR,
-            **self._identity,
-            agentRunId=context.run_id,
-            stage=payload.stage,
-            errorType=type(payload.error).__name__,
-        )
-
-    async def on_agent_end(
-        self,
-        context: AgentRunContext,
-        result: dict[str, Any],
-    ) -> None:
-        log_event(
-            "agent.run.completed",
-            **self._identity,
-            agentRunId=context.run_id,
-            elapsedMs=round(max(0.0, time.time() - context.started_at) * 1000, 3),
-            messageCount=len(result.get("messages") or []),
-        )
+        context = event.context
+        if isinstance(event, AgentStartedEvent):
+            log_event(
+                "agent.run.started", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                messageCount=len(event.messages),
+            )
+        elif isinstance(event, ContextBuiltEvent):
+            payload = event.payload
+            log_event(
+                "context.plan.completed", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                inputMessageCount=payload.input_message_count,
+                activeMessageCount=payload.active_message_count,
+                providerMessageCount=payload.provider_message_count,
+                compactedMessageCount=payload.compacted_message_count,
+                summaryChars=payload.summary_chars,
+                attachmentCount=payload.attachment_count,
+                autoCompacted=payload.auto_compacted,
+                contextWindow=payload.budget.get("context_window"),
+                inputBudget=payload.budget.get("input_budget"),
+                estimatedInput=payload.breakdown.get("estimatedInput"),
+                remainingTokens=payload.breakdown.get("remaining"),
+                systemTokens=payload.breakdown.get("system"),
+                memoryTokens=payload.breakdown.get("memory"),
+                skillsAndToolsTokens=payload.breakdown.get("skillsAndTools"),
+                messageTokens=payload.breakdown.get("messages"),
+                summaryTokens=payload.breakdown.get("summary"),
+            )
+        elif isinstance(event, ContextPrunedEvent):
+            payload = event.payload
+            log_event(
+                "context.tool_outputs.pruned", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                iteration=payload.iteration,
+                prunedOutputCount=payload.pruned_output_count,
+                beforeChars=payload.before_chars,
+                afterChars=payload.after_chars,
+            )
+        elif isinstance(event, ModelStartedEvent):
+            payload = event.payload
+            log_event(
+                "model.call.started", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                operationId=payload.operation_id,
+                iteration=payload.iteration,
+                model=payload.model,
+                messageCount=len(payload.messages),
+                toolDefinitionCount=len(payload.tools),
+            )
+        elif isinstance(event, ModelCompletedEvent):
+            payload = event.payload
+            log_event(
+                "model.call.completed", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                operationId=payload.operation_id,
+                iteration=payload.iteration,
+                model=payload.model,
+                responseId=payload.response_id or None,
+                elapsedMs=round(payload.elapsed_ms, 3),
+                outputChars=len(payload.output_text),
+                toolCallCount=payload.function_call_count,
+            )
+        elif isinstance(event, ToolStartedEvent):
+            payload = event.payload
+            log_event(
+                "tool.call.started", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                operationId=payload.operation_id,
+                callId=payload.call_id,
+                attempt=payload.attempt,
+                iteration=payload.iteration,
+                source=payload.source,
+                serverId=payload.server_id,
+                tool=payload.name,
+                argumentKeys=sorted(str(key) for key in payload.arguments),
+            )
+        elif isinstance(event, ToolCompletedEvent):
+            payload = event.payload
+            log_event(
+                "tool.call.completed", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                operationId=payload.operation_id,
+                callId=payload.call_id,
+                attempt=payload.attempt,
+                iteration=payload.iteration,
+                source=payload.source,
+                serverId=payload.server_id,
+                tool=payload.name,
+                elapsedMs=round(payload.elapsed_ms, 3),
+                outputChars=len(payload.output),
+            )
+        elif isinstance(event, OperationFailedEvent):
+            payload = event.payload
+            if payload.stage.startswith("tool_"):
+                detail = payload.detail
+                log_event(
+                    "tool.call.failed", level=logging.ERROR, **self._identity,
+                    agentExecutionId=context.agent_execution_id,
+                    operationId=payload.operation_id,
+                    source=detail.get("source"),
+                    serverId=detail.get("serverId"),
+                    tool=detail.get("toolName"),
+                    callId=detail.get("callId"),
+                    errorType=type(payload.error).__name__,
+                )
+                return
+            if payload.stage in {"model_call", "model_middleware", "before_model", "after_model"}:
+                log_event(
+                    "model.call.failed", level=logging.ERROR, **self._identity,
+                    agentExecutionId=context.agent_execution_id,
+                    operationId=payload.operation_id,
+                    errorType=type(payload.error).__name__,
+                )
+                return
+            log_event(
+                "agent.run.failed", level=logging.ERROR, **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                operationId=payload.operation_id,
+                stage=payload.stage,
+                errorType=type(payload.error).__name__,
+            )
+        elif isinstance(event, AgentCompletedEvent):
+            log_event(
+                "agent.run.completed", **self._identity,
+                agentExecutionId=context.agent_execution_id,
+                elapsedMs=round(max(0.0, time.time() - context.started_at) * 1000, 3),
+                messageCount=len(event.result.get("messages") or []),
+            )

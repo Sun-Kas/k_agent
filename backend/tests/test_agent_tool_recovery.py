@@ -79,14 +79,7 @@ class AgentToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 completions=SimpleNamespace(create=create),
             )
         )
-        agent = OpenAIAgent(
-            [tool],
-            McpClientManager([]),
-            config=Settings(
-                OPENAI_API_KEY="test",
-                MAX_MODEL_ITERATIONS=2,
-            ),
-        )
+        agent = OpenAIAgent()
         request = AgentRunRequest(
             messages=[
                 ChatMessage(
@@ -106,7 +99,16 @@ class AgentToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("backend.agent.react_agent.AsyncOpenAI", return_value=fake_client):
-            events = [event async for event in agent.run_stream(request)]
+            runtime = await agent.create_runtime(
+                request,
+                [tool],
+                McpClientManager([]),
+                config=Settings(
+                    OPENAI_API_KEY="test",
+                    MAX_MODEL_ITERATIONS=2,
+                ),
+            )
+            events = [event async for event in agent.run_stream_react(runtime)]
 
         tool_result_event = next(
             event for event in events if event["type"] == "tool_result"

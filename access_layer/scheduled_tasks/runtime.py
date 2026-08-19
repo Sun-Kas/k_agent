@@ -100,6 +100,93 @@ class ScheduledTaskRuntime:
             self._spawn(claimed)
         return claimed
 
+    async def resume_approval(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        interrupt_id: str,
+        action: str,
+        scope: str,
+    ) -> dict[str, Any]:
+        """用 scheduled task 原配置启动标准 Resume Run，并更新原触发记录。"""
+
+        task = await self.store.get(task_id)
+        run = await self.store.get_run(task_id, run_id)
+        if task is None or run is None or not run.get("sessionId"):
+            raise KeyError(run_id)
+        agent_run_id = f"scheduled-resume-{os.urandom(12).hex()}"
+        open_interrupts = (
+            await self._session_store.list_open_interrupts(run["sessionId"])
+            if self._session_store is not None
+            else []
+        )
+        requires_reconfirm = any(
+            item.get("id") == interrupt_id
+            and item.get("status") in {"unknown_outcome", "resume_failed"}
+            for item in open_interrupts
+        )
+        payload = RunAgentInput.model_validate({
+            "threadId": run["sessionId"],
+            "runId": agent_run_id,
+            "state": {}, "messages": [], "tools": [], "context": [],
+            "resume": [{
+                "interruptId": interrupt_id,
+                "status": "cancelled" if action == "cancel" else "resolved",
+                **(
+                    {}
+                    if action == "cancel"
+                    else {"payload": {
+                        "approved": action == "approve", "scope": scope,
+                        **({"reconfirm": True} if requires_reconfirm else {}),
+                    }}
+                ),
+            }],
+            "forwardedProps": {
+                "modelId": task["modelId"],
+                "mcpServerIds": task["mcpServerIds"],
+                "skillIds": task["skillIds"],
+                "reasoningEffort": task["reasoningEffort"],
+                "attachments": [],
+                "agentKind": task["agentKind"],
+                "agentOptions": {
+                    "cliSessionMode": "ephemeral",
+                    "permissionMode": task["permissionMode"],
+                },
+            },
+        })
+        response = await self._access_layer.run(payload)
+        run_error: str | None = None
+        interrupted = False
+        async for chunk in response.body_iterator:
+            text = chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+            for line in text.splitlines():
+                if not line.startswith("data: "):
+                    continue
+                event = json.loads(line[6:])
+                if event.get("type") == "RUN_ERROR":
+                    run_error = str(event.get("message") or "Agent run failed")
+                if (
+                    event.get("type") == "RUN_FINISHED"
+                    and isinstance(event.get("outcome"), dict)
+                    and event["outcome"].get("type") == "interrupt"
+                ):
+                    interrupted = True
+        if run_error:
+            await self.store.finish_run(
+                run_id, success=False, error_code="resume_failed",
+                error_message=run_error,
+            )
+            raise RuntimeError(run_error)
+        if interrupted:
+            await self.store.finish_run(
+                run_id, success=False, error_code="interrupted",
+                error_message="恢复运行再次等待人工审批",
+            )
+            return {"ok": True, "status": "interrupted", "runId": agent_run_id}
+        await self.store.finish_run(run_id, success=True)
+        return {"ok": True, "status": "completed", "runId": agent_run_id}
+
     async def health(self) -> dict[str, Any]:
         next_due = await self.store.next_due_at()
         return {
@@ -201,6 +288,7 @@ class ScheduledTaskRuntime:
                 })
                 response = await self._access_layer.run(payload)
                 run_error: str | None = None
+                interrupted = False
                 async for chunk in response.body_iterator:
                     text = chunk.decode() if isinstance(chunk, bytes) else str(chunk)
                     for line in text.splitlines():
@@ -209,8 +297,22 @@ class ScheduledTaskRuntime:
                         event = json.loads(line[6:])
                         if event.get("type") == "RUN_ERROR":
                             run_error = str(event.get("message") or "Agent run failed")
+                        if (
+                            event.get("type") == "RUN_FINISHED"
+                            and isinstance(event.get("outcome"), dict)
+                            and event["outcome"].get("type") == "interrupt"
+                        ):
+                            interrupted = True
                 if run_error:
                     raise RuntimeError(run_error)
+                if interrupted:
+                    # terminal Interrupt 已释放 HTTP/全局并发槽；本次周期不能标为
+                    # succeeded，也不会阻塞下一个调度周期等待人类数小时。
+                    await self.store.finish_run(
+                        run["id"], success=False, error_code="interrupted",
+                        error_message="运行等待人工审批，可在对应会话中恢复",
+                    )
+                    return
                 await self.store.finish_run(run["id"], success=True)
                 log_event(
                     "scheduled.run.finished",

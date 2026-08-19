@@ -61,6 +61,10 @@ export interface SessionState {
   tasks: string[];
   thinking: ThinkingActivity[];
   events?: AgUiEvent[];
+  openInterrupts?: Array<Omit<ApprovalActivity, "sequence"> & {
+    requestHash?: string;
+    toolCallId?: string;
+  }>;
   contextSummary?: string;
   compactedMessageIds?: string[];
   contextStats?: Record<string, unknown>;
@@ -170,8 +174,16 @@ export interface McpCapabilities {
 /** AG-UI / 扩展 SSE 事件联合类型；App.applyAgUiEvent 按 type 投影到 UI。 */
 export type AgUiEvent =
   | { type: "RUN_STARTED"; threadId: string; runId: string }
-  | { type: "RUN_FINISHED"; threadId: string; runId: string; result?: unknown }
+  | {
+      type: "RUN_FINISHED";
+      threadId: string;
+      runId: string;
+      result?: unknown;
+      outcome?: { type: "interrupt"; interrupts: AgUiInterrupt[] };
+    }
   | { type: "RUN_ERROR"; message: string; code?: string }
+  | { type: "STATE_SNAPSHOT"; snapshot: unknown }
+  | { type: "MESSAGES_SNAPSHOT"; messages: unknown[] }
   | { type: "TEXT_MESSAGE_START"; messageId: string; role: "assistant" }
   | { type: "TEXT_MESSAGE_CONTENT"; messageId: string; delta: string }
   | { type: "TEXT_MESSAGE_END"; messageId: string }
@@ -225,6 +237,11 @@ export interface AgUiRunInput {
   messages: Array<Pick<ChatMessage, "id" | "role" | "content">>;
   tools: unknown[];
   context: unknown[];
+  resume?: Array<{
+    interruptId: string;
+    status: "resolved" | "cancelled";
+    payload?: { approved: boolean; scope?: "once" | "run"; reconfirm?: boolean };
+  }>;
   forwardedProps: {
     modelId?: string;
     mcpServerIds?: string[];
@@ -300,7 +317,16 @@ export interface ApprovalActivity {
   title: string;
   message: string;
   detail: Record<string, unknown>;
-  status: "pending" | "submitting" | "approved" | "denied" | "cancelled" | "expired" | "error";
+  status: "pending" | "submitting" | "approved" | "denied" | "cancelled" | "expired" | "unknown_outcome" | "resume_failed" | "error";
   sequence: number;
   error?: string;
+}
+
+export interface AgUiInterrupt {
+  id: string;
+  reason: string;
+  message: string;
+  toolCallId?: string;
+  responseSchema?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
 }

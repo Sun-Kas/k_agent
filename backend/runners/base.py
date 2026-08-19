@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -28,7 +28,7 @@ slots=True = 不能随便加新字段 + 更省内存
 '''
 @dataclass(frozen=True, slots=True)
 class RunnerContext:
-    """单次 run 的共享入参；所有后端实现只读这份上下文，不跨请求保留状态。"""
+    """创建 Runtime 所需的只读请求输入与进程级依赖。"""
 
     thread_id: str
     run_id: str
@@ -39,26 +39,26 @@ class RunnerContext:
     skills: list[dict[str, Any]]
     reasoning_effort: str | None
     attachments: list[dict[str, Any]]
-    # Team 跑法经 workspaceDir 下发任务级目录；普通对话留空，回落 session workspace。
+    # 标准 AG-UI Resume 决议及 Access Layer 可信 checkpoint；Runner 不读磁盘。
+    resume: list[dict[str, Any]] = field(default_factory=list)
+    resume_checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    # Access Layer 必须显式下发；Runner 不得通过 thread_id 推导会话存储路径。
     workspace_dir: Path | None = None
     team_id: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     settings: Settings | None = None
     mcp_pool: McpSessionPool | None = None
     langfuse: LangfuseRuntime | None = None
-    logging_callback: Any | None = None
+    logging_observer: Any | None = None
     approval_broker: ApprovalBroker | None = None
 
 
 class AgentRunner(Protocol):
-    """无状态执行器：吃掉 RunnerContext，流式产出内部 `{type,payload}` 事件。"""
+    """进程内复用的无状态 Agent；Runtime 只存在于函数调用作用域。"""
 
     kind: AgentKind
 
-    async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
-        """产出供 `translate_agent_events` 消费的内部事件。"""
+    def run_stream(self, context: RunnerContext) -> AsyncIterator[dict[str, Any]]:
+        """流式转发本轮 Runtime 结果。"""
 
         ...
-
-
-RunnerFactory = Callable[[], AgentRunner]

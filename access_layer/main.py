@@ -836,6 +836,7 @@ def create_app() -> FastAPI:
         session = await app.state.session_store.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        open_interrupts = await app.state.session_store.list_open_interrupts(session_id)
         return SessionState(
             sessionId=session.id,
             messages=session.messages,
@@ -843,6 +844,7 @@ def create_app() -> FastAPI:
             tasks=session.tasks,
             thinking=session.thinking,
             events=session.events,
+            openInterrupts=open_interrupts,
             capabilities=(
                 SessionCapabilities(
                     mcpServerIds=session.mcp_server_ids,

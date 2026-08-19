@@ -23,8 +23,6 @@ import {
   getSessionWorkspace,
   getSessionWorkspaceFile,
   listSessions,
-  getApprovalStatus,
-  resolveApproval,
   stopSessionRun,
   streamAgentRun
 } from "./api/agui";
@@ -140,9 +138,9 @@ type ActiveConversationRun = {
   controller: AbortController;
   events: AgUiEvent[];
   initialMessages: ChatMessage[];
-  pendingAssistantId: string;
+  pendingAssistantId: string | null;
   runId: string;
-  userMessageId: string;
+  userMessageId?: string;
   /** Prevent queued stream callbacks from mutating a durable manual-stop snapshot. */
   stopped?: boolean;
 };
@@ -890,6 +888,11 @@ export function App() {
         data.events.forEach((event) => applyAgUiEvent(event));
         replayingHistoryRef.current = false;
       }
+      // 独立 approval 文件是恢复真相源；即使进程在 durable-before-visible
+      // 屏障之后、普通 events 落盘之前退出，刷新仍能重建可操作卡片。
+      for (const interrupt of data.openInterrupts ?? []) {
+        applyApprovalSnapshot(interrupt as unknown as Record<string, unknown>);
+      }
       if (!Array.isArray(data.events) || !data.events.length) {
         setTrace(normalizeStringList(data.trace));
         setTasks(normalizeStringList(data.tasks));
@@ -1543,6 +1546,10 @@ export function App() {
         ? "approved"
         : rawStatus === "denied" || action === "deny"
           ? "denied"
+          : rawStatus === "unknown_outcome"
+            ? "unknown_outcome"
+          : rawStatus === "resume_failed"
+            ? "resume_failed"
           : rawStatus === "expired" || action === "expired"
             ? "expired"
             : rawStatus === "cancelled" || action === "cancel"
@@ -1815,15 +1822,24 @@ export function App() {
         const toolSequence = activitySequenceRef.current + 1;
         activitySequenceRef.current = toolSequence;
         // textOffset：工具卡片相对助手可见文本的插入位点，供 inline 时间线交错渲染。
-        setTools((current) => [...current, {
-          id: event.toolCallId,
-          turnId: toolTurnId,
-          name: event.toolCallName,
-          arguments: "",
-          status: "preparing",
-          sequence: toolSequence,
-          textOffset: assistantVisibleTextLengthRef.current
-        }]);
+        setTools((current) => current.some((tool) => tool.id === event.toolCallId)
+          ? current.map((tool) => tool.id === event.toolCallId
+            ? {
+              ...tool,
+              name: event.toolCallName,
+              arguments: "",
+              status: "preparing"
+            }
+            : tool)
+          : [...current, {
+            id: event.toolCallId,
+            turnId: toolTurnId,
+            name: event.toolCallName,
+            arguments: "",
+            status: "preparing",
+            sequence: toolSequence,
+            textOffset: assistantVisibleTextLengthRef.current
+          }]);
         setStatus(`调用 ${event.toolCallName}`);
         break;
       }
@@ -1879,16 +1895,32 @@ export function App() {
         }
         break;
       case "RUN_FINISHED": {
+        const interrupted = event.outcome?.type === "interrupt";
         const stopped = Boolean(
           event.result
           && typeof event.result === "object"
           && (event.result as Record<string, unknown>).status === "stopped"
         );
         if (stopped) stopRunActivities(event.runId);
+        if (interrupted) {
+          const waitingToolIds = new Set(
+            event.outcome?.interrupts
+              .map((interrupt) => interrupt.toolCallId)
+              .filter((id): id is string => Boolean(id)) ?? []
+          );
+          setTools((current) => current.map((tool) =>
+            waitingToolIds.has(tool.id) ? { ...tool, status: "waiting" } : tool
+          ));
+          closeActiveThinkingBlock();
+        }
         activeRunIdRef.current = null;
         setActiveRunId(null);
         pendingAssistantIdRef.current = null;
-        setStatus(stopped ? "已停止" : appConfig.status.complete);
+        setStatus(
+          stopped
+            ? "已停止"
+            : interrupted ? "等待人工审批" : appConfig.status.complete
+        );
         break;
       }
       case "RUN_ERROR": {
@@ -2001,18 +2033,69 @@ export function App() {
   async function submitApproval(
     approval: ApprovalActivity,
     action: "approve" | "deny" | "cancel",
-    remember = false
+    scope: "once" | "run" = "once"
   ) {
     setApprovals((current) => current.map((item) => item.id === approval.id
       ? { ...item, status: "submitting", error: undefined }
       : item));
+    const targetSessionId = approval.threadId;
+    const runId = createClientId();
+    const controller = new AbortController();
+    const activeRun: ActiveConversationRun = {
+      controller,
+      events: [],
+      initialMessages: messages,
+      pendingAssistantId: null,
+      runId
+    };
     try {
-      await resolveApproval(approval.id, {
-        threadId: approval.threadId,
-        runId: approval.runId,
-        action,
-        remember
-      });
+      const runInput: AgUiRunInput = {
+        threadId: targetSessionId,
+        runId,
+        state: {},
+        messages: [],
+        tools: [],
+        context: [],
+        resume: [{
+          interruptId: approval.id,
+          status: action === "cancel" ? "cancelled" : "resolved",
+          ...(action === "cancel" ? {} : {
+            payload: {
+              approved: action === "approve",
+              scope,
+              ...(
+                approval.status === "unknown_outcome"
+                || approval.status === "resume_failed"
+                  ? { reconfirm: true }
+                  : {}
+              )
+            }
+          })
+        }],
+        forwardedProps: {
+          modelId,
+          mcpServerIds: selectedMcp,
+          skillIds: selectedSkills,
+          reasoningEffort,
+          attachments: [],
+          agentKind: approval.agentKind,
+          agentOptions: {
+            permissionMode,
+            ...(approval.agentKind === "k_agent" ? {} : { cliSessionMode })
+          }
+        }
+      };
+      activeRunsRef.current.set(targetSessionId, activeRun);
+      setRunningSessionIds((current) => new Set(current).add(targetSessionId));
+      setLoading(true);
+      setStatus(appConfig.status.processing);
+      await streamAgentRun(runInput, (streamEvent) => {
+        if (activeRun.stopped) return;
+        activeRun.events.push(streamEvent);
+        if (activeSessionIdRef.current === targetSessionId) {
+          applyAgUiEvent(streamEvent);
+        }
+      }, controller.signal);
       setApprovals((current) => current.map((item) => item.id === approval.id
         ? {
           ...item,
@@ -2030,6 +2113,17 @@ export function App() {
           error: expired ? "该审批已失效，请重新发起任务。" : message
         }
         : item));
+    } finally {
+      if (activeRunsRef.current.get(targetSessionId)?.controller === controller) {
+        activeRunsRef.current.delete(targetSessionId);
+        setRunningSessionIds((current) => {
+          const next = new Set(current);
+          next.delete(targetSessionId);
+          return next;
+        });
+      }
+      setLoading(false);
+      await refreshSessions();
     }
   }
 
@@ -3429,24 +3523,14 @@ function ApprovalCard({
   onDecision: (
     approval: ApprovalActivity,
     action: "approve" | "deny" | "cancel",
-    remember?: boolean
+    scope?: "once" | "run"
   ) => Promise<void>;
 }) {
-  const pending = approval.status === "pending" || approval.status === "error";
+  const pending = approval.status === "pending"
+    || approval.status === "unknown_outcome"
+    || approval.status === "resume_failed"
+    || approval.status === "error";
   const submitting = approval.status === "submitting";
-  useEffect(() => {
-    if (approval.status !== "pending") return;
-    let active = true;
-    void getApprovalStatus(approval.id, {
-      threadId: approval.threadId,
-      runId: approval.runId
-    }).then(({ pending: stillPending }) => {
-      if (active && !stillPending) {
-        void onDecision(approval, "cancel").catch(() => undefined);
-      }
-    }).catch(() => undefined);
-    return () => { active = false; };
-  }, [approval.id, approval.runId, approval.status, approval.threadId]);
   const argumentsValue = approval.detail.arguments;
   const command = approval.detail.command;
   const preview = command
@@ -3461,6 +3545,8 @@ function ApprovalCard({
     denied: "已拒绝",
     cancelled: "已取消",
     expired: "已失效",
+    unknown_outcome: "结果未知，需复核",
+    resume_failed: "恢复失败",
     error: "提交失败"
   }[approval.status];
 
@@ -3475,13 +3561,18 @@ function ApprovalCard({
         <b>{statusText}</b>
       </header>
       <p>{approval.message}</p>
+      {approval.status === "unknown_outcome" && (
+        <p className="approval-error">
+          服务曾在恢复期间退出，工具是否已经执行无法确认。请先检查外部状态；再次允许可能重复产生副作用。
+        </p>
+      )}
       {preview && <code>{preview}</code>}
       {approval.error && <p className="approval-error">{approval.error}</p>}
       {pending && (
         <footer>
           <button type="button" disabled={submitting} onClick={() => void onDecision(approval, "deny")}>拒绝</button>
-          <button type="button" disabled={submitting} onClick={() => void onDecision(approval, "approve")}>允许一次</button>
-          <button className="primary" type="button" disabled={submitting} onClick={() => void onDecision(approval, "approve", true)}>本轮始终允许</button>
+          <button type="button" disabled={submitting} onClick={() => void onDecision(approval, "approve")}>{approval.status === "unknown_outcome" ? "确认后再次执行" : "允许一次"}</button>
+          <button className="primary" type="button" disabled={submitting} onClick={() => void onDecision(approval, "approve", "run")}>本轮始终允许</button>
         </footer>
       )}
     </section>

@@ -3,6 +3,10 @@
 > 状态：未解决  
 > 关联范围：`backend/`、`access_layer/`、`frontend/src/components/ConversationTranscript.tsx`、`frontend/src/App.tsx`
 
+> 2026-08-19 更新：terminal Interrupt、durable-before-visible、前端实时
+> `ACTIVITY_SNAPSHOT` 投影及标准 Resume 已实现并通过自动化测试；由于当前环境没有
+> 可连接浏览器，第 5 节真实 DOM/截图验收尚未完成，因此本 TODO 暂不关闭。
+
 ## 1. 问题描述
 
 当前存在一个持续未解决的问题：当模型在流式输出过程中触发审批或工具相关卡片时，前端卡片不会实时渲染出来，通常要等刷新页面后才出现。
@@ -64,4 +68,3 @@
 - 先确认后端 AG-UI 事件类型是否已经进入统一事件枚举。
 - 再检查 Access Layer 的事件转发和前端订阅是否一致。
 - 最后核对 `ConversationTranscript.tsx` 是否在流式阶段就能消费这些事件，而不是只读静态 session 快照。
-

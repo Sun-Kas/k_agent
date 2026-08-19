@@ -4,41 +4,89 @@ import asyncio
 import json
 import unittest
 
+from pydantic import ValidationError
+
 from backend.agui import translate_agent_events
-from backend.approvals import ApprovalBroker
+from backend.api.schemas import ApprovalResolutionInput
+from backend.approvals import (
+    ApprovalBroker,
+    canonical_json_sha256,
+    consume_resume_authorization,
+)
 from backend.runners.claude_approval_bridge import ClaudeApprovalBridge
 from backend.runners.codex_app_server import _handle_server_request
 
 
 class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_timeout_emits_expired_before_runner_error(self) -> None:
-        broker = ApprovalBroker(timeout_seconds=0.01)
+    def test_provider_resume_authorization_is_hash_bound_and_one_shot(self) -> None:
+        detail = {
+            "source": "claude_permission_prompt",
+            "toolName": "Bash",
+            "input": {"command": "pwd"},
+        }
+        authorization = {
+            "requestHash": canonical_json_sha256({
+                "target": "Bash", "source": "claude_permission_prompt",
+                "serverId": None, "arguments": {"command": "pwd"},
+            }),
+            "decision": {
+                "status": "resolved",
+                "payload": {"approved": True, "scope": "once"},
+            },
+        }
+        self.assertEqual(
+            consume_resume_authorization(
+                authorization, title="Claude Code 请求调用 Bash", detail=detail
+            ),
+            {"action": "approve", "scope": "once"},
+        )
+        self.assertIsNone(consume_resume_authorization(
+            authorization, title="Claude Code 请求调用 Bash", detail=detail
+        ))
+        changed = {**detail, "input": {"command": "rm note.txt"}}
+        self.assertIsNone(consume_resume_authorization(
+            {**authorization, "consumed": False},
+            title="Claude Code 请求调用 Bash", detail=changed,
+        ))
+
+    def test_resolution_contract_rejects_legacy_remember_field(self) -> None:
+        with self.assertRaises(ValidationError):
+            ApprovalResolutionInput.model_validate({
+                "threadId": "thread-1",
+                "runId": "run-1",
+                "action": "approve",
+                "remember": True,
+            })
+
+    async def test_permission_terminates_run_without_backend_pending_state(self) -> None:
+        broker = ApprovalBroker()
 
         async def runner():
             await broker.request(
-                thread_id="thread-timeout",
-                run_id="run-timeout",
+                thread_id="thread-pending",
+                run_id="run-pending",
                 agent_kind="k_agent",
                 category="local_tool",
                 title="Allow?",
-                message="timeout test",
+                message="pending test",
             )
             if False:
                 yield {}
 
         stream = broker.stream(
-            runner(), thread_id="thread-timeout", run_id="run-timeout"
+            runner(), thread_id="thread-pending", run_id="run-pending"
         )
         requested = await anext(stream)
         self.assertEqual(requested["type"], "approval_request")
-        resolved = await anext(stream)
-        self.assertEqual(resolved["type"], "approval_resolved")
-        self.assertEqual(resolved["payload"]["action"], "expired")
-        with self.assertRaisesRegex(RuntimeError, "Human approval timed out"):
+        self.assertFalse(await broker.is_pending(
+            requested["payload"]["id"], thread_id="thread-pending", run_id="run-pending"
+        ))
+        self.assertEqual((await anext(stream))["type"], "interrupt")
+        with self.assertRaises(StopAsyncIteration):
             await anext(stream)
 
-    async def test_request_is_streamed_and_resolution_resumes_runner(self) -> None:
-        broker = ApprovalBroker(timeout_seconds=1)
+    async def test_request_is_streamed_then_original_runner_stops(self) -> None:
+        broker = ApprovalBroker()
 
         async def runner():
             decision = await broker.request(
@@ -54,30 +102,13 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
 
         stream = broker.stream(runner(), thread_id="thread-1", run_id="run-1")
         requested = await anext(stream)
-        request_id = requested["payload"]["id"]
         self.assertEqual(requested["type"], "approval_request")
-        self.assertTrue(await broker.is_pending(
-            request_id, thread_id="thread-1", run_id="run-1"
-        ))
-
-        self.assertTrue(await broker.resolve(
-            request_id,
-            thread_id="thread-1",
-            run_id="run-1",
-            decision={"action": "approve", "remember": False},
-        ))
-        resolved = await anext(stream)
-        resumed = await anext(stream)
-        self.assertEqual(resolved["type"], "approval_resolved")
-        self.assertFalse(await broker.is_pending(
-            request_id, thread_id="thread-1", run_id="run-1"
-        ))
-        self.assertEqual(resumed["payload"]["message"], "approve")
+        self.assertEqual((await anext(stream))["type"], "interrupt")
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
 
     async def test_resolution_rejects_wrong_run_scope(self) -> None:
-        broker = ApprovalBroker(timeout_seconds=1)
+        broker = ApprovalBroker()
 
         async def runner():
             await broker.request(
@@ -101,8 +132,8 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         ))
         await stream.aclose()
 
-    async def test_codex_user_input_approval_returns_matching_option(self) -> None:
-        broker = ApprovalBroker(timeout_seconds=1)
+    async def test_codex_user_input_becomes_terminal_interrupt(self) -> None:
+        broker = ApprovalBroker()
 
         async def runner():
             response = await _handle_server_request(
@@ -128,21 +159,10 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         stream = broker.stream(runner(), thread_id="thread-1", run_id="run-1")
         requested = await anext(stream)
         self.assertEqual(requested["payload"]["category"], "user_input")
-        self.assertTrue(await broker.resolve(
-            requested["payload"]["id"],
-            thread_id="thread-1",
-            run_id="run-1",
-            decision={"action": "approve", "remember": False},
-        ))
-        self.assertEqual((await anext(stream))["type"], "approval_resolved")
-        response = await anext(stream)
-        self.assertEqual(
-            response["payload"]["answers"],
-            {"approval": {"answers": ["Accept"]}},
-        )
+        self.assertEqual((await anext(stream))["type"], "interrupt")
 
-    async def test_codex_remembered_command_approval_maps_to_session(self) -> None:
-        broker = ApprovalBroker(timeout_seconds=1)
+    async def test_codex_command_becomes_terminal_interrupt(self) -> None:
+        broker = ApprovalBroker()
 
         async def runner():
             response = await _handle_server_request(
@@ -156,18 +176,11 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
 
         stream = broker.stream(runner(), thread_id="thread-1", run_id="run-1")
         requested = await anext(stream)
-        self.assertTrue(await broker.resolve(
-            requested["payload"]["id"],
-            thread_id="thread-1",
-            run_id="run-1",
-            decision={"action": "approve", "remember": True},
-        ))
-        await anext(stream)
-        response = await anext(stream)
-        self.assertEqual(response["payload"], {"decision": "acceptForSession"})
+        self.assertEqual(requested["type"], "approval_request")
+        self.assertEqual((await anext(stream))["type"], "interrupt")
 
     async def test_claude_permission_bridge_uses_the_same_broker_contract(self) -> None:
-        broker = ApprovalBroker(timeout_seconds=1)
+        broker = ApprovalBroker()
         hold_runner = asyncio.Event()
 
         async def runner():
@@ -196,16 +209,7 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
             requested = await next_event
             self.assertEqual(requested["type"], "approval_request")
             self.assertEqual(requested["payload"]["agentKind"], "claude_code")
-            self.assertTrue(await broker.resolve(
-                requested["payload"]["id"],
-                thread_id="thread-cc",
-                run_id="run-cc",
-                decision={"action": "approve", "remember": True},
-            ))
-            self.assertEqual((await anext(stream))["type"], "approval_resolved")
-            decision = json.loads(await reader.readline())
-            self.assertEqual(decision["behavior"], "allow")
-            self.assertEqual(decision["updatedInput"], {"command": "npm test"})
+            self.assertEqual((await anext(stream))["type"], "interrupt")
             writer.close()
             await writer.wait_closed()
         await stream.aclose()
@@ -258,7 +262,7 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
     async def test_agui_activity_arrives_before_human_resolution(self) -> None:
         """The public AG-UI iterator must expose the card while the tool is blocked."""
 
-        broker = ApprovalBroker(timeout_seconds=1)
+        broker = ApprovalBroker()
 
         async def runner():
             await broker.request(
@@ -282,10 +286,14 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activity.type, "ACTIVITY_SNAPSHOT")
         self.assertEqual(activity.activity_type, "approval")
         self.assertEqual(activity.content["status"], "pending")
-        self.assertTrue(await broker.is_pending(
+        self.assertFalse(await broker.is_pending(
             activity.message_id, thread_id="thread-live", run_id="run-live"
         ))
-        await events.aclose()
+        self.assertEqual((await anext(events)).type, "STATE_SNAPSHOT")
+        self.assertEqual((await anext(events)).type, "MESSAGES_SNAPSHOT")
+        finished = await anext(events)
+        self.assertEqual(finished.type, "RUN_FINISHED")
+        self.assertEqual(finished.outcome.type, "interrupt")
 
     async def test_live_tool_output_is_forwarded_as_custom_delta(self) -> None:
         async def internal_events():

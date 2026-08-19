@@ -2,6 +2,9 @@
 
 > 状态：已实现  
 > 适用范围：Work 对话、Agent Team、定时任务，以及 K Agent、Codex、Claude Code 三类运行时。
+>
+> 本文描述当前已实现的进程内审批语义。跨刷新、断线和服务重启的延迟审批属于后续
+> 方案，见[可持久化 HITL 检查点与延迟恢复技术方案](durable-hitl-checkpoint-technical-solution.md)。
 
 ## 1. 背景与目标
 
@@ -133,7 +136,8 @@ Bash 示例：
 
 ### 4.2 审批前置
 
-`OpenAIAgent` 在参数校验、`before_tool` 回调和工具执行之前完成权限判断：
+`OpenAIAgent` 的 sealed Tool Pipeline 在参数校验、`ToolStarted` Observer 事件和工具执行
+之前完成权限判断：
 
 1. 执行权限规则 `check_permissions()`。
 2. `permission_mode == full_access` 时规范化为 `allow`。
@@ -211,7 +215,6 @@ sequenceDiagram
       → approved
       → denied
       → cancelled
-      → timed_out
 ```
 
 Broker 维护：
@@ -220,7 +223,8 @@ Broker 维护：
 - `request_id → PendingApproval(request_id, thread_id, run_id, future)`
 
 Runner producer 与审批事件共用一个合流队列。工具可以阻塞在 Future 上，而 SSE 仍能
-先把审批卡发送给浏览器。默认审批超时为 600 秒。
+先把审批卡发送给浏览器。审批本身不设置固定墙钟超时；它由所属 run 的取消信号管理，
+直到显式批准、拒绝、取消，或 SSE/HTTP run 关闭。
 
 ### 5.2 公开接口
 
@@ -232,12 +236,12 @@ Content-Type: application/json
   "threadId": "...",
   "runId": "...",
   "action": "approve" | "deny" | "cancel",
-  "remember": false
+  "scope": "once" | "run"
 }
 ```
 
 Access Layer 代理至 `POST /internal/approvals/{requestId}`。Backend 只有在
-`requestId + threadId + runId` 全部匹配且 Future 仍未完成时才返回成功；过期、重复、
+`requestId + threadId + runId` 全部匹配且 Future 仍未完成时才返回成功；已取消、重复、
 跨 run 或跨会话请求统一返回 404。
 
 ### 5.3 三种用户决定
@@ -269,8 +273,8 @@ Frontend 把 `approval_request` 投影为时间线审批卡，展示 Agent、类
 参数；提交期间禁用按钮，收到 `approval_resolved` 后显示最终状态。
 
 定时任务不跳转普通会话：执行记录在自动化详情页读取对应专属 Session，在原页面
-渲染审批卡，并每 2 秒刷新仍打开的执行结果。默认权限下必须在 Broker 的 600 秒
-期限内处理；页面关闭、Backend 重启或流被取消不会永久保存一个可恢复的 Future。
+渲染审批卡，并每 2 秒刷新仍打开的执行结果。审批没有固定处理期限，但页面关闭导致
+流取消、Backend 重启或 run 被终止时，内存 Future 会被取消，不能跨进程恢复。
 
 完全权限定时任务必须持续显示：
 
@@ -281,7 +285,7 @@ Frontend 把 `approval_request` 投影为时间线审批卡，展示 Agent、类
 | 场景 | 处理 |
 | --- | --- |
 | 用户拒绝 | 工具不执行，结构化错误返回模型，模型可以换方案 |
-| 600 秒无决定 | Future 超时，本次工具调用失败 |
+| 长时间无决定 | Future 保持 pending；只发送提醒，不自动批准或拒绝 |
 | SSE/HTTP run 关闭 | `cancel_run()` 取消该 run 所有未决 Future |
 | 重复提交审批 | Future 已完成，返回 404 |
 | threadId/runId 不匹配 | 返回 404，不泄露其他 run 是否存在 |
@@ -305,7 +309,7 @@ Frontend 把 `approval_request` 投影为时间线审批卡，展示 Agent、类
 后端回归至少覆盖：
 
 - 默认权限的 `require_escalated` 在工具执行前进入 HITL；
-- allow/deny/remember、超时、run 取消和三元组不匹配；
+- allow/deny、once/run scope、run 取消和三元组不匹配；
 - 完全权限跳过规则、K Agent srt、Codex/Claude sandbox 映射；
 - Session、Team、定时任务权限持久化与旧表默认迁移；
 - 定时任务和 Team dispatch 确实转发 `permissionMode`；

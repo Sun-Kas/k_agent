@@ -192,39 +192,6 @@ export async function reloadMcp(): Promise<void> {
   if (!response.ok) throw new Error(`Unable to reload MCP (${response.status})`);
 }
 
-export async function resolveApproval(
-  requestId: string,
-  input: {
-    threadId: string;
-    runId: string;
-    action: "approve" | "deny" | "cancel";
-    remember?: boolean;
-    answers?: Record<string, string[]>;
-    content?: Record<string, unknown>;
-  }
-): Promise<void> {
-  const response = await fetch(apiUrl(`/api/approvals/${encodeURIComponent(requestId)}`), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input)
-  });
-  if (!response.ok) {
-    throw new Error(await configResponseError(response, "审批提交失败"));
-  }
-}
-
-export async function getApprovalStatus(
-  requestId: string,
-  input: { threadId: string; runId: string }
-): Promise<{ pending: boolean }> {
-  const query = new URLSearchParams(input);
-  const response = await fetch(apiUrl(
-    `/api/approvals/${encodeURIComponent(requestId)}?${query.toString()}`
-  ));
-  if (!response.ok) throw new Error(await configResponseError(response, "审批状态查询失败"));
-  return response.json() as Promise<{ pending: boolean }>;
-}
-
 export async function getSkillsConfig(): Promise<{ path: string; skillDir?: string; skills: SkillConfig[]; loadedSkills?: SkillConfig[] }> {
   const response = await configFetch("/api/config/skills");
   if (!response.ok) throw new Error(`Unable to load skills config (${response.status})`);
@@ -342,7 +309,7 @@ export async function streamAgentRun(
   });
 
   if (!response.ok) {
-    throw new Error(`Agent request failed (${response.status})`);
+    throw new Error(await configResponseError(response, "Agent 请求失败"));
   }
 
   const reader = response.body?.getReader();

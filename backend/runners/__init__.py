@@ -1,6 +1,10 @@
-from backend.runners.base import AgentKind, AgentRunner, RunnerContext
+from backend.runners.base import (
+    AgentKind,
+    AgentRunner,
+    RunnerContext,
+)
 from backend.runners.detect import DetectedAgent, detect_agents
-from backend.runners.registry import RunnerRegistry, build_default_registry
+from backend.runners.registry import RunnerRegistry, get_default_registry
 
 __all__ = [
     "AgentKind",
@@ -8,6 +12,6 @@ __all__ = [
     "DetectedAgent",
     "RunnerContext",
     "RunnerRegistry",
-    "build_default_registry",
+    "get_default_registry",
     "detect_agents",
 ]

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { getApprovalStatus, resolveApproval } from "../api/agui";
 import type { AgUiEvent, ApprovalActivity, ChatMessage, SessionState, ToolActivity } from "../types";
 import { MarkdownContent } from "./MarkdownContent";
 import { timelineFromEvents, type StaticTimelineActivity } from "./transcript-timeline";
@@ -38,13 +37,26 @@ function InlineToolIcon() {
 }
 
 /** Read-only sessions reuse chat's bubbles, Markdown and collapsed tool presentation. */
-export function StaticConversationTranscript({ session }: { session: SessionState }) {
+export function StaticConversationTranscript({
+  session,
+  onApprovalDecision
+}: {
+  session: SessionState;
+  onApprovalDecision?: (
+    approval: ApprovalActivity,
+    action: "approve" | "deny",
+    scope: "once" | "run"
+  ) => Promise<void>;
+}) {
   const messages = useMemo(() => groupDisplayMessages(session.messages), [session.messages]);
   const timeline = useMemo(() => timelineFromEvents(session.events ?? []), [session.events]);
   const userMessages = messages.filter((message) => message.role === "user");
   const assistantMessages = messages.filter((message) => message.role === "assistant");
   const fallbackAnswer = assistantMessages.map((message) => message.content).filter(Boolean).join("\n\n");
-  const approvals = useMemo(() => approvalsFromEvents(session.events ?? []), [session.events]);
+  const approvals = useMemo(
+    () => approvalsFromEvents(session.events ?? [], session.openInterrupts ?? []),
+    [session.events, session.openInterrupts]
+  );
   return <div className="scheduled-transcript">{userMessages.map((message) =>
     <article className={`message-row ${message.role}`} key={message.id}>
       <div className="avatar">你</div>
@@ -62,13 +74,16 @@ export function StaticConversationTranscript({ session }: { session: SessionStat
               ? <InlineToolActivity tool={activity.tool} key={activity.id} />
               : <div className="assistant-output" key={activity.id}><MarkdownContent content={activity.content} /></div>)
           : <div className="assistant-output"><MarkdownContent content={fallbackAnswer} /></div>}
-        {approvals.map((approval) => <StaticApprovalCard approval={approval} key={approval.id} />)}
+        {approvals.map((approval) => <StaticApprovalCard approval={approval} key={approval.id} onDecision={onApprovalDecision} />)}
       </div>
     </article>}
   </div>;
 }
 
-function approvalsFromEvents(events: AgUiEvent[]): ApprovalActivity[] {
+function approvalsFromEvents(
+  events: AgUiEvent[],
+  openInterrupts: SessionState["openInterrupts"] = []
+): ApprovalActivity[] {
   const approvals = new Map<string, ApprovalActivity>();
   let sequence = 0;
   for (const event of events) {
@@ -124,41 +139,41 @@ function approvalsFromEvents(events: AgUiEvent[]): ApprovalActivity[] {
               : "pending"
     });
   }
+  for (const value of openInterrupts ?? []) {
+    const existing = approvals.get(value.id);
+    approvals.set(value.id, {
+      ...(existing ?? { ...value, sequence: sequence += 1 }),
+      ...value,
+      sequence: existing?.sequence ?? sequence,
+    });
+  }
   return [...approvals.values()];
 }
 
 /** 定时任务在原页面内完成 HITL；审批后轮询到的持久化事件会成为最终状态。 */
-function StaticApprovalCard({ approval }: { approval: ApprovalActivity }) {
+function StaticApprovalCard({ approval, onDecision }: {
+  approval: ApprovalActivity;
+  onDecision?: (
+    approval: ApprovalActivity,
+    action: "approve" | "deny",
+    scope: "once" | "run"
+  ) => Promise<void>;
+}) {
   const [status, setStatus] = useState(approval.status);
   const [error, setError] = useState("");
   useEffect(() => { setStatus(approval.status); }, [approval.status]);
-  useEffect(() => {
-    if (approval.status !== "pending") return;
-    let active = true;
-    void getApprovalStatus(approval.id, {
-      threadId: approval.threadId,
-      runId: approval.runId
-    }).then(({ pending: stillPending }) => {
-      if (active && !stillPending) {
-        setStatus("expired");
-        setError("该审批已失效，请重新发起任务。");
-      }
-    }).catch(() => undefined);
-    return () => { active = false; };
-  }, [approval.id, approval.runId, approval.status, approval.threadId]);
-  const pending = status === "pending" || status === "error";
+  const pending = status === "pending"
+    || status === "unknown_outcome"
+    || status === "resume_failed"
+    || status === "error";
   const preview = approval.detail.command ?? approval.detail.arguments;
 
-  async function decide(action: "approve" | "deny", remember = false) {
+  async function decide(action: "approve" | "deny", scope: "once" | "run" = "once") {
     setStatus("submitting");
     setError("");
     try {
-      await resolveApproval(approval.id, {
-        threadId: approval.threadId,
-        runId: approval.runId,
-        action,
-        remember
-      });
+      if (!onDecision) throw new Error("当前视图不支持恢复该审批");
+      await onDecision(approval, action, scope);
       setStatus(action === "approve" ? "approved" : "denied");
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "审批提交失败";
@@ -169,11 +184,12 @@ function StaticApprovalCard({ approval }: { approval: ApprovalActivity }) {
   }
 
   return <section className={`approval-card ${status}`} aria-live="polite">
-    <header><span className="approval-shield" aria-hidden="true">!</span><div><small>{approval.agentKind} · {approval.category}</small><strong>{approval.title}</strong></div><b>{status === "pending" ? "等待确认" : status === "submitting" ? "正在提交" : status === "approved" ? "已允许" : status === "denied" ? "已拒绝" : status === "cancelled" ? "已取消" : status === "expired" ? "已失效" : "提交失败"}</b></header>
+    <header><span className="approval-shield" aria-hidden="true">!</span><div><small>{approval.agentKind} · {approval.category}</small><strong>{approval.title}</strong></div><b>{status === "pending" ? "等待确认" : status === "submitting" ? "正在提交" : status === "approved" ? "已允许" : status === "denied" ? "已拒绝" : status === "cancelled" ? "已取消" : status === "expired" ? "已失效" : status === "unknown_outcome" ? "结果未知，需复核" : "提交失败"}</b></header>
     <p>{approval.message}</p>
+    {status === "unknown_outcome" && <p className="approval-error">恢复期间曾退出，重复执行可能产生副作用，请先检查外部状态。</p>}
     {preview !== undefined && <code>{typeof preview === "string" ? preview : JSON.stringify(preview, null, 2)}</code>}
     {error && <p className="approval-error">{error}</p>}
-    {pending && <footer><button type="button" onClick={() => void decide("deny")}>拒绝</button><button type="button" onClick={() => void decide("approve")}>允许一次</button><button className="primary" type="button" onClick={() => void decide("approve", true)}>本轮始终允许</button></footer>}
+    {pending && <footer><button type="button" onClick={() => void decide("deny")}>拒绝</button><button type="button" onClick={() => void decide("approve")}>{status === "unknown_outcome" ? "确认后再次执行" : "允许一次"}</button><button className="primary" type="button" onClick={() => void decide("approve", "run")}>本轮始终允许</button></footer>}
   </section>;
 }
 

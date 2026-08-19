@@ -9,7 +9,7 @@ import secrets
 import sys
 from typing import Any
 
-from backend.approvals import ApprovalBroker
+from backend.approvals import ApprovalBroker, consume_resume_authorization
 
 
 APPROVAL_SERVER_ID = "k_agent_human_approval"
@@ -30,14 +30,17 @@ class ClaudeApprovalBridge:
         broker: ApprovalBroker,
         thread_id: str,
         run_id: str,
+        resume_authorization: dict[str, Any] | None = None,
     ) -> None:
         self._broker = broker
         self._thread_id = thread_id
         self._run_id = run_id
+        self._resume_authorization = resume_authorization
         self._token = secrets.token_urlsafe(32)
         self._server: asyncio.Server | None = None
         self._port = 0
-        self._remembered_tools: set[str] = set()
+        # Claude's accept-for-session maps to this bridge/run lifetime only.
+        self._run_allowed_tools: set[str] = set()
 
     async def __aenter__(self) -> "ClaudeApprovalBridge":
         self._server = await asyncio.start_server(
@@ -95,25 +98,32 @@ class ClaudeApprovalBridge:
             tool_input = request.get("input")
             if not isinstance(tool_input, dict):
                 tool_input = {}
-            if tool_name in self._remembered_tools:
+            if tool_name in self._run_allowed_tools:
                 response = {"behavior": "allow", "updatedInput": tool_input}
             else:
-                decision = await self._broker.request(
-                    thread_id=self._thread_id,
-                    run_id=self._run_id,
-                    agent_kind="claude_code",
-                    category="tool",
+                detail = {
+                    "source": "claude_permission_prompt",
+                    "toolName": tool_name,
+                    "input": tool_input,
+                }
+                decision = consume_resume_authorization(
+                    self._resume_authorization,
                     title=f"Claude Code 请求调用 {tool_name}",
-                    message="该工具调用需要你的确认。",
-                    detail={
-                        "source": "claude_permission_prompt",
-                        "toolName": tool_name,
-                        "input": tool_input,
-                    },
+                    detail=detail,
                 )
+                if decision is None:
+                    decision = await self._broker.request(
+                        thread_id=self._thread_id,
+                        run_id=self._run_id,
+                        agent_kind="claude_code",
+                        category="tool",
+                        title=f"Claude Code 请求调用 {tool_name}",
+                        message="该工具调用需要你的确认。",
+                        detail=detail,
+                    )
                 if decision.get("action") == "approve":
-                    if decision.get("remember"):
-                        self._remembered_tools.add(tool_name)
+                    if decision.get("scope") == "run":
+                        self._run_allowed_tools.add(tool_name)
                     response = {"behavior": "allow", "updatedInput": tool_input}
                 else:
                     response = {

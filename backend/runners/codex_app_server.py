@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
-from backend.approvals import ApprovalBroker
+from backend.approvals import ApprovalBroker, consume_resume_authorization
 from backend.runners.cli_process import (
     _CliStreamState,
     append_text,
@@ -46,6 +46,7 @@ async def run_codex_app_server(
     run_id: str,
     network_access: bool,
     permission_mode: str,
+    resume_authorization: dict[str, Any] | None,
     mapper: CodexItemMapper,
     env: dict[str, str] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -170,6 +171,7 @@ async def run_codex_app_server(
                     broker=approval_broker,
                     public_thread_id=public_thread_id,
                     run_id=run_id,
+                    resume_authorization=resume_authorization,
                 )
                 await send({"id": message["id"], "result": response})
                 continue
@@ -260,6 +262,7 @@ async def _handle_server_request(
     broker: ApprovalBroker,
     public_thread_id: str,
     run_id: str,
+    resume_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render supported Codex server requests as one generic approval card."""
 
@@ -285,22 +288,31 @@ async def _handle_server_request(
         or _question_text(params)
         or "请确认是否继续该操作。"
     )
-    decision = await broker.request(
-        thread_id=public_thread_id,
-        run_id=run_id,
-        agent_kind="codex",
-        category=category,
-        title=title,
-        message=message,
-        detail={"method": method, **params},
+    detail = {"method": method, **params}
+    decision = consume_resume_authorization(
+        resume_authorization, title=title, detail=detail
     )
+    if decision is None:
+        decision = await broker.request(
+            thread_id=public_thread_id,
+            run_id=run_id,
+            agent_kind="codex",
+            category=category,
+            title=title,
+            message=message,
+            detail=detail,
+        )
     action = str(decision.get("action") or "cancel")
     if method in {
         "item/commandExecution/requestApproval",
         "item/fileChange/requestApproval",
     }:
         mapped = {
-            "approve": "acceptForSession" if decision.get("remember") else "accept",
+            "approve": (
+                "acceptForSession"
+                if decision.get("scope") == "run"
+                else "accept"
+            ),
             "deny": "decline",
             "cancel": "cancel",
         }[action]
@@ -316,7 +328,7 @@ async def _handle_server_request(
     requested = params.get("permissions") or params.get("requestedPermissions") or {}
     return {
         "permissions": requested if action == "approve" else {},
-        "scope": "session" if decision.get("remember") else "turn",
+        "scope": "session" if decision.get("scope") == "run" else "turn",
     }
 
 

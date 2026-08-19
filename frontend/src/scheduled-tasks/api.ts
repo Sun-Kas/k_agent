@@ -42,3 +42,17 @@ export const listScheduledRuns = (id: string) => request<ScheduledRun[]>(`/api/s
 export const getScheduledRunSession = (taskId: string, runId: string) => request<SessionState>(
   `/api/scheduled-tasks/${taskId}/runs/${runId}/session`
 );
+export const resumeScheduledRunApproval = (
+  taskId: string,
+  runId: string,
+  interruptId: string,
+  action: "approve" | "deny",
+  scope: "once" | "run"
+) => request<{ ok: boolean; status: string; runId: string }>(
+  `/api/scheduled-tasks/${taskId}/runs/${runId}/resume`,
+  {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interruptId, action, scope })
+  }
+);

@@ -45,9 +45,10 @@
   permissions 请求会暂停当前 run，等待前端明确答复，不再被 CLI 自动取消。
 - Agent Backend 新增 run-scoped `ApprovalBroker`。它把待审批请求输出为
   `CUSTOM(approval_request)`，完成后输出 `CUSTOM(approval_resolved)`；请求 ID 必须
-  同时匹配 thread ID 和 run ID，流关闭时未决请求会被取消，避免跨会话误批。
+  同时匹配 thread ID 和 run ID，审批不设固定超时，流关闭时未决请求会被取消，
+  避免跨会话误批。
 - 新增 `POST /internal/approvals/{requestId}` 和 Access Layer 对外代理
-  `POST /api/approvals/{requestId}`。请求体包含 `threadId/runId/action/remember`，
+  `POST /api/approvals/{requestId}`。请求体包含 `threadId/runId/action/scope`，
   并可为 Codex 表单请求携带 `answers/content`；过期或归属不符统一返回 404。
 - K Agent 的 `ask` 权限规则接入同一审批通道。选择“本轮始终允许”只缓存当前
   Agent 实例内的精确工具目标，不写入持久权限配置。
@@ -335,3 +336,23 @@
   `attachments` 字段，因此刷新会话及下一轮上下文仍能保留媒体归属。
 - Agent Backend 将图片转换为 OpenAI 兼容的 `image_url` 内容块，将视频转换为
   `video_url` 内容块，并依据所选模型的 `inputModalities` 再次拒绝不支持的媒体。
+
+## 2026-08-19 Durable HITL / AG-UI Resume
+
+- `POST /api/agent` 现在接受标准 `RunAgentInput.resume[]`：Resume 必须使用原
+  `threadId`、新的 `runId`、空 `messages`，并完整覆盖该线程全部开放 Interrupt。
+- 原 run 通过 `RUN_FINISHED.outcome.type="interrupt"` 正常终止；此前依次发送
+  `STATE_SNAPSHOT` 与 `MESSAGES_SNAPSHOT`。审批卡仍使用
+  `ACTIVITY_SNAPSHOT(activityType="approval")`，但只承担展示。
+- `GET /api/sessions/{sessionId}` 新增 `openInterrupts`，只返回审批展示/状态字段，
+  不返回 `_checkpoint`。有开放 Interrupt 时，缺少 Resume 的普通输入返回 409。
+- Session 包新增 `approvals/{interruptId}.json`、
+  `resume-intents/{resumeIntentId}.json`；主 JSON 新增 `openInterruptIds`。
+- Agent Backend 私有运行载荷新增 `resume` 与 `resumeCheckpoints`。后者只能由
+  Access Layer 从可信存储装配，浏览器提交的 checkpoint 不会被接受。
+- 新增 `POST /api/scheduled-tasks/{taskId}/runs/{runId}/resume`，请求体为
+  `interruptId/action/scope`。
+- 新增 `POST /api/teams/{teamId}/approvals/{approvalId}/resume`，Team checkpoint
+  保存在 SQLite 事件日志中，但 Team 查询与 SSE 接口会剥离 `_checkpoint`。
+- 旧 `/api/approvals/{id}` 暂留迁移壳，但新前端和新 run 均不再依赖其 Backend
+  内存 pending 状态。
