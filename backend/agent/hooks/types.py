@@ -1,4 +1,11 @@
-"""Typed, request-scoped contracts used by Agent hooks and middleware."""
+"""Hook / Middleware 使用的类型化、请求级契约。
+
+设计目标：
+- 事件和模型/工具请求尽量 ``frozen``，避免 Observer 或 Middleware 改到共享对象
+- ``AgentRunContext`` 是少数可变容器，且 **一次 HTTP run 一份**，防止同进程
+  并发会话互相污染（尤其是 Skill 白名单）
+- Observer 只消费这些快照，不能靠返回值改 Agent 行为
+"""
 
 from __future__ import annotations
 
@@ -13,7 +20,7 @@ from backend.api.schemas import ChatMessage
 
 
 class AgentEventType(str, Enum):
-    """Stable observer event names."""
+    """Observer 事件名。取值稳定，供日志、Langfuse 和 ``@observe`` 过滤使用。"""
 
     AGENT_STARTED = "agent_started"
     CONTEXT_BUILT = "context_built"
@@ -27,7 +34,11 @@ class AgentEventType(str, Enum):
 
 
 class HookKind(str, Enum):
-    """Execution extension points compiled into an Agent pipeline."""
+    """编译进 Pipeline 的扩展点种类。
+
+    ``OBSERVER`` 不编进 Definition，只在 ``bind_runtime`` 时注入，因为日志 /
+    Langfuse 带着 ``request_id`` 等请求级身份。
+    """
 
     OBSERVER = "observer"
     BEFORE_AGENT = "before_agent"
@@ -39,7 +50,11 @@ class HookKind(str, Enum):
 
 
 class FailureMode(str, Enum):
-    """Whether an extension failure may affect the business operation."""
+    """扩展失败是否允许影响这次业务执行。
+
+    - ``OPEN``：观测失败只记 warning，run 继续（Observer 默认）
+    - ``CLOSED``：异常向上抛，视为执行失败（Middleware 默认）
+    """
 
     OPEN = "open"
     CLOSED = "closed"
@@ -47,7 +62,7 @@ class FailureMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class HookSpec:
-    """Immutable metadata attached by declarative decorators."""
+    """装饰器贴到函数上的不可变元数据；不是全局注册表里的条目。"""
 
     kind: HookKind
     name: str
@@ -59,7 +74,11 @@ class HookSpec:
 
 @dataclass(slots=True)
 class AgentRunContext:
-    """Identity and mutable state belonging to exactly one Agent run."""
+    """恰好属于一次 Agent run 的身份与可变状态。
+
+    ``KAgentRunner`` / ``OpenAIAgent.create_runtime`` 每次 run 新建一份。
+    进程级 ``AgentPipelineDefinition`` 不能持有这些字段，否则并发会话会串数据。
+    """
 
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     request_id: str = ""
@@ -67,15 +86,15 @@ class AgentRunContext:
     agent_execution_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     started_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
-    # Skill narrowing is request state. Keeping it here prevents concurrent runs
-    # served by the same process-level Agent from contaminating each other.
+    # Skill 收窄是请求状态。放在这里可避免同进程、同 Agent 实例上的并发 run
+    # 互相覆盖白名单。
     skill_allowlist: set[str] | None = None
     skill_allowlist_owner: str = "skill"
 
 
 @dataclass(frozen=True, slots=True)
 class ModelCallPayload:
-    """Immutable logical model request exposed to middleware and observers."""
+    """暴露给 Middleware / Observer 的逻辑模型请求（不含流式增量）。"""
 
     iteration: int
     model: str
@@ -85,14 +104,14 @@ class ModelCallPayload:
     operation_id: str = ""
 
     def override(self, **changes: Any) -> "ModelCallPayload":
-        """Return a new request snapshot instead of mutating shared state."""
+        """返回新快照，禁止原地改共享 messages/tools。"""
 
         return replace(self, **changes)
 
 
 @dataclass(frozen=True, slots=True)
 class ContextPlanPayload:
-    """Context budget summary without message bodies."""
+    """上下文预算摘要。只含计数/预算，不含消息正文，避免观测层泄露 prompt。"""
 
     input_message_count: int
     active_message_count: int
@@ -107,7 +126,7 @@ class ContextPlanPayload:
 
 @dataclass(frozen=True, slots=True)
 class ContextPrunePayload:
-    """Old tool-output pruning statistics for one model iteration."""
+    """某次模型迭代里，旧工具输出被裁剪后的统计。"""
 
     iteration: int
     pruned_output_count: int
@@ -117,7 +136,7 @@ class ContextPrunePayload:
 
 @dataclass(frozen=True, slots=True)
 class ModelResultPayload:
-    """Aggregated non-stream result after the provider stream is consumed."""
+    """提供商流被完整消费后的聚合结果（给 Observer / after_model）。"""
 
     iteration: int
     model: str
@@ -131,31 +150,32 @@ class ModelResultPayload:
 
 @dataclass(frozen=True, slots=True)
 class ModelReasoningDelta:
-    """One provider reasoning delta in original arrival order."""
+    """一条按到达顺序保留的 reasoning 增量。"""
 
     content: str
 
 
 @dataclass(frozen=True, slots=True)
 class ModelTextDelta:
-    """One user-visible model text delta in original arrival order."""
+    """一条按到达顺序保留的、对用户可见的文本增量。"""
 
     content: str
 
 
 @dataclass(frozen=True, slots=True)
 class ModelCallCompleted:
-    """Terminal aggregate for one successfully consumed provider stream."""
+    """一次成功消费完的提供商流的终结标记；Middleware 必须最终 yield 它。"""
 
     result: ModelResultPayload
 
 
+# 模型流事件三态：思考增量 / 可见文本 / 终结聚合。出现增量后禁止再重试。
 ModelStreamEvent: TypeAlias = ModelReasoningDelta | ModelTextDelta | ModelCallCompleted
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCallRequest:
-    """Logical tool request; retries keep call_id and create new operation IDs."""
+    """逻辑工具请求。重试保持 ``call_id``，每次物理尝试另发 ``operation_id``。"""
 
     call_id: str
     iteration: int
@@ -166,12 +186,12 @@ class ToolCallRequest:
     server_id: str | None = None
 
     def __post_init__(self) -> None:
-        # Copy the top-level mapping so middleware cannot mutate the model-owned
-        # dictionary through an otherwise frozen dataclass.
+        # 拷贝顶层 mapping，避免 Middleware 通过「frozen dataclass + 可变 dict」
+        # 改到模型侧仍在使用的参数对象。
         object.__setattr__(self, "arguments", MappingProxyType(dict(self.arguments)))
 
     def override(self, **changes: Any) -> "ToolCallRequest":
-        """Return a new request that will pass through the sealed safety gate."""
+        """返回新请求；Pipeline 会让它重新经过 sealed 安全门，不能绕过权限。"""
 
         if "arguments" in changes:
             changes["arguments"] = dict(changes["arguments"])
@@ -180,7 +200,7 @@ class ToolCallRequest:
 
 @dataclass(frozen=True, slots=True)
 class ToolCallPayload:
-    """One physical tool attempt emitted immediately before validation/execution."""
+    """一次物理工具尝试，在校验/执行前立刻发给 Observer。"""
 
     iteration: int
     name: str
@@ -194,7 +214,7 @@ class ToolCallPayload:
 
 @dataclass(frozen=True, slots=True)
 class ToolResultPayload:
-    """Successful result for one physical tool attempt."""
+    """一次物理工具尝试成功后的观测载荷。"""
 
     iteration: int
     name: str
@@ -210,7 +230,7 @@ class ToolResultPayload:
 
 @dataclass(frozen=True, slots=True)
 class ToolCallResult:
-    """Middleware-facing successful tool result."""
+    """给 wrap_tool Middleware 的成功返回值（含本次 attempt / operation_id）。"""
 
     request: ToolCallRequest
     output: str
@@ -221,7 +241,7 @@ class ToolCallResult:
 
 @dataclass(frozen=True, slots=True)
 class AgentErrorPayload:
-    """Failure metadata; observers decide how much detail is safe to export."""
+    """失败元数据。Observer 自行决定导出多少细节，dispatcher 日志不得带正文。"""
 
     error: BaseException
     stage: str
@@ -232,6 +252,8 @@ class AgentErrorPayload:
 
 @dataclass(frozen=True, slots=True)
 class AgentStartedEvent:
+    """before_agent 成功后发出；messages 是进入循环时的快照。"""
+
     context: AgentRunContext
     messages: tuple[ChatMessage, ...]
     type: AgentEventType = field(default=AgentEventType.AGENT_STARTED, init=False)
@@ -239,6 +261,8 @@ class AgentStartedEvent:
 
 @dataclass(frozen=True, slots=True)
 class ContextBuiltEvent:
+    """上下文预算规划完成（不含消息正文）。"""
+
     context: AgentRunContext
     payload: ContextPlanPayload
     type: AgentEventType = field(default=AgentEventType.CONTEXT_BUILT, init=False)
@@ -246,6 +270,8 @@ class ContextBuiltEvent:
 
 @dataclass(frozen=True, slots=True)
 class ContextPrunedEvent:
+    """本轮模型调用前裁剪了旧工具输出。"""
+
     context: AgentRunContext
     payload: ContextPrunePayload
     type: AgentEventType = field(default=AgentEventType.CONTEXT_PRUNED, init=False)
@@ -253,6 +279,8 @@ class ContextPrunedEvent:
 
 @dataclass(frozen=True, slots=True)
 class ModelStartedEvent:
+    """sealed 模型终端即将调用提供商；此时已分配本次 ``operation_id``。"""
+
     context: AgentRunContext
     payload: ModelCallPayload
     type: AgentEventType = field(default=AgentEventType.MODEL_STARTED, init=False)
@@ -260,6 +288,8 @@ class ModelStartedEvent:
 
 @dataclass(frozen=True, slots=True)
 class ModelCompletedEvent:
+    """提供商流已完整消费并得到聚合结果。"""
+
     context: AgentRunContext
     payload: ModelResultPayload
     type: AgentEventType = field(default=AgentEventType.MODEL_COMPLETED, init=False)
@@ -267,6 +297,8 @@ class ModelCompletedEvent:
 
 @dataclass(frozen=True, slots=True)
 class ToolStartedEvent:
+    """preflight 通过后、execute 之前。权限拒绝不会发这条。"""
+
     context: AgentRunContext
     payload: ToolCallPayload
     type: AgentEventType = field(default=AgentEventType.TOOL_STARTED, init=False)
@@ -274,6 +306,8 @@ class ToolStartedEvent:
 
 @dataclass(frozen=True, slots=True)
 class ToolCompletedEvent:
+    """工具 execute 成功。异常走 ``OperationFailedEvent``。"""
+
     context: AgentRunContext
     payload: ToolResultPayload
     type: AgentEventType = field(default=AgentEventType.TOOL_COMPLETED, init=False)
@@ -281,6 +315,8 @@ class ToolCompletedEvent:
 
 @dataclass(frozen=True, slots=True)
 class OperationFailedEvent:
+    """任一 fail-closed 阶段失败。stage 区分 before/wrap/preflight/execute 等。"""
+
     context: AgentRunContext
     payload: AgentErrorPayload
     type: AgentEventType = field(default=AgentEventType.OPERATION_FAILED, init=False)
@@ -288,6 +324,8 @@ class OperationFailedEvent:
 
 @dataclass(frozen=True, slots=True)
 class AgentCompletedEvent:
+    """循环正常交出最终 result 后发出；随后才跑 after_agent。"""
+
     context: AgentRunContext
     result: Mapping[str, Any]
     type: AgentEventType = field(default=AgentEventType.AGENT_COMPLETED, init=False)
