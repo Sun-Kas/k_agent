@@ -103,7 +103,21 @@ class RuntimeCatalog:
 
     def mcp_summaries(self) -> list[dict[str, Any]]:
         """读取 MCP 目录摘要（id/name/description/enabled）。"""
-        return _read_list(self.mcp_catalog_path, "servers")
+        summaries = _read_list(self.mcp_catalog_path, "servers")
+        # Catalog can drift from mcp.json (e.g. a server was disabled in
+        # runtime config but the picker catalog still says enabled). Overlay
+        # live availability so the UI cannot select servers the access layer
+        # would reject as "Missing MCP runtime config".
+        scoped = load_scoped_mcp_servers(explicit_config_path=str(self.mcp_config_path))
+        available = {server.id for server in scoped.servers}
+        synced: list[dict[str, Any]] = []
+        for item in summaries:
+            entry = dict(item)
+            server_id = str(entry.get("id") or "")
+            if server_id and server_id not in available:
+                entry["enabled"] = False
+            synced.append(entry)
+        return synced
 
     def skill_summaries(self) -> list[dict[str, Any]]:
         """读取 Skill 目录摘要（id/name/description/enabled）。"""

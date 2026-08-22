@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -109,24 +110,89 @@ def ensure_shared_runtime() -> Path:
     return runtime
 
 
+def _is_dir_link(path: Path) -> bool:
+    """True for symlinks or Windows directory junctions."""
+
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction()) if callable(is_junction) else False
+
+
+def _remove_path(path: Path) -> None:
+    """Remove a file, symlink, junction, or directory tree."""
+
+    if _is_dir_link(path):
+        # unlink/rmdir removes the link itself, not the shared runtime target.
+        try:
+            path.unlink()
+        except OSError:
+            os.rmdir(path)
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    if path.exists():
+        path.unlink()
+
+
+def _link_directory(link: Path, target: Path) -> None:
+    """Create a directory symlink, falling back to a Windows junction.
+
+    Plain users on Windows often lack SeCreateSymbolicLinkPrivilege
+    (WinError 1314) unless Developer Mode or elevation is enabled. Directory
+    junctions do not require that privilege and still give a stable `.runtime`
+    path inside each workspace.
+    """
+
+    symlink_winerror: int | None = None
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        symlink_winerror = getattr(exc, "winerror", None)
+        if os.name != "nt" or symlink_winerror not in {1314, 1}:
+            raise
+        logger.info(
+            "symlink privilege missing (%s); using directory junction for %s",
+            symlink_winerror,
+            link,
+        )
+
+    # mklink /J creates a junction without admin rights.
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0 or not link.exists():
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise OSError(
+            symlink_winerror or 1314,
+            detail or "failed to create directory junction for shared runtime",
+            str(link),
+        )
+
+
 def link_shared_runtime(target_dir: Path, runtime: Path | None = None) -> Path:
     """在工作区挂 `.runtime` → 共享 runtime；旧链接/目录先拆再建。"""
 
     runtime = (runtime or ensure_shared_runtime()).resolve()
     link = target_dir / ".runtime"
-    if link.is_symlink():
+    if _is_dir_link(link):
         try:
             if link.resolve() == runtime:
                 return link
         except OSError:
             pass
-        link.unlink()
-    elif link.is_dir():
-        shutil.rmtree(link)
+        _remove_path(link)
     elif link.exists():
-        link.unlink()
+        _remove_path(link)
     target_dir.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(runtime, target_is_directory=True)
+    _link_directory(link, runtime)
     return link
 
 

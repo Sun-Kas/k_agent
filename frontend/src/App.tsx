@@ -775,16 +775,25 @@ export function App() {
   }
 
   async function refreshOptions() {
+    const fallbackAgents: DetectedAgent[] = [{ kind: "k_agent", name: "K Agent", available: true }];
     try {
-      const [modelData, catalog, agentsCatalog] = await Promise.all([
+      const [modelResult, catalogResult, agentsResult] = await Promise.allSettled([
         getModelsConfig(), getRuntimeCatalog(), getAgentsCatalog()
       ]);
+      if (modelResult.status !== "fulfilled" || catalogResult.status !== "fulfilled") {
+        throw new Error("Unable to load models or runtime catalog");
+      }
+      const modelData = modelResult.value;
+      const catalog = catalogResult.value;
+      const agentsCatalog = agentsResult.status === "fulfilled"
+        ? agentsResult.value
+        : { defaultKind: "k_agent" as const, agents: fallbackAgents };
       const enabledModels = modelData.models.filter((model) => model.enabled);
       const enabledMcp = catalog.mcpServers.filter((server) => server.enabled);
       const enabledSkills = catalog.skills.filter((skill) => skill.enabled);
-      const availableAgents = agentsCatalog.agents;
+      const availableAgents = agentsCatalog.agents.length ? agentsCatalog.agents : fallbackAgents;
       setModels(enabledModels);
-      setAgents(availableAgents.length ? availableAgents : [{ kind: "k_agent", name: "K Agent", available: true }]);
+      setAgents(availableAgents);
       setMcpServers(enabledMcp);
       setSkills(enabledSkills);
       catalogLoadedRef.current = true;
@@ -821,7 +830,7 @@ export function App() {
     } catch {
       catalogLoadedRef.current = false;
       setModels([]);
-      setAgents([{ kind: "k_agent", name: "K Agent", available: true }]);
+      setAgents(fallbackAgents);
       setAgentKind("k_agent");
       setMcpServers([]);
       setSkills([]);
