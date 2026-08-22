@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from backend.agent.contracts import AgentRunRequest
 from backend.agent.react_agent import OpenAIAgent
+from backend.agui import translate_agent_events
 from backend.api.schemas import ChatMessage
 from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager
@@ -30,10 +31,15 @@ class _ChunkStream:
         return iterate()
 
 
-def _chunk(*, content: str | None = None, tool_call: SimpleNamespace | None = None):
+def _chunk(
+    *,
+    content: str | None = None,
+    reasoning_content: str | None = None,
+    tool_call: SimpleNamespace | None = None,
+):
     delta = SimpleNamespace(
         content=content,
-        reasoning_content=None,
+        reasoning_content=reasoning_content,
         tool_calls=[tool_call] if tool_call is not None else None,
     )
     return SimpleNamespace(
@@ -43,6 +49,129 @@ def _chunk(*, content: str | None = None, tool_call: SimpleNamespace | None = No
 
 
 class AgentToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reasoning_ends_before_text_stream_starts(self) -> None:
+        stream = _ChunkStream(
+            [
+                _chunk(reasoning_content="reason-1"),
+                _chunk(reasoning_content="reason-2"),
+                _chunk(content="answer"),
+                _chunk(content="!"),
+            ]
+        )
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=AsyncMock(return_value=stream)),
+            )
+        )
+        agent = OpenAIAgent()
+        request = AgentRunRequest(
+            messages=[
+                ChatMessage(
+                    id="user-stream-order",
+                    role="user",
+                    content="answer with reasoning",
+                    createdAt=datetime.now(timezone.utc),
+                )
+            ],
+            system_prompt="Finish reasoning before visible text.",
+            user_context={},
+            model_config={
+                "model": "test-model",
+                "apiKey": "test",
+                "baseUrl": "http://example.test/v1",
+            },
+        )
+
+        with patch("backend.agent.react_agent.AsyncOpenAI", return_value=fake_client):
+            runtime = await agent.create_runtime(
+                request,
+                [],
+                McpClientManager([]),
+                config=Settings(OPENAI_API_KEY="test"),
+            )
+            events = [event async for event in agent.run_stream_react(runtime)]
+
+        stream_events = [
+            event
+            for event in events
+            if event["type"]
+            in {
+                "reasoning_start",
+                "reasoning_delta",
+                "reasoning_end",
+                "message_start",
+                "delta",
+                "message_end",
+            }
+        ]
+        self.assertEqual(
+            [event["type"] for event in stream_events],
+            [
+                "reasoning_start",
+                "reasoning_delta",
+                "reasoning_delta",
+                "reasoning_end",
+                "message_start",
+                "delta",
+                "delta",
+                "message_end",
+            ],
+        )
+        self.assertEqual(
+            [
+                event["payload"]["content"]
+                for event in stream_events
+                if event["type"] == "reasoning_delta"
+            ],
+            ["reason-1", "reason-2"],
+        )
+        self.assertEqual(
+            len(
+                {
+                    event["payload"]["reasoningId"]
+                    for event in stream_events
+                    if event["type"].startswith("reasoning_")
+                }
+            ),
+            1,
+        )
+
+        async def replay_events():
+            for event in events:
+                yield event
+
+        translated = [
+            event
+            async for event in translate_agent_events(
+                replay_events(), "thread-stream-order", "run-stream-order"
+            )
+        ]
+        event_types = [event.type for event in translated]
+        text_start = event_types.index("TEXT_MESSAGE_START")
+        self.assertEqual(
+            event_types[text_start - 2 : text_start + 1],
+            ["REASONING_MESSAGE_END", "REASONING_END", "TEXT_MESSAGE_START"],
+        )
+        reasoning_start = max(
+            index
+            for index, event_type in enumerate(event_types[:text_start])
+            if event_type == "REASONING_START"
+        )
+        self.assertEqual(
+            len(
+                {
+                    event.message_id
+                    for event in translated[reasoning_start:text_start]
+                    if event.type.startswith("REASONING_")
+                }
+            ),
+            1,
+        )
+        self.assertLess(
+            event_types.index("TEXT_MESSAGE_CONTENT", text_start),
+            event_types.index("TEXT_MESSAGE_END", text_start),
+        )
+
     async def test_tool_exception_is_returned_to_model_and_next_iteration_runs(self) -> None:
         async def fail_read(_: dict) -> str:
             raise ValueError("path is outside workspace: /tmp/result.md")
@@ -125,7 +254,9 @@ class AgentToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
             json.loads(second_model_messages[-1]["content"])["error"],
             "path is outside workspace: /tmp/result.md",
         )
-        self.assertTrue(any(event["type"] == "final" for event in events))
+        final = next(event for event in events if event["type"] == "final")
+        self.assertEqual(final["payload"]["output"], "已根据错误原因改用其他方案。")
+        self.assertNotIn("messages", final["payload"])
         self.assertFalse(any(event["type"] == "RUN_ERROR" for event in events))
 
 

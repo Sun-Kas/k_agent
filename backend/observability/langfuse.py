@@ -225,25 +225,13 @@ class LangfuseAgentObserver:
         context: AgentRunContext,
         result: dict[str, Any],
     ) -> None:
-        messages = result.get("messages") or []
-        final_message = next(
-            (
-                message
-                for message in reversed(messages)
-                if getattr(message, "role", None) == "assistant"
-                or (
-                    isinstance(message, dict)
-                    and message.get("role") == "assistant"
-                )
-            ),
-            None,
-        )
+        output = str(result.get("output") or "")
         self._safe_update(
             self._root,
-            output=_json_safe(final_message),
+            output=output,
             metadata={
                 "agentRunId": context.run_id,
-                "messageCount": len(messages),
+                "outputChars": len(output),
                 "elapsedMs": round(
                     max(0.0, time.time() - context.started_at) * 1000,
                     3,

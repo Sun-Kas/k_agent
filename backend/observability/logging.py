@@ -162,5 +162,5 @@ class AgentBackendLoggingObserver:
                 "agent.run.completed", **self._identity,
                 agentExecutionId=context.agent_execution_id,
                 elapsedMs=round(max(0.0, time.time() - context.started_at) * 1000, 3),
-                messageCount=len(event.result.get("messages") or []),
+                outputChars=len(str(event.result.get("output") or "")),
             )

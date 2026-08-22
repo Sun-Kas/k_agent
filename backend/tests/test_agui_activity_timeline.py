@@ -761,7 +761,7 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_active_thinking_closed_by_text_is_not_reopened_by_late_completion(self) -> None:
+    async def test_streamed_thinking_ends_before_text_starts(self) -> None:
         active_thinking = {
             "id": "thinking-active-before-text",
             "phase": "reasoning",
@@ -771,19 +771,18 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
         }
         complete_thinking = {
             **active_thinking,
-            "detail": "done",
             "status": "complete",
         }
 
         async def events():
             yield {"type": "thinking", "payload": active_thinking}
+            yield {"type": "thinking", "payload": complete_thinking}
             yield {"type": "message_start", "payload": {"messageId": "assistant-late"}}
             yield {
                 "type": "delta",
                 "payload": {"messageId": "assistant-late", "content": "answer"},
             }
             yield {"type": "message_end", "payload": {"messageId": "assistant-late"}}
-            yield {"type": "thinking", "payload": complete_thinking}
             yield {"type": "final", "payload": {"messages": [], "trace": [], "tasks": []}}
 
         translated = [
@@ -798,7 +797,7 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             event_types.index("REASONING_END"),
             event_types.index("TEXT_MESSAGE_START"),
         )
-        # 正文边界关掉 reasoning 时必须带上已累积 detail，避免前端把思考正文盖空。
+        # 显式 complete 只关闭 reasoning，不得改写已流式累积的正文。
         end_events = [
             event
             for event in translated

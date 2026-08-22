@@ -1,8 +1,8 @@
-"""OpenAI 兼容聊天 API 上的流式 React 主循环（模型 ↔ 工具交替）。
+"""OpenAI 兼容聊天 API 上的流式 ReAct 主循环（Reason ↔ Act ↔ Observe）。
 
 pipeline 核心：`KAgentRunner` 复用一个 `OpenAIAgent`，每轮调用
-`create_runtime` 拼出请求级运行信息，再由同一个 Agent 的 `run_stream`
-执行 thinking/message/tool/trace/final 循环，最后交给 `agui` 转 AG-UI。
+`create_runtime` 拼出请求级运行信息，再由同一个 Agent 的 `run_stream_react`
+驱动模型推理、工具执行与观察回填，最后交给 `agui` 转 AG-UI。
 """
 
 from __future__ import annotations
@@ -38,14 +38,13 @@ from backend.agent.hooks import (
 from backend.agent.contracts import AgentRunRequest
 from backend.context import (
     build_context_plan,
-    compose_api_messages,
+    compose_api_messages as compose_messages,
     estimate_text_tokens,
     prune_old_tool_outputs,
 )
 from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager, McpToolDescriptor
 from backend.permissions import PermissionDecision, check_permission, check_permissions
-from backend.api.schemas import ChatMessage, ChatMeta, ChatRole
 from backend.approvals import canonical_json_sha256
 from backend.sandbox import is_domain_allowed, notice_from_tool_result
 from backend.tools import ToolDefinition, validate_tool_arguments
@@ -115,8 +114,9 @@ class OpenAIAgent:
                     "Treat it as continuity context, not a new user request.\n\n"
                     + context_plan.summary
                 )
-            working_messages = list(context_plan.messages)
-            api_messages = compose_api_messages(
+            # compose 后的 messages 含 system 和 provider 协议消息，是唯一驱动
+            # ReAct 的列表；会话持久化另由流式事件完成。
+            messages = compose_messages(
                 context_plan.messages,
                 system_prompt=request.system_prompt,
                 user_context=user_context,
@@ -155,8 +155,7 @@ class OpenAIAgent:
             "mcp_tools": mcp_tools,
             "tool_specs": tool_specs,
             "context_plan": context_plan,
-            "working_messages": working_messages,
-            "api_messages": api_messages,
+            "messages": messages,
             "selected_model": selected_model,
             "client": client,
         }
@@ -179,31 +178,60 @@ class OpenAIAgent:
         self,
         runtime: dict[str, Any],
     ) -> AsyncIterator[dict[str, Any]]:
-        """驱动 ReAct 循环：模型推理 → 工具执行 → 观察结果，直到完成或达到上限。"""
+        """驱动一次 ReAct 循环，直到 Finish、迭代上限、取消或不可恢复错误。
 
-        # create_runtime 已完成所有循环前准备；这里仅加载并驱动执行。
-        request: AgentRunRequest = runtime["request"]  # 本轮已拼好的 prompt/消息/权限入参
-        config: Settings = runtime["config"]  # 进程配置（迭代上限、默认模型、状态文案等）
-        trace: list[str] = runtime["trace"]  # 本轮内部轨迹字符串，最终打进 final.payload
-        thinking: list[dict[str, Any]] = runtime["thinking"]  # UI 思考步骤累计，供 thinking 事件
+        ReAct（Yao et al.）在本函数里的对应关系：
+
+        - **Reason**：把 ``messages`` 发给模型。产出思考增量、可见文本，以及
+          零个或多个 function ``tool_calls``。没有 tool_calls 就是 Finish。
+        - **Act**：按模型给出的顺序逐个执行本地/MCP 工具。权限、Skill 白名单、
+          HITL 审批都在 ``_run_tool`` 内，本循环只负责发卡和收结果。
+        - **Observe**：每次 Act 的字符串结果写成 ``role=tool`` 消息，追加到
+          ``messages``，成为下一轮 Reason 的输入。工具失败同样是 Observation：
+          异常不冒泡，模型读到错误文案后再 Reason 一次以修正。
+
+        对用户和 Access Layer 来说，真相是本函数 **yield 出去的事件**
+        （``message_*`` / ``tool_*``）。Access Layer 按 AG-UI 事件 upsert session；
+        ``agui`` 遇到内部 ``final`` 时只会收尾，不会用 payload 覆盖会话。
+
+        ``messages`` 是**唯一喂给模型的列表**：含 system、带
+        ``tool_calls`` 的 assistant，以及用 ``tool_call_id`` 配对的 tool。
+        对用户可见的消息与工具结果依靠 yield 出去的事件持久化，不在
+        Agent 内部再维护第二份 ``ChatMessage`` 快照。
+
+        循环正常出口是「Reason 不再请求工具」。跑满 ``max_model_iterations`` 是兜底，
+        会插入上限文案后 Finish，而不是让 run 无限继续。HITL Interrupt 发生在 Act
+        边界（``runtime["_react_tool_boundary"]``）；恢复时先把未做完的 Act 做完，
+        再从 ``checkpoint.iteration + 1`` 开始下一轮 Reason，避免重放已流式打出的模型输出。
+
+        ``create_runtime`` 已完成 prompt、工具表、上下文预算；这里只驱动执行。
+        """
+
+        request: AgentRunRequest = runtime["request"]  # 本轮已拼好的 prompt / 消息 / 权限入参
+        config: Settings = runtime["config"]  # 迭代上限、默认模型、状态文案
+        trace: list[str] = runtime["trace"]  # 内部轨迹，最终打进 final.payload
+        thinking: list[dict[str, Any]] = runtime["thinking"]  # UI 思考步骤，供 thinking 事件
         selected_model: str = runtime["selected_model"]  # 实际发给 provider 的模型 id
-        client: AsyncOpenAI = runtime["client"]  # 本轮专用 OpenAI 兼容客户端（含 apiKey/baseUrl）
-        context: AgentRunContext = runtime["context"]  # 回调共享的 run 元数据（含 permission_mode）
-        pipeline: AgentPipelineRuntime = runtime["pipeline"]  # 本轮 Observer/Middleware 执行管线
-        mcp_tools: list[McpToolDescriptor] = runtime["mcp_tools"]  # 本轮已过滤的 MCP 工具描述
-        tool_specs: list[dict[str, Any]] = runtime["tool_specs"]  # 发给 chat.completions 的 tools schema
-        context_plan = runtime["context_plan"]  # 裁剪/摘要后的上下文预算方案
-        working_messages: list[ChatMessage] = runtime["working_messages"]  # 回写 Access Layer 的会话消息
-        api_messages: list[dict[str, Any]] = runtime["api_messages"]  # 发给 provider 的原生消息（含 system）
+        client: AsyncOpenAI = runtime["client"]  # 本轮专用客户端（apiKey / baseUrl）
+        context: AgentRunContext = runtime["context"]  # 本轮 run 元数据（含 permission_mode）
+        pipeline: AgentPipelineRuntime = runtime["pipeline"]  # Observer / Middleware 管线
+        mcp_tools: list[McpToolDescriptor] = runtime["mcp_tools"]  # 本轮已过滤的 MCP 工具
+        tool_specs: list[dict[str, Any]] = runtime["tool_specs"]  # chat.completions 的 tools schema
+        context_plan = runtime["context_plan"]  # 裁剪 / 摘要后的上下文预算
+        # 含 system 的 provider 协议列表，也是 ReAct 循环唯一的消息状态。
+        messages: list[dict[str, Any]] = runtime["messages"]
 
-        agent_scope = pipeline.agent_run(working_messages)
+        # agent_run 把 before_agent / AgentStarted 与 after_agent / AgentCompleted
+        # 收口成一对；后面每次 Finish 或失败都必须走 __aexit__，否则观测会漏收尾。
+        # AgentStarted 带的是开跑时的压缩窗口，不是全量 session。
+        agent_scope = pipeline.agent_run(list(context_plan.messages))
         try:
             await agent_scope.__aenter__()
             await pipeline.emit_context_built(
                 ContextPlanPayload(
                     input_message_count=len(request.messages),
                     active_message_count=len(context_plan.messages),
-                    provider_message_count=len(api_messages),
+                    provider_message_count=len(messages),
                     compacted_message_count=len(
                         context_plan.compacted_message_ids
                     ),
@@ -214,6 +242,10 @@ class OpenAIAgent:
                     breakdown=dict(context_plan.breakdown),
                 ),
             )
+            # -----------------------------------------------------------------
+            # 开场：还不是 ReAct 一步。把本轮上下文预算、memory/MCP 痕迹和「任务
+            # 已读入」思考步骤推给前端，再进入循环。trace[-1] 来自 AgentStarted。
+            # -----------------------------------------------------------------
             yield {
                 "type": "context_state",
                 "payload": {
@@ -221,15 +253,15 @@ class OpenAIAgent:
                     "loadedMemoryPaths": request.loaded_memory_paths,
                 },
             }
-            yield {"type": "trace", "payload": {"entry": trace[-1]}}
+            yield self._run_trace(trace[-1])
             if request.loaded_memory_paths:
                 trace.append(
                     f"memory:eager_loaded:{len(request.loaded_memory_paths)} files"
                 )
-                yield {"type": "trace", "payload": {"entry": trace[-1]}}
+                yield self._run_trace(trace[-1])
             if mcp_tools:
                 trace.append(f"prompt:mcp_dynamic_section:{len(mcp_tools)} tools")
-                yield {"type": "trace", "payload": {"entry": trace[-1]}}
+                yield self._run_trace(trace[-1])
             preparation = self._thinking_step(
                 thinking,
                 phase="analysis",
@@ -239,14 +271,21 @@ class OpenAIAgent:
                 iteration=0,
             )
             yield {"type": "thinking", "payload": preparation}
-            yield {"type": "status", "payload": {"message": config.status_model_started}}
+            yield self._run_status(config.status_model_started)
 
+            # -----------------------------------------------------------------
+            # 可选：从 HITL 中断点续跑 Act（不重放 Reason）
+            #
+            # checkpoint 停在某一轮 Reason 之后、某一批 tool_calls 之中。
+            # 当时模型输出已经流式给过前端，所以这里只补执行剩余工具，把
+            # Observation 写回 messages，然后从 iteration+1 再 Reason。
+            # -----------------------------------------------------------------
             start_iteration = 0
             resume_checkpoint = runtime.get("resume_checkpoint")
             if isinstance(resume_checkpoint, dict):
                 if resume_checkpoint.get("kind") != "react_tool_boundary":
                     raise RuntimeError("K Agent checkpoint is not a ReAct tool boundary")
-                checkpoint_messages = resume_checkpoint.get("apiMessages")
+                checkpoint_messages = resume_checkpoint.get("modelMessages")
                 pending_calls = resume_checkpoint.get("pendingCalls")
                 pending_index = resume_checkpoint.get("pendingIndex")
                 checkpoint_iteration = resume_checkpoint.get("iteration")
@@ -259,7 +298,9 @@ class OpenAIAgent:
                     or pending_index >= len(pending_calls)
                 ):
                     raise RuntimeError("K Agent ReAct checkpoint is incomplete")
-                api_messages = [dict(message) for message in checkpoint_messages]
+                # 用中断时的 provider 消息覆盖 create_runtime 拼出的新列表，
+                # 否则 assistant.tool_calls 与后续 tool 消息对不上。
+                messages = [dict(message) for message in checkpoint_messages]
                 resume_decision = runtime.get("resume_decision")
                 if not isinstance(resume_decision, dict):
                     raise RuntimeError("K Agent resume decision is missing")
@@ -291,12 +332,16 @@ class OpenAIAgent:
                         },
                     }
                     if index == pending_index and not approved:
+                        # 用户拒绝也要留下 Observation，否则下一轮 Reason 会以为
+                        # 这个 tool_call 还没结果，再次请求同一工具。
                         tool_result = (
                             f"Tool {tool_name} was not executed because the user denied "
                             "or cancelled the approval request."
                         )
                     else:
                         if index == pending_index:
+                            # 仅当前被审批的那一次调用带上 resume 授权；同批后续
+                            # 工具若仍需 HITL，会再次 Interrupt，而不是一次批过。
                             runtime["_resume_authorization"] = {
                                 "callId": call_id,
                                 "requestHash": runtime.get("resume_request_hash"),
@@ -307,7 +352,7 @@ class OpenAIAgent:
                             "iteration": checkpoint_iteration,
                             "pendingIndex": index,
                             "pendingCalls": [dict(item) for item in pending_calls],
-                            "apiMessages": [dict(item) for item in api_messages],
+                            "modelMessages": [dict(item) for item in messages],
                         }
                         tool_result = await self._run_tool(
                             runtime=runtime,
@@ -316,34 +361,43 @@ class OpenAIAgent:
                             tool_name=tool_name,
                             arguments=raw_arguments,
                         )
-                    tool_message = self._message("tool", tool_result, tool_name=tool_name)
-                    working_messages.append(tool_message)
+                    tool_message_id = str(uuid.uuid4())
                     yield {
                         "type": "tool_result",
                         "payload": {
                             "toolCallId": call_id,
-                            "messageId": tool_message.id,
+                            "messageId": tool_message_id,
                             "content": tool_result,
                         },
                     }
-                    api_messages.append({
+                    messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": tool_result,
                     })
+                # 本轮 Reason 已在旧 run 完成；从下一 iteration 重新 Reason。
                 start_iteration = checkpoint_iteration + 1
-                yield {"type": "status", "payload": {"message": config.status_model_started}}
+                yield self._run_status(config.status_model_started)
 
-            # 循环的正常出口是下面「模型不再请求工具」的分支；跑满迭代次数属于
-            # 异常兜底，会在循环后返回一条上限提示，而不是让 run 无限继续。
+            # -----------------------------------------------------------------
+            # ReAct 主循环
+            #
+            #   每轮：Observe(裁剪旧工具结果) → Reason(模型) → Finish | Act(工具)
+            #   Act 结束后 Observation 已写进 messages，下一轮 for 再 Reason。
+            #
+            # range 上界是 inclusive：最后一次迭代仍允许一次 Reason。若仍要工具，
+            # 循环结束后走上限 Finish，避免「差一轮就能答完」被直接掐掉。
+            # -----------------------------------------------------------------
             for iteration in range(start_iteration, config.max_model_iterations + 1):
-                # 每轮开头裁剪一次：工具结果是上下文增长最快的来源，
-                # 若等到超预算再处理，本轮请求已经发不出去了。
-                before_tool_chars = self._tool_output_chars(api_messages)
-                before_tool_outputs = self._tool_output_contents(api_messages)
-                api_messages = prune_old_tool_outputs(api_messages)
-                after_tool_chars = self._tool_output_chars(api_messages)
-                after_tool_outputs = self._tool_output_contents(api_messages)
+                # ----- Observe（上下文）-----
+                # 工具结果是上下文增长最快的来源。必须在 Reason 之前裁剪：若等
+                # 超预算再处理，本轮请求已经发不出去。这里只压缩旧 Observation
+                # 正文，不删除 tool 消息本身，以免破坏 tool_call_id 配对。
+                before_tool_chars = self._tool_output_chars(messages)
+                before_tool_outputs = self._tool_output_contents(messages)
+                messages = prune_old_tool_outputs(messages)
+                after_tool_chars = self._tool_output_chars(messages)
+                after_tool_outputs = self._tool_output_contents(messages)
                 pruned_output_count = sum(
                     before != after
                     for before, after in zip(
@@ -360,31 +414,32 @@ class OpenAIAgent:
                             after_chars=after_tool_chars,
                         ),
                     )
-                model_step = self._thinking_step(
-                    thinking,
-                    phase="reasoning",
-                    title="分析并决定下一步" if iteration == 0 else "结合工具结果继续分析",
-                    detail="正在评估上下文、可用工具与回答路径。",
-                    status="active",
-                    iteration=iteration,
-                )
-                yield {"type": "thinking", "payload": model_step}
+
+                # ----- Reason -----
                 model_request = ModelCallPayload(
                     iteration=iteration,
                     model=selected_model,
-                    messages=tuple(dict(message) for message in api_messages),
+                    messages=tuple(dict(message) for message in messages),
                     tools=tuple(tool_specs),
                     reasoning_effort=request.reasoning_effort,
                 )
-                assistant_draft_id = str(uuid.uuid4())
+                # provider reasoning 直接映射为 start/delta/end，不再造
+                # thinking 快照、写死标题或在 Agent 内累加展示文本。
+                # 一次 model call 只有一条 reasoning message，内外层事件共用同一 ID。
+                reasoning_id: str | None = None
+                # 可见正文的 messageId；第一个 token 就要 message_start，必须先有 id。
+                message_id = str(uuid.uuid4())
+                # 还没出过可见文字。只思考/只调工具时不要发空的 message_start。
                 message_started = False
+                # 「正在思考...」只发一次，避免每个 reasoning delta 刷一条 status。
                 reasoning_status_sent = False
-                content_buffer = ""
-                reasoning_buffer = ""
+                # 等管道最后一帧 ModelCallCompleted；没有这一帧就当模型管线失败。
                 model_result: ModelResultPayload | None = None
 
                 async def provider_terminal(current: ModelCallPayload):
-                    async for item in self._provider_model_stream(
+                    # Middleware wrap_model 的最内层：真正打 provider。
+                    # current 可能已被 before_model / wrap_model 改写。
+                    async for item in self._model_call_stream(
                         current,
                         client=client,
                         config=config,
@@ -394,73 +449,90 @@ class OpenAIAgent:
                     ):
                         yield item
 
+                # model call stream
+                # 一轮 model call 的结束标志是收到 ModelCallCompleted 事件。
+                # 期间可能收到 ModelReasoningDelta 和 ModelTextDelta 事件。
+                # 最终要么正文输出结束，要么function call
                 async for model_event in pipeline.stream_model(
                     model_request,
                     provider_terminal,
                 ):
                     if isinstance(model_event, ModelReasoningDelta):
-                        reasoning_buffer += model_event.content
-                        # DeepSeek 会通过 reasoning_content 流式返回思考文本，这里同步到前端“思考过程”面板。
-                        model_step["detail"] = reasoning_buffer
-                        yield {"type": "thinking", "payload": model_step}
+                        if message_started:
+                            raise RuntimeError(
+                                "Provider emitted reasoning after the text stream started"
+                            )
+                        if reasoning_id is None:
+                            reasoning_id = str(uuid.uuid4())
+                            yield {
+                                "type": "reasoning_start",
+                                "payload": {"reasoningId": reasoning_id},
+                            }
                         if not reasoning_status_sent:
                             reasoning_status_sent = True
-                            yield {"type": "status", "payload": {"message": "正在思考..."}}
+                            yield self._run_status("正在思考...")
+                        yield {
+                            "type": "reasoning_delta",
+                            "payload": {
+                                "reasoningId": reasoning_id,
+                                "content": model_event.content,
+                            },
+                        }
 
                     elif isinstance(model_event, ModelTextDelta):
                         if not message_started:
+                            # 第一个正文 delta 是 AG-UI reasoning/text 的硬边界。
+                            # 必须先收口 reasoning，再开始 TEXT_MESSAGE。
+                            if reasoning_id is not None:
+                                yield {
+                                    "type": "reasoning_end",
+                                    "payload": {"reasoningId": reasoning_id},
+                                }
+                                reasoning_id = None
                             message_started = True
-                            yield {"type": "message_start", "payload": {"messageId": assistant_draft_id}}
-                        content_buffer += model_event.content
+                            yield {"type": "message_start", "payload": {"messageId": message_id}}
                         yield {
                             "type": "delta",
                             "payload": {
-                                "messageId": assistant_draft_id,
+                                "messageId": message_id,
                                 "content": model_event.content,
                             },
                         }
                     elif isinstance(model_event, ModelCallCompleted):
+                        # 流必须收到这一帧才算 Reason 完成；tool_calls 在这里聚齐。
                         model_result = model_event.result
 
                 if model_result is None:
                     raise RuntimeError("Model pipeline finished without a result")
                 tool_calls = [dict(item) for item in model_result.tool_calls]
 
-                # End message if text was streamed
+                # 没有正文时，Completed 才是 reasoning 的终止边界。
+                if reasoning_id is not None:
+                    yield {
+                        "type": "reasoning_end",
+                        "payload": {"reasoningId": reasoning_id},
+                    }
                 if message_started:
-                    yield {"type": "message_end", "payload": {"messageId": assistant_draft_id}}
+                    yield {"type": "message_end", "payload": {"messageId": message_id}}
 
-                model_step["status"] = "complete"
-                if reasoning_buffer:
-                    model_step["detail"] = reasoning_buffer
-                else:
-                    model_step["detail"] = (
-                        f"分析完成，决定调用 {len(tool_calls)} 个工具。"
-                        if tool_calls
-                        else "分析完成，已形成最终回答。"
-                    )
-                yield {"type": "thinking", "payload": model_step}
-
-                # No tool calls — we're done
+                # ----- Finish：Reason 未请求工具，循环结束 -----
+                # 可见文本已经 yield 过；完成事件直接携带最终文本。
                 if not tool_calls:
-                    if content_buffer.strip():
-                        assistant_message = self._message("assistant", content_buffer.strip())
-                        working_messages.append(assistant_message)
-                    result = self._final_state(working_messages, trace, thinking)
+                    result = self._final_state(model_result.output_text, trace, thinking)
                     agent_scope.complete(result)
                     await agent_scope.__aexit__(None, None, None)
-                    yield {"type": "trace", "payload": {"entry": trace[-1]}}
+                    yield self._run_trace(trace[-1])
                     yield {"type": "final", "payload": result}
                     return
 
-                # Has tool calls — process them
-                # Append assistant message with tool_calls to api_messages
-                # 这条带 tool_calls 的 assistant 消息只进 api_messages，不进
-                # working_messages：它是 provider 协议要求的配对前提（后面每条
-                # tool 消息都要能通过 tool_call_id 找到它），但对会话历史无意义。
-                assistant_api_msg: dict[str, Any] = {
+                # ----- Act：按顺序执行本轮全部 tool_calls（不并行）-----
+                # 并行会打乱 Observation 顺序，也让 HITL checkpoint 的 pendingIndex
+                # 失去「做到第几个」的含义。同轮多个工具仍是一次 Reason 的产物。
+                #
+                # 带 tool_calls 的 assistant 必须进 messages，后续 tool 消息才能配对。
+                assistant_message: dict[str, Any] = {
                     "role": "assistant",
-                    "content": content_buffer or None,
+                    "content": model_result.output_text or None,
                     "tool_calls": [
                         {
                             "id": tc["id"],
@@ -473,7 +545,7 @@ class OpenAIAgent:
                         for tc in tool_calls
                     ],
                 }
-                api_messages.append(assistant_api_msg)
+                messages.append(assistant_message)
 
                 for tool_call_index, tc in enumerate(tool_calls):
                     tool_name = tc["name"]
@@ -481,20 +553,12 @@ class OpenAIAgent:
                     try:
                         raw_arguments = self._decode_tool_arguments(tc["arguments"])
                     except Exception as exc:
-                        # Malformed model-generated arguments are a recoverable
-                        # tool observation; the model needs the reason in its
-                        # tool result so it can repair the next call.
+                        # 模型生成的 JSON 坏掉是可恢复 Observation：把原因写进
+                        # tool 结果，下一轮 Reason 才能改参数，而不是整 run 失败。
                         raw_arguments = {}
                         argument_error = exc
-                    tool_step = self._thinking_step(
-                        thinking,
-                        phase="tool",
-                        title=f"调用 {tool_name}",
-                        detail=self._tool_decision_summary(tool_name, raw_arguments),
-                        status="active",
-                        iteration=iteration,
-                    )
-                    yield {"type": "thinking", "payload": tool_step}
+                    # 工具卡片只认 tool_start / tool_result；不要再发 phase=tool
+                    # 的 thinking，agui 本来就会丢掉，前端也会从 thinking 列表滤掉。
                     yield {
                         "type": "tool_start",
                         "payload": {
@@ -503,10 +567,7 @@ class OpenAIAgent:
                             "arguments": tc["arguments"] or "{}",
                         },
                     }
-                    yield {
-                        "type": "status",
-                        "payload": {"message": f"调用工具 {tool_name}"},
-                    }
+                    yield self._run_status(f"调用工具 {tool_name}")
                     if argument_error is not None:
                         await pipeline.emit_failure(
                             argument_error,
@@ -518,107 +579,70 @@ class OpenAIAgent:
                             error=argument_error,
                         )
                     else:
-                        # 若权限层在工具真正执行前产生 terminal Interrupt，恢复所需
-                        # 的 provider 消息与剩余调用列表必须精确停在这个边界。
+                        # 执行前先拍 ReAct 工具边界。权限/HITL 在 _run_tool 里，
+                        # 一旦 Interrupt，当前 run 结束；用户同意后是新 run，
+                        # 不能重放已流式打出的 Reason，只能从「第几个工具」续 Act。
+                        # KAgentRunner.request_approval 会把这份 dict 拷进 checkpoint：
+                        # - pendingIndex：本批 tool_calls 里正要执行的下标
+                        # - pendingCalls：这一轮模型点名的全部工具
+                        # - modelMessages：已含 assistant.tool_calls，不含本工具及之后的 Observation
                         runtime["_react_tool_boundary"] = {
                             "version": 1,
                             "kind": "react_tool_boundary",
                             "iteration": iteration,
                             "pendingIndex": tool_call_index,
                             "pendingCalls": [dict(item) for item in tool_calls],
-                            "apiMessages": [dict(item) for item in api_messages],
+                            "modelMessages": [dict(item) for item in messages],
                         }
-                        # A long-running interactive CLI can print an OAuth URL
-                        # and then wait. Run the tool in a sibling task so its
-                        # ContextVar output sink can feed AG-UI before completion.
-                        output_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-                        sink_token = set_tool_output_sink(output_queue.put_nowait)
-                        try:
-                            tool_task = asyncio.create_task(self._run_tool(
-                                runtime=runtime,
-                                iteration=iteration,
-                                call_id=tc["id"],
-                                tool_name=tool_name,
-                                arguments=raw_arguments,
-                            ))
-                        finally:
-                            # The child task captured the binding; resetting the
-                            # parent prevents output leaking into the next call.
-                            reset_tool_output_sink(sink_token)
+                        # 在兄弟任务里跑工具，把过程中的 stdout 先 yield 成 tool_output
+                        # （例如 CLI 打出 OAuth URL 再阻塞）。全部结束后 live_result[0]
+                        # 才是写入 messages 的 Observation 正文。
+                        live_result: list[str] = []
+                        async for event in self._tool_excute_serially(
+                            runtime,
+                            iteration=iteration,
+                            call_id=tc["id"],
+                            tool_name=tool_name,
+                            arguments=raw_arguments,
+                            result_out=live_result,
+                        ):
+                            yield event
+                        tool_result = live_result[0]
 
-                        output_task: asyncio.Task[dict[str, Any]] | None = None
-                        try:
-                            while not tool_task.done():
-                                output_task = asyncio.create_task(output_queue.get())
-                                done, _ = await asyncio.wait(
-                                    {tool_task, output_task},
-                                    return_when=asyncio.FIRST_COMPLETED,
-                                )
-                                if output_task in done:
-                                    output = output_task.result()
-                                    yield {
-                                        "type": "tool_output",
-                                        "payload": {"toolCallId": tc["id"], **output},
-                                    }
-                                else:
-                                    output_task.cancel()
-                                    await asyncio.gather(output_task, return_exceptions=True)
-                        except asyncio.CancelledError:
-                            if output_task is not None:
-                                output_task.cancel()
-                            tool_task.cancel()
-                            await asyncio.gather(
-                                *(task for task in (tool_task, output_task) if task is not None),
-                                return_exceptions=True,
-                            )
-                            raise
-                        while not output_queue.empty():
-                            output = output_queue.get_nowait()
-                            yield {
-                                "type": "tool_output",
-                                "payload": {"toolCallId": tc["id"], **output},
-                            }
-                        tool_result = await tool_task
-                    working_messages.append(self._message("tool", tool_result, tool_name=tool_name))
-                    tool_failed = self._tool_result_failed(tool_result)
-                    tool_step["status"] = "error" if tool_failed else "complete"
-                    tool_step["detail"] = (
-                        f"{tool_name} 执行失败，已把原因返回模型以便修正。"
-                        if tool_failed
-                        else f"{tool_name} 已返回结果，准备继续分析。"
-                    )
-                    yield {"type": "thinking", "payload": tool_step}
+                    # ----- Observe（本工具）-----
+                    # yield tool_result：用户和 Access Layer 看到的结果。
+                    # messages.append：下一轮 Reason 要读的 Observation。
+                    tool_message_id = str(uuid.uuid4())
                     yield {
                         "type": "tool_result",
                         "payload": {
                             "toolCallId": tc["id"],
-                            "messageId": working_messages[-1].id,
+                            "messageId": tool_message_id,
                             "content": tool_result,
                         },
                     }
-                    yield {"type": "trace", "payload": {"entry": trace[-1], "output": tool_result}}
+                    yield self._run_trace(trace[-1], output=tool_result)
                     notice = self._sandbox_user_notice(
                         context, tool_name, tool_result, config
                     )
                     if notice is not None:
-                        yield {"type": "status", "payload": {"message": notice}}
-                    # Append tool result to api_messages
-                    # 失败结果同样以正常 tool 消息回填。模型据此自行修正后重试，
-                    # 这正是工具错误可恢复的关键：异常不冒泡，只变成一次观测。
-                    api_messages.append({
+                        yield self._run_status(notice)
+                    messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": tool_result,
                     })
-                yield {"type": "status", "payload": {"message": config.status_model_started}}
+                # 本轮 Act 全部 Observe 完毕；status 切回「正在调用模型」，进入下一 Reason。
+                yield self._run_status(config.status_model_started)
 
-            # Reached iteration limit
+            # ----- Finish：迭代上限（兜底，不是模型主动结束）-----
+            # 最后一轮 Reason 仍请求了工具，但不再 Act，以免无限转。上限文案
+            # 既流式发给用户，也作为明确 output 交给完成 Observer。
             limit_message = config.tool_iteration_limit_message
-            assistant_message = self._message("assistant", limit_message)
-            working_messages.append(assistant_message)
-            yield {"type": "message_start", "payload": {"messageId": assistant_message.id}}
-            yield {"type": "delta", "payload": {"messageId": assistant_message.id, "content": limit_message}}
-            yield {"type": "message_end", "payload": {"messageId": assistant_message.id}}
+            assistant_message_id = str(uuid.uuid4())
+            yield {"type": "message_start", "payload": {"messageId": assistant_message_id}}
+            yield {"type": "delta", "payload": {"messageId": assistant_message_id, "content": limit_message}}
+            yield {"type": "message_end", "payload": {"messageId": assistant_message_id}}
             limit_step = self._thinking_step(
                 thinking,
                 phase="complete",
@@ -628,32 +652,105 @@ class OpenAIAgent:
                 iteration=config.max_model_iterations,
             )
             yield {"type": "thinking", "payload": limit_step}
-            result = self._final_state(working_messages, trace, thinking)
+            result = self._final_state(limit_message, trace, thinking)
             agent_scope.complete(result)
             await agent_scope.__aexit__(None, None, None)
-            yield {"type": "trace", "payload": {"entry": trace[-1]}}
+            yield self._run_trace(trace[-1])
             yield {"type": "final", "payload": result}
         except (asyncio.CancelledError, GeneratorExit) as exc:
-            # Cancellation must close model/agent observations but must never be
-            # converted to a model-visible tool error or an AG-UI success event.
+            # 取消必须关掉模型/Agent 观测，但绝不能变成模型可见的 tool 错误，
+            # 也不能伪装成 AG-UI 成功 Finish。
             await agent_scope.__aexit__(type(exc), exc, exc.__traceback__)
             raise
         except Exception as exc:
-            # Agent 级异常（模型不可达、上下文构建失败等）不像工具失败那样可恢复，
-            # 记录后继续上抛，由 agui 层转成 RUN_ERROR 告知前端。
+            # Agent 级异常（模型不可达、上下文构建失败等）不像工具失败那样可恢复。
+            # 记入观测后继续上抛，由 agui 转成 RUN_ERROR。
             await agent_scope.__aexit__(type(exc), exc, exc.__traceback__)
-            # MCP discovery and context planning run before the first trace entry
-            # exists, so indexing blindly would raise an IndexError that replaces
-            # the failure the operator actually needs to see.
-            yield {
-                "type": "trace",
-                "payload": {
-                    "entry": trace[-1] if trace else f"agent:failed:{type(exc).__name__}"
-                },
-            }
+            # 循环前失败时 trace 可能仍为空，不能盲取 trace[-1] 盖掉真正错误。
+            yield self._run_trace(
+                trace[-1] if trace else f"agent:failed:{type(exc).__name__}"
+            )
             raise
 
-    async def _provider_model_stream(
+    async def _tool_excute_serially(
+        self,
+        runtime: dict[str, Any],
+        *,
+        iteration: int,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result_out: list[str],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """跑完当前这一个工具，并把过程 stdout 先 yield 成 ``tool_output``。
+
+        多个 tool_calls 的串行由外层 for 保证：这里不会并行跑两个工具。
+        不能直接 ``await _run_tool``：有的 CLI 会先打印 OAuth URL 再阻塞，
+        必须在进程结束前把那一行推给前端。
+
+        权限 / HITL 仍在 ``_run_tool`` 内。Interrupt 发生在真正执行前时，
+        这里会带着异常退出，通常走不到 live output。
+
+        async generator 不好直接 return 正文，所以把最终字符串写入
+        ``result_out[0]``，供调用方写成 Observation。
+        """
+
+        # 工具代码通过 ContextVar sink 往这里塞行。create_task 会拷贝「当时」
+        # 的 ContextVar 到子任务，所以父任务可以立刻 reset，避免下一个工具串台。
+        output_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        sink_token = set_tool_output_sink(output_queue.put_nowait)
+        try:
+            tool_task = asyncio.create_task(
+                self._run_tool(
+                    runtime=runtime,
+                    iteration=iteration,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+            )
+        finally:
+            reset_tool_output_sink(sink_token)
+
+        output_task: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            # 同时盯「工具结束」和「来了一行输出」，谁先到处理谁。
+            while not tool_task.done():
+                output_task = asyncio.create_task(output_queue.get())
+                done, _ = await asyncio.wait(
+                    {tool_task, output_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if output_task in done:
+                    output = output_task.result()
+                    yield {
+                        "type": "tool_output",
+                        "payload": {"toolCallId": call_id, **output},
+                    }
+                else:
+                    # 工具先结束：取消空等 queue.get() 的 task。
+                    output_task.cancel()
+                    await asyncio.gather(output_task, return_exceptions=True)
+        except asyncio.CancelledError:
+            # 上层取消 run 时，输出等待和 Bash 都要停，避免工具在后台继续跑。
+            if output_task is not None:
+                output_task.cancel()
+            tool_task.cancel()
+            await asyncio.gather(
+                *(task for task in (tool_task, output_task) if task is not None),
+                return_exceptions=True,
+            )
+            raise
+        # 工具结束后队列里可能还剩几行，排干再取最终结果。
+        while not output_queue.empty():
+            output = output_queue.get_nowait()
+            yield {
+                "type": "tool_output",
+                "payload": {"toolCallId": call_id, **output},
+            }
+        result_out.append(await tool_task)
+
+    async def _model_call_stream(
         self,
         request: ModelCallPayload,
         *,
@@ -800,60 +897,89 @@ class OpenAIAgent:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> ToolCallResult:
-        """Resolve one logical call and pass it through the sealed Tool Pipeline."""
+        """解析一次工具调用，并送进密封的 Tool Pipeline。
 
-        config: Settings = runtime["config"]
-        tools: list[ToolDefinition] = runtime["tools"]
-        mcp_client_manager: McpClientManager = runtime["mcp_client_manager"]
-        skills: list[dict[str, Any]] = runtime["skills"]
-        pipeline: AgentPipelineRuntime = runtime["pipeline"]
-        context = pipeline.context
+        和 ``_run_tool`` 的分工：这里负责「这是哪个工具、怎么跑」；
+        ``_run_tool`` 负责把异常收成模型可见的 Observation。
+        ``pipeline.run_tool`` 的顺序是 wrap → preflight（权限/HITL）→
+        观测 → execute。Middleware 改参数也会再过 preflight，绕不开安全门。
+
+        解析顺序：同名本地工具 → Skill 别名（模型把 Skill 名当函数名）→
+        MCP（``server__tool`` 约定）→ 未知则失败，让模型改用真实工具。
+        """
+
+        config: Settings = runtime["config"]  # 权限规则、超时等进程配置
+        tools: list[ToolDefinition] = runtime["tools"]  # 本轮本地工具表（含 Skill 元工具）
+        mcp_client_manager: McpClientManager = runtime["mcp_client_manager"]  # 已连接的 MCP
+        skills: list[dict[str, Any]] = runtime["skills"]  # 本轮勾选的 Skill 列表
+        pipeline: AgentPipelineRuntime = runtime["pipeline"]  # wrap / 观测 / 密封执行
+        context = pipeline.context  # 本轮 run 元数据（permission_mode、Skill 白名单）
+        # 按模型给的名字在本地表里找第一个定义；找不到就是 None。
         local_tool = next((tool for tool in tools if tool.name == tool_name), None)
-        selected_skill = self._selected_skill(tool_name, skills)
-        # 本地工具优先。只有名字对不上任何本地工具时，才考虑它是不是
-        # provider 把 Skill 名当成函数名直接调用了。
+        
+        
+        # 正常调用是函数名 Skill，参数里带 skill/args。下面是兼容垫片：
+        # 部分模型/网关会把 Skill 名直接当成 tool name。必须先确认它真是
+        # 本轮已选 Skill，否则幻觉名不能改道去跑 Skill。
+        selected_skill = next(
+            (
+                skill
+                for skill in skills
+                if skill.get("enabled", True)
+                and tool_name in {
+                    str(skill.get("id") or ""),
+                    str(skill.get("name") or ""),
+                }
+            ),
+            None,
+        )
         if local_tool is None and selected_skill is not None:
+            # 拧回标准路径：仍执行本地名为 Skill 的元工具，不把 Skill 名当新工具。
             local_tool = next(
                 (tool for tool in tools if tool.name == "Skill"),
                 None,
             )
             if local_tool is not None:
+                # 把畸形参数收成 {skill, args}，和正规 Skill 调用一致。
                 arguments = self._skill_alias_arguments(tool_name, arguments)
+
+
+
+
+
+        # 正常路径：工具表里找，能匹配上就跑。
         if local_tool is not None:
-            permission_tool_name = local_tool.name
-            if permission_tool_name in _READ_ONLY_LOCAL_TOOLS:
-                # Older turns or providers can replay the former escalation field.
-                # Drop it before validation so a harmless read neither asks for HITL
-                # nor fails merely because its schema has since been tightened.
-                arguments = {
-                    key: value
-                    for key, value in arguments.items()
-                    if key not in {"sandbox_permissions", "escalation_scope", "escalation_resource"}
-                }
+            # 权限按规范名（Read / Skill），不是模型乱起的别名。
             request = ToolCallRequest(
-                call_id=call_id or str(uuid.uuid4()),
-                iteration=iteration,
-                requested_name=tool_name,
-                canonical_name=permission_tool_name,
-                arguments=arguments,
-                source="local",
+                call_id=call_id or str(uuid.uuid4()),  # 模型没给 id 时自己造
+                iteration=iteration,  # 第几轮 Reason 之后的 Act
+                requested_name=tool_name,  # 模型原始函数名
+                canonical_name=local_tool.name,  # 真正要执行/鉴权的名字
+                arguments=arguments,  # 可能已被 Skill 别名改写
+                source="local",  # 与 MCP 路径分流
             )
 
             async def preflight(current: ToolCallRequest) -> None:
+                # wrap 改过参数也会再进这里，不能跳过。
+                # 除非权限模式是全开，否则校验 tool 是否在skill的白名单内。
+                # TODO: Skill 退出机制，因为用了skill后，后续会进行别的任务，不能一直用skill的白名单进行规范
                 if context.metadata.get("permission_mode") != "full_access":
+                    # 非全开时，Skill 收窄后的白名单仍然生效。
                     self._enforce_skill_allowlist(context, current.canonical_name)
+                # 按规则算出 allow / deny / ask（HITL）。
                 decision = self._local_permission_decision(
                     config,
                     context,
                     current.canonical_name,
-                    dict(current.arguments),
+                    dict(current.arguments),  # 拷一份，避免规则侧改 MappingProxy
                 )
+                # deny 抛错；ask 走审批 Interrupt。
                 await self._enforce_permission(
                     runtime,
                     current.canonical_name,
                     decision,
                     {
-                        "toolName": current.requested_name,
+                        "toolName": current.requested_name,  # 卡片上显示模型点的名
                         "callId": current.call_id,
                         "iteration": current.iteration,
                         "arguments": dict(current.arguments),
@@ -862,6 +988,7 @@ class OpenAIAgent:
                 )
 
             async def execute(current: ToolCallRequest) -> str:
+                # 再查一次表：middleware 可能把 canonical_name 改成别的本地工具。
                 resolved = next(
                     (tool for tool in tools if tool.name == current.canonical_name),
                     None,
@@ -870,25 +997,26 @@ class OpenAIAgent:
                     raise RuntimeError(
                         f"Unknown local tool requested: {current.canonical_name}"
                     )
-                current_arguments = dict(current.arguments)
-                # Validation remains after permission and ToolStarted to preserve
-                # the existing security/observability ordering contract.
+                current_arguments = dict(current.arguments)  # execute 要可变 dict
+                # 校验放在权限和 ToolStarted 之后，保持现有顺序。
                 validate_tool_arguments(resolved.parameters, current_arguments)
-                output = await resolved.execute(current_arguments)
+                output = await resolved.execute(current_arguments)  # 真正跑本地实现
                 if current.canonical_name == "Skill":
+                    # Skill 正文可能声明后续只允许哪些工具。
                     self._activate_skill_allowlist(context, output)
                 return output
 
+            # 密封门：wrap → preflight → 观测 → execute。
             return await pipeline.run_tool(
                 request,
                 preflight=preflight,
                 execute=execute,
             )
 
+        # 本地没中：看是不是 MCP 的 server__tool 命名。
         target = self._parse_mcp_tool(tool_name)
-        # 既不是本地工具也不符合 MCP 命名约定：可能是模型幻觉出的函数名，
-        # 直接拒绝执行，错误会作为工具结果回给模型让它改用真实工具。
         if target is None:
+            # 模型幻觉的函数名：观测一条失败，再抛给 _run_tool 收成 Observation。
             await pipeline.emit_failure(
                 RuntimeError(f"Unknown tool requested: {tool_name}"),
                 stage="tool_resolve",
@@ -896,12 +1024,12 @@ class OpenAIAgent:
             )
             raise RuntimeError(f"Unknown tool requested: {tool_name}")
 
-        server_id, name = target
+        server_id, name = target  # MCP server id 与该 server 上的工具名
         request = ToolCallRequest(
             call_id=call_id or str(uuid.uuid4()),
             iteration=iteration,
-            requested_name=tool_name,
-            canonical_name=name,
+            requested_name=tool_name,  # 原始拼接名，白名单按这个匹配
+            canonical_name=name,  # MCP 侧真正的 tool name
             arguments=arguments,
             source="mcp",
             server_id=server_id,
@@ -911,11 +1039,13 @@ class OpenAIAgent:
             if current.server_id is None:
                 raise RuntimeError("MCP tool request is missing server_id")
             if context.metadata.get("permission_mode") != "full_access":
+                # MCP 白名单用 requested_name（带 server 前缀的那个）。
                 self._enforce_skill_allowlist(context, current.requested_name)
             await self._enforce_permission(
                 runtime,
                 f"MCP tool {current.server_id}:{current.canonical_name}",
                 (
+                    # 本轮选了全开：不再问 MCP 规则。
                     PermissionDecision("allow", "full access selected for this run")
                     if context.metadata.get("permission_mode") == "full_access"
                     else check_permission(
@@ -935,6 +1065,7 @@ class OpenAIAgent:
         async def execute(current: ToolCallRequest) -> str:
             if current.server_id is None:
                 raise RuntimeError("MCP tool request is missing server_id")
+            # 经连接池调对应 server 上的工具。
             return await mcp_client_manager.call_tool(
                 current.server_id,
                 current.canonical_name,
@@ -954,23 +1085,46 @@ class OpenAIAgent:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> PermissionDecision:
-        """Resolve local-tool policy after middleware has finalized the request."""
+        """本地工具的 allow / deny / ask，只出结论，不挂起、不执行。
 
+        调用点是 ``_execute_tool`` 的 preflight：middleware wrap 之后、
+        ``_enforce_permission`` 之前。``ask`` 才会进 HITL；``deny`` 变成可恢复
+        工具错误；``allow`` 才进入参数校验与 execute。
+
+        分层（后者可覆盖前者，但 full_access 直接短路）：
+        1. 规则文件 ``check_permissions``：按工具名 + subject（命令/路径/URL）
+           取最严结果。
+        2. 只读本地工具（Read/Glob/Grep/LS）把 ``ask`` 降成 ``allow``，避免
+           读工作区也弹审批。``deny`` 仍生效。
+        3. 本 run ``permission_mode == full_access``：一律 ``allow``，包括规则
+           deny。这是会话级开关，不是单次工具授权。
+        4. 默认可写工具若声明 ``sandbox_permissions=require_escalated``，强制
+           ``ask``。模型不能靠这个字段自批；只是申请越权。Bash 还必须带合法
+           ``escalation_scope`` + 具体 ``escalation_resource``；已在沙箱网络
+           白名单里的域名直接 deny，避免无意义审批。
+        """
+
+        # 1. 规则：Bash 会拿整句 + &&/||/; 分段一起匹配，防止链式绕过 deny。
         decision = check_permissions(
             tool_name,
             OpenAIAgent._permission_subjects(tool_name, arguments),
         )
+        # 2. 只读探查不走 HITL；规则 deny 不能在这里被抹掉。
+        # 只读工具除非明确deny，ask的情况不用管，直接开放就行
         if tool_name in _READ_ONLY_LOCAL_TOOLS and decision.behavior == "ask":
             decision = PermissionDecision(
                 "allow", "read-only local access does not require HITL"
             )
+        # 3. 全开：跳过规则与越权申请，后面的 sandbox 实现仍可能因 ContextVar 跳过 srt。
         if context.metadata.get("permission_mode") == "full_access":
             return PermissionDecision("allow", "full access selected for this run")
+        # 未申请越权，或工具根本不能越权（Skill、WebFetch 等）：采用上面的规则结果。
         if (
             tool_name not in _ESCALATABLE_LOCAL_TOOLS
             or arguments.get("sandbox_permissions") != "require_escalated"
         ):
             return decision
+        # 4. 正向越权：Write/Edit/NotebookEdit 只问一次「出沙箱」；细节在卡片参数里。
         if tool_name != "Bash":
             return PermissionDecision(
                 "ask", "该工具请求访问默认沙箱范围之外的本机资源。"
@@ -988,6 +1142,7 @@ class OpenAIAgent:
                 "Bash escalation requires escalation_scope and a concrete "
                 "escalation_resource.",
             )
+        # 白名单内域名本就可以在沙箱里访问，再申请越权视为模型误用，直接拒绝。
         if scope == "network_destination" and is_domain_allowed(
             resource, config.bash_sandbox_allowed_domains
         ):
@@ -1132,47 +1287,6 @@ class OpenAIAgent:
         return message
 
     @staticmethod
-    def _tool_result_failed(result: str) -> bool:
-        """Recognize the common structured failure contracts used by tools."""
-
-        # 纯文本结果无法判断成败，一律按成功处理，避免把正常输出误标为错误。
-        try:
-            payload = json.loads(result)
-        except (TypeError, json.JSONDecodeError):
-            return False
-        # 三种键分别来自不同来源：ok 是本地工具与恢复路径的约定，
-        # success 是部分工具的历史写法，isError 来自 MCP 协议。
-        return (
-            isinstance(payload, dict)
-            and (
-                payload.get("ok") is False
-                or payload.get("success") is False
-                or payload.get("isError") is True
-            )
-        )
-
-    def _selected_skill(
-        self,
-        tool_name: str,
-        skills: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        """Resolve a direct function name only against this request's Skills."""
-
-        return next(
-            (
-                skill
-                for skill in skills
-                if skill.get("enabled", True)
-                and tool_name
-                in {
-                    str(skill.get("id") or ""),
-                    str(skill.get("name") or ""),
-                }
-            ),
-            None,
-        )
-
-    @staticmethod
     def _skill_alias_arguments(
         skill_name: str,
         arguments: dict[str, Any],
@@ -1268,25 +1382,39 @@ class OpenAIAgent:
         _, server_id, *name_parts = tool_name.split("__")
         return server_id, "__".join(name_parts)
 
-    def _message(self, role: ChatRole, content: str, tool_name: str | None = None) -> ChatMessage:
-        """创建一条带时间戳的 ChatMessage。"""
-        return ChatMessage(
-            id=str(uuid.uuid4()),
-            role=role,
-            content=content,
-            createdAt=datetime.now(timezone.utc),
-            meta=ChatMeta(toolName=tool_name) if tool_name else None,
-        )
+    @staticmethod
+    def _run_status(message: str) -> dict[str, Any]:
+        """顶栏胶囊 / 轨迹摘要的瞬时文案，不是会话 transcript。
+
+        agui 把它打成 CUSTOM ``status``；前端 ``setStatus``，不进消息流、
+        也不落工具卡片。和 ``tool_start`` / ``message_*`` 形状相近，所以
+        单独成函数，避免在 ReAct 循环里看起来像对话事件。
+        """
+
+        return {"type": "status", "payload": {"message": message}}
+
+    @staticmethod
+    def _run_trace(entry: str, *, output: str | None = None) -> dict[str, Any]:
+        """右侧「执行轨迹」的一行，不是会话 transcript。
+
+        agui 打成 CUSTOM ``trace``；前端只读 ``entry`` 追加到列表。
+        ``output`` 仅工具完成时附带，当前 UI 不用。
+        """
+
+        payload: dict[str, Any] = {"entry": entry}
+        if output is not None:
+            payload["output"] = output
+        return {"type": "trace", "payload": payload}
 
     def _final_state(
         self,
-        messages: list[ChatMessage],
+        output: str,
         trace: list[str],
         thinking: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """组装 Agent run 的最终内部状态。"""
+        """组装内部 final；会话消息由流式事件单独持久化。"""
         return {
-            "messages": messages,
+            "output": output,
             "trace": trace,
             "tasks": [],
             "thinking": thinking,
@@ -1314,12 +1442,6 @@ class OpenAIAgent:
         }
         thinking.append(step)
         return step
-
-    @staticmethod
-    def _tool_decision_summary(tool_name: str, arguments: dict[str, Any]) -> str:
-        """把工具调用计划渲染成 thinking 摘要。"""
-        argument_count = len(arguments)
-        return f"为推进任务，使用 {tool_name}，传入 {argument_count} 个参数。"
 
     @staticmethod
     def _tool_output_contents(messages: list[dict[str, Any]]) -> list[str]:

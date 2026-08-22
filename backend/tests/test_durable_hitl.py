@@ -85,7 +85,7 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
                             "name": "Bash",
                             "arguments": "{\"command\":\"pwd\"}",
                         }],
-                        "apiMessages": [],
+                        "modelMessages": [],
                     },
                 },
             }
@@ -244,7 +244,7 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
                                     "id": "call-gateway", "name": "Write",
                                     "arguments": "{\"path\":\"note.txt\"}",
                                 }],
-                                "apiMessages": [],
+                                "modelMessages": [],
                             },
                         },
                     }

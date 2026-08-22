@@ -1,9 +1,9 @@
 """AG-UI 边界：把 Runner 内部事件方言翻译成标准 AG-UI 事件流。
 
 pipeline 位置：`/internal/agent/run` 在 HTTP 写出前唯一的协议转换层。
-关键语义差异：内部 thinking 是「同 step 整体快照、detail 变长」，
-AG-UI reasoning 是 start/增量 delta/end；工具参数在内部已齐全，
-这里一次性补齐 TOOL_CALL START/ARGS/END 三件套。
+    provider reasoning 已是 start/delta/end，这里一对一转换；其他内部
+    thinking 仍是「同 step 整体快照」。工具参数在内部已齐全，
+    这里一次性补齐 TOOL_CALL START/ARGS/END 三件套。
 """
 
 from __future__ import annotations
@@ -174,6 +174,10 @@ async def translate_agent_events(
                 completed_reasoning_message_ids.add(step_id)
                 active_reasoning_message_id = None
                 active_reasoning_step = None
+                # 一个 complete thinking 同时结束内层消息和外层
+                # reasoning 区段；下一个事件才能开始正文。
+                events.append(ReasoningEndEvent(message_id=reasoning_message_id))
+                reasoning_message_id = None
             return events
 
         # 换到了新的 step：先把上一个未收尾的 step 关掉，保证任意时刻
@@ -214,6 +218,8 @@ async def translate_agent_events(
             completed_reasoning_message_ids.add(step_id)
             active_reasoning_message_id = None
             active_reasoning_step = None
+            events.append(ReasoningEndEvent(message_id=reasoning_message_id))
+            reasoning_message_id = None
         return events
 
     def close_reasoning_events() -> list[Any]:
@@ -258,13 +264,52 @@ async def translate_agent_events(
             event_type = event["type"]
             payload = event["payload"]
 
-            if event_type == "message_start":
+            if event_type == "reasoning_start":
+                # 一次 model call 只有一条 reasoning message，因此外层
+                # REASONING 与内层 REASONING_MESSAGE 共用同一 ID。
+                for reasoning_event in close_reasoning_events():
+                    yield reasoning_event
+                reasoning_message_id = str(payload["reasoningId"])
+                active_reasoning_message_id = reasoning_message_id
+                active_reasoning_step = None
+                yield ReasoningStartEvent(message_id=reasoning_message_id)
+                yield ReasoningMessageStartEvent(
+                    message_id=active_reasoning_message_id,
+                    role="reasoning",
+                )
+            elif event_type == "reasoning_delta":
+                message_id = str(payload["reasoningId"])
+                if active_reasoning_message_id != message_id:
+                    raise RuntimeError("Reasoning delta does not match an active message")
+                yield ReasoningMessageContentEvent(
+                    message_id=message_id,
+                    delta=str(payload["content"]),
+                )
+            elif event_type == "reasoning_end":
+                message_id = str(payload["reasoningId"])
+                if (
+                    active_reasoning_message_id != message_id
+                    or reasoning_message_id != message_id
+                ):
+                    raise RuntimeError("Reasoning end does not match the active stream")
+                completed_reasoning_message_ids.add(message_id)
+                yield ReasoningMessageEndEvent(
+                    message_id=message_id,
+                    raw_event={"id": message_id, "status": "complete"},
+                )
+                yield ReasoningEndEvent(message_id=message_id)
+                active_reasoning_message_id = None
+                active_reasoning_step = None
+                reasoning_message_id = None
+            elif event_type == "message_start":
+                # react_agent 正常路径会先显式 complete thinking；这里兜底
+                # 收口其他 Runner 遗留的 reasoning，确保 END 永远早于 START。
                 for reasoning_event in close_reasoning_events():
                     yield reasoning_event
                 yield TextMessageStartEvent(message_id=payload["messageId"])
             elif event_type == "delta":
-                # 只有非空白增量才算正文开始。模型常常先吐几个换行或空格，
-                # 拿它们去关闭 reasoning 会让思考块在真正有正文前就提前收起。
+                # 兼容未发 message_start 的非标准 Runner：非空正文 delta
+                # 仍然必须先关闭 reasoning。
                 if str(payload["content"]).strip():
                     for reasoning_event in close_reasoning_events():
                         yield reasoning_event

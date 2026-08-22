@@ -117,7 +117,7 @@ class ContextPrunePayload:
 
 @dataclass(frozen=True, slots=True)
 class ModelResultPayload:
-    """Aggregated result after the provider stream has been fully consumed."""
+    """Aggregated non-stream result after the provider stream is consumed."""
 
     iteration: int
     model: str

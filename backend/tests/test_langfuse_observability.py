@@ -114,7 +114,7 @@ class LangfuseObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 operation_id="tool-op",
             ),
         )
-        await observer.on_agent_end(context, {"messages": [message]})
+        await observer.on_agent_end(context, {"output": "assistant output"})
 
         self.assertEqual(
             [child.created["as_type"] for child in root.children],
@@ -126,6 +126,8 @@ class LangfuseObservabilityTests(unittest.IsolatedAsyncioTestCase):
             root.children[0].updates[0]["metadata"]["responseId"],
             "response-1",
         )
+        self.assertEqual(root.updates[-1]["output"], "assistant output")
+        self.assertEqual(root.updates[-1]["metadata"]["outputChars"], 16)
 
     def test_sensitive_fields_and_image_payloads_are_masked(self) -> None:
         masked = _json_safe(

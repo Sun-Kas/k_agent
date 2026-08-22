@@ -23,6 +23,7 @@ from backend.agent.hooks import (
     wrap_model_call,
     wrap_tool_call,
 )
+from backend.agent.hooks.builtins import build_k_agent_pipeline_definition
 from backend.agent.hooks.observers import ObserverDispatcher
 
 
@@ -114,6 +115,77 @@ class ObserverDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MiddlewarePipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_read_middleware_strips_legacy_escalation_fields(self) -> None:
+        """The built-in registration must rewrite before the sealed preflight."""
+
+        received: list[dict] = []
+        runtime = build_k_agent_pipeline_definition().bind_runtime(
+            context=AgentRunContext(run_id="run-default-middleware")
+        )
+
+        async def preflight(request) -> None:
+            received.append(dict(request.arguments))
+
+        async def execute(request) -> str:
+            received.append(dict(request.arguments))
+            return "ok"
+
+        result = await runtime.run_tool(
+            ToolCallRequest(
+                call_id="call-read-legacy",
+                iteration=0,
+                requested_name="Read",
+                canonical_name="Read",
+                arguments={
+                    "file_path": "/workspace/result.md",
+                    "sandbox_permissions": "require_escalated",
+                    "escalation_scope": "workspace",
+                    "escalation_resource": "/workspace/result.md",
+                },
+                source="local",
+            ),
+            preflight=preflight,
+            execute=execute,
+        )
+
+        expected = {"file_path": "/workspace/result.md"}
+        self.assertEqual(result.output, "ok")
+        self.assertEqual(received, [expected, expected])
+
+    async def test_default_read_middleware_preserves_bash_escalation_fields(self) -> None:
+        """Write-capable tools still need escalation metadata for permission checks."""
+
+        received: list[dict] = []
+        runtime = build_k_agent_pipeline_definition().bind_runtime(
+            context=AgentRunContext(run_id="run-default-middleware-bash")
+        )
+
+        async def preflight(request) -> None:
+            received.append(dict(request.arguments))
+
+        async def execute(_request) -> str:
+            return "ok"
+
+        arguments = {
+            "command": "pwd",
+            "sandbox_permissions": "require_escalated",
+            "escalation_scope": "workspace",
+        }
+        await runtime.run_tool(
+            ToolCallRequest(
+                call_id="call-bash-escalated",
+                iteration=0,
+                requested_name="Bash",
+                canonical_name="Bash",
+                arguments=arguments,
+                source="local",
+            ),
+            preflight=preflight,
+            execute=execute,
+        )
+
+        self.assertEqual(received, [arguments])
+
     async def test_node_hooks_and_model_wrappers_follow_stack_order(self) -> None:
         calls: list[str] = []
 
