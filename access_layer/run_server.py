@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SCRIPT_DIR) in sys.path:
     sys.path.remove(str(SCRIPT_DIR))
 
-from backend.config import get_or_init_settings
+from access_layer.settings import get_or_init_settings
 
 
 def main() -> None:

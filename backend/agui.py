@@ -399,15 +399,24 @@ async def translate_agent_events(
                         ),
                         message=str(payload.get("message") or "请确认是否继续。"),
                         tool_call_id=str(payload.get("toolCallId") or payload["id"]),
-                        response_schema={
-                            "type": "object",
-                            "properties": {
-                                "approved": {"type": "boolean"},
-                                "scope": {"enum": ["once", "run"]},
-                            },
-                            "required": ["approved"],
-                            "additionalProperties": True,
-                        },
+                        response_schema=(
+                            {
+                                "type": "object",
+                                "properties": {"answers": {"type": "object"}},
+                                "required": ["answers"],
+                                "additionalProperties": False,
+                            }
+                            if payload.get("category") == "user_input"
+                            else {
+                                "type": "object",
+                                "properties": {
+                                    "approved": {"type": "boolean"},
+                                    "scope": {"enum": ["once", "run"]},
+                                },
+                                "required": ["approved"],
+                                "additionalProperties": True,
+                            }
+                        ),
                         metadata={
                             "agentKind": payload.get("agentKind"),
                             "category": payload.get("category"),

@@ -10,6 +10,10 @@ import sys
 from typing import Any
 
 from backend.approvals import ApprovalBroker, consume_resume_authorization
+from backend.user_questions import (
+    normalize_user_question_answers,
+    normalize_user_questions,
+)
 
 
 APPROVAL_SERVER_ID = "k_agent_human_approval"
@@ -101,11 +105,21 @@ class ClaudeApprovalBridge:
             if tool_name in self._run_allowed_tools:
                 response = {"behavior": "allow", "updatedInput": tool_input}
             else:
+                is_user_question = tool_name == "AskUserQuestion"
+                questions = (
+                    _normalize_claude_questions(tool_input)
+                    if is_user_question
+                    else None
+                )
                 detail = {
                     "source": "claude_permission_prompt",
                     "toolName": tool_name,
                     "input": tool_input,
                 }
+                if questions is not None:
+                    # Access Layer validates answers from this server-owned
+                    # projection; the browser never supplies question schemas.
+                    detail["questions"] = questions
                 decision = consume_resume_authorization(
                     self._resume_authorization,
                     title=f"Claude Code 请求调用 {tool_name}",
@@ -116,15 +130,31 @@ class ClaudeApprovalBridge:
                         thread_id=self._thread_id,
                         run_id=self._run_id,
                         agent_kind="claude_code",
-                        category="tool",
-                        title=f"Claude Code 请求调用 {tool_name}",
-                        message="该工具调用需要你的确认。",
+                        category="user_input" if is_user_question else "tool",
+                        title=(
+                            "Claude Code 需要你的回答"
+                            if is_user_question
+                            else f"Claude Code 请求调用 {tool_name}"
+                        ),
+                        message=(
+                            "请回答问题后继续 Claude Code。"
+                            if is_user_question
+                            else "该工具调用需要你的确认。"
+                        ),
                         detail=detail,
                     )
                 if decision.get("action") == "approve":
                     if decision.get("scope") == "run":
                         self._run_allowed_tools.add(tool_name)
-                    response = {"behavior": "allow", "updatedInput": tool_input}
+                    updated_input = dict(tool_input)
+                    if is_user_question:
+                        supplied = decision.get("answers")
+                        if not isinstance(supplied, dict) or questions is None:
+                            raise ValueError("Claude AskUserQuestion answers are missing")
+                        updated_input.update(
+                            _claude_question_updated_input(questions, supplied)
+                        )
+                    response = {"behavior": "allow", "updatedInput": updated_input}
                 else:
                     response = {
                         "behavior": "deny",
@@ -141,3 +171,64 @@ class ClaudeApprovalBridge:
         await writer.drain()
         writer.close()
         await writer.wait_closed()
+
+
+def _normalize_claude_questions(tool_input: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project Claude's richer question schema onto the shared HITL contract."""
+
+    raw_questions = tool_input.get("questions")
+    if not isinstance(raw_questions, list):
+        return normalize_user_questions({"questions": raw_questions})
+    projected: list[dict[str, Any]] = []
+    for question in raw_questions:
+        if not isinstance(question, dict):
+            projected.append(question)
+            continue
+        options = question.get("options")
+        projected_options = []
+        if isinstance(options, list):
+            for option in options:
+                if isinstance(option, dict):
+                    # Claude may include a preview field. The shared compact
+                    # form currently renders label/description only.
+                    projected_options.append({
+                        "label": option.get("label"),
+                        "description": option.get("description"),
+                    })
+                else:
+                    projected_options.append(option)
+        projected.append({
+            "header": question.get("header"),
+            "question": question.get("question"),
+            "options": projected_options,
+            "multiSelect": question.get("multiSelect", False),
+        })
+    return normalize_user_questions({"questions": projected})
+
+
+def _claude_question_updated_input(
+    questions: list[dict[str, Any]],
+    supplied: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert shared selected/custom answers to Claude's tool input shape."""
+
+    normalized = normalize_user_question_answers(questions, supplied)
+    answers: dict[str, str] = {}
+    annotations: dict[str, dict[str, str]] = {}
+    for question in questions:
+        question_id = str(question["id"])
+        answer = normalized[question_id]
+        selected = answer.get("selected")
+        custom = answer.get("custom")
+        values = [str(value) for value in selected] if isinstance(selected, list) else []
+        custom_text = custom.strip() if isinstance(custom, str) else ""
+        if custom_text:
+            values.append(custom_text)
+            annotations[str(question["question"])] = {"notes": custom_text}
+        if not values:
+            raise ValueError(f"Answer for {question_id} is empty")
+        answers[str(question["question"])] = ", ".join(values)
+    result: dict[str, Any] = {"answers": answers}
+    if annotations:
+        result["annotations"] = annotations
+    return result

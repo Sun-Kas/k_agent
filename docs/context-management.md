@@ -1,5 +1,8 @@
 # K Agent 上下文管理系统
 
+压缩策略、与 Claude Code 源码的对照和数字以
+[上下文压缩技术方案](context-compaction-technical-solution.md) 为准。本文是组成与数据流总览。
+
 本系统参考 Claude Code 的公开上下文模型实现，但保持 K Agent 的双进程边界：
 
 - Access Layer 只拥有公开接口、完整会话与 AG-UI Event 持久化、并发控制和流式透传。

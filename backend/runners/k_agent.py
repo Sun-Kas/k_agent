@@ -7,23 +7,38 @@ pipeline：按请求连接 MCP → 拼 prompt → 绑定本轮工具 → 创建 
 from __future__ import annotations
 
 import copy
+import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any
 
 from backend.agent import AgentRunRequest, OpenAIAgent
 from backend.agent.hooks import AgentRunContext
 from backend.agent.hooks.builtins import build_k_agent_pipeline_definition
 from backend.mcp_tool import mcp_manager_from_runtime
-from backend.prompts import (
-    build_prompt_bundle,
-    extract_referenced_paths,
-    voice_conversation_prompt,
+from backend.memory import (
+    load_eager_memory,
+    load_fresh_nested_memory,
+    resolve_instruction_root,
+    trusted_tool_paths,
 )
+from backend.prompts import (
+    McpInstruction,
+    PersonaInputs,
+    PromptInputs,
+    compose_prompt,
+)
+from backend.prompts.memory import render_nested_reminder
 from backend.runners.base import RunnerContext
 from backend.runtime_config import normalize_reasoning_effort, select_model
-from backend.tools import bind_request_scoped_tools, load_local_tools
+from backend.tools import (
+    SkillCatalog,
+    bind_request_scoped_tools,
+    build_tool_catalog,
+    load_local_tools,
+)
 from backend.permissions import PermissionDecision
 
 
@@ -109,76 +124,66 @@ class KAgentRunner:
                 for server in ctx.mcp_servers
                 if server.get("id")
             }
-            # 已连接 server 的工具快照，供 prompt 告诉模型「这轮能调哪些 MCP」。
+            # 已连接 server 的工具快照。能力本身只通过 Provider tools 暴露；
+            # Prompt 只读取最终 Catalog 生成少量条件指导。
             mcp_tools = await mcp_manager.list_tools()
-            # 从消息里抽出被 @ 的路径，prompt 才会把对应本地文件/目录编进上下文。
-            referenced_paths = extract_referenced_paths(ctx.messages)
-            prompt_started_at = time.perf_counter()
-            # 拼本轮 system + user_context；Skills / 语音提示都只活在这次请求里。
-            prompt_bundle = build_prompt_bundle(
-                settings.system_prompt,
-                # Prompt helpers also accept SkillDefinition. This request carries
-                # only serialized Skill dictionaries from the Access Layer.
-                skills=cast(Any, skills),
-                # Voice guidance is rebuilt per run and never becomes a
-                # persisted chat message or process-global prompt mutation.
-                append_system_prompt=voice_conversation_prompt(ctx.options),
-                referenced_paths=referenced_paths,
-                mcp_tools=cast(list[Any], mcp_tools),
+            instruction_root = resolve_instruction_root(
+                settings.local_tool_workspace_root
             )
-            # 拷一份再改：workspace / MCP 列表 / server instructions 都是本轮附加，不写回 bundle。
-            # user_context 是给模型看的 旁路环境字典，不是用户输入
-            user_context = dict(prompt_bundle.user_context)
-            if ctx.workspace_dir is not None:
-                # 与请求级本地工具同一边界。显式写入 prompt，避免 Skill 仍往 /tmp 写。
-                workspace = str(ctx.workspace_dir)
-                if ctx.team_id:
-                    user_context["workingDirectory"] = (
-                        f"{workspace}\n"
-                        "这是当前 Team 任务工作区（不是普通对话的 session 协作区）。"
-                        "正式交付物写在此目录下的 output/；"
-                        "不要写到 /tmp、仓库根目录、其他 Team 任务目录或对话 session 目录。"
-                        "相对路径相对此任务目录解析。"
-                    )
-                else:
-                    user_context["workingDirectory"] = (
-                        f"{workspace}\n"
-                        "这是当前对话的 session 协作区（每个会话独立，不同于 Team 任务目录）。"
-                        "生成的报告、脚本 --output-file、下载文件和其他交付物都必须写在这个目录内；"
-                        "不要写到 /tmp、仓库根目录、其他会话目录或 Team 目录。"
-                        "相对路径也相对此目录解析。"
-                    )
-            # 把用户勾选的 MCP 名称/说明列进上下文，模型才知道本轮启用了哪些服务。
-            if ctx.mcp_servers:
-                user_context["selectedMcpServers"] = "\n".join(
-                    f"- {server.get('name') or server.get('id')}: "
-                    f"{server.get('description') or ''}".rstrip()
-                    for server in ctx.mcp_servers
-                )
-            # MCP initialize 带回的动态指令只属于本轮；未勾选的 server 即使连上也丢掉。
-            instructions = {
-                server_id: value
-                for server_id, value in mcp_manager.connected_instructions().items()
-                if not selected_mcp_ids or server_id in selected_mcp_ids
-            }
-            if instructions:
-                user_context["mcpInstructions"] = "\n\n".join(
-                    f"## {server_id}\n\n{value}"
-                    for server_id, value in instructions.items()
-                )
-            # 本地工具 + 本轮 MCP + Skills 绑成请求级工具表；不要挂到 Runner 单例上。
+            # Memory discovery is blocking filesystem work and must stay off the
+            # streaming event loop. It is rooted at the project, never at the
+            # session/Team artifact workspace.
+            memory_files = await asyncio.to_thread(
+                load_eager_memory,
+                instruction_root,
+                ctx.messages,
+            )
+            skill_catalog = SkillCatalog.from_skills(skills)
             tools = bind_request_scoped_tools(
-                await load_local_tools(), mcp_manager, skills
+                await load_local_tools(),
+                mcp_manager,
+                skill_catalog=skill_catalog,
+            )
+            tool_catalog = build_tool_catalog(
+                local_tools=tools,
+                mcp_tools=mcp_tools,
+            )
+            instructions = tuple(
+                McpInstruction(server_id=server_id, content=value)
+                for server_id, value in mcp_manager.connected_instructions().items()
+                if (not selected_mcp_ids or server_id in selected_mcp_ids) and value
+            )
+            prompt_started_at = time.perf_counter()
+            # All K Agent injected text is compiled here. The Runner supplies a
+            # frozen snapshot and never edits the resulting bundle.
+            prompt_bundle = compose_prompt(
+                PromptInputs(
+                    instruction_root=instruction_root,
+                    output_workspace=ctx.workspace_dir,
+                    memory_files=tuple(memory_files),
+                    tool_catalog=tool_catalog,
+                    mcp_instructions=instructions,
+                    mcp_servers=tuple(dict(server) for server in ctx.mcp_servers),
+                    persona=PersonaInputs(custom=settings.persona_override),
+                    permission_mode=(
+                        "full_access"
+                        if ctx.options.get("permissionMode") == "full_access"
+                        else "default"
+                    ),
+                    options=dict(ctx.options),
+                    team_id=ctx.team_id,
+                    cache_breaker=(
+                        os.getenv("K_AGENT_SYSTEM_PROMPT_INJECTION")
+                        or os.getenv("CLAUDE_CODE_SYSTEM_PROMPT_INJECTION")
+                    ),
+                )
             )
             # 模型循环的输入快照：消息/prompt/模型/权限都在这里，create_runtime 本身不跑 Agent。
             run_request = AgentRunRequest(
                 # 会话历史（含用户输入）；不是 user_context。Access Layer 已按 carries_context 过滤。
                 messages=ctx.messages,
-                # 本轮 system：人设、Skill 摘要、MCP 动态清单、语音附加指令等。
-                system_prompt=prompt_bundle.system_prompt,
-                # 旁路环境字典（日期/memory/工作区/MCP 说明），渲染成 system-reminder，不是用户原话。
-                user_context=user_context,
                 model_config=model,
+                prompt=prompt_bundle,
                 attachments=ctx.attachments,
                 mcp_server_ids=selected_mcp_ids,
                 reasoning_effort=normalize_reasoning_effort(
@@ -189,7 +194,6 @@ class KAgentRunner:
                     if ctx.options.get("permissionMode") == "full_access"
                     else "default"
                 ),
-                loaded_memory_paths=prompt_bundle.memory_paths,
             )
             # 请求级 Observer 在真正打开 Langfuse trace 后再统一绑定。
             observers = [item for item in (ctx.logging_observer,) if item is not None]
@@ -201,6 +205,8 @@ class KAgentRunner:
                 "skills": skills,
                 "tools": tools,
                 "run_request": run_request,
+                "instruction_root": instruction_root,
+                "output_workspace": ctx.workspace_dir,
                 "observers": observers,
                 "observability_metadata": {
                     "mcpServerIds": sorted(selected_mcp_ids),
@@ -210,7 +216,9 @@ class KAgentRunner:
                         if skill.get("id") or skill.get("name")
                     ],
                     "reasoningEffort": run_request.reasoning_effort,
-                    "loadedMemoryPathCount": len(prompt_bundle.memory_paths),
+                    "loadedMemoryPathCount": len(prompt_bundle.initial_memory_paths),
+                    "stablePromptFingerprint": prompt_bundle.stable_fingerprint,
+                    "dynamicPromptFingerprint": prompt_bundle.dynamic_fingerprint,
                     "requestId": ctx.request_id,
                     "promptComposeMs": round(
                         (time.perf_counter() - prompt_started_at) * 1000, 3
@@ -233,13 +241,56 @@ class KAgentRunner:
         mcp_manager = runtime["mcp_manager"]
         agent_runtime_ref: dict[str, Any] = {}
 
+        async def enrich_observation(
+            tool_name: str,
+            arguments: dict[str, Any],
+            tool_result: str,
+        ) -> str:
+            """Load scoped rules from trusted local tool arguments only."""
+
+            agent_runtime = agent_runtime_ref.get("value")
+            if not isinstance(agent_runtime, dict):
+                return tool_result
+            paths = trusted_tool_paths(
+                tool_name,
+                arguments,
+                instruction_root=runtime["instruction_root"],
+                tool_workspace=runtime["output_workspace"],
+            )
+            if not paths:
+                return tool_result
+            loaded: set[str] = agent_runtime["loaded_memory_paths"]
+            fresh = await asyncio.to_thread(
+                load_fresh_nested_memory,
+                paths,
+                instruction_root=runtime["instruction_root"],
+                loaded_paths=set(loaded),
+            )
+            reminder, loaded_paths = render_nested_reminder(fresh)
+            loaded.update(loaded_paths)
+            if reminder is None:
+                return tool_result
+            agent_runtime["trace"].append(
+                f"memory:lazy_loaded:{len(loaded_paths)} files"
+            )
+            return f"{tool_result}\n\n{reminder}"
+
         async def request_approval(
             target: str,
             decision: PermissionDecision,
             detail: dict[str, Any],
         ) -> dict[str, Any]:
+            """把 ReAct preflight 的 ask 接到本轮 HTTP 的 ApprovalBroker。
+
+            OpenAIAgent 只认识这个回调，不认识 thread/run/Broker。这里组好
+            checkpoint 后调用 ``broker.request()``：往当前流塞 Interrupt，然后
+            ``await run_closed``。返回值不是用户决定（那是另一次 Resume Run）；
+            原 Run 随后被取消，K Agent 不会拿这里的返回值去执行工具。
+            """
             if ctx.approval_broker is None:
                 raise RuntimeError("Approval broker is unavailable")
+            # create_runtime 时尚无检查点；Act 写入 _react_tool_boundary 之后
+            # 才会第一次 ask。用 ref 是因为闭包必须在 create_runtime 之前定义。
             agent_runtime = agent_runtime_ref.get("value")
             boundary = (
                 copy.deepcopy(agent_runtime.get("_react_tool_boundary"))
@@ -247,6 +298,8 @@ class KAgentRunner:
                 and isinstance(agent_runtime.get("_react_tool_boundary"), dict)
                 else {"version": 1, "kind": "restart_from_context"}
             )
+            # AG-UI MESSAGES_SNAPSHOT 用请求级消息；Resume Act 用 boundary 里的
+            # modelMessages。两者不能混成一份列表。
             boundary["messages"] = [
                 message.model_dump(by_alias=True, mode="json")
                 for message in ctx.messages
@@ -256,10 +309,20 @@ class KAgentRunner:
                 run_id=ctx.run_id,
                 agent_kind=self.kind,
                 category=(
-                    "mcp_tool" if detail.get("source") == "mcp" else "local_tool"
+                    "user_input"
+                    if detail.get("source") == "user_input"
+                    else "mcp_tool" if detail.get("source") == "mcp" else "local_tool"
                 ),
-                title=f"允许调用 {target}？",
-                message=decision.reason or "该工具调用需要你的确认。",
+                title=(
+                    "Agent 需要你的回答"
+                    if detail.get("source") == "user_input"
+                    else f"允许调用 {target}？"
+                ),
+                message=(
+                    str((detail.get("questions") or [{}])[0].get("question") or decision.reason)
+                    if detail.get("source") == "user_input"
+                    else decision.reason or "该工具调用需要你的确认。"
+                ),
                 detail=detail,
                 checkpoint=boundary,
             )
@@ -294,6 +357,9 @@ class KAgentRunner:
                     skills=runtime["skills"],
                     approval_handler=request_approval,
                 )
+                # The generic Agent core does not import Prompt/Memory modules;
+                # this request callback owns K Agent's lazy-rule semantics.
+                agent_runtime["observation_enricher"] = enrich_observation
                 agent_runtime_ref["value"] = agent_runtime
                 if ctx.resume_checkpoints:
                     # Access Layer 已验证 resume 完整覆盖开放 Interrupt；K Agent

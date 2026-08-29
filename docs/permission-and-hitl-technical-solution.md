@@ -1,342 +1,635 @@
 # 权限模式与 HITL 技术方案
 
-> 状态：已实现  
-> 适用范围：Work 对话、Agent Team、定时任务，以及 K Agent、Codex、Claude Code 三类运行时。
->
-> 本文描述当前已实现的进程内审批语义。跨刷新、断线和服务重启的延迟审批属于后续
-> 方案，见[可持久化 HITL 检查点与延迟恢复技术方案](durable-hitl-checkpoint-technical-solution.md)。
+> 状态：已实现，与 2026-08-24 当前代码一致
+> 适用范围：Work 对话、Agent Team、定时任务；K Agent、Codex、Claude Code
+> 实现级逐函数说明：[K Agent HITL 实现说明](hitl-implementation.md)
+> 设计演进与恢复状态机：[可持久化 HITL 检查点与延迟恢复技术方案](durable-hitl-checkpoint-technical-solution.md)
 
-## 1. 背景与目标
+## 1. 先说结论
 
-Agent 既要能在工作空间内稳定自动执行，又需要在确有必要时访问工作空间外文件、
-网络或具有明显副作用的能力。如果只有固定沙箱，合法任务会因边界受阻；如果默认
-关闭沙箱，则普通提示词、第三方 Skill 或误判命令都可能扩大到宿主机。
+当前 HITL 不是“Backend 保存一个 Future，HTTP 一直等用户点击”。实际模型是：
 
-本方案提供两个用户可见的运行权限模式：
+```text
+原 Run
+  模型产生工具调用或 AskUserQuestion
+  → Agent Backend 在副作用前生成 Interrupt
+  → Access Layer 先持久化 checkpoint，再把卡片发给浏览器
+  → RUN_FINISHED(outcome=interrupt)
+  → 原 HTTP、Runner、MCP 租约与并发槽释放
 
-| 模式 | 行为 | 适用场景 |
-| --- | --- | --- |
-| `default` | 保持现有沙箱和权限规则；越权调用暂停并进入 HITL | 默认选择、日常对话、来源不完全可信的任务 |
-| `full_access` | 关闭运行时沙箱和人工审批，允许宿主机级访问 | 用户明确理解风险、任务必须无人值守访问宿主机时 |
+用户以后提交决定
+  → 相同 threadId + 新 runId + resume[]
+  → Access Layer 原子认领持久化 Interrupt
+  → Agent Backend 收到可信 resumeCheckpoints
+  → K Agent 从工具边界继续 Act，再进入下一轮 Reason
+```
 
-设计目标：
+`backend/approvals.py` 仍叫 `ApprovalBroker`，但它不再保存跨请求
+`requestId → Future`。跨刷新、断线和 Backend 重启的权威状态属于 Access Layer。
 
-1. 旧数据和未传字段保持 `default`，不因升级扩大权限。
-2. 权限是 run 或所属对象的显式配置，不通过进程全局变量临时切换。
-3. 默认权限下，工具执行必须发生在审批之后，不能“先执行、后展示”。
-4. 审批必须绑定 `requestId + threadId + runId`，禁止跨会话误批。
-5. Work、Team、定时任务复用同一个 `ApprovalBroker` 与公开审批接口。
-6. 完全权限必须在界面持续展示风险，尤其说明定时任务会在每次无人值守触发时复用授权。
+系统当前有两类 HITL：
 
-非目标：
+| 类型 | category | 用户提交 | `full_access` 是否跳过 |
+| --- | --- | --- | --- |
+| 权限审批 | `local_tool` / `mcp_tool` / provider 类别 | approve / deny / cancel，once / run | 是，K Agent 权限规则直接 allow |
+| 用户提问 | `user_input` | 每题 `selected[] + custom`，或 cancel | 否，问题必须由用户回答 |
 
-- 完全权限不会提升为 `root`，也不会绕过操作系统账号、容器或宿主平台限制。
-- 完全权限不会凭空创建 API Key、OAuth token 或第三方服务 scope。
-- 本方案不把审批做成跨进程、跨重启的永久队列；审批只属于仍然存活的 run。
+这两类请求共用 durable Interrupt/Resume 基础设施，但语义不能混用：回答问题不是给工具授权，
+权限批准也不能携带一份任意表单覆盖原工具参数。
 
-## 2. 总体架构
+---
+
+## 2. 服务职责与信任边界
 
 ```mermaid
 flowchart LR
-    UI["Frontend<br/>权限选择与审批卡片"]
-    AL["Access Layer<br/>配置持久化与公开 API"]
-    BE["Agent Backend<br/>权限判断与 ApprovalBroker"]
-    RUNNER["K Agent / Codex / Claude"]
-    TOOL["Bash / File / MCP"]
-
-    UI -->|"permissionMode"| AL
-    AL -->|"agentOptions.permissionMode"| BE
-    BE --> RUNNER
-    RUNNER -->|"ask"| BE
-    BE -->|"approval_request · SSE"| AL
-    AL --> UI
-    UI -->|"POST /api/approvals/{id}"| AL
-    AL -->|"POST /internal/approvals/{id}"| BE
-    BE -->|"Future resolved"| RUNNER
-    RUNNER --> TOOL
+    UI[Frontend\n卡片与答案] -->|POST /api/agent + resume[]| AL
+    AL[Access Layer\nSession/审批文件/Resume CAS] -->|完整历史 + resumeCheckpoints| BE
+    BE[Agent Backend\n无状态执行/权限/Interrupt] --> RUNNER[K Agent / Codex / Claude]
+    RUNNER --> PIPE[sealed Tool Pipeline]
+    PIPE --> TOOL[Local / MCP tool]
+    BE -->|AG-UI NDJSON| AL
+    AL -->|SSE, checkpoint 已剥离| UI
 ```
 
-职责边界：
+### 2.1 Frontend
 
-- **Frontend**：让用户选择权限、展示风险、渲染审批请求并提交决定。
-- **Access Layer**：校验公开请求、持久化会话/Team/定时任务权限，并代理审批 API。
-- **Agent Backend**：保存当前 run 的权限上下文，执行规则判断，管理未决审批和 Runner。
-- **Runner/Tool**：只消费已经校验的权限结果，不直接读取前端或 Access Layer 状态。
+- 只渲染公开的 Activity 与 `openInterrupts` 投影。
+- 权限卡提交 `approved/scope`；问题卡提交 `answers`。
+- 不保存、不回传、不修改 checkpoint。
+- 刷新后从 Session API 的 `openInterrupts` 恢复可操作卡片，不能只根据历史事件猜测。
 
-## 3. 权限数据模型与持久化
+### 2.2 Access Layer
 
-统一枚举：
+- 拥有 Session、Team、定时任务及 Interrupt 持久化。
+- 在卡片可见前执行 durable-before-visible 写入。
+- 校验 Resume 覆盖全部开放 Interrupt，使用 ResumeIntent 一次性认领。
+- 将浏览器 `resume[]` 与服务端 `resumeCheckpoints` 分开：后者永不来自客户端。
+- 有开放 Interrupt 时拒绝普通新消息，防止对话越过未完成的工具边界。
+
+### 2.3 Agent Backend
+
+- 每个 worker 复用无状态 Runner/Agent，给每次请求创建独立 Runtime。
+- 绑定 workspace、网络、权限模式和工具环境的 ContextVar。
+- 计算 allow / deny / ask，或产生 `AskUserQuestion` 输入请求。
+- 在工具副作用前生成 checkpoint 与 Interrupt。
+- Resume 时消费 Access Layer 下发的可信 checkpoint/decision。
+- 不读写 `$K_AGENT_HOME/state/sessions`，不持有跨请求 Future。
+
+### 2.4 工具层
+
+- 普通工具只实现 schema 与 execute，不直接访问前端。
+- `sandbox_permissions=require_escalated` 是申请，不是授权凭证。
+- `AskUserQuestion` 的 executor 故意不可达；答案只由 Resume 路径生成 tool result。
+
+---
+
+## 3. 权限模式与持久化
+
+统一字段：
 
 ```json
 "permissionMode": "default" | "full_access"
 ```
 
-### 3.1 Work 对话
+### 3.1 default
 
-- 字段位于 `forwardedProps.agentOptions.permissionMode`。
-- Access Layer 在 run 开始时写入 Session 的 `capabilities.permissionMode`。
-- 打开旧 Session 时缺少该字段，规范化为 `default`。
-- 新会话始终从 `default` 开始，不继承前一个会话的完全权限。
+- 保持 K Agent 权限规则、Skill allowlist 和 Bash 沙箱。
+- 明确越权请求可进入权限审批 Interrupt。
+- deny 是可恢复工具错误，不弹审批卡。
 
-### 3.2 Agent Team
+### 3.2 full_access
 
-- 创建请求使用 `TeamCreateInput.permissionMode`。
-- 数据库存储于 `teams.permission_mode`，旧表迁移时增加
-  `TEXT NOT NULL DEFAULT 'default'`。
-- Supervisor 和所有 Worker dispatch 都从 Team 快照读取相同模式。
-- Team 创建后的运行使用该持久化快照，避免并行 Worker 处于不同权限语义。
+- K Agent 本地/MCP 权限决策直接 allow，文件工具可越过 workspace，Bash 跳过 srt。
+- Codex 使用 `danger-full-access + approvalPolicy=never`。
+- Claude Code 使用 `bypassPermissions` 并关闭其 sandbox。
+- 不会提升为 root，也不会提供不存在的密钥、OAuth scope 或操作系统能力。
+- **不会跳过 `AskUserQuestion`**；业务信息缺失与宿主机权限是两件事。
 
-### 3.3 定时任务
+### 3.3 所有权
 
-- 创建/编辑请求使用 `ScheduledTaskInput.permissionMode`。
-- 数据库存储于 `scheduled_tasks.permission_mode`，旧任务迁移为 `default`。
-- 每次计划触发与“立即运行”都把该字段传入新的 Session run。
-- `full_access` 是对该自动化后续每次触发的持续授权，不是一次性批准。
-
-## 4. K Agent 默认权限与单次越权
-
-### 4.1 模型请求契约
-
-本地文件工具和 Bash 暴露可选字段：
-
-```json
-{
-  "sandbox_permissions": "require_escalated"
-}
-```
-
-它只表示“请求越权”，不是已经取得授权。标准调用必须先经过
-`OpenAIAgent._enforce_permission()`；不得将本地工具执行函数直接暴露为公开 API。
-
-Bash 示例：
-
-```json
-{
-  "command": "需要访问默认沙箱外资源的命令",
-  "description": "向用户解释越权原因",
-  "sandbox_permissions": "require_escalated"
-}
-```
-
-`require_escalated` 采用正向触发规则。只有当前任务必须执行下列行为之一时，模型才可
-申请 HITL：
-
-1. 写入、修改或删除 Session workspace 之外的路径；
-2. 访问默认沙箱阻止的宿主设备、本地 Socket、GUI、进程、凭据存储或系统服务；
-3. 访问一个不在当前 `BASH_SANDBOX_ALLOWED_DOMAINS` 中的具体网络域名。
-
-申请中的 `description` 必须指出具体资源及其必要性，例如“写入
-`/etc/example/config` 以完成用户要求的系统级配置”，不能只写“需要 host access”。
-这是允许发起 Bash 审批的完整条件集合。调用还必须提供
-`escalation_scope=outside_workspace_write|host_resource|network_destination` 与具体的
-`escalation_resource`，Backend 会在进入 ApprovalBroker 前强制校验。网络资源必须是
-不带协议、路径和端口的准确 hostname；Backend 使用本轮实际域名白名单匹配，白名单
-内的目标不会进入审批。普通网络超时、DNS 失败、HTTP 错误、连接重置、
-`IncompleteRead`、远端限流以及脚本异常也不会进入审批。
-
-### 4.2 审批前置
-
-`OpenAIAgent` 的 sealed Tool Pipeline 在参数校验、`ToolStarted` Observer 事件和工具执行
-之前完成权限判断：
-
-1. 执行权限规则 `check_permissions()`。
-2. `permission_mode == full_access` 时规范化为 `allow`。
-3. 默认模式且请求 `require_escalated` 时强制规范化为 `ask`。
-4. `deny` 直接返回可恢复工具错误。
-5. `ask` 调用注入的 `approval_handler`，当前工具协程暂停。
-6. 只有收到 `approve` 才继续参数校验与实际执行。
-
-这个顺序是不变量：任何重构都不能把参数中的 `require_escalated` 直接当成授权凭证。
-
-### 4.3 Bash 是否跳过 srt
-
-Backend 用 `ContextVar` 把 `permissionMode` 绑定到当前异步 run，关闭流时恢复 token，
-避免并发会话相互污染。`cc_bash()` 计算：
-
-```python
-full_access = (
-    current_tool_permission_mode() == "full_access"
-    or payload.get("sandbox_permissions") == "require_escalated"
-)
-```
-
-随后 `plan_bash_invocation()` 返回：
-
-| 条件 | `argv` | 执行方式 |
+| 场景 | 字段位置 | 持久化位置 |
 | --- | --- | --- |
-| 完全权限或已批准的单次越权 | `None` | `create_subprocess_shell()`，跳过 srt |
-| 默认权限且 srt 可用 | `[srt, --settings, ..., shell, -c, command]` | `create_subprocess_exec()` |
-| `BASH_SANDBOX_MODE=off` | `None` | 全局配置关闭沙箱 |
-| `auto` 且 srt 不可用 | `None` | 降级执行，并在结果中携带原因 |
-| `required` 且 srt 不可用 | 不返回 | 拒绝执行 |
+| Work | `forwardedProps.agentOptions.permissionMode` | Session capabilities |
+| Team | `TeamCreateInput.permissionMode` | `teams.permission_mode` |
+| 定时任务 | `ScheduledTaskInput.permissionMode` | `scheduled_tasks.permission_mode` |
 
-即使跳过 srt，Bash 仍保留：
+旧数据或缺省字段一律规范化为 `default`。新会话不会继承上一会话的完全权限。
 
-- 当前 Session/Team workspace 作为 `cwd`；
-- `build_child_env()` 环境变量白名单和敏感变量清理；
-- 命令超时、输出截断、stdout/stderr 结构化返回；
-- run 取消时的子进程生命周期处理。
+---
 
-## 5. HITL 完整时序
+## 4. Agent Backend 请求入口
 
-```mermaid
-sequenceDiagram
-    participant M as Model
-    participant A as OpenAIAgent
-    participant B as ApprovalBroker
-    participant U as Frontend
-    participant AL as Access Layer
-    participant T as Bash Tool
+入口是 `backend/main.py::run_agent()`：
 
-    M->>A: Bash(command, require_escalated)
-    A->>A: PermissionDecision(ask)
-    A->>B: request(threadId, runId, detail)
-    B->>B: 创建 requestId + Future
-    B-->>U: CUSTOM approval_request（经 AG-UI/SSE）
-    Note over A,B: Bash 协程停在 await Future
-    U->>AL: POST /api/approvals/{requestId}
-    AL->>B: POST /internal/approvals/{requestId}
-    B->>B: 校验 requestId/threadId/runId
-    B-->>U: CUSTOM approval_resolved
-    B-->>A: Future 返回 decision
-    alt approve
-        A->>T: 校验参数并执行
-        T-->>A: TOOL_CALL_RESULT
-    else deny/cancel/timeout
-        A-->>M: 可恢复工具错误
-    end
-```
+1. `AgentBackendRunInput` 接收完整历史、Runtime catalog 快照、workspace、
+   `resume[]` 与私有 `resumeCheckpoints[]`。
+2. 构造 `RunnerContext`，把浏览器决定和服务端 checkpoint 分开存放。
+3. 设置请求级 ContextVar：
+   - `set_tool_workspace()`
+   - `set_tool_network_access()`
+   - `set_tool_permission_mode()`
+   - `set_tool_env_overrides()`
+4. 从 worker-local `runner_registry` 取惰性缓存的 Runner。
+5. 使用 `app.state.approvals.stream(runner.run_stream(...))` 合流普通 Runner 事件与
+   Interrupt。
+6. `translate_agent_events()` 把内部事件转成 AG-UI，再编码为 NDJSON。
+7. `finally` 恢复全部 ContextVar；K Agent Runner 自己关闭本请求的 MCP manager 租约。
 
-### 5.1 ApprovalBroker 内部状态
+这里的“不保存 Session”很重要：Backend 可以多 worker，因为 Resume 不需要命中原来的
+worker。多 worker 限制当前只存在于文件式 Access Layer ResumeIntent CAS，而不是
+Agent Backend。
+
+---
+
+## 5. K Agent 的 ReAct 工具边界
+
+主循环位于 `backend/agent/react_agent.py::run_stream_react()`：
 
 ```text
-不存在
-  → pending(Future)
-      → approved
-      → denied
-      → cancelled
+Reason
+  model stream
+  assistant.tool_calls 写入 provider messages
+
+Act（按 tool_calls 顺序串行）
+  yield tool_start
+  写 runtime["_react_tool_boundary"]
+  _run_tool
+    → _execute_tool
+      → pipeline.run_tool
+
+Observe
+  yield tool_result
+  append role=tool + tool_call_id
+  下一轮 Reason
 ```
 
-Broker 维护：
+`tool_start` 早于权限判断，所以 UI 能看到模型打算调用什么；真正副作用仍在 sealed
+preflight 之后。工具必须串行执行，否则 `pendingIndex` 与 Observation 顺序无法稳定恢复。
 
-- `(thread_id, run_id) → event queue`
-- `request_id → PendingApproval(request_id, thread_id, run_id, future)`
+### 5.1 react_tool_boundary
 
-Runner producer 与审批事件共用一个合流队列。工具可以阻塞在 Future 上，而 SSE 仍能
-先把审批卡发送给浏览器。审批本身不设置固定墙钟超时；它由所属 run 的取消信号管理，
-直到显式批准、拒绝、取消，或 SSE/HTTP run 关闭。
+每次调用 `_run_tool` 前保存：
 
-### 5.2 公开接口
-
-```http
-POST /api/approvals/{requestId}
-Content-Type: application/json
-
+```json
 {
-  "threadId": "...",
-  "runId": "...",
-  "action": "approve" | "deny" | "cancel",
-  "scope": "once" | "run"
+  "version": 1,
+  "kind": "react_tool_boundary",
+  "iteration": 2,
+  "pendingIndex": 0,
+  "pendingCalls": [
+    {"id": "call-1", "name": "Bash", "arguments": "{...}"}
+  ],
+  "modelMessages": [
+    {"role": "assistant", "tool_calls": [{"id": "call-1", "function": {"name": "Bash"}}]}
+  ]
 }
 ```
 
-Access Layer 代理至 `POST /internal/approvals/{requestId}`。Backend 只有在
-`requestId + threadId + runId` 全部匹配且 Future 仍未完成时才返回成功；已取消、重复、
-跨 run 或跨会话请求统一返回 404。
+它表示“这一轮 Reason 已完成，正准备执行第几个 Act”。Resume 不能重新请求同一轮模型，
+否则会重放已展示文本并可能生成不同参数。
 
-### 5.3 三种用户决定
+---
 
-| 决定 | 当前调用 | 后续调用 |
-| --- | --- | --- |
-| 拒绝 | 不执行，错误返回模型 | 仍需重新审批 |
-| 允许一次 | 当前越权调用执行 | 下一次越权重新审批 |
-| 本轮始终允许 | 当前调用执行 | 当前 Agent run 内同一权限目标不再询问 |
+## 6. sealed Tool Pipeline
 
-“本轮始终允许”只写入当前 `OpenAIAgent._approved_targets`，不落库、不跨 run、
-不影响其他 Session。对 Bash 而言，后续调用只有再次携带 `require_escalated` 才会
-跳过 srt；普通 Bash 仍按默认沙箱执行。
+`backend/agent/hooks/pipeline.py::AgentPipelineRuntime.run_tool()` 的顺序是：
 
-## 6. Codex 与 Claude Code 映射
+```text
+wrap_tool middleware
+  └─ sealed(current)
+       1. preflight(current)
+       2. emit ToolStarted
+       3. execute(current)
+       4. emit ToolCompleted
+```
 
-| Runner | 默认权限 | 完全权限 |
-| --- | --- | --- |
-| K Agent | srt + 本地权限规则 + ApprovalBroker | 文件工具可越过 workspace；Bash 跳过 srt；不询问 |
-| Codex | `workspace-write` + `approvalPolicy=on-request` | `danger-full-access` + `approvalPolicy=never` |
-| Claude Code | sandbox enabled + approval bridge | `bypassPermissions` + sandbox disabled |
+安全性质：
 
-三者产生的请求最终都进入同一个公开审批 API，但 provider 原生请求会保留各自的
-命令、文件变更、表单答案或 MCP elicitation 结构。
+1. middleware 只能拿到 `call_next`，拿不到 raw executor。
+2. middleware 修改参数或重试时会重新进入 sealed preflight。
+3. 权限判断、Skill allowlist 与用户提问都在 preflight。
+4. Observer 是 fail-open 的观测面，不是权限决定面。
+5. `ApprovalInterrupt`/任务取消使用 `BaseException` 级控制流，不会被普通工具错误恢复层
+   伪装成模型可见的执行失败。
 
-## 7. 前端与定时任务审批
+### 6.1 本地/MCP 权限审批
 
-Frontend 把 `approval_request` 投影为时间线审批卡，展示 Agent、类别、原因、命令或
-参数；提交期间禁用按钮，收到 `approval_resolved` 后显示最终状态。
+普通本地工具 preflight：
 
-定时任务不跳转普通会话：执行记录在自动化详情页读取对应专属 Session，在原页面
-渲染审批卡，并每 2 秒刷新仍打开的执行结果。审批没有固定处理期限，但页面关闭导致
-流取消、Backend 重启或 run 被终止时，内存 Future 会被取消，不能跨进程恢复。
+1. 非 `full_access` 时校验 Skill allowlist。
+2. `_local_permission_decision()` 根据规则、只读工具特殊语义、权限模式和越权字段得到
+   `PermissionDecision`。
+3. `_enforce_permission()`：
+   - allow：继续；
+   - deny：抛出可恢复错误；
+   - ask：调用 `approval_handler`，生成权限 Interrupt。
 
-完全权限定时任务必须持续显示：
+MCP 工具使用相同 sealed 门，只是 target 与规则 subject 为 `{serverId}:{toolName}`。
 
-> 每次计划或手动触发都不会启用沙箱或等待审批，可读取、修改或删除本机文件并访问网络。
+### 6.2 AskUserQuestion 特殊门
 
-## 8. 失败与恢复语义
+`AskUserQuestion` 仍进入同一个 sealed preflight；非 `full_access` 时先经过 Skill allowlist，
+但它不经过 `_local_permission_decision()`：
 
-| 场景 | 处理 |
+1. `validate_tool_arguments()` 校验顶层 schema。
+2. `normalize_user_questions()` 做业务校验并生成稳定 ID：`question-1..4`。
+3. 调用相同 `approval_handler`，但 `source=user_input`、`category=user_input`。
+4. handler 进入 Broker 后当前 Run terminal interrupt。
+5. `_unreachable_execute()` 不应执行；若 Broker 非预期同步返回，preflight fail-closed。
+
+该路径在 `full_access` 中仍会触发，因为它请求信息，不请求权限。
+
+---
+
+## 7. 权限决策规则
+
+`_local_permission_decision()` 的当前覆盖顺序：
+
+1. `check_permissions(tool, subjects)` 读取权限规则；Bash 会匹配整句与按
+   `&& || ; |` 拆出的片段并取最严结果。
+2. Read / Glob / Grep / LS 的规则 ask 降为 allow，deny 保留。
+3. `permissionMode=full_access` 直接 allow。
+4. Write / Edit / NotebookEdit / Bash 带
+   `sandbox_permissions=require_escalated` 时在 default 强制 ask。
+
+Bash 越权还必须给出：
+
+```json
+{
+  "sandbox_permissions": "require_escalated",
+  "escalation_scope": "outside_workspace_write | host_resource | network_destination",
+  "escalation_resource": "具体路径、资源或 hostname"
+}
+```
+
+白名单内域名再申请网络越权会 deny；普通网络错误不会自动升级成 HITL。
+
+---
+
+## 8. ApprovalBroker 的当前职责
+
+`backend/approvals.py::ApprovalBroker` 只持有当前 HTTP run 的瞬时合流状态：
+
+```text
+(threadId, runId) → interrupt_queue(maxsize=1)
+(threadId, runId) → run_closed Event
+```
+
+### 8.1 request()
+
+1. 确认请求属于已注册的 active run。
+2. 计算 canonical `requestHash`：target、source、serverId、arguments。
+3. 生成公开卡片字段与私有 `_checkpoint`。
+4. `put_nowait()` 到容量为 1 的 Interrupt queue。
+5. 等待 `run_closed`，保证调用工具的协程停在副作用前。
+
+它不会等待用户决定。返回的 cancel 只是给少数 provider bridge 的同步调用契约兜底；
+正常 K Agent Runner 会先被 `stream()` 取消。
+
+### 8.2 stream()
+
+`stream()` 同时等待 Runner 的下一事件与 Interrupt queue：
+
+```text
+普通事件到达 → 原样 yield
+
+Interrupt 到达
+  → cancel pump_task
+  → set run_closed
+  → yield approval_request
+  → yield interrupt
+  → return，原 Run 结束
+```
+
+原 Run 在 interrupt 后结束；用户决定通过 Access Layer 认领 Resume，再开新 Run。
+
+---
+
+## 9. AG-UI 映射
+
+`backend/agui.py::translate_agent_events()` 生成：
+
+```text
+approval_request
+  → ACTIVITY_SNAPSHOT(activityType="approval", replace=true)
+
+interrupt
+  → STATE_SNAPSHOT(openInterrupts)
+  → MESSAGES_SNAPSHOT(checkpoint.messages)
+  → RUN_FINISHED(outcome.type="interrupt")
+```
+
+权限请求：
+
+```json
+{
+  "reason": "tool_call",
+  "responseSchema": {
+    "required": ["approved"],
+    "properties": {
+      "approved": {"type": "boolean"},
+      "scope": {"enum": ["once", "run"]}
+    }
+  }
+}
+```
+
+用户问题：
+
+```json
+{
+  "reason": "input_required",
+  "responseSchema": {
+    "required": ["answers"],
+    "properties": {"answers": {"type": "object"}}
+  }
+}
+```
+
+Activity 是富 UI 投影；真正可执行的 checkpoint 只在 Backend → Access Layer 私有事件里。
+
+---
+
+## 10. AskUserQuestion 数据契约
+
+### 10.1 模型调用
+
+```json
+{
+  "questions": [
+    {
+      "header": "实现方式",
+      "question": "你希望怎样继续？",
+      "options": [
+        {"label": "方案 A", "description": "保持当前边界"},
+        {"label": "方案 B", "description": "扩大实现范围"},
+        {"label": "方案 C", "description": "先做最小版本"}
+      ],
+      "multiSelect": true
+    }
+  ]
+}
+```
+
+限制：1–4 个问题；每题 2–4 个 label 唯一的选项；header 最长 24；问题最长 500；
+自定义答案最长 4000。
+
+### 10.2 用户回答
+
+```json
+{
+  "answers": {
+    "question-1": {
+      "selected": ["方案 A", "方案 C"],
+      "custom": "同时保留旧接口，并补一份迁移说明"
+    }
+  }
+}
+```
+
+`selected` 与 `custom` 独立：
+
+- 只选选项：允许；
+- 只写自定义内容：允许；
+- 选择后补充自由文本：允许；
+- 两者都空：拒绝；
+- 单选题多个 preset：拒绝；
+- label 不属于服务端问题定义：拒绝。
+
+Access Layer 使用持久化 `detail.questions` 再校验；Frontend 不能新增选项或问题 ID。
+
+### 10.3 回给模型的 Observation
+
+Resume 后 K Agent 生成：
+
+```json
+{
+  "ok": true,
+  "answers": [
+    {
+      "id": "question-1",
+      "question": "你希望怎样继续？",
+      "selected": ["方案 A", "方案 C"],
+      "custom": "同时保留旧接口"
+    }
+  ]
+}
+```
+
+取消则为 `{"ok": false, "cancelled": true}`。两者都会成为原
+`AskUserQuestion` callId 对应的 `TOOL_CALL_RESULT`。
+
+---
+
+## 11. Access Layer durable-before-visible
+
+`access_layer/gateway.py` 在读取 Backend NDJSON 时：
+
+1. 识别带 `_checkpoint` 的 approval Activity。
+2. 把本轮 model/MCP/Skill/reasoning/agentOptions 写入 `checkpoint.resumeContext`。
+3. 调用 `SessionStore.persist_interrupt()` 原子写：
+   `sessions/{sessionId}/approvals/{interruptId}.json`。
+4. 更新 Session 主 JSON 的 `openInterruptIds`。
+5. 从公开 Activity 剥离 `_checkpoint`。
+6. 最后才 yield SSE，并追加 flush comment。
+
+因此“卡片已经可点击”意味着 checkpoint 已经落盘。若持久化失败，卡片不能先暴露给用户。
+
+---
+
+## 12. Resume 校验与状态机
+
+Frontend 使用同一个公开 `POST /api/agent`：
+
+```json
+{
+  "threadId": "same-thread",
+  "runId": "new-run",
+  "messages": [],
+  "resume": [{
+    "interruptId": "interrupt-id",
+    "status": "resolved",
+    "payload": {"approved": true, "scope": "once"}
+  }]
+}
+```
+
+问题回答把 payload 换成 `answers`。Resume 不得同时携带新用户消息。
+
+`SessionStore.prepare_resume()`：
+
+1. `resume[]` 必须精确覆盖当前线程所有开放 Interrupt。
+2. Interrupt 状态必须是 `pending/unknown_outcome/resume_failed`。
+3. 当前 runtime selection 必须与 checkpoint 的 `resumeContext` 相同。
+4. 权限请求要求 `approved:boolean`；用户问题要求完整、合法 answers。
+5. 未知结果或恢复失败必须显式 `reconfirm:true`。
+6. 先写 ResumeIntent，再把记录改成 `resuming`。
+7. 返回带 checkpoint、decision、requestHash 的私有 records 给 Backend。
+
+`finish_resume()`：
+
+| 情况 | 最终状态 |
 | --- | --- |
-| 用户拒绝 | 工具不执行，结构化错误返回模型，模型可以换方案 |
-| 长时间无决定 | Future 保持 pending；只发送提醒，不自动批准或拒绝 |
-| SSE/HTTP run 关闭 | `cancel_run()` 取消该 run 所有未决 Future |
-| 重复提交审批 | Future 已完成，返回 404 |
-| threadId/runId 不匹配 | 返回 404，不泄露其他 run 是否存在 |
-| Backend 重启 | 内存审批失效；自动任务本次运行按 worker/run 失败处理，不重放副作用 |
-| srt required 但不可用 | 拒绝执行，不自动转为完全权限 |
-| srt auto 但不可用 | 返回明确 `sandboxed=false` 和原因，不能伪装成沙箱成功 |
+| 权限批准 | `approved` |
+| 用户回答 | `answered`，保存规范化 answers |
+| 拒绝 | `denied` |
+| 取消 | `cancelled` |
+| 已知恢复失败 | `resume_failed` |
+| 外部副作用结果不明 | `unknown_outcome` |
 
-## 9. 安全不变量
+成功后从 `openInterruptIds` 移除；失败状态保留为可复核卡片。
 
-1. `default` 是 API、数据库迁移和前端初始化的共同默认值。
-2. 完全权限必须由用户在运行入口显式选择，模型不能自行修改 `permissionMode`。
-3. `require_escalated` 是请求，不是授权；只能在已注册的 active run 中进入 Broker。
-4. 工具必须在审批完成后执行，不能预执行或并行启动。
-5. 审批归属必须校验三元组，不能只凭 `requestId`。
-6. run 结束必须清理 ContextVar、队列和未决 Future。
-7. 环境变量脱敏独立于 srt，即使完全权限也不自动继承 Backend 全量环境。
-8. 完全权限的风险文案不能只放在帮助文档，选择时和持久化详情中都要可见。
+---
 
-## 10. 验证要求
+## 13. K Agent Resume 的两条分支
 
-后端回归至少覆盖：
+`backend/runners/k_agent.py` 要求恰好一个 checkpoint，并写入 Runtime：
 
-- 默认权限的 `require_escalated` 在工具执行前进入 HITL；
-- allow/deny、once/run scope、run 取消和三元组不匹配；
-- 完全权限跳过规则、K Agent srt、Codex/Claude sandbox 映射；
-- Session、Team、定时任务权限持久化与旧表默认迁移；
-- 定时任务和 Team dispatch 确实转发 `permissionMode`；
-- 并发 run 的 ContextVar 不串值。
+- `resume_checkpoint`
+- `resume_decision`
+- `resume_request_hash`
 
-前端回归至少覆盖：
+`run_stream_react()` 用 checkpoint 的 `modelMessages/pendingCalls/pendingIndex` 恢复 Act。
 
-- 三个入口默认选中“默认权限”；
-- 完全权限风险文案在浅色/深色主题和窄屏下可读；
-- 定时任务授权文案明确“每次无人值守触发”；
-- 审批卡可提交且状态不重复；
-- 权限卡片不覆盖后续 MCP/Skill 表单。
+### 13.1 权限审批
 
-## 11. 主要实现位置
+1. 拒绝/取消：不执行，写“用户拒绝” Observation。
+2. 批准：设置 `_resume_authorization={callId, requestHash}`。
+3. 再进入 `_run_tool()`；完整 preflight 仍会运行。
+4. `_enforce_permission()` 只有在 callId 与重新计算的 hash 都一致时消费一次授权。
+5. 同批后续工具没有该授权，需要时再次 Interrupt。
 
-| 位置 | 职责 |
+### 13.2 AskUserQuestion
+
+1. 重新计算 `AskUserQuestion + source=user_input + arguments` 的 request hash。
+2. 与 `resume_request_hash` 不同则拒绝恢复。
+3. cancelled 生成取消结果；resolved 重新校验每题答案。
+4. 直接生成结构化 tool result，不调用 `_unreachable_execute()`。
+5. append `role=tool` Observation，再从 `checkpoint.iteration + 1` Reason。
+
+问题回答不会写入 `approved_targets`，也不会授权任何后续工具。
+
+---
+
+## 14. Codex 与 Claude Code
+
+### 14.1 Codex
+
+`backend/runners/codex_app_server.py` 把 provider 请求映射为类别：
+
+- command execution
+- file change
+- `item/tool/requestUserInput` → `user_input`
+- MCP elicitation
+- permissions
+
+CLI/app-server 原执行现场不会跨 terminal Interrupt 保存。Resume 使用
+`consume_resume_authorization()` 按 requestHash 消费一次 provider 重放请求。
+`requestUserInput` 的 `{selected, custom}` 会合并为 Codex 所需的 answers 数组。
+
+`_codex_request_detail()` 将 method 和实际语义参数纳入哈希，但剔除重启时会变化的
+`threadId/turnId/itemId`。因此新 provider Turn 可以消费同一决定，命令、补丁、权限范围或
+问题内容一旦变化则不能消费。Access Layer 对 Codex 不开旁路：仍然先持久化
+`restart_from_context` checkpoint，公开 Activity 才能向浏览器发送。
+
+### 14.2 Claude Code
+
+Claude CLI 自己执行权限算法。`claude_approval_bridge.py` 把
+`--permission-prompt-tool` 的请求经 loopback bridge 接入同一个 Broker。原 CLI
+进程在 Interrupt 后结束；Resume 属于 `restart_from_context` + 一次性 hash 授权，
+不是恢复旧 Promise 或旧子进程。
+
+Claude 原生 `AskUserQuestion` 由 bridge 识别为 `category=user_input`。bridge 将 Claude
+可选的 preview 字段投影为共享问题契约，Access Layer 仍用服务端问题定义校验答案；Resume
+再把 `selected + custom` 合并到 Claude `updatedInput.answers`，并把自定义内容保留在
+`annotations.notes`。即使 `permissionMode=full_access`，私有 prompt bridge 也会保留，
+因为 Claude 的 `requiresUserInteraction` 不能由 bypass 自动回答。
+
+---
+
+## 15. Team 与定时任务
+
+- 定时任务在执行记录对应 Session 中保存 Interrupt；详情页使用
+  `ScheduledApprovalResumeInput` 提交 approve/deny/cancel/answer。
+- Team 的 checkpoint 保存于 SQLite 事件日志，浏览器只提交 approvalId 与决定；
+  `TeamRuntime._approval_resume_decision()` 再按服务端问题定义校验答案。
+- Team worker 与 supervisor 都用新 runId Resume，原 task/attempt 保持不变。
+- terminal Interrupt 释放当前执行槽，不能把等待人工输入误记为失败或空 Artifact。
+
+---
+
+## 16. 安全与并发不变量
+
+1. 工具副作用只能发生在 sealed preflight 之后。
+2. `_checkpoint` 永远不进入公开 SSE、Session API 或 Team API。
+3. 浏览器答案不能改变 toolName、arguments、问题定义或 requestHash。
+4. 权限批准绑定 callId + requestHash；AskUserQuestion 回答也重新校验 hash。
+5. 一次 Resume 必须覆盖线程全部开放 Interrupt。
+6. 同一 Backend run 的 Interrupt queue 容量为 1。
+7. ContextVar 与 Runtime 均请求隔离，不能放到共享 Agent 实例字段。
+8. Backend 不保存跨请求审批状态，因此可以多 worker。
+9. 文件式 SessionStore 的 ResumeIntent CAS 当前只支持单 Access Layer worker；多 worker
+   必须迁移到 SQLite/共享事务存储。
+10. `unknown_outcome` 不能自动重试可能已产生副作用的工具。
+
+---
+
+## 17. 失败语义
+
+| 场景 | 行为 |
 | --- | --- |
-| `access_layer/gateway.py` | 校验并转发 run 权限 |
-| `access_layer/sessions/store.py` | Session capability 持久化 |
-| `access_layer/teams/` | Team 权限迁移与 Worker/Supervisor dispatch |
-| `access_layer/scheduled_tasks/` | 自动化权限迁移与每次触发转发 |
-| `backend/approvals.py` | Future、事件合流、归属校验与清理 |
-| `backend/agent/react_agent.py` | K Agent 权限决策与工具执行前门禁 |
-| `backend/tools/workspace.py` | run-scoped 权限 ContextVar |
-| `backend/tools/cc_like.py` | 文件越界与 Bash 执行入口 |
-| `backend/sandbox/plan.py` | srt/裸 shell 执行计划 |
-| `backend/runners/codex_app_server.py` | Codex sandbox/approval 映射 |
-| `backend/runners/claude_code.py` | Claude sandbox/permission 映射 |
-| `frontend/src/components/PermissionModeField.tsx` | Team/定时任务权限选择与风险提示 |
-| `frontend/src/components/ConversationTranscript.tsx` | 定时任务原页审批 |
+| 规则 deny | 模型可见工具错误，不弹卡 |
+| 问题 schema 非法 | 模型可见工具错误，不生成不可回答卡片 |
+| 页面刷新 | 从 `openInterrupts` 重建，checkpoint 仍在服务端 |
+| Backend 重启 | 原 Run 已结束；Access Layer checkpoint 仍可 Resume |
+| Resume runtime selection 变化 | 409 冲突 |
+| 重复/不同 Resume 决定 | ResumeIntent CAS 冲突 |
+| 参数或 requestHash 变化 | 授权/答案不消费，拒绝或再次询问 |
+| 问题没有选择也没有文本 | 409，仍保持可回答 |
+| 工具结果不确定 | `unknown_outcome`，要求人工复核 |
+
+---
+
+## 18. 代码地图
+
+| 文件 | 职责 |
+| --- | --- |
+| `backend/main.py` | Backend run 入口、ContextVar、Runner/Broker/AG-UI 装配 |
+| `backend/agent/react_agent.py` | ReAct、工具边界、权限门、问题门、Resume Act |
+| `backend/agent/hooks/pipeline.py` | sealed preflight → observe → execute |
+| `backend/permissions/rules.py` | allow/deny/ask 规则 |
+| `backend/runners/k_agent.py` | K Agent Runtime 与 Broker/checkpoint 适配 |
+| `backend/approvals.py` | requestHash、当前 run Interrupt 合流 |
+| `backend/agui.py` | Activity、Snapshot、terminal outcome |
+| `backend/tools/user_question.py` | 模型可见 AskUserQuestion schema |
+| `backend/user_questions.py` | 问题/答案校验与模型结果渲染 |
+| `backend/runners/codex_app_server.py` | Codex approval/input 映射 |
+| `backend/runners/claude_approval_bridge.py` | Claude permission prompt bridge |
+| `access_layer/gateway.py` | durable-before-visible、Resume 转发 |
+| `access_layer/sessions/store.py` | approval 文件、open index、ResumeIntent CAS |
+| `access_layer/teams/runtime.py` | Team Interrupt/Resume |
+| `access_layer/scheduled_tasks/runtime.py` | 定时任务 Interrupt/Resume |
+| `frontend/src/components/UserQuestionForm.tsx` | 选项 + 自定义输入问题表单 |
+| `frontend/src/App.tsx` | Work 卡片与标准 Resume Run |
+
+---
+
+## 19. 验证
+
+主要自动化入口：
+
+```bash
+.venv/bin/python -m pytest backend/tests -q
+npm --prefix frontend run test:user-question
+npm --prefix frontend run test:approval
+npm --prefix frontend run test:transcript
+npm --prefix frontend run check
+npm --prefix frontend run build:client
+git diff --check
+```
+
+当前实现已验证 `255 passed, 18 subtests passed`，其中包含 Claude/Codex 接入层重启恢复、
+语义哈希和用户问题回填测试。前端类型检查、用户问题状态测试、审批卡回归、静态时间线
+回归与生产构建通过。真实浏览器实例在本次环境中不可用，因此截图、
+窄屏和主题视觉验收仍应在可连接浏览器的环境补做。

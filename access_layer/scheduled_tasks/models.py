@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -86,8 +86,9 @@ class ScheduledApprovalResumeInput(BaseModel):
     """恢复某次 scheduled run 的 terminal Interrupt。"""
 
     interrupt_id: str = Field(alias="interruptId", min_length=1)
-    action: Literal["approve", "deny", "cancel"]
+    action: Literal["approve", "deny", "cancel", "answer"]
     scope: Literal["once", "run"] = "once"
+    answers: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class ScheduledTaskOutput(BaseModel):

@@ -14,18 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import AsyncIterator
-
-
-@dataclass(frozen=True, slots=True)
-class ConcurrencySnapshot:
-    """运维/健康检查用的瞬时并发计数快照。"""
-
-    max_concurrent_requests: int
-    active_requests: int
-    available_request_slots: int
-    session_lock_count: int
 
 
 class RequestConcurrencyLimiter:
@@ -37,14 +26,12 @@ class RequestConcurrencyLimiter:
     """
 
     def __init__(self, max_concurrent_requests: int, acquire_timeout_seconds: float) -> None:
-        """初始化全局信号量、会话锁表与活跃计数（均进程本地）。"""
+        """初始化全局信号量与会话锁表（均进程本地）。"""
         self.max_concurrent_requests = max(1, max_concurrent_requests)
         self.acquire_timeout_seconds = max(0.0, acquire_timeout_seconds)
         self._request_slots = asyncio.BoundedSemaphore(self.max_concurrent_requests)
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_locks_guard = asyncio.Lock()
-        self._active_requests = 0
-        self._active_guard = asyncio.Lock()
 
     @asynccontextmanager
     async def protect(self, session_id: str) -> AsyncIterator[None]:
@@ -58,8 +45,6 @@ class RequestConcurrencyLimiter:
         try:
             await asyncio.wait_for(self._request_slots.acquire(), timeout=self.acquire_timeout_seconds)
             acquired_slot = True
-            async with self._active_guard:
-                self._active_requests += 1
 
             # 不同会话可并行；同会话必须串行，否则历史会出现 last-write-wins。
             session_lock = await self._get_session_lock(session_id)
@@ -72,20 +57,7 @@ class RequestConcurrencyLimiter:
             if acquired_session_lock and session_lock is not None:
                 session_lock.release()
             if acquired_slot:
-                async with self._active_guard:
-                    self._active_requests -= 1
                 self._request_slots.release()
-
-    async def snapshot(self) -> ConcurrencySnapshot:
-        """返回计数快照，不暴露也不修改底层锁对象。"""
-        async with self._active_guard:
-            active = self._active_requests
-        return ConcurrencySnapshot(
-            max_concurrent_requests=self.max_concurrent_requests,
-            active_requests=active,
-            available_request_slots=max(0, self.max_concurrent_requests - active),
-            session_lock_count=len(self._session_locks),
-        )
 
     async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """惰性创建并缓存 per-session Lock；表本身用独立锁保护。"""

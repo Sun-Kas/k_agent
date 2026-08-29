@@ -16,15 +16,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from backend.home import (
+from access_layer.home import (
     mcp_catalog_path as default_mcp_catalog_path,
     mcp_config_path as default_mcp_config_path,
     skills_catalog_path as default_skills_catalog_path,
     skills_dir as default_skills_dir,
 )
-from backend.mcp_tool.config import load_scoped_mcp_servers
-from backend.skills.frontmatter import parse_bool, parse_markdown_frontmatter, split_frontmatter_list
-from backend.storage import write_json_atomic
+from access_layer.mcp_config import load_scoped_mcp_servers
+from access_layer.skills.frontmatter import parse_bool, parse_markdown_frontmatter, split_frontmatter_list
+from access_layer.storage import write_json_atomic
 
 
 class CatalogError(ValueError):

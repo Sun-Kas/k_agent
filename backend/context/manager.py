@@ -12,6 +12,7 @@ import math
 from typing import Any
 
 from backend.api.schemas import ChatMessage
+from backend.prompts.models import PromptBundle
 
 
 # 这些默认值只在模型配置缺字段时兜底，真实值应由 models.config.json 提供。
@@ -68,8 +69,9 @@ class ContextPlan:
 def build_context_plan(
     messages: list[ChatMessage],
     *,
-    system_prompt: str,
-    user_context: dict[str, str],
+    prompt: PromptBundle | None = None,
+    system_prompt: str = "",
+    user_context: dict[str, str] | None = None,
     model_config: dict[str, Any],
     existing_summary: str = "",
     compacted_message_ids: list[str] | None = None,
@@ -83,8 +85,14 @@ def build_context_plan(
     active = pair_tool_messages(
         [message for message in messages if message.id not in compacted]
     )
-    system_tokens = estimate_text_tokens(system_prompt)
-    memory_tokens = estimate_text_tokens("\n".join(user_context.values()))
+    effective_system = prompt.system_prompt if prompt is not None else system_prompt
+    effective_context = (
+        prompt.context_message or ""
+        if prompt is not None
+        else "\n".join((user_context or {}).values())
+    )
+    system_tokens = estimate_text_tokens(effective_system)
+    memory_tokens = estimate_text_tokens(effective_context)
     summary_tokens = estimate_text_tokens(existing_summary)
     message_tokens = estimate_message_tokens(active)
     # 系统提示词、记忆、摘要和工具定义都是本轮无法裁剪的固定开销，
@@ -266,8 +274,10 @@ def prune_old_tool_outputs(
 def compose_api_messages(
     messages: list[ChatMessage],
     *,
-    system_prompt: str,
-    user_context: dict[str, str],
+    prompt: PromptBundle | None = None,
+    system_prompt: str = "",
+    user_context: dict[str, str] | None = None,
+    context_summary: str = "",
     attachments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """组装 provider 请求需要的 system/user/context/messages/attachments。"""
@@ -314,11 +324,21 @@ def compose_api_messages(
             })
             continue
         body.append({"role": message.role, "content": content})
-    reminder = _render_user_context(user_context)
+    if prompt is not None:
+        reminder = prompt.context_message or ""
+    else:
+        reminder = _render_user_context(user_context or {})
+    if context_summary:
+        summary_block = (
+            "<system-reminder>\n# conversation_summary\n"
+            "This is continuity context from compacted earlier turns, not a new user request.\n\n"
+            f"{context_summary}\n</system-reminder>"
+        )
+        reminder = "\n\n".join(item for item in (reminder, summary_block) if item)
     # 记忆和动态上下文作为独立的 user 消息插在历史之前，而不是拼进 system：
     # 这样 system 提示词保持稳定，可被 provider 端前缀缓存复用。
     return [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": prompt.system_prompt if prompt is not None else system_prompt},
         *([{"role": "user", "content": reminder}] if reminder else []),
         *body,
     ]

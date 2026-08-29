@@ -240,7 +240,10 @@ export interface AgUiRunInput {
   resume?: Array<{
     interruptId: string;
     status: "resolved" | "cancelled";
-    payload?: { approved: boolean; scope?: "once" | "run"; reconfirm?: boolean };
+    payload?: (
+      | { approved: boolean; scope?: "once" | "run"; reconfirm?: boolean }
+      | { answers: UserQuestionAnswers; reconfirm?: boolean }
+    );
   }>;
   forwardedProps: {
     modelId?: string;
@@ -317,10 +320,29 @@ export interface ApprovalActivity {
   title: string;
   message: string;
   detail: Record<string, unknown>;
-  status: "pending" | "submitting" | "approved" | "denied" | "cancelled" | "expired" | "unknown_outcome" | "resume_failed" | "error";
+  status: "pending" | "submitting" | "approved" | "answered" | "denied" | "cancelled" | "expired" | "unknown_outcome" | "resume_failed" | "error";
   sequence: number;
   error?: string;
+  answers?: UserQuestionAnswers;
 }
+
+export interface UserQuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface UserQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: UserQuestionOption[];
+  multiSelect: boolean;
+}
+
+export type UserQuestionAnswers = Record<string, {
+  selected: string[];
+  custom: string;
+}>;
 
 export interface AgUiInterrupt {
   id: string;

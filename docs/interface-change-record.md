@@ -2,6 +2,22 @@
 
 > 维护约定：后续涉及前后端接口、MCP/Skill/Memory 加载链路、系统提示词拼接、权限边界或缓存策略的重要修改，都需要在本文追加记录。
 
+## 2026-08-24 AskUserQuestion 持久化用户输入 HITL
+
+- K Agent 的 `coding` 工具预设新增 `AskUserQuestion`。一次调用可包含 1–4 个
+  问题，每题提供 2–4 个预设选项并声明单选或多选；前端始终同时提供自由文本。
+  预设选择与自由文本是两个独立字段，因此用户可以只选、只输入，或选择后继续补充。
+- 该工具不是权限申请，不受 `permissionMode=full_access` 跳过审批的行为影响。
+  Agent Backend 在 sealed preflight 中先校验问题定义，再发出
+  `category=user_input` 的 terminal Interrupt；用户回答前不会执行工具。
+- Resume payload 使用 `answers[questionId] = { selected: string[], custom: string }`。
+  Access Layer 必须用服务端 checkpoint 中的问题和选项重新校验答案，浏览器不能替换
+  问题定义或 request hash。恢复后 K Agent 把结构化答案写成原调用的
+  `TOOL_CALL_RESULT`，然后从下一轮 Reason 继续。
+- Work、Agent Team 与定时任务共用相同答案结构和问题卡。回答后的 Activity 状态为
+  `answered`；取消则产生明确的 cancelled 工具结果。问题 Interrupt 与权限审批仍复用
+  durable-before-visible、开放 Interrupt 阻断新消息和一次性 Resume 认领机制。
+
 ## 2026-08-11 会话、Team 与定时任务统一权限模式
 
 > 设计依据、完整审批时序、Runner 映射与失败恢复见
@@ -356,3 +372,11 @@
   保存在 SQLite 事件日志中，但 Team 查询与 SSE 接口会剥离 `_checkpoint`。
 - 旧 `/api/approvals/{id}` 暂留迁移壳，但新前端和新 run 均不再依赖其 Backend
   内存 pending 状态。
+- Claude Code 与 Codex 使用同一 durable-before-visible 接入层：两者的 Interrupt 都先
+  保存 `restart_from_context` checkpoint，再公开 Activity；Access Layer 重启后仍可列出、
+  原子认领并向 Backend 发送私有 `resumeCheckpoints`。
+- Codex provider 请求哈希绑定 method 与实际语义 params，排除重放时变化的
+  `threadId/turnId/itemId`；命令、补丁、权限或问题内容变化时不能消费旧授权。
+- Claude 原生 `AskUserQuestion` 经私有 permission-prompt bridge 映射为 `user_input`；
+  Resume 将共享的 `selected/custom` 回填到 Claude `updatedInput.answers/annotations`。
+  即使 `full_access/bypassPermissions`，该交互 bridge 仍保留。

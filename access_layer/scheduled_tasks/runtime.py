@@ -13,7 +13,7 @@ from ag_ui.core import RunAgentInput
 
 from access_layer.gateway import AgentAccessLayer
 from access_layer.scheduled_tasks.store import ScheduledTaskStore
-from backend.logging_config import log_event
+from access_layer.logging_config import log_event
 
 
 logger = logging.getLogger("k_agent.access.scheduled_tasks")
@@ -108,6 +108,7 @@ class ScheduledTaskRuntime:
         interrupt_id: str,
         action: str,
         scope: str,
+        answers: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """用 scheduled task 原配置启动标准 Resume Run，并更新原触发记录。"""
 
@@ -137,7 +138,11 @@ class ScheduledTaskRuntime:
                     {}
                     if action == "cancel"
                     else {"payload": {
-                        "approved": action == "approve", "scope": scope,
+                        **(
+                            {"answers": answers or {}}
+                            if action == "answer"
+                            else {"approved": action == "approve", "scope": scope}
+                        ),
                         **({"reconfirm": True} if requires_reconfirm else {}),
                     }}
                 ),

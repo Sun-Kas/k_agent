@@ -23,7 +23,7 @@ def test_ignores_runtime_config_names() -> None:
 
 def test_lists_user_files_and_skips_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("K_AGENT_HOME", str(tmp_path / "home"))
-    from backend.home import reset_home_cache, session_workspace_dir
+    from access_layer.home import reset_home_cache, session_workspace_dir
 
     reset_home_cache()
     session_id = "sess-demo"
@@ -48,7 +48,7 @@ def test_reads_text_and_blocks_config_and_escape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("K_AGENT_HOME", str(tmp_path / "home"))
-    from backend.home import reset_home_cache, session_workspace_dir
+    from access_layer.home import reset_home_cache, session_workspace_dir
 
     reset_home_cache()
     session_id = "sess-read"

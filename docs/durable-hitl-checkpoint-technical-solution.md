@@ -1,8 +1,8 @@
 # 基于 AG-UI Interrupt 的可持久化 HITL 技术方案
 
-> 状态：待实现、待评审  
-> 协议基线：`ag-ui-protocol 0.1.19` 及其 Interrupt 生命周期  
-> 适用范围：Work 对话、定时任务、Agent Team；K Agent、Codex、Claude Code  
+> 状态：主体已实现；文件式 CAS 仍限定单 Access Layer worker，真实浏览器视觉验收待补
+> 协议基线：`ag-ui-protocol 0.1.19` 及其 Interrupt 生命周期
+> 适用范围：Work 对话、定时任务、Agent Team；K Agent、Codex、Claude Code
 > 关联文档：[权限模式与 HITL 技术方案](permission-and-hitl-technical-solution.md)
 
 ## 1. 结论
@@ -14,18 +14,18 @@
 2. Access Layer 立即把 Interrupt 和恢复检查点持久化到 Session 目录。
 3. 原 Run 发送状态/消息快照，并以
    `RUN_FINISHED.outcome.type="interrupt"` 正常结束。
-4. 用户以后批准、拒绝或取消时，使用相同 `threadId`、新的 `runId` 和
+4. 用户以后批准、拒绝、回答问题或取消时，使用相同 `threadId`、新的 `runId` 和
    `RunAgentInput.resume[]` 启动恢复 Run。
 5. Resume Run 重新校验检查点；批准时执行原来展示过的准确工具调用，拒绝时把结构化
-   拒绝结果交回 Agent。
+   拒绝结果交回 Agent；`AskUserQuestion` 则校验 `selected/custom` 后把答案作为 tool result。
 
 这意味着系统不再需要“在线等待十分钟后才保存”的业务语义。审批请求一产生就持久化，
 原 Run 随即释放 HTTP 流、会话执行锁、MCP 租约、CLI 子进程和并发槽。审批本身可以
 长期保持未决，但绝不会因等待时间自动批准或执行。
 
-## 2. 当前实现与问题
+## 2. 迁移前实现与问题（历史背景）
 
-当前实现使用自定义的在线审批通道：
+2026-08-19 迁移前使用自定义的在线审批通道：
 
 - `ApprovalBroker.request()` 创建进程内 `asyncio.Future`；
 - Runner 停在 `await Future`；
@@ -483,24 +483,35 @@ K Agent 第一阶段实现精确的 `react_tool_boundary`：
 
 ### 11.1 Codex
 
-1. 保存 provider thread ID、原生 request method/params 和 canonical hash。
-2. Resume Run 使用 app-server `thread/resume`。
-3. Provider 若重新暴露相同 request，则消费一次标准 resume 决议。
-4. Provider 无法恢复原 request 时，进入 `restart_from_context`；新 Turn 必须重新生成并
+1. Interrupt 保存原生 request method、语义 params 和 canonical hash；
+   `threadId/turnId/itemId` 等重放路由 ID 不进入哈希。
+2. 已有持久化 provider thread ID 且会话配置为 resume 时，使用 app-server
+   `thread/resume`；否则从 Access Layer 历史 `restart_from_context`。
+3. Provider 若重新暴露相同语义 request，则消费一次标准 resume 决议；命令、补丁、权限
+   或问题内容变化时重新 Interrupt。
+4. Provider 无法恢复原 request 时，新 Turn 必须重新生成并
    校验工具调用，不能直接执行旧参数。
+5. `item/tool/requestUserInput` 复用同一持久化记录；`selected/custom` 都转换进 Codex
+   answers 数组。
 
 ### 11.2 Claude Code
 
 原 MCP permission socket 和 CLI 进程不能跨 Run 恢复：
 
-1. 保存 Claude session ID、tool name、input hash 和 permission request 摘要。
-2. 新 Run 使用 `--resume` 恢复 provider session。
+1. 保存 tool name、完整 input hash 和 permission request 摘要。
+2. 已有持久化 Claude session ID 且会话配置为 resume 时使用 `--resume`；否则从 Access
+   Layer 历史 `restart_from_context`。
 3. 注入只对准确 `(toolName,inputHash)` 有效的一次性授权。
 4. Claude 重新请求完全相同工具和参数时消费授权。
 5. 名称或参数变化时重新进入 HITL。
+6. 原生 `AskUserQuestion` 映射为 `user_input`，由 Access Layer 校验答案；Resume 将
+   `selected/custom` 回填为 Claude `updatedInput.answers`。
+7. `full_access/bypassPermissions` 仍保留私有 prompt bridge，保证
+   `requiresUserInteraction` 工具有可用的回答通道。
 
-在完成真实 provider 协议测试前，Codex/Claude UI 应显示“重新开始并继续”，不能声称
-能够原地恢复旧进程。
+Codex/Claude UI 应描述为“重新开始并继续”，不能声称原地恢复旧进程。接入层持久化、
+重启读取、一次性认领和 hash 消费已经有自动化覆盖；真实 CLI 版本升级后仍需做 provider
+协议兼容测试。
 
 ## 12. TOCTOU 与安全不变量
 
@@ -681,9 +692,9 @@ K Agent 第一阶段实现精确的 `react_tool_boundary`：
 4. 新字段和目录不能改变原始 AG-UI event 到达顺序。
 5. 旧版本如果会删除未知字段，降级写入前必须阻止启动或先备份 Session。
 
-## 20. 评审建议
+## 20. 已采纳的评审结论
 
-建议按以下结论进入实现：
+实现已按以下结论落地：
 
 1. 采用 AG-UI terminal interrupt，不保留十分钟在线 Future 快速路径。
 2. approval/checkpoint 使用 Session 下的独立原子文件，主 JSON 只保存开放 ID 索引。
@@ -693,7 +704,7 @@ K Agent 第一阶段实现精确的 `react_tool_boundary`：
    `restart_from_context` 降级语义。
 6. 文件式存储阶段限定单 Access Layer worker；需要多 worker 时先迁移到 SQLite。
 
-## 21. 2026-08-19 实施记录
+## 21. 实施记录（2026-08-19，更新于 2026-08-24）
 
 本方案已落入代码，当前实现边界如下。
 
@@ -709,6 +720,10 @@ K Agent 第一阶段实现精确的 `react_tool_boundary`：
 - K Agent 保存 `react_tool_boundary`，包含 provider 消息、iteration、并列工具调用和
   当前下标；批准只授权匹配 `callId + requestHash` 的一次执行，拒绝/取消作为 tool
   result 返回模型。
+- K Agent 注册模型可见的 `AskUserQuestion`。问题请求使用 `category=user_input` 和
+  `reason=input_required`，不被 `full_access` 跳过；用户可只选选项、只填写自定义内容，
+  或同时提交二者。Resume 以 checkpoint 原问题和 requestHash 校验答案，再把答案作为
+  tool result 交回模型，不调用普通工具 executor。
 - Codex/Claude 采用 `restart_from_context` 降级，并对 provider 重新发出的完全相同
   请求消费一次 hash 绑定授权；参数改变时重新进入审批。
 - 前端主对话、定时任务和 Team 工作台均改为提交标准 Resume Run，不再依赖旧的
@@ -720,11 +735,14 @@ K Agent 第一阶段实现精确的 `react_tool_boundary`：
 
 ### 21.2 已验证
 
-- `.venv/bin/python -m pytest backend/tests -q`：240 passed，13 subtests passed。
-- `npm --prefix frontend run check`、`test:stream`、`test:approval`、
-  `test:transcript` 和 `build:client` 均通过。
+- `.venv/bin/python -m pytest backend/tests -q`：255 passed，18 subtests passed。
+- `npm --prefix frontend run check`、`test:stream`、`test:user-question`、
+  `test:approval`、`test:transcript` 和 `build:client` 均通过。
 - 覆盖 durable-before-visible、服务重载、开放 Interrupt 门禁、完整 Resume 覆盖、
-  checkpoint 不出服务端、Team terminal interrupt 和 provider 一次性 hash 授权。
+  checkpoint 不出服务端、用户问题三种回答组合、Team terminal interrupt 和 provider
+  一次性 hash 授权。
+- Claude/Codex 专项覆盖 Access Layer 重启后认领 `restart_from_context` checkpoint、Codex
+  语义参数 hash、Claude `AskUserQuestion` 回填，以及 full-access 下保留交互桥。
 
 ### 21.3 尚未关闭的验收项
 

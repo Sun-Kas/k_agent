@@ -7,7 +7,7 @@ import unittest
 
 from access_layer.catalog import CatalogError, RuntimeCatalog
 from access_layer.main import _merge_mcp_runtime_status
-from backend.api.schemas import McpServerInput
+from access_layer.schemas import McpServerInput
 from pydantic import ValidationError
 
 

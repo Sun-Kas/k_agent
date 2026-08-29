@@ -11,6 +11,12 @@ from backend.memory.cache import MEMORY_CACHE, clear_memory_cache
 from backend.memory.discovery import get_memory_files, get_nested_memory_files, is_memory_file
 from backend.memory.models import MemoryFile, MemoryLoadReport, MemoryType
 from backend.memory.renderer import get_memory_context
+from backend.memory.runtime import (
+    load_eager_memory,
+    load_fresh_nested_memory,
+    resolve_instruction_root,
+    trusted_tool_paths,
+)
 
 __all__ = [
     "MEMORY_CACHE",
@@ -25,6 +31,10 @@ __all__ = [
     "get_memory_files",
     "get_nested_memory_files",
     "is_memory_file",
+    "load_eager_memory",
+    "load_fresh_nested_memory",
     "read_auto_memory",
+    "resolve_instruction_root",
     "search_auto_memory",
+    "trusted_tool_paths",
 ]

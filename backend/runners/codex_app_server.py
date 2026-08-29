@@ -288,7 +288,7 @@ async def _handle_server_request(
         or _question_text(params)
         or "请确认是否继续该操作。"
     )
-    detail = {"method": method, **params}
+    detail = _codex_request_detail(method, params)
     decision = consume_resume_authorization(
         resume_authorization, title=title, detail=detail
     )
@@ -332,6 +332,29 @@ async def _handle_server_request(
     }
 
 
+def _codex_request_detail(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Build a hashable provider request without binding replay-only IDs.
+
+    Codex creates new thread/turn/item identifiers when a durable Resume must
+    restart from Access Layer history. Those routing IDs cannot be part of the
+    one-shot authorization hash, while the actual command, patch, permission,
+    elicitation, or question payload must be. Keeping the original params at
+    the top level also preserves the UI detail and question definitions.
+    """
+
+    volatile_keys = {"threadId", "turnId", "itemId"}
+    arguments = {
+        key: value for key, value in params.items() if key not in volatile_keys
+    }
+    return {
+        **params,
+        "method": method,
+        "source": "codex_app_server",
+        "toolName": method,
+        "arguments": arguments,
+    }
+
+
 def _tool_answers(
     params: dict[str, Any],
     action: str,
@@ -347,6 +370,15 @@ def _tool_answers(
         if not question_id:
             continue
         selected = supplied.get(question_id)
+        if isinstance(selected, dict):
+            values = selected.get("selected")
+            custom = selected.get("custom")
+            combined = [str(value) for value in values] if isinstance(values, list) else []
+            if isinstance(custom, str) and custom.strip():
+                combined.append(custom.strip())
+            if combined:
+                result[question_id] = {"answers": combined}
+                continue
         if isinstance(selected, list) and selected:
             result[question_id] = {"answers": [str(value) for value in selected]}
             continue

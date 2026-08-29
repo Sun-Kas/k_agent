@@ -92,7 +92,11 @@ class ClaudeCodeRunner:
             if full_access:
                 permission_mode = "bypassPermissions"
             claude_mcp_servers = list(ctx.mcp_servers)
-            if approval_bridge is not None and permission_mode != "bypassPermissions":
+            if approval_bridge is not None:
+                # Even bypassPermissions cannot answer requiresUserInteraction
+                # tools such as AskUserQuestion. Keep the private prompt bridge
+                # installed in full-access runs while ordinary tools remain
+                # bypassed by Claude's own permission mode.
                 claude_mcp_servers.append(approval_bridge.mcp_server())
             mcp_config = write_claude_mcp_config(workspace, claude_mcp_servers)
 
@@ -119,10 +123,10 @@ class ClaudeCodeRunner:
                     separators=(",", ":"),
                 ),
             ])
-            if approval_bridge is not None and permission_mode != "bypassPermissions":
+            if approval_bridge is not None:
                 # Claude print mode delegates permission prompts to this private
-                # MCP tool; its result is normalized by ApprovalBroker exactly
-                # like K Agent and Codex app-server requests.
+                # MCP tool. Under bypassPermissions it is still needed for
+                # requiresUserInteraction tools; normal permissions stay bypassed.
                 argv.extend([
                     "--allowedTools", *_claude_allowed_tools(ctx),
                     "--permission-prompt-tool", APPROVAL_TOOL_NAME,

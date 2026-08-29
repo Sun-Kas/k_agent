@@ -551,7 +551,7 @@ def test_accepted_files_publish_to_team_workspace_and_flow_downstream(tmp_path: 
     import os
     from unittest.mock import patch
 
-    from backend.home import reset_home_cache, shared_runtime_dir
+    from access_layer.home import reset_home_cache, shared_runtime_dir
 
     workspace = tmp_path / "team-deliverables"
     home = tmp_path / "k_agent_home"

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { AgUiEvent, ApprovalActivity, ChatMessage, SessionState, ToolActivity } from "../types";
+import type { AgUiEvent, ApprovalActivity, ChatMessage, SessionState, ToolActivity, UserQuestionAnswers } from "../types";
 import { MarkdownContent } from "./MarkdownContent";
 import { timelineFromEvents, type StaticTimelineActivity } from "./transcript-timeline";
+import { UserQuestionForm } from "./UserQuestionForm";
+import { userQuestionsFromDetail } from "../user-question";
 
 export function groupDisplayMessages(messages: ChatMessage[]): ChatMessage[] {
   const grouped: ChatMessage[] = [];
@@ -44,8 +46,9 @@ export function StaticConversationTranscript({
   session: SessionState;
   onApprovalDecision?: (
     approval: ApprovalActivity,
-    action: "approve" | "deny",
-    scope: "once" | "run"
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope: "once" | "run",
+    answers?: UserQuestionAnswers
   ) => Promise<void>;
 }) {
   const messages = useMemo(() => groupDisplayMessages(session.messages), [session.messages]);
@@ -119,6 +122,9 @@ function approvalsFromEvents(
           ? value.detail as Record<string, unknown>
           : {},
         status: "pending",
+        answers: value.answers && typeof value.answers === "object"
+          ? value.answers as UserQuestionAnswers
+          : undefined,
         sequence: sequence += 1
       });
     }
@@ -128,8 +134,13 @@ function approvalsFromEvents(
     const status = String(value.status ?? "");
     approvals.set(id, {
       ...current,
+      answers: value.answers && typeof value.answers === "object"
+        ? value.answers as UserQuestionAnswers
+        : current.answers,
       status: status === "approved" || action === "approve"
         ? "approved"
+        : status === "answered" || action === "answer"
+          ? "answered"
         : status === "denied" || action === "deny"
           ? "denied"
           : status === "expired" || action === "expired"
@@ -155,12 +166,14 @@ function StaticApprovalCard({ approval, onDecision }: {
   approval: ApprovalActivity;
   onDecision?: (
     approval: ApprovalActivity,
-    action: "approve" | "deny",
-    scope: "once" | "run"
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope: "once" | "run",
+    answers?: UserQuestionAnswers
   ) => Promise<void>;
 }) {
   const [status, setStatus] = useState(approval.status);
   const [error, setError] = useState("");
+  const [submittedAnswers, setSubmittedAnswers] = useState<UserQuestionAnswers | undefined>();
   useEffect(() => { setStatus(approval.status); }, [approval.status]);
   const pending = status === "pending"
     || status === "unknown_outcome"
@@ -168,13 +181,18 @@ function StaticApprovalCard({ approval, onDecision }: {
     || status === "error";
   const preview = approval.detail.command ?? approval.detail.arguments;
 
-  async function decide(action: "approve" | "deny", scope: "once" | "run" = "once") {
+  async function decide(
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope: "once" | "run" = "once",
+    answers?: UserQuestionAnswers
+  ) {
     setStatus("submitting");
     setError("");
     try {
       if (!onDecision) throw new Error("当前视图不支持恢复该审批");
-      await onDecision(approval, action, scope);
-      setStatus(action === "approve" ? "approved" : "denied");
+      await onDecision(approval, action, scope, answers);
+      if (action === "answer") setSubmittedAnswers(answers);
+      setStatus(action === "answer" ? "answered" : action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled");
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "审批提交失败";
       const expired = /no longer pending|不再等待|已失效/i.test(message);
@@ -183,13 +201,25 @@ function StaticApprovalCard({ approval, onDecision }: {
     }
   }
 
-  return <section className={`approval-card ${status}`} aria-live="polite">
-    <header><span className="approval-shield" aria-hidden="true">!</span><div><small>{approval.agentKind} · {approval.category}</small><strong>{approval.title}</strong></div><b>{status === "pending" ? "等待确认" : status === "submitting" ? "正在提交" : status === "approved" ? "已允许" : status === "denied" ? "已拒绝" : status === "cancelled" ? "已取消" : status === "expired" ? "已失效" : status === "unknown_outcome" ? "结果未知，需复核" : "提交失败"}</b></header>
-    <p>{approval.message}</p>
-    {status === "unknown_outcome" && <p className="approval-error">恢复期间曾退出，重复执行可能产生副作用，请先检查外部状态。</p>}
-    {preview !== undefined && <code>{typeof preview === "string" ? preview : JSON.stringify(preview, null, 2)}</code>}
+  const statusText = status === "pending" ? "等待确认" : status === "submitting" ? "正在提交" : status === "answered" ? "已回答" : status === "approved" ? "已允许" : status === "denied" ? "已拒绝" : status === "cancelled" ? "已取消" : status === "expired" ? "已失效" : status === "unknown_outcome" ? "结果未知，需复核" : "提交失败";
+  const questions = approval.category === "user_input" ? userQuestionsFromDetail(approval.detail) : [];
+  return <section className={`approval-card ${approval.category === "user_input" ? "user-question-card" : ""} ${status}`} aria-live="polite">
+    <header><span className="approval-shield" aria-hidden="true">{approval.category === "user_input" ? "?" : "!"}</span><div><small>{approval.agentKind} · {approval.category}</small><strong>{approval.title}</strong></div><b>{statusText}</b></header>
+    {approval.category === "user_input" && questions.length > 0
+      ? <UserQuestionForm
+          disabled={status === "submitting"}
+          onCancel={() => decide("cancel")}
+          onSubmit={(answers) => decide("answer", "once", answers)}
+          questions={questions}
+          resolvedAnswers={status === "answered" ? (approval.answers ?? submittedAnswers) : undefined}
+        />
+      : <>
+          <p>{approval.message}</p>
+          {status === "unknown_outcome" && <p className="approval-error">恢复期间曾退出，重复执行可能产生副作用，请先检查外部状态。</p>}
+          {preview !== undefined && <code>{typeof preview === "string" ? preview : JSON.stringify(preview, null, 2)}</code>}
+          {pending && <footer><button type="button" onClick={() => void decide("deny")}>拒绝</button><button type="button" onClick={() => void decide("approve")}>{status === "unknown_outcome" ? "确认后再次执行" : "允许一次"}</button><button className="primary" type="button" onClick={() => void decide("approve", "run")}>本轮始终允许</button></footer>}
+        </>}
     {error && <p className="approval-error">{error}</p>}
-    {pending && <footer><button type="button" onClick={() => void decide("deny")}>拒绝</button><button type="button" onClick={() => void decide("approve")}>{status === "unknown_outcome" ? "确认后再次执行" : "允许一次"}</button><button className="primary" type="button" onClick={() => void decide("approve", "run")}>本轮始终允许</button></footer>}
   </section>;
 }
 
