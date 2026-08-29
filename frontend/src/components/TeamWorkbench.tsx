@@ -40,7 +40,8 @@ import type {
   DetectedAgent,
   HealthState,
   ModelProfile,
-  RuntimeOption
+  RuntimeOption,
+  UserQuestionAnswers
 } from "../types";
 import type { PermissionMode } from "../types";
 import type {
@@ -52,6 +53,8 @@ import type {
   TeamTask
 } from "../team/types";
 import { PermissionModeField } from "./PermissionModeField";
+import { UserQuestionForm } from "./UserQuestionForm";
+import { userQuestionsFromDetail } from "../user-question";
 
 
 const BUILTIN_AGENTS: DetectedAgent[] = [
@@ -1015,7 +1018,7 @@ type ConversationItem =
   | { kind: "message"; id: string; content: string; occurredAt: string }
   | { kind: "reasoning"; id: string; content: string; occurredAt: string }
   | { kind: "tool"; id: string; name: string; arguments: string; result: string; status: "running" | "waiting" | "complete" | "error"; occurredAt: string }
-  | { kind: "approval"; id: string; teamId: string; threadId: string; runId: string; agentKind: AgentKind; category: string; title: string; message: string; detail: Record<string, unknown>; status: "pending" | "approved" | "denied" | "cancelled"; action?: string; occurredAt: string }
+  | { kind: "approval"; id: string; teamId: string; threadId: string; runId: string; agentKind: AgentKind; category: string; title: string; message: string; detail: Record<string, unknown>; status: "pending" | "approved" | "answered" | "denied" | "cancelled"; action?: string; answers?: UserQuestionAnswers; occurredAt: string }
   | { kind: "notice"; id: string; label: string; tone: "normal" | "error" | "success"; occurredAt: string };
 
 
@@ -1235,18 +1238,25 @@ function ConversationTool({ item }: { item: Extract<ConversationItem, { kind: "t
 function ConversationApproval({ item }: { item: Extract<ConversationItem, { kind: "approval" }> }) {
   const [submission, setSubmission] = useState<"idle" | "submitting" | "error">("idle");
   const [optimisticAction, setOptimisticAction] = useState<string | null>(null);
+  const [optimisticAnswers, setOptimisticAnswers] = useState<UserQuestionAnswers | undefined>();
   const resolvedAction = item.action ?? optimisticAction;
   const pending = item.status === "pending" && !resolvedAction;
   const preview = approvalPreview(item.detail);
+  const questions = item.category === "user_input" ? userQuestionsFromDetail(item.detail) : [];
 
   useEffect(() => {
     if (item.status !== "pending") setSubmission("idle");
   }, [item.status]);
 
-  async function decide(action: "approve" | "deny" | "cancel", scope: "once" | "run" = "once") {
+  async function decide(
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope: "once" | "run" = "once",
+    answers?: UserQuestionAnswers
+  ) {
     setSubmission("submitting");
     try {
-      await resumeTeamApproval(item.teamId, item.id, action, scope);
+      await resumeTeamApproval(item.teamId, item.id, action, scope, answers);
+      if (action === "answer") setOptimisticAnswers(answers);
       setOptimisticAction(action);
       setSubmission("idle");
     } catch {
@@ -1256,6 +1266,8 @@ function ConversationApproval({ item }: { item: Extract<ConversationItem, { kind
 
   const statusLabel = resolvedAction === "approve"
     ? "已允许"
+    : resolvedAction === "answer"
+      ? "已回答"
     : resolvedAction === "deny"
       ? "已拒绝"
       : resolvedAction === "cancel"
@@ -1267,9 +1279,19 @@ function ConversationApproval({ item }: { item: Extract<ConversationItem, { kind
     <section className={`team-conversation-approval ${pending ? "pending" : "resolved"}`}>
       <header><span>!</span><div><small>HUMAN APPROVAL · {item.agentKind}</small><strong>{item.title}</strong></div><b>{statusLabel}</b></header>
       <p>{item.message}</p>
-      {preview && <pre>{preview}</pre>}
+      {item.category === "user_input" && questions.length > 0
+        ? <UserQuestionForm
+            disabled={submission === "submitting"}
+            onCancel={() => decide("cancel")}
+            onSubmit={(answers) => decide("answer", "once", answers)}
+            questions={questions}
+            resolvedAnswers={item.status === "answered" ? item.answers : optimisticAnswers}
+          />
+        : <>
+            {preview && <pre>{preview}</pre>}
+            {pending && <footer><button type="button" disabled={submission === "submitting"} onClick={() => void decide("deny")}>拒绝</button><button type="button" disabled={submission === "submitting"} onClick={() => void decide("approve")}>允许一次</button><button className="primary" type="button" disabled={submission === "submitting"} onClick={() => void decide("approve", "run")}>本任务始终允许</button></footer>}
+          </>}
       {submission === "error" && <p className="team-approval-error">审批提交失败或请求已失效，请刷新后重试。</p>}
-      {pending && <footer><button type="button" disabled={submission === "submitting"} onClick={() => void decide("deny")}>拒绝</button><button type="button" disabled={submission === "submitting"} onClick={() => void decide("approve")}>允许一次</button><button className="primary" type="button" disabled={submission === "submitting"} onClick={() => void decide("approve", "run")}>本任务始终允许</button></footer>}
     </section>
   );
 }
@@ -1381,6 +1403,9 @@ function appendApprovalRequest(
       ? value.detail as Record<string, unknown>
       : {},
     status: "pending",
+    answers: value.answers && typeof value.answers === "object"
+      ? value.answers as UserQuestionAnswers
+      : undefined,
     occurredAt: event.occurredAt,
   };
   approvals.set(id, approval);
@@ -1398,9 +1423,14 @@ function resolveApprovalItem(
   approval.action = action;
   approval.status = snapshotStatus === "approved" || action === "approve"
     ? "approved"
+    : snapshotStatus === "answered" || action === "answer"
+      ? "answered"
     : snapshotStatus === "denied" || action === "deny"
       ? "denied"
       : "cancelled";
+  if (value.answers && typeof value.answers === "object") {
+    approval.answers = value.answers as UserQuestionAnswers;
+  }
 }
 
 function approvalPreview(detail: Record<string, unknown>): string {

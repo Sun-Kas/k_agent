@@ -172,7 +172,11 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
     ) -> dict:
         try:
             return await runtime.resume_approval(
-                team_id, approval_id, action=payload.action, scope=payload.scope
+                team_id,
+                approval_id,
+                action=payload.action,
+                scope=payload.scope,
+                answers=payload.answers,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Team not found") from exc

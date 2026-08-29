@@ -22,7 +22,7 @@ from access_layer.workspace_fs import (
     list_workspace_files,
     read_workspace_file,
 )
-from backend.home import public_home_relative_path, session_workspace_dir
+from access_layer.home import public_home_relative_path, session_workspace_dir
 
 # Re-export for existing tests / callers.
 def is_ignored_workspace_name(name: str) -> bool:

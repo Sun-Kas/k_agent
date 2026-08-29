@@ -221,26 +221,3 @@ class SkillInput(BaseModel):
 class SkillsConfigUpdate(BaseModel):
     """描述 Skill 配置更新请求。"""
     skills: list[SkillInput]
-
-
-class SkillCreateInput(BaseModel):
-    """描述创建 Skill 的请求字段。"""
-    id: str = Field(min_length=1, max_length=80)
-    name: str = Field(min_length=1, max_length=120)
-    description: str = Field(default="", max_length=500)
-    instructions: str = Field(default="", max_length=50_000)
-    paths: list[str] = Field(default_factory=list)
-
-
-class ApprovalResolutionInput(BaseModel):
-    """User decision for a run-scoped approval request."""
-
-    # Approval decisions are security-sensitive. Reject stale/unknown fields
-    # instead of silently degrading an old `remember` request to scope=once.
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
-    thread_id: str = Field(alias="threadId", min_length=1)
-    run_id: str = Field(alias="runId", min_length=1)
-    action: Literal["approve", "deny", "cancel"]
-    scope: Literal["once", "run"] = "once"
-    answers: dict[str, list[str]] = Field(default_factory=dict)
-    content: dict[str, Any] = Field(default_factory=dict)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Response
 
-from backend.api.schemas import SessionCapabilities, SessionState
+from access_layer.schemas import SessionCapabilities, SessionState
 
 from access_layer.scheduled_tasks.models import (
     ScheduledApprovalResumeInput,
@@ -119,6 +119,7 @@ def build_scheduled_task_router(runtime) -> APIRouter:
                 interrupt_id=payload.interrupt_id,
                 action=payload.action,
                 scope=payload.scope,
+                answers=payload.answers,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Scheduled run not found") from exc

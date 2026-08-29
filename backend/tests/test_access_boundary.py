@@ -48,6 +48,24 @@ class AccessBoundaryTests(unittest.TestCase):
         self.assertNotIn("compose_api_messages", source)
         self.assertNotIn('"apiMessages"', source)
 
+    def test_access_layer_does_not_import_backend_or_shared_packages(self) -> None:
+        access_root = Path(__file__).resolve().parents[2] / "access_layer"
+        violations: list[str] = []
+        for path in access_root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                modules: list[str] = []
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    modules.append(node.module)
+                elif isinstance(node, ast.Import):
+                    modules.extend(alias.name for alias in node.names)
+                for module in modules:
+                    if module == "backend" or module.startswith("backend."):
+                        violations.append(f"{path.relative_to(access_root.parent)}: {module}")
+                    if module == "shared" or module.startswith("shared."):
+                        violations.append(f"{path.relative_to(access_root.parent)}: {module}")
+        self.assertEqual(violations, [])
+
     def test_agent_backend_does_not_import_session_prompt_memory_or_skills(self) -> None:
         agent_dir = Path(__file__).resolve().parents[1] / "agent"
         forbidden = {

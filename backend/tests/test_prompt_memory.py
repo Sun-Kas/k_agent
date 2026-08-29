@@ -9,7 +9,6 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from backend.api.schemas import ChatMessage
-from backend.config import DEFAULT_SYSTEM_PROMPT
 from backend.context import compose_api_messages
 from backend.memory import (
     MemoryFile,
@@ -23,6 +22,7 @@ from backend.memory import (
     search_auto_memory,
 )
 from backend.prompts import (
+    DEFAULT_PERSONA,
     VOICE_CONVERSATION_SYSTEM_PROMPT,
     build_nested_memory_context,
     build_prompt_bundle,
@@ -86,7 +86,7 @@ class PromptMemoryTests(unittest.TestCase):
 
     def test_default_prompt_has_one_identity_and_no_internal_context_leaks(self) -> None:
         bundle = build_prompt_bundle(
-            DEFAULT_SYSTEM_PROMPT,
+            DEFAULT_PERSONA,
             mcp_tools=[FakeMcpTool(server_id="calendar", name="create_event", description="Create an event.")],
         )
 

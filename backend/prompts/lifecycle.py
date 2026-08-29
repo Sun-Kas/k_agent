@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from backend.memory import clear_memory_cache
-from backend.prompts.sections import SECTION_CACHE
 
 
 @dataclass
@@ -22,7 +21,6 @@ STATE = PromptLifecycleState()
 
 def reset_prompt_caches(reason: str = "manual") -> PromptLifecycleState:
     """在 /clear、/compact、配置变更或重连后清空 prompt 与 memory 缓存。"""
-    SECTION_CACHE.clear()
     clear_memory_cache()
     STATE.generation += 1
     STATE.reason = reason

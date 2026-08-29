@@ -4,17 +4,17 @@ import asyncio
 import json
 import unittest
 
-from pydantic import ValidationError
-
 from backend.agui import translate_agent_events
-from backend.api.schemas import ApprovalResolutionInput
 from backend.approvals import (
     ApprovalBroker,
     canonical_json_sha256,
     consume_resume_authorization,
 )
 from backend.runners.claude_approval_bridge import ClaudeApprovalBridge
-from backend.runners.codex_app_server import _handle_server_request
+from backend.runners.codex_app_server import (
+    _codex_request_detail,
+    _handle_server_request,
+)
 
 
 class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
@@ -49,15 +49,6 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
             title="Claude Code 请求调用 Bash", detail=changed,
         ))
 
-    def test_resolution_contract_rejects_legacy_remember_field(self) -> None:
-        with self.assertRaises(ValidationError):
-            ApprovalResolutionInput.model_validate({
-                "threadId": "thread-1",
-                "runId": "run-1",
-                "action": "approve",
-                "remember": True,
-            })
-
     async def test_permission_terminates_run_without_backend_pending_state(self) -> None:
         broker = ApprovalBroker()
 
@@ -78,9 +69,6 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         )
         requested = await anext(stream)
         self.assertEqual(requested["type"], "approval_request")
-        self.assertFalse(await broker.is_pending(
-            requested["payload"]["id"], thread_id="thread-pending", run_id="run-pending"
-        ))
         self.assertEqual((await anext(stream))["type"], "interrupt")
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
@@ -106,31 +94,6 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await anext(stream))["type"], "interrupt")
         with self.assertRaises(StopAsyncIteration):
             await anext(stream)
-
-    async def test_resolution_rejects_wrong_run_scope(self) -> None:
-        broker = ApprovalBroker()
-
-        async def runner():
-            await broker.request(
-                thread_id="thread-1",
-                run_id="run-1",
-                agent_kind="codex",
-                category="command",
-                title="Allow?",
-                message="scope test",
-            )
-            if False:
-                yield {}
-
-        stream = broker.stream(runner(), thread_id="thread-1", run_id="run-1")
-        requested = await anext(stream)
-        self.assertFalse(await broker.resolve(
-            requested["payload"]["id"],
-            thread_id="thread-1",
-            run_id="another-run",
-            decision={"action": "approve"},
-        ))
-        await stream.aclose()
 
     async def test_codex_user_input_becomes_terminal_interrupt(self) -> None:
         broker = ApprovalBroker()
@@ -178,6 +141,187 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         requested = await anext(stream)
         self.assertEqual(requested["type"], "approval_request")
         self.assertEqual((await anext(stream))["type"], "interrupt")
+
+    async def test_codex_resume_hash_binds_semantics_but_not_replay_ids(self) -> None:
+        original = {
+            "threadId": "provider-thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": "pwd",
+            "reason": "Inspect the workspace",
+        }
+        detail = _codex_request_detail(
+            "item/commandExecution/requestApproval", original
+        )
+        request_hash = canonical_json_sha256({
+            "target": detail["toolName"],
+            "source": detail["source"],
+            "serverId": None,
+            "arguments": detail["arguments"],
+        })
+        authorization = {
+            "requestHash": request_hash,
+            "decision": {
+                "status": "resolved",
+                "payload": {"approved": True, "scope": "once"},
+            },
+        }
+        replayed = {**original, "threadId": "provider-thread-2", "turnId": "turn-2"}
+        result = await _handle_server_request(
+            method="item/commandExecution/requestApproval",
+            params=replayed,
+            broker=ApprovalBroker(),
+            public_thread_id="thread-1",
+            run_id="run-2",
+            resume_authorization=authorization,
+        )
+        self.assertEqual(result, {"decision": "accept"})
+
+        changed_authorization = {**authorization, "consumed": False}
+        with self.assertRaisesRegex(RuntimeError, "outside an active run"):
+            await _handle_server_request(
+                method="item/commandExecution/requestApproval",
+                params={**replayed, "command": "rm note.txt"},
+                broker=ApprovalBroker(),
+                public_thread_id="thread-1",
+                run_id="run-3",
+                resume_authorization=changed_authorization,
+            )
+
+    async def test_codex_user_input_resume_preserves_selection_and_custom_text(self) -> None:
+        params = {
+            "threadId": "provider-thread-1",
+            "questions": [{
+                "id": "approach",
+                "question": "Which approach?",
+                "options": [
+                    {"label": "A", "description": "Use A"},
+                    {"label": "B", "description": "Use B"},
+                ],
+            }],
+        }
+        detail = _codex_request_detail("item/tool/requestUserInput", params)
+        authorization = {
+            "requestHash": canonical_json_sha256({
+                "target": detail["toolName"],
+                "source": detail["source"],
+                "serverId": None,
+                "arguments": detail["arguments"],
+            }),
+            "decision": {
+                "status": "resolved",
+                "payload": {
+                    "answers": {
+                        "approach": {"selected": ["A"], "custom": "Only recent data"}
+                    }
+                },
+            },
+        }
+        result = await _handle_server_request(
+            method="item/tool/requestUserInput",
+            params={**params, "threadId": "provider-thread-2"},
+            broker=ApprovalBroker(),
+            public_thread_id="thread-1",
+            run_id="run-2",
+            resume_authorization=authorization,
+        )
+        self.assertEqual(
+            result,
+            {"answers": {"approach": {"answers": ["A", "Only recent data"]}}},
+        )
+
+    async def test_claude_ask_user_question_uses_durable_answer_contract(self) -> None:
+        broker = ApprovalBroker()
+
+        async def runner():
+            await asyncio.Event().wait()
+            if False:
+                yield {}
+
+        stream = broker.stream(runner(), thread_id="thread-q", run_id="run-q1")
+        next_event = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        tool_input = {
+            "questions": [{
+                "header": "Approach",
+                "question": "Which approach?",
+                "options": [
+                    {"label": "A", "description": "Use A", "preview": "A preview"},
+                    {"label": "B", "description": "Use B"},
+                ],
+                "multiSelect": False,
+            }]
+        }
+        async with ClaudeApprovalBridge(
+            broker=broker, thread_id="thread-q", run_id="run-q1"
+        ) as bridge:
+            config = bridge.child_env()
+            reader, writer = await asyncio.open_connection(
+                config["K_AGENT_APPROVAL_HOST"], int(config["K_AGENT_APPROVAL_PORT"])
+            )
+            writer.write((json.dumps({
+                "token": config["K_AGENT_APPROVAL_TOKEN"],
+                "toolName": "AskUserQuestion",
+                "input": tool_input,
+            }) + "\n").encode())
+            await writer.drain()
+            requested = await next_event
+            self.assertEqual(requested["payload"]["category"], "user_input")
+            self.assertEqual(
+                requested["payload"]["detail"]["questions"][0]["id"],
+                "question-1",
+            )
+            self.assertNotIn(
+                "preview",
+                requested["payload"]["detail"]["questions"][0]["options"][0],
+            )
+            self.assertEqual((await anext(stream))["type"], "interrupt")
+            await reader.readline()
+            writer.close()
+            await writer.wait_closed()
+
+        authorization = {
+            "requestHash": requested["payload"]["requestHash"],
+            "decision": {
+                "status": "resolved",
+                "payload": {
+                    "answers": {
+                        "question-1": {
+                            "selected": ["A"],
+                            "custom": "Only recent data",
+                        }
+                    }
+                },
+            },
+        }
+        async with ClaudeApprovalBridge(
+            broker=ApprovalBroker(),
+            thread_id="thread-q",
+            run_id="run-q2",
+            resume_authorization=authorization,
+        ) as bridge:
+            config = bridge.child_env()
+            reader, writer = await asyncio.open_connection(
+                config["K_AGENT_APPROVAL_HOST"], int(config["K_AGENT_APPROVAL_PORT"])
+            )
+            writer.write((json.dumps({
+                "token": config["K_AGENT_APPROVAL_TOKEN"],
+                "toolName": "AskUserQuestion",
+                "input": tool_input,
+            }) + "\n").encode())
+            await writer.drain()
+            response = json.loads(await reader.readline())
+            self.assertEqual(response["behavior"], "allow")
+            self.assertEqual(
+                response["updatedInput"]["answers"]["Which approach?"],
+                "A, Only recent data",
+            )
+            self.assertEqual(
+                response["updatedInput"]["annotations"]["Which approach?"]["notes"],
+                "Only recent data",
+            )
+            writer.close()
+            await writer.wait_closed()
 
     async def test_claude_permission_bridge_uses_the_same_broker_contract(self) -> None:
         broker = ApprovalBroker()
@@ -286,9 +430,6 @@ class ApprovalBrokerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activity.type, "ACTIVITY_SNAPSHOT")
         self.assertEqual(activity.activity_type, "approval")
         self.assertEqual(activity.content["status"], "pending")
-        self.assertFalse(await broker.is_pending(
-            activity.message_id, thread_id="thread-live", run_id="run-live"
-        ))
         self.assertEqual((await anext(events)).type, "STATE_SNAPSHOT")
         self.assertEqual((await anext(events)).type, "MESSAGES_SNAPSHOT")
         finished = await anext(events)

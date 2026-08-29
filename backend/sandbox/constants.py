@@ -82,3 +82,4 @@ DEFAULT_BASH_SANDBOX_WRITE_PATHS = (
     "~/.agently-cli",
     "~/Library/Application Support/agently-cli",
 )
+

@@ -49,6 +49,11 @@ from backend.approvals import canonical_json_sha256
 from backend.sandbox import is_domain_allowed, notice_from_tool_result
 from backend.tools import ToolDefinition, validate_tool_arguments
 from backend.tools.streaming import reset_tool_output_sink, set_tool_output_sink
+from backend.user_questions import (
+    normalize_user_question_answers,
+    normalize_user_questions,
+    render_user_question_result,
+)
 
 
 _READ_ONLY_LOCAL_TOOLS = frozenset({"Read", "Glob", "Grep", "LS"})
@@ -102,24 +107,16 @@ class OpenAIAgent:
             )
             context_plan = build_context_plan(
                 [message for message in request.messages if message.carries_context()],
-                system_prompt=request.system_prompt,
-                user_context=request.user_context,
+                prompt=request.prompt,
                 model_config=request.model_config,
                 tool_definition_tokens=tool_definition_tokens,
             )
-            user_context = dict(request.user_context)
-            if context_plan.summary:
-                user_context["conversationSummary"] = (
-                    "The following is a compacted summary of earlier conversation turns. "
-                    "Treat it as continuity context, not a new user request.\n\n"
-                    + context_plan.summary
-                )
             # compose 后的 messages 含 system 和 provider 协议消息，是唯一驱动
             # ReAct 的列表；会话持久化另由流式事件完成。
             messages = compose_messages(
                 context_plan.messages,
-                system_prompt=request.system_prompt,
-                user_context=user_context,
+                prompt=request.prompt,
+                context_summary=context_plan.summary,
                 attachments=request.attachments,
             )
             selected_model = request.model_config.get(
@@ -158,6 +155,12 @@ class OpenAIAgent:
             "messages": messages,
             "selected_model": selected_model,
             "client": client,
+            "loaded_memory_paths": set(
+                [
+                    *(request.prompt.initial_memory_paths if request.prompt is not None else ()),
+                    *request.loaded_memory_paths,
+                ]
+            ),
         }
 
     async def run(
@@ -220,6 +223,15 @@ class OpenAIAgent:
         context_plan = runtime["context_plan"]  # 裁剪 / 摘要后的上下文预算
         # 含 system 的 provider 协议列表，也是 ReAct 循环唯一的消息状态。
         messages: list[dict[str, Any]] = runtime["messages"]
+        loaded_memory_paths: set[str] = runtime["loaded_memory_paths"]
+        resume_checkpoint = runtime.get("resume_checkpoint")
+        if isinstance(resume_checkpoint, dict):
+            restored_paths = resume_checkpoint.get("loadedMemoryPaths", [])
+            if not isinstance(restored_paths, list) or not all(
+                isinstance(item, str) for item in restored_paths
+            ):
+                raise RuntimeError("K Agent checkpoint has invalid memory state")
+            loaded_memory_paths.update(restored_paths)
 
         # agent_run 把 before_agent / AgentStarted 与 after_agent / AgentCompleted
         # 收口成一对；后面每次 Finish 或失败都必须走 __aexit__，否则观测会漏收尾。
@@ -250,17 +262,17 @@ class OpenAIAgent:
                 "type": "context_state",
                 "payload": {
                     **context_plan.as_dict(),
-                    "loadedMemoryPaths": request.loaded_memory_paths,
+                    "loadedMemoryPaths": sorted(loaded_memory_paths),
                 },
             }
             yield self._run_trace(trace[-1])
-            if request.loaded_memory_paths:
+            if loaded_memory_paths:
                 trace.append(
-                    f"memory:eager_loaded:{len(request.loaded_memory_paths)} files"
+                    f"memory:eager_loaded:{len(loaded_memory_paths)} files"
                 )
                 yield self._run_trace(trace[-1])
             if mcp_tools:
-                trace.append(f"prompt:mcp_dynamic_section:{len(mcp_tools)} tools")
+                trace.append(f"tools:mcp_catalog:{len(mcp_tools)} tools")
                 yield self._run_trace(trace[-1])
             preparation = self._thinking_step(
                 thinking,
@@ -281,12 +293,13 @@ class OpenAIAgent:
             # Observation 写回 messages，然后从 iteration+1 再 Reason。
             # -----------------------------------------------------------------
             start_iteration = 0
-            resume_checkpoint = runtime.get("resume_checkpoint")
             if isinstance(resume_checkpoint, dict):
                 if resume_checkpoint.get("kind") != "react_tool_boundary":
                     raise RuntimeError("K Agent checkpoint is not a ReAct tool boundary")
                 checkpoint_messages = resume_checkpoint.get("modelMessages")
+                # 同一批tool calls
                 pending_calls = resume_checkpoint.get("pendingCalls")
+                # 审核的是这批 tool calls 中的第几个
                 pending_index = resume_checkpoint.get("pendingIndex")
                 checkpoint_iteration = resume_checkpoint.get("iteration")
                 if (
@@ -320,6 +333,7 @@ class OpenAIAgent:
                     if not call_id or not tool_name:
                         raise RuntimeError("K Agent checkpoint tool identity is missing")
                     raw_arguments = self._decode_tool_arguments(str(tc.get("arguments") or "{}"))
+                    tool_executed = False
                     # 首个调用在旧 run 已显示过卡片，但 SessionStore 已在 terminal
                     # 边界清掉未完成 buffer。Resume 必须重发同 id START/ARGS/END，
                     # 前端按 id 原位更新，持久层则重新建立完整 tool-call 配对。
@@ -331,7 +345,38 @@ class OpenAIAgent:
                             "arguments": str(tc.get("arguments") or "{}"),
                         },
                     }
-                    if index == pending_index and not approved:
+                    if index == pending_index and tool_name == "AskUserQuestion":
+                        # A question Resume is an Observation, not a permission grant.
+                        # The trusted checkpoint supplies the original form; the
+                        # browser contributes only selections and optional text.
+                        question_hash = canonical_json_sha256({
+                            "target": tool_name,
+                            "source": "user_input",
+                            "serverId": None,
+                            "arguments": raw_arguments,
+                        })
+                        if question_hash != runtime.get("resume_request_hash"):
+                            raise RuntimeError(
+                                "AskUserQuestion resume does not match the interrupted call"
+                            )
+                        if resume_decision.get("status") == "cancelled":
+                            tool_result = json.dumps(
+                                {"ok": False, "cancelled": True}, ensure_ascii=False
+                            )
+                        else:
+                            if not isinstance(decision_payload, dict):
+                                raise RuntimeError("AskUserQuestion resume payload is missing")
+                            # 问题定义只信 checkpoint 参数；浏览器只能提交 selected/custom。
+                            questions = normalize_user_questions(raw_arguments)
+                            answers = normalize_user_question_answers(
+                                questions, decision_payload.get("answers")
+                            )
+                            # 不跑 AskUserQuestion executor；规范化答案就是这次 Observation。
+                            tool_result = json.dumps(
+                                render_user_question_result(questions, answers),
+                                ensure_ascii=False,
+                            )
+                    elif index == pending_index and not approved:
                         # 用户拒绝也要留下 Observation，否则下一轮 Reason 会以为
                         # 这个 tool_call 还没结果，再次请求同一工具。
                         tool_result = (
@@ -347,13 +392,16 @@ class OpenAIAgent:
                                 "requestHash": runtime.get("resume_request_hash"),
                             }
                         runtime["_react_tool_boundary"] = {
-                            "version": 1,
+                            "version": 2,
                             "kind": "react_tool_boundary",
                             "iteration": checkpoint_iteration,
                             "pendingIndex": index,
                             "pendingCalls": [dict(item) for item in pending_calls],
                             "modelMessages": [dict(item) for item in messages],
+                            "loadedMemoryPaths": sorted(loaded_memory_paths),
                         }
+                        # 批准不作为 _run_tool 参数：密封 preflight 只认 runtime。
+                        # _enforce_permission 用 callId + requestHash 消费上面的一次性授权。
                         tool_result = await self._run_tool(
                             runtime=runtime,
                             iteration=checkpoint_iteration,
@@ -361,6 +409,7 @@ class OpenAIAgent:
                             tool_name=tool_name,
                             arguments=raw_arguments,
                         )
+                        tool_executed = True
                     tool_message_id = str(uuid.uuid4())
                     yield {
                         "type": "tool_result",
@@ -370,10 +419,19 @@ class OpenAIAgent:
                             "content": tool_result,
                         },
                     }
+                    observation = (
+                        await self._observation_with_lazy_memory(
+                            runtime,
+                            call_id=call_id,
+                            tool_result=tool_result,
+                        )
+                        if tool_executed
+                        else tool_result
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": tool_result,
+                        "content": observation,
                     })
                 # 本轮 Reason 已在旧 run 完成；从下一 iteration 重新 Reason。
                 start_iteration = checkpoint_iteration + 1
@@ -549,6 +607,7 @@ class OpenAIAgent:
 
                 for tool_call_index, tc in enumerate(tool_calls):
                     tool_name = tc["name"]
+                    tool_executed = False
                     argument_error: Exception | None = None
                     try:
                         raw_arguments = self._decode_tool_arguments(tc["arguments"])
@@ -587,12 +646,13 @@ class OpenAIAgent:
                         # - pendingCalls：这一轮模型点名的全部工具
                         # - modelMessages：已含 assistant.tool_calls，不含本工具及之后的 Observation
                         runtime["_react_tool_boundary"] = {
-                            "version": 1,
+                            "version": 2,
                             "kind": "react_tool_boundary",
                             "iteration": iteration,
                             "pendingIndex": tool_call_index,
                             "pendingCalls": [dict(item) for item in tool_calls],
                             "modelMessages": [dict(item) for item in messages],
+                            "loadedMemoryPaths": sorted(loaded_memory_paths),
                         }
                         # 在兄弟任务里跑工具，把过程中的 stdout 先 yield 成 tool_output
                         # （例如 CLI 打出 OAuth URL 再阻塞）。全部结束后 live_result[0]
@@ -608,6 +668,7 @@ class OpenAIAgent:
                         ):
                             yield event
                         tool_result = live_result[0]
+                        tool_executed = True
 
                     # ----- Observe（本工具）-----
                     # yield tool_result：用户和 Access Layer 看到的结果。
@@ -627,10 +688,19 @@ class OpenAIAgent:
                     )
                     if notice is not None:
                         yield self._run_status(notice)
+                    observation = (
+                        await self._observation_with_lazy_memory(
+                            runtime,
+                            call_id=tc["id"],
+                            tool_result=tool_result,
+                        )
+                        if tool_executed
+                        else tool_result
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": tool_result,
+                        "content": observation,
                     })
                 # 本轮 Act 全部 Observe 完毕；status 切回「正在调用模型」，进入下一 Reason。
                 yield self._run_status(config.status_model_started)
@@ -883,11 +953,44 @@ class OpenAIAgent:
                 tool_name=tool_name,
                 arguments=arguments,
             )
+            # Preserve the sealed pipeline's final canonical request. Lazy
+            # context must never trust pre-middleware names or arguments.
+            runtime.setdefault("_completed_tool_requests", {})[call_id] = {
+                "name": result.request.canonical_name,
+                "arguments": dict(result.request.arguments),
+                "source": result.request.source,
+            }
             return result.output
         except Exception as exc:
             # Tool failures must not abort the whole run. Cancellation and
             # process-level BaseException subclasses still propagate normally.
             return self._recoverable_tool_error(tool_name=tool_name, error=exc)
+
+    async def _observation_with_lazy_memory(
+        self,
+        runtime: dict[str, Any],
+        *,
+        call_id: str,
+        tool_result: str,
+    ) -> str:
+        """Append newly applicable rules only to the model's Observation.
+
+        The browser receives the raw tool result before this method runs. Only
+        declared path arguments from local filesystem tools can cause reads;
+        arbitrary tool/MCP output is never scanned for paths.
+        """
+
+        enricher = runtime.get("observation_enricher")
+        if enricher is None:
+            return tool_result
+        completed = runtime.get("_completed_tool_requests", {}).pop(call_id, None)
+        if not isinstance(completed, dict) or completed.get("source") != "local":
+            return tool_result
+        canonical_name = completed.get("name")
+        canonical_arguments = completed.get("arguments")
+        if not isinstance(canonical_name, str) or not isinstance(canonical_arguments, dict):
+            return tool_result
+        return await enricher(canonical_name, canonical_arguments, tool_result)
 
     async def _execute_tool(
         self,
@@ -966,6 +1069,41 @@ class OpenAIAgent:
                 if context.metadata.get("permission_mode") != "full_access":
                     # 非全开时，Skill 收窄后的白名单仍然生效。
                     self._enforce_skill_allowlist(context, current.canonical_name)
+                if current.canonical_name == "AskUserQuestion":
+                    # Unlike permission approvals, user questions are required
+                    # even in full-access mode. Validate the form before making
+                    # a durable card so malformed model output remains a normal,
+                    # recoverable tool error instead of an unanswerable Interrupt.
+                    resolved = next(
+                        (tool for tool in tools if tool.name == current.canonical_name),
+                        None,
+                    )
+                    if resolved is None:
+                        raise RuntimeError("AskUserQuestion tool is unavailable")
+                    current_arguments = dict(current.arguments)
+                    validate_tool_arguments(resolved.parameters, current_arguments)
+                    questions = normalize_user_questions(current_arguments)
+                    approval_handler = runtime.get("approval_handler")
+                    if approval_handler is None:
+                        raise RuntimeError("AskUserQuestion requires an interactive client")
+                    # 返回值故意丢掉。Broker.request 只结束本轮 HTTP，占位
+                    # {"action":"cancel"} 不是用户答案；答案在 Resume 时写入 Observation。
+                    # 若按 _enforce_permission 去读这个 cancel，会把「等人」误判成「已拒绝」。
+                    await approval_handler(
+                        "AskUserQuestion",
+                        PermissionDecision("ask", "需要用户提供信息后才能继续。"),
+                        {
+                            "toolName": current.requested_name,
+                            "callId": current.call_id,
+                            "iteration": current.iteration,
+                            "arguments": current_arguments,
+                            "questions": questions,
+                            "source": "user_input",
+                        },
+                    )
+                    # 正常路径执行不到这里：request() 会拆掉原 Run。
+                    # 同步返回时 fail-closed，避免落到不可达 executor 伪造答案。
+                    raise RuntimeError("AskUserQuestion interrupt closed unexpectedly")
                 # 按规则算出 allow / deny / ask（HITL）。
                 decision = self._local_permission_decision(
                     config,
@@ -974,6 +1112,7 @@ class OpenAIAgent:
                     dict(current.arguments),  # 拷一份，避免规则侧改 MappingProxy
                 )
                 # deny 抛错；ask 走审批 Interrupt。
+                # Resume 时若 runtime["_resume_authorization"] 匹配本次 call，这里直接放行。
                 await self._enforce_permission(
                     runtime,
                     current.canonical_name,
@@ -1168,7 +1307,11 @@ class OpenAIAgent:
         decision: PermissionDecision,
         detail: dict[str, Any],
     ) -> None:
-        """执行权限：deny 立即失败；ask 经 approval_handler 挂起等人决策。"""
+        """执行权限：deny 立即失败；ask 经 approval_handler 挂起等人决策。
+
+        Resume 批准写在 runtime["_resume_authorization"]，不另开函数参数，
+        避免 wrap/preflight 伪造「用户已批」。匹配 callId + 现算 hash 才放行。
+        """
 
         approved_targets: set[str] = runtime["approved_targets"]
         approval_handler = runtime["approval_handler"]

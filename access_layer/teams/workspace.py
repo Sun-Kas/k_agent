@@ -12,7 +12,7 @@ from access_layer.workspace_fs import (
     list_workspace_files,
     read_workspace_file,
 )
-from backend.home import public_home_relative_path, resolve_managed_path
+from access_layer.home import public_home_relative_path, resolve_managed_path
 
 
 def list_team_workspace(workspace_dir: str | Path) -> WorkspaceListing:

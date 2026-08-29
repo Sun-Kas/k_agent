@@ -27,21 +27,21 @@ from fastapi.responses import StreamingResponse
 from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import CatalogError, RuntimeCatalog
 from access_layer.concurrency import ConcurrencyLimitExceeded, RequestConcurrencyLimiter
+from access_layer.home import session_workspace_dir, to_managed_path
+from access_layer.logging_config import log_event
+from access_layer.messages import to_chat_messages
 from access_layer.request_context import (
     get_request_context,
     reset_request_context,
     set_request_context,
     update_request_context,
 )
+from access_layer.schemas import MessageAttachment
 from access_layer.sessions.store import (
     OpenInterruptError,
     ResumeConflictError,
     SessionStore,
 )
-from backend.agui import to_chat_messages
-from backend.api.schemas import MessageAttachment
-from backend.home import session_workspace_dir, to_managed_path
-from backend.logging_config import log_event
 
 
 class AgentAccessLayer:
@@ -67,6 +67,65 @@ class AgentAccessLayer:
         前端每轮只提交新增的用户消息；完整历史由本层从 SessionStore 补齐后
         发给后端，避免浏览器重报导致重复或丢失。
         """
+
+        '''
+{
+    "threadId": "thread-abc",
+    "runId": "run-1",
+    "parentRunId": None,
+    "state": {},
+    "messages": [
+        {"id": "sys-1", "role": "system", "content": "You are a helpful coding agent."},
+        {"id": "user-1", "role": "user", "content": "帮我在 workspace 里新建 hello.py"},
+    ],
+    "tools": [
+        {
+            "name": "write_file",
+            "description": "Write a file in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        }
+    ],
+    "context": [
+        {"description": "cwd", "value": "/tmp/thread-abc/workspace"},
+    ],
+    "forwardedProps": {
+        "agentKind": "k_agent",
+        "agentOptions": {"permissionMode": "default"},
+        "modelId": "claude-sonnet-4",
+    },
+    "resume": None,
+}
+
+
+
+{
+    "threadId": "thread-abc",   # 必须同一 thread
+    "runId": "run-2",           # 新 run
+    "state": {},
+    "messages": [],             # resume 路径通常不再塞新 user 消息
+    "tools": [],
+    "context": [],
+    "forwardedProps": {
+        "agentKind": "k_agent",
+        "agentOptions": {"permissionMode": "default"},
+    },
+    "resume": [
+        {
+            "interruptId": "interrupt-write-hello",
+            "status": "resolved",  # 或 "cancelled"
+            "payload": {"approved": True, "scope": "once"},
+        }
+    ],
+}
+
+'''
         submitted = to_chat_messages(payload.messages)
         resume_entries = [
             entry.model_dump(by_alias=True, mode="json")
@@ -90,6 +149,15 @@ class AgentAccessLayer:
         agentKind / agentOptions — 用哪个 agent、权限模式等
         mcpServerIds / skillIds — 启用的 MCP / Skill
         modelId / reasoningEffort — 模型与推理强度
+        '''
+
+        '''
+        ChatMessage(
+            id="msg-1",
+            role="user",
+            content="看看这张图",
+            attachments=[MessageAttachment(name="cat.png", ...)],  # 图挂上了
+        )
         '''
         forwarded = payload.forwarded_props or {}
         attachments = self._attachments(forwarded.get("attachments", []))
@@ -133,6 +201,9 @@ class AgentAccessLayer:
             )
             mcp_servers = []
             skills = []
+
+        # HITL 审批模式下，需要先获取会话，再进行后续操作
+        # 非 HITL 模式下，创建或获取会话
         if is_resume:
             session = await self._session_store.get(payload.thread_id)
             if session is None:
@@ -182,6 +253,135 @@ class AgentAccessLayer:
 
             # 用户轮次与 Resume 认领都必须在会话锁之后发生。前者避免 429
             # 留下孤立消息，后者保证同一 Interrupt 只有一个新 run 能拿到执行权。
+            '''
+            resume_records = [
+                {
+                    "version": 1,
+                    "id": "interrupt-write-hello",
+                    "threadId": "thread-abc",
+                    "runId": "run-1",              # 当初被打断的那次 run
+                    "agentKind": "k_agent",
+                    "category": "local_tool",      # 或 mcp_tool / user_input
+                    "title": "写入 hello.py",
+                    "message": "是否允许写入 workspace/hello.py？",
+                    "detail": {
+                        "toolName": "write_file",
+                        "path": "hello.py",
+                    },
+                    "toolCallId": "call_write_hello",
+                    "requestHash": "sha256:9f3c…",
+                    "status": "resuming",
+                    "resumeRunId": "run-2",        # 这次新 run
+                    "decision": {
+                        "interruptId": "interrupt-write-hello",
+                        "status": "resolved",
+                        "payload": {"approved": True, "scope": "once"},
+                    },
+                    # K Agent 实际写入的是整批工具边界，不是单个 pendingToolCall。
+                    "checkpoint": {
+                        "version": 1,
+                        "kind": "react_tool_boundary",
+                        "iteration": 2,
+                        "pendingIndex": 0,
+                        "pendingCalls": [
+                            {
+                                "id": "call_write_hello",
+                                "name": "Write",
+                                "arguments": '{"path": "hello.py", "content": "print(1)"}',
+                            }
+                        ],
+                        "modelMessages": [{"role": "assistant", "tool_calls": ["…"]}],
+                        "messages": [{"role": "user", "content": "…"}],
+                        "requestHash": "sha256:9f3c…",
+                        "resumeContext": {
+                            "modelId": "claude-sonnet-4",
+                            "mcpServerIds": ["filesystem"],
+                            "skillIds": [],
+                            "reasoningEffort": None,
+                            "agentKind": "k_agent",
+                            "agentOptions": {"permissionMode": "default"},
+                        },
+                    },
+                    "createdAt": "2026-08-25T06:50:00+00:00",
+                    "updatedAt": "2026-08-25T06:58:00+00:00",
+                }
+            ]
+
+
+            用户回答
+            resume_records = [
+                {
+                    "version": 1,
+                    "id": "question-interrupt",
+                    "threadId": "thread-abc",
+                    "runId": "run-1",
+                    "agentKind": "k_agent",
+                    "category": "user_input",
+                    "title": "需要确认",
+                    "message": "请确认是否继续。",
+                    "detail": {
+                        "toolName": "AskUserQuestion",
+                        "callId": "call_ask_1",
+                        "source": "user_input",
+                        "questions": [
+                            {
+                                "id": "question-1",
+                                "header": "实现方式",
+                                "question": "你希望怎样继续？",
+                                "options": [
+                                    {"label": "方案 A", "description": "保持当前边界"},
+                                    {"label": "方案 B", "description": "扩大实现范围"},
+                                    {"label": "方案 C", "description": "先做最小版本"},
+                                ],
+                                "multiSelect": True,
+                            }
+                        ],
+                    },
+                    "toolCallId": "call_ask_1",
+                    "requestHash": "sha256:question…",
+                    "status": "resuming",
+                    "resumeRunId": "run-2",
+                    "decision": {
+                        "interruptId": "question-interrupt",
+                        "status": "resolved",
+                        "payload": {
+                            "answers": {
+                                "question-1": {
+                                    "selected": ["方案 A", "方案 C"],
+                                    "custom": "同时保留旧接口，并补一份迁移说明",
+                                }
+                            }
+                        },
+                    },
+                    "checkpoint": {
+                        "version": 1,
+                        "kind": "react_tool_boundary",
+                        "iteration": 0,
+                        "pendingIndex": 0,
+                        "pendingCalls": [
+                            {
+                                "id": "call_ask_1",
+                                "name": "AskUserQuestion",
+                                "arguments": '{"questions":[...]}',
+                            }
+                        ],
+                        "modelMessages": [{"role": "assistant", "tool_calls": ["…"]}],
+                        "messages": [{"role": "user", "content": "…"}],
+                        "requestHash": "sha256:question…",
+                        "resumeContext": {
+                            "modelId": "claude-sonnet-4",
+                            "mcpServerIds": [],
+                            "skillIds": [],
+                            "agentKind": "k_agent",
+                            "agentOptions": {"permissionMode": "default"},
+                        },
+                    },
+                    "createdAt": "2026-08-25T06:50:00+00:00",
+                    "updatedAt": "2026-08-25T06:58:00+00:00",
+                    "answers": None,  # 要等 finish_resume 成功后才写成 answered
+                }
+            ]
+            '''
             resume_records: list[dict[str, Any]] = []
             try:
                 if is_resume:

@@ -1,6 +1,6 @@
 import { appConfig } from "../config";
 import type { ScheduledRun, ScheduledTask, ScheduledTaskInput } from "./types";
-import type { SessionState } from "../types";
+import type { SessionState, UserQuestionAnswers } from "../types";
 
 const url = (path: string) => `${appConfig.apiBaseUrl}${path}`;
 
@@ -46,13 +46,14 @@ export const resumeScheduledRunApproval = (
   taskId: string,
   runId: string,
   interruptId: string,
-  action: "approve" | "deny",
-  scope: "once" | "run"
+  action: "approve" | "deny" | "cancel" | "answer",
+  scope: "once" | "run",
+  answers?: UserQuestionAnswers
 ) => request<{ ok: boolean; status: string; runId: string }>(
   `/api/scheduled-tasks/${taskId}/runs/${runId}/resume`,
   {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ interruptId, action, scope })
+    body: JSON.stringify({ interruptId, action, scope, answers })
   }
 );

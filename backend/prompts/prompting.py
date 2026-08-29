@@ -194,6 +194,10 @@ def classify_paths_for_memory(paths: list[Path]) -> tuple[list[Path], list[Path]
 
 def _default_system_prompt(base_prompt: str, *, mcp_tools: list[McpPromptTool] | None = None) -> str:
     """生成包含默认行为和工具说明的系统提示词。"""
+    # This compatibility helper predates typed sections and expects a complete
+    # base prompt. Production composition owns identity separately.
+    if "You are K Agent" not in base_prompt:
+        base_prompt = f"You are K Agent, a helpful personal assistant.\n\n{base_prompt}"
     # 静态段按内容指纹缓存，动态段每次重建：MCP 工具清单会随连接状态变化，
     # 缓存它会让模型看到已经断开的工具。指纹保证 base_prompt 改动后自动失效。
     # 动态段排在最后，前面的稳定前缀才能被 provider 端前缀缓存命中。

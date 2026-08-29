@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from backend.runners.cli_models import list_models_for_kind
 from backend.runners.claude_code import (
+    ClaudeCodeRunner,
     ClaudeCodeStreamState,
     _claude_allowed_tools,
     build_claude_skill_preamble,
@@ -199,6 +200,35 @@ class NetworkPolicyTests(unittest.TestCase):
             _claude_allowed_tools(restricted),
             ["Read", "mcp__k_agent_human_approval__request_approval"],
         )
+
+
+class ClaudeInteractiveToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_access_keeps_prompt_bridge_for_ask_user_question(self) -> None:
+        ctx = RunnerContext(
+            thread_id="thread-full",
+            run_id="run-full",
+            request_id="request-full",
+            messages=[],
+            model_id=None,
+            mcp_servers=[],
+            skills=[],
+            reasoning_effort=None,
+            attachments=[],
+            options={"permissionMode": "full_access"},
+            approval_broker=ApprovalBroker(),
+        )
+        with TemporaryDirectory() as tmp, patch(
+            "backend.runners.claude_code.resolve_cli",
+            return_value=type("Resolved", (), {"path": "/usr/local/bin/claude"})(),
+        ):
+            ctx = replace(ctx, workspace_dir=Path(tmp))
+            async with ClaudeCodeRunner().create_runtime(ctx) as runtime:
+                argv = runtime["argv"]
+                self.assertIn("bypassPermissions", argv)
+                self.assertIn("--permission-prompt-tool", argv)
+                self.assertIn(
+                    "mcp__k_agent_human_approval__request_approval", argv
+                )
 
 
 class DetectAgentsTests(unittest.IsolatedAsyncioTestCase):
@@ -577,19 +607,19 @@ class McpConfigAndSkillTests(unittest.TestCase):
 
 class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_nested_session_json_and_workspace(self) -> None:
-        from backend.storage import FileStorage
+        from access_layer.storage import FileStorage
         from access_layer.sessions.store import SessionStore
-        from backend.config import get_or_init_settings
-        import backend.config.config as config_mod
+        from access_layer.settings import get_or_init_settings
+        import access_layer.settings as settings_mod
         import os
 
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"K_AGENT_HOME": tmp}, clear=False):
-                from backend.home import reset_home_cache, ensure_home_layout
+                from access_layer.home import reset_home_cache, ensure_home_layout
 
                 reset_home_cache()
                 ensure_home_layout(migrate=False)
-                config_mod._config = None
+                settings_mod._config = None
                 settings = await get_or_init_settings()
                 storage = FileStorage(settings.storage_base_dir)
                 store = SessionStore(storage)
@@ -603,19 +633,19 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("cliSessions", payload)
 
     async def test_migrates_flat_session_file(self) -> None:
-        from backend.storage import FileStorage
+        from access_layer.storage import FileStorage
         from access_layer.sessions.store import SessionStore
-        from backend.config import get_or_init_settings
-        import backend.config.config as config_mod
+        from access_layer.settings import get_or_init_settings
+        import access_layer.settings as settings_mod
         import os
 
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"K_AGENT_HOME": tmp}, clear=False):
-                from backend.home import reset_home_cache, ensure_home_layout
+                from access_layer.home import reset_home_cache, ensure_home_layout
 
                 reset_home_cache()
                 ensure_home_layout(migrate=False)
-                config_mod._config = None
+                settings_mod._config = None
                 settings = await get_or_init_settings()
                 root = Path(settings.storage_base_dir) / "sessions"
                 root.mkdir(parents=True, exist_ok=True)

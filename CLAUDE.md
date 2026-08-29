@@ -1,6 +1,7 @@
 # Project Instructions
 
 - Keep `access_layer/` and `backend/` as independently running services.
+- Access Layer must not import `backend` (and Agent Backend must not import `access_layer`). They talk over HTTP.
 - The Access Layer owns public APIs, sessions, persistence, and request concurrency.
 - The Agent Backend owns stateless model and tool execution.
 - Preserve the HTTP-only boundary between the frontend and backend services.

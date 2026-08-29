@@ -98,8 +98,9 @@ class TeamCommandInput(BaseModel):
 class TeamApprovalResumeInput(BaseModel):
     """用户对 Team terminal Interrupt 的决定；checkpoint 始终从 SQLite 读取。"""
 
-    action: Literal["approve", "deny", "cancel"]
+    action: Literal["approve", "deny", "cancel", "answer"]
     scope: Literal["once", "run"] = "once"
+    answers: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class TeamMessageInput(BaseModel):

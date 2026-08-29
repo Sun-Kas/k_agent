@@ -14,7 +14,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from backend.agui import translate_agent_events
 from backend.approvals import ApprovalBroker
-from backend.api.schemas import ApprovalResolutionInput, ChatMessage
+from backend.api.schemas import ChatMessage
 from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
 from backend.home import (
@@ -43,11 +43,7 @@ from backend.sandbox import (
     set_tool_env_overrides,
 )
 from backend.observability import AgentBackendLoggingObserver, LangfuseRuntime
-from backend.prompts import (
-    build_prompt_bundle,
-    prompt_lifecycle_state,
-    reset_prompt_caches,
-)
+from backend.prompts import reset_prompt_caches
 from backend.runners import RunnerContext, get_default_registry
 from backend.runners.network_policy import network_access_enabled
 from backend.runners.detect import detect_agents_payload
@@ -233,38 +229,6 @@ def create_app() -> FastAPI:
         )
         return status
 
-    @app.post("/internal/prompt/reset")
-    async def reset_prompt_cache() -> dict[str, Any]:
-        """丢弃进程内 prompt section / memory 缓存。
-
-        Skill 不在此重载：Access Layer 每轮随请求下发已解析定义，
-        Backend 没有独立的 Skill 注册表可刷新。
-        """
-
-        reset_prompt_caches("agent_backend_prompt_reset")
-        return {"ok": True}
-
-    @app.get("/internal/prompt/context")
-    async def prompt_context() -> dict[str, Any]:
-        """调试用：当前 prompt 生命周期代数与拼装后的上下文键。"""
-        manager = app.state.mcp_manager
-        mcp_tools = await manager.list_tools()
-        mcp_prompts = await manager.list_prompts()
-        prompt_bundle = build_prompt_bundle(
-            settings.system_prompt,
-            skills=[],
-            mcp_tools=cast(list[Any], mcp_tools),
-        )
-        return {
-            "lifecycle": prompt_lifecycle_state().__dict__,
-            "systemPromptLength": len(prompt_bundle.system_prompt),
-            "userContextKeys": list(prompt_bundle.user_context),
-            "systemContextKeys": list(prompt_bundle.system_context),
-            "memoryPaths": prompt_bundle.memory_paths,
-            "mcpToolCount": len(mcp_tools),
-            "mcpPromptCount": sum(len(items) for items in mcp_prompts.values()),
-        }
-
     @app.post("/internal/agent/run")
     async def run_agent(payload: AgentBackendRunInput, request: Request) -> StreamingResponse:
         """核心入口：按 agentKind 选 Runner，经 ApprovalBroker 合流后输出 AG-UI NDJSON。"""
@@ -424,34 +388,5 @@ def create_app() -> FastAPI:
                 "X-Event-Protocol": "AG-UI",
             },
         )
-
-    @app.post("/internal/approvals/{request_id}")
-    async def resolve_approval(
-        request_id: str, payload: ApprovalResolutionInput
-    ) -> dict[str, Any]:
-        """人类审批回调：校验 threadId/runId 后唤醒挂起的工具调用。"""
-
-        resolved = await app.state.approvals.resolve(
-            request_id,
-            thread_id=payload.thread_id,
-            run_id=payload.run_id,
-            decision=payload.model_dump(by_alias=True),
-        )
-        if not resolved:
-            from fastapi import HTTPException
-
-            raise HTTPException(status_code=404, detail="Approval request is no longer pending")
-        return {"ok": True, "requestId": request_id}
-
-    @app.get("/internal/approvals/{request_id}")
-    async def get_approval_status(
-        request_id: str, threadId: str, runId: str
-    ) -> dict[str, Any]:
-        """Expose only whether this exact run-scoped approval is still actionable."""
-
-        pending = await app.state.approvals.is_pending(
-            request_id, thread_id=threadId, run_id=runId
-        )
-        return {"ok": True, "requestId": request_id, "pending": pending}
 
     return app

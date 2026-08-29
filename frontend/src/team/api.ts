@@ -9,7 +9,7 @@ import type {
   TeamSnapshot,
   TeamSummary
 } from "./types";
-import type { PermissionMode } from "../types";
+import type { PermissionMode, UserQuestionAnswers } from "../types";
 
 export interface TeamWorkspaceFile {
   path: string;
@@ -114,11 +114,12 @@ export const commandTeam = (teamId: string, command: "pause" | "resume" | "cance
 export const resumeTeamApproval = (
   teamId: string,
   approvalId: string,
-  action: "approve" | "deny" | "cancel",
-  scope: "once" | "run" = "once"
+  action: "approve" | "deny" | "cancel" | "answer",
+  scope: "once" | "run" = "once",
+  answers?: UserQuestionAnswers
 ) => teamFetch<{ ok: boolean; status: string; runId: string }>(
   `/${encodeURIComponent(teamId)}/approvals/${encodeURIComponent(approvalId)}/resume`,
-  { method: "POST", body: JSON.stringify({ action, scope }) }
+  { method: "POST", body: JSON.stringify({ action, scope, answers }) }
 );
 
 export const sendTeamMessage = (teamId: string, recipientId: string, content: string) =>

@@ -29,9 +29,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from backend.config import get_or_init_settings
-from backend.api.schemas import ChatMessage, ChatMeta, SessionSummary, ToolCallRecord
-from backend.storage import StorageBackend
+from access_layer.settings import get_or_init_settings
+from access_layer.schemas import ChatMessage, ChatMeta, SessionSummary, ToolCallRecord
+from access_layer.storage import StorageBackend
+from access_layer.user_questions import normalize_user_question_answers
 
 
 logger = logging.getLogger("k_agent.access_layer.sessions")
@@ -594,13 +595,28 @@ class SessionStore:
                 payload = entry.get("payload")
                 if status not in {"resolved", "cancelled"}:
                     raise ResumeConflictError("Unsupported resume status")
-                if status == "resolved" and (
-                    not isinstance(payload, dict)
-                    or not isinstance(payload.get("approved"), bool)
-                ):
-                    raise ResumeConflictError(
-                        "Resolved approval payload must contain approved:boolean"
-                    )
+                if status == "resolved":
+                    if record.get("category") == "user_input":
+                        detail = record.get("detail")
+                        questions = (
+                            detail.get("questions") if isinstance(detail, dict) else None
+                        )
+                        try:
+                            normalized_answers = normalize_user_question_answers(
+                                questions if isinstance(questions, list) else [],
+                                payload.get("answers") if isinstance(payload, dict) else None,
+                            )
+                        except ValueError as exc:
+                            raise ResumeConflictError(str(exc)) from exc
+                        payload = {**payload, "answers": normalized_answers}
+                        entry = {**entry, "payload": payload}
+                    elif (
+                        not isinstance(payload, dict)
+                        or not isinstance(payload.get("approved"), bool)
+                    ):
+                        raise ResumeConflictError(
+                            "Resolved approval payload must contain approved:boolean"
+                        )
                 if (
                     record.get("status") in {"unknown_outcome", "resume_failed"}
                     and (
@@ -663,6 +679,10 @@ class SessionStore:
                     final_status = "resume_failed"
                 elif decision.get("status") == "cancelled":
                     final_status = "cancelled"
+                elif record.get("category") == "user_input":
+                    final_status = "answered"
+                    if isinstance(payload, dict):
+                        record["answers"] = copy.deepcopy(payload.get("answers") or {})
                 elif isinstance(payload, dict) and payload.get("approved") is True:
                     final_status = "approved"
                 else:

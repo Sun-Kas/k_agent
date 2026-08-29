@@ -10,13 +10,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.home import mcp_config_path, state_dir
 
-
-DEFAULT_SYSTEM_PROMPT = """
-You are K Agent, a helpful personal assistant for planning, answering questions, and completing tasks.
-Use tools when they help. Keep answers concise, practical, and grounded in available context.
-When tool results are returned, base your response on those results.
-""".strip()
-
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 PROJECT_DIR = BACKEND_DIR.parent
 # Example templates remain in-repo; live MCP/models files live under $K_AGENT_HOME.
@@ -113,7 +106,9 @@ class Settings(BaseSettings):
         ge=0.1,
         le=30.0,
     )
-    system_prompt: str = Field(default=DEFAULT_SYSTEM_PROMPT, alias="SYSTEM_PROMPT")
+    # Configuration carries only an optional persona override. The default
+    # prompt text and selection precedence belong to backend.prompts.persona.
+    persona_override: str | None = Field(default=None, alias="SYSTEM_PROMPT")
     max_model_iterations: int = Field(default=1000, alias="MAX_MODEL_ITERATIONS")
     # Every provider call is bounded twice: once for establishing the request and
     # once for the gap between streamed chunks. Without both, a provider that

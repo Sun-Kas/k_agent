@@ -4,7 +4,7 @@ import {
   pauseScheduledTask, resumeScheduledRunApproval, resumeScheduledTask, runScheduledTaskNow, updateScheduledTask
 } from "../scheduled-tasks/api";
 import type { ScheduledRun, ScheduledTask, ScheduledTaskInput } from "../scheduled-tasks/types";
-import type { ApprovalActivity, DetectedAgent, ModelProfile, RuntimeOption, SessionState } from "../types";
+import type { ApprovalActivity, DetectedAgent, ModelProfile, RuntimeOption, SessionState, UserQuestionAnswers } from "../types";
 import { StaticConversationTranscript } from "./ConversationTranscript";
 import { PermissionModeField } from "./PermissionModeField";
 
@@ -100,12 +100,13 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
 
   async function resumeScheduledApproval(
     approval: ApprovalActivity,
-    action: "approve" | "deny",
-    scope: "once" | "run"
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope: "once" | "run",
+    answers?: UserQuestionAnswers
   ) {
     if (!selected || !selectedId || !openedRunId) return;
     await resumeScheduledRunApproval(
-      selectedId, openedRunId, approval.id, action, scope
+      selectedId, openedRunId, approval.id, action, scope, answers
     );
     setOpenedRunSession(await getScheduledRunSession(selectedId, openedRunId));
     await refresh();

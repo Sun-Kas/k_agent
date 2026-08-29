@@ -32,6 +32,7 @@ import { ConfigCenter } from "./components/ConfigCenter";
 import { ContentStage, type ContentStageItem } from "./components/ContentStage";
 import { TeamWorkbench } from "./components/TeamWorkbench";
 import { ScheduledTasksView } from "./components/ScheduledTasksView";
+import { UserQuestionForm } from "./components/UserQuestionForm";
 import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
 import { mergeHistoricalMessages } from "./history";
@@ -40,6 +41,7 @@ import { bindApprovalRunToAssistant } from "./live-approval";
 import { keepStoppedRunMessages } from "./run-visibility";
 import { readVoiceConfig, type VoiceConfig } from "./voice-config";
 import { shouldInterruptForTranscript } from "./voice-interruption";
+import { userQuestionsFromDetail } from "./user-question";
 import type {
   AgUiEvent,
   AgUiRunInput,
@@ -57,7 +59,8 @@ import type {
   SessionSummary,
   TextActivity,
   ThinkingActivity,
-  ToolActivity
+  ToolActivity,
+  UserQuestionAnswers
 } from "./types";
 
 const AGENT_KIND_STORAGE_KEY = "k-agent-agent-kind";
@@ -1544,6 +1547,8 @@ export function App() {
       const rawStatus = String(value.status ?? "");
       const status: ApprovalActivity["status"] = rawStatus === "approved" || action === "approve"
         ? "approved"
+        : rawStatus === "answered" || action === "answer"
+          ? "answered"
         : rawStatus === "denied" || action === "deny"
           ? "denied"
           : rawStatus === "unknown_outcome"
@@ -1568,7 +1573,10 @@ export function App() {
             detail: value.detail && typeof value.detail === "object"
               ? value.detail as Record<string, unknown>
               : approval.detail,
-            status
+            status,
+            answers: value.answers && typeof value.answers === "object"
+              ? value.answers as UserQuestionAnswers
+              : approval.answers
           }
           : approval);
       }
@@ -1585,6 +1593,9 @@ export function App() {
           ? value.detail as Record<string, unknown>
           : {},
         status,
+        answers: value.answers && typeof value.answers === "object"
+          ? value.answers as UserQuestionAnswers
+          : undefined,
         sequence: activitySequenceRef.current
       }];
     });
@@ -2032,8 +2043,9 @@ export function App() {
 
   async function submitApproval(
     approval: ApprovalActivity,
-    action: "approve" | "deny" | "cancel",
-    scope: "once" | "run" = "once"
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope: "once" | "run" = "once",
+    answers?: UserQuestionAnswers
   ) {
     setApprovals((current) => current.map((item) => item.id === approval.id
       ? { ...item, status: "submitting", error: undefined }
@@ -2061,8 +2073,9 @@ export function App() {
           status: action === "cancel" ? "cancelled" : "resolved",
           ...(action === "cancel" ? {} : {
             payload: {
-              approved: action === "approve",
-              scope,
+              ...(action === "answer"
+                ? { answers: answers ?? {} }
+                : { approved: action === "approve", scope }),
               ...(
                 approval.status === "unknown_outcome"
                 || approval.status === "resume_failed"
@@ -2099,10 +2112,11 @@ export function App() {
       setApprovals((current) => current.map((item) => item.id === approval.id
         ? {
           ...item,
-          status: action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled"
+          status: action === "answer" ? "answered" : action === "approve" ? "approved" : action === "deny" ? "denied" : "cancelled",
+          ...(action === "answer" ? { answers } : {})
         }
         : item));
-      setStatus(action === "approve" ? appConfig.status.processing : "已拒绝工具调用");
+      setStatus(action === "approve" || action === "answer" ? appConfig.status.processing : "已取消当前操作");
     } catch (error) {
       const message = error instanceof Error ? error.message : "审批提交失败";
       const expired = /no longer pending|不再等待|已失效/i.test(message);
@@ -3522,8 +3536,9 @@ function ApprovalCard({
   approval: ApprovalActivity;
   onDecision: (
     approval: ApprovalActivity,
-    action: "approve" | "deny" | "cancel",
-    scope?: "once" | "run"
+    action: "approve" | "deny" | "cancel" | "answer",
+    scope?: "once" | "run",
+    answers?: UserQuestionAnswers
   ) => Promise<void>;
 }) {
   const pending = approval.status === "pending"
@@ -3542,6 +3557,7 @@ function ApprovalCard({
     pending: "等待确认",
     submitting: "正在提交",
     approved: "已允许",
+    answered: "已回答",
     denied: "已拒绝",
     cancelled: "已取消",
     expired: "已失效",
@@ -3549,6 +3565,29 @@ function ApprovalCard({
     resume_failed: "恢复失败",
     error: "提交失败"
   }[approval.status];
+
+  if (approval.category === "user_input") {
+    const questions = userQuestionsFromDetail(approval.detail);
+    return (
+      <section className={`approval-card user-question-card ${approval.status}`} aria-live="polite">
+        <header>
+          <span className="approval-shield" aria-hidden="true">?</span>
+          <div><small>{approval.agentKind} · 需要你的输入</small><strong>{approval.title}</strong></div>
+          <b>{statusText}</b>
+        </header>
+        {questions.length > 0
+          ? <UserQuestionForm
+              disabled={submitting}
+              onCancel={() => onDecision(approval, "cancel")}
+              onSubmit={(answers) => onDecision(approval, "answer", "once", answers)}
+              questions={questions}
+              resolvedAnswers={approval.status === "answered" ? approval.answers : undefined}
+            />
+          : <p className="approval-error">问题表单无效，无法提交回答。</p>}
+        {approval.error && <p className="approval-error">{approval.error}</p>}
+      </section>
+    );
+  }
 
   return (
     <section className={`approval-card ${approval.status}`} aria-live="polite">

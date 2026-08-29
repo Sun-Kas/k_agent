@@ -6,10 +6,13 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from backend.memory import append_auto_memory, compact_auto_memory, read_auto_memory, search_auto_memory
 from backend.tools.workspace import current_tool_workspace
+
+if TYPE_CHECKING:
+    from backend.tools.catalog import SkillCatalog
 ToolExecutor = Callable[[dict[str, Any]], Awaitable[str]]
 
 
@@ -112,6 +115,8 @@ async def invoke_skill(
 def build_skill_tool(
     mcp_prompt_caller: Callable[[str, str, dict[str, Any]], Awaitable[str]] | None = None,
     skills: list[dict[str, Any]] | None = None,
+    *,
+    skill_catalog: "SkillCatalog | None" = None,
 ) -> ToolDefinition:
     """以闭包绑定本轮 MCP prompt 调用与 skills，避免跨请求复用连接。"""
 
@@ -125,18 +130,29 @@ def build_skill_tool(
             _, server_id, *prompt_parts = skill_name.split("__")
             prompt_name = "__".join(prompt_parts)
             return await mcp_prompt_caller(server_id, prompt_name, {"args": args} if args else {})
-        return await invoke_skill(payload, skills)
+        bound_skills = list(skill_catalog.items) if skill_catalog is not None else skills
+        return await invoke_skill(payload, bound_skills)
+
+    if skill_catalog is not None:
+        description = skill_catalog.tool_description()
+    else:
+        # Base registry construction has no request catalog yet. The definition
+        # is replaced before execution, so keep this description intentionally generic.
+        description = "Load a named K Agent skill or MCP prompt enabled for this run."
+    skill_property: dict[str, Any] = {
+        "type": "string",
+        "description": "The skill or MCP prompt name, without a leading slash.",
+    }
+    # Do not add an enum: the same entry point also accepts dynamically listed
+    # MCP prompt names, which are not part of the local SkillCatalog.
 
     return ToolDefinition(
         name="Skill",
-        description="Load and execute a named K Agent skill. Use this when an available skill matches the task.",
+        description=description,
         parameters={
             "type": "object",
             "properties": {
-                "skill": {
-                    "type": "string",
-                    "description": "The skill name, without a leading slash.",
-                },
+                "skill": skill_property,
                 "args": {
                     "type": "string",
                     "description": "Optional arguments for the skill.",

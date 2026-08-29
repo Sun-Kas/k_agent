@@ -21,7 +21,7 @@ from typing import Any
 import uuid
 
 from access_layer.teams.models import SupervisorDecision, TeamCreateInput, TeamTaskCreateInput
-from backend.home import public_home_relative_path, resolve_managed_path, to_managed_path
+from access_layer.home import public_home_relative_path, resolve_managed_path, to_managed_path
 
 
 def _now() -> str:

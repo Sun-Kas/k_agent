@@ -133,6 +133,72 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await reloaded.get(session.id)).open_interrupt_ids, [])
             self.assertEqual(await reloaded.list_open_interrupts(session.id), [])
 
+    async def test_cli_provider_interrupts_survive_access_layer_restart(self) -> None:
+        for agent_kind in ("claude_code", "codex"):
+            with self.subTest(agent_kind=agent_kind), tempfile.TemporaryDirectory() as temp_dir:
+                storage = FileStorage(Path(temp_dir))
+                store = SessionStore(storage)
+                session = await store.create_session(session_id=f"thread-{agent_kind}")
+                interrupt_id = f"interrupt-{agent_kind}"
+                request_hash = f"sha256:{agent_kind}"
+                public_event = await store.persist_interrupt(session.id, {
+                    "type": "ACTIVITY_SNAPSHOT",
+                    "messageId": interrupt_id,
+                    "activityType": "approval",
+                    "replace": True,
+                    "content": {
+                        "id": interrupt_id,
+                        "threadId": session.id,
+                        "runId": "run-1",
+                        "agentKind": agent_kind,
+                        "category": "tool",
+                        "title": "Provider approval",
+                        "message": "Confirm",
+                        "detail": {
+                            "source": f"{agent_kind}_provider",
+                            "toolName": "Bash",
+                            "input": {"command": "pwd"},
+                        },
+                        "requestHash": request_hash,
+                        "status": "pending",
+                        "_checkpoint": {
+                            "version": 1,
+                            "kind": "restart_from_context",
+                            "requestHash": request_hash,
+                            "resumeContext": {
+                                "agentKind": agent_kind,
+                                "agentOptions": {"permissionMode": "default"},
+                            },
+                        },
+                    },
+                })
+                self.assertNotIn("_checkpoint", public_event["content"])
+
+                # A new Access Layer process can still list and atomically
+                # claim either provider's server-owned checkpoint.
+                restarted = SessionStore(storage)
+                open_interrupts = await restarted.list_open_interrupts(session.id)
+                self.assertEqual(open_interrupts[0]["agentKind"], agent_kind)
+                self.assertNotIn("checkpoint", open_interrupts[0])
+                records = await restarted.prepare_resume(
+                    session.id,
+                    [{
+                        "interruptId": interrupt_id,
+                        "status": "resolved",
+                        "payload": {"approved": True, "scope": "once"},
+                    }],
+                    resume_run_id="run-2",
+                    resume_context={
+                        "agentKind": agent_kind,
+                        "agentOptions": {"permissionMode": "default"},
+                    },
+                )
+                self.assertEqual(records[0]["agentKind"], agent_kind)
+                self.assertEqual(
+                    records[0]["checkpoint"]["kind"], "restart_from_context"
+                )
+                self.assertEqual(records[0]["requestHash"], request_hash)
+
     async def test_resume_must_cover_every_open_interrupt(self) -> None:
         store = SessionStore()
         session = await store.create_session(session_id="thread-many")

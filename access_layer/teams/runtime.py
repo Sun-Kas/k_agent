@@ -26,7 +26,7 @@ from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import RuntimeCatalog
 from access_layer.teams.models import SupervisorDecision
 from access_layer.teams.store import TeamStore
-from backend.home import (
+from access_layer.home import (
     ensure_shared_runtime,
     link_shared_runtime,
     public_home_relative_path,
@@ -34,6 +34,7 @@ from backend.home import (
     shared_runtime_tool_env,
     to_managed_path,
 )
+from access_layer.user_questions import normalize_user_question_answers
 
 
 logger = logging.getLogger("k_agent.access.team_runtime")
@@ -125,6 +126,7 @@ class TeamRuntime:
         *,
         action: str,
         scope: str = "once",
+        answers: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """以标准 Resume Run 继续一个持久化的 worker-task Interrupt。
 
@@ -174,6 +176,7 @@ class TeamRuntime:
                     checkpoint=checkpoint,
                     action=action,
                     scope=scope,
+                    answers=answers,
                 )
             raise ValueError("Team task for this approval no longer exists")
         if agent is None:
@@ -184,15 +187,13 @@ class TeamRuntime:
             raise ValueError("Team task already has an active run")
 
         run_id = f"team-resume-{uuid.uuid4().hex}"
-        decision = {
-            "interruptId": approval_id,
-            "status": "cancelled" if action == "cancel" else "resolved",
-            **(
-                {}
-                if action == "cancel"
-                else {"payload": {"approved": action == "approve", "scope": scope}}
-            ),
-        }
+        decision = self._approval_resume_decision(
+            value,
+            approval_id=approval_id,
+            action=action,
+            scope=scope,
+            answers=answers,
+        )
         resume_record = {
             "id": approval_id,
             "requestHash": value.get("requestHash"),
@@ -212,9 +213,14 @@ class TeamRuntime:
             await self.store.record_approval(
                 team_id, task_id, agent_id, "approval.resolved", {
                     **{key: item for key, item in value.items() if key != "_checkpoint"},
-                    "status": "approved" if action == "approve" else "denied",
+                    "status": self._approval_resolution_status(action),
                     "action": action,
                     "scope": scope,
+                    **(
+                        {"answers": decision.get("payload", {}).get("answers", {})}
+                        if action == "answer"
+                        else {}
+                    ),
                     "resumeRunId": run_id,
                 },
             )
@@ -264,6 +270,7 @@ class TeamRuntime:
         checkpoint: dict[str, Any],
         action: str,
         scope: str,
+        answers: dict[str, dict[str, Any]] | None,
     ) -> dict[str, Any]:
         """恢复主管控制 run，并沿用原 job/attempt 应用结构化决策。"""
 
@@ -273,15 +280,13 @@ class TeamRuntime:
         if active_key in self._active:
             raise ValueError("Supervisor already has an active resume run")
         run_id = f"team-supervisor-resume-{uuid.uuid4().hex}"
-        decision = {
-            "interruptId": approval_id,
-            "status": "cancelled" if action == "cancel" else "resolved",
-            **(
-                {}
-                if action == "cancel"
-                else {"payload": {"approved": action == "approve", "scope": scope}}
-            ),
-        }
+        decision = self._approval_resume_decision(
+            value,
+            approval_id=approval_id,
+            action=action,
+            scope=scope,
+            answers=answers,
+        )
         resume_record = {
             "id": approval_id,
             "requestHash": value.get("requestHash"),
@@ -298,9 +303,14 @@ class TeamRuntime:
             await self.store.record_approval(
                 team_id, job_id, supervisor_id, "approval.resolved", {
                     **{key: item for key, item in value.items() if key != "_checkpoint"},
-                    "status": "approved" if action == "approve" else "denied",
+                    "status": self._approval_resolution_status(action),
                     "action": action,
                     "scope": scope,
+                    **(
+                        {"answers": decision.get("payload", {}).get("answers", {})}
+                        if action == "answer"
+                        else {}
+                    ),
                     "resumeRunId": run_id,
                 },
             )
@@ -626,6 +636,47 @@ class TeamRuntime:
             encoding="utf-8",
         )
         return artifact_id, staging, final_path
+
+    @staticmethod
+    def _approval_resume_decision(
+        value: dict[str, Any],
+        *,
+        approval_id: str,
+        action: str,
+        scope: str,
+        answers: dict[str, dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Validate Team answers against the server-owned Interrupt definition."""
+
+        if action == "cancel":
+            return {"interruptId": approval_id, "status": "cancelled"}
+        if value.get("category") == "user_input":
+            if action != "answer":
+                raise ValueError("User question interrupts require structured answers")
+            detail = value.get("detail")
+            questions = detail.get("questions") if isinstance(detail, dict) else None
+            normalized = normalize_user_question_answers(
+                questions if isinstance(questions, list) else [], answers
+            )
+            payload: dict[str, Any] = {"answers": normalized}
+        else:
+            if action == "answer":
+                raise ValueError("Permission approvals do not accept question answers")
+            payload = {"approved": action == "approve", "scope": scope}
+        return {
+            "interruptId": approval_id,
+            "status": "resolved",
+            "payload": payload,
+        }
+
+    @staticmethod
+    def _approval_resolution_status(action: str) -> str:
+        return {
+            "approve": "approved",
+            "deny": "denied",
+            "cancel": "cancelled",
+            "answer": "answered",
+        }.get(action, "denied")
 
     @staticmethod
     def _ensure_team_workspace(team: dict[str, Any]) -> Path:

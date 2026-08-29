@@ -5,7 +5,7 @@
   RuntimeCatalog、TeamRuntime（后台调度）
 - 中间件：为每个请求绑定 RequestContext / x-request-id
 - `/api/agent` → AgentAccessLayer；Team 路由委托 TeamStore/Runtime
-- 配置中心读写 `$K_AGENT_HOME`；MCP reload / approval 等代理到后端 `/internal/*`
+- 配置中心读写 `$K_AGENT_HOME`；MCP reload 等代理到后端 `/internal/*`
 
 服务边界：本进程是唯一对外入口；Agent Backend 不暴露给浏览器。本地构建时
 在全部 API 注册后再挂载 frontend/dist，保证 `/api` 语义优先。
@@ -24,7 +24,6 @@ import tempfile
 import zipfile
 
 from ag_ui.core import RunAgentInput
-import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -48,8 +47,7 @@ from access_layer.sessions.workspace import (
 from access_layer.scheduled_tasks import ScheduledTaskRuntime, ScheduledTaskStore
 from access_layer.scheduled_tasks.router import build_scheduled_task_router
 from access_layer.teams import TeamRuntime, TeamStore, build_team_router
-from backend.api.schemas import (
-    ApprovalResolutionInput,
+from access_layer.schemas import (
     HealthResponse,
     McpConfigUpdate,
     ModelsConfigUpdate,
@@ -59,18 +57,18 @@ from backend.api.schemas import (
     SessionCapabilities,
     SkillsConfigUpdate,
 )
-from backend.config import Settings, get_or_init_settings
-from backend.home import ensure_home_layout, skills_dir, teams_dir
-from backend.logging_config import configure_agent_backend_logging
-from backend.runtime_config import (
+from access_layer.settings import Settings, get_or_init_settings
+from access_layer.home import ensure_home_layout, skills_dir, teams_dir
+from access_layer.logging_config import configure_agent_backend_logging
+from access_layer.models_catalog import (
     models_path,
     load_models,
     model_api_key,
     write_models,
 )
-from backend.skills import SkillDefinition, clear_skill_caches, get_available_skills
-from backend.skills.frontmatter import parse_bool, parse_markdown_frontmatter
-from backend.storage import create_storage, write_json_atomic
+from access_layer.skills import SkillDefinition, clear_skill_caches, get_available_skills
+from access_layer.skills.frontmatter import parse_bool, parse_markdown_frontmatter
+from access_layer.storage import create_storage, write_json_atomic
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -440,7 +438,6 @@ def create_app() -> FastAPI:
         """启动时装配依赖并启动 Team 调度；关闭时仅停止本进程拥有的 TeamRuntime。"""
         ensure_home_layout(migrate=True)
         app.state.settings = await get_or_init_settings()
-        app.state.base_system_prompt = app.state.settings.system_prompt
         app.state.storage = create_storage(app.state.settings)
         app.state.request_limiter = RequestConcurrencyLimiter(
             app.state.settings.max_concurrent_agent_requests,
@@ -547,18 +544,6 @@ def create_app() -> FastAPI:
             bashSandbox=backend_health.get("bashSandbox"),
         )
 
-    @app.get("/api/health/concurrency")
-    async def concurrency_health():
-        """暴露当前进程内并发槽位/会话锁形状，供运维与测试观测。"""
-        snapshot = await app.state.request_limiter.snapshot()
-        return {
-            "serverWorkers": app.state.settings.server_workers,
-            "maxConcurrentAgentRequests": snapshot.max_concurrent_requests,
-            "activeRequests": snapshot.active_requests,
-            "availableRequestSlots": snapshot.available_request_slots,
-            "sessionLockCount": snapshot.session_lock_count,
-        }
-
     @app.get("/api/health/scheduled-tasks")
     async def scheduled_tasks_health():
         """Expose scheduler liveness without expanding the stable HealthResponse schema."""
@@ -659,18 +644,6 @@ def create_app() -> FastAPI:
         await app.state.agent_backend_client.post_json("/internal/mcp/reload")
         return {"ok": True, "restartRequired": False, **await get_mcp_config()}
 
-    @app.get("/api/mcp/status")
-    async def get_mcp_status():
-        """代理读取 MCP server 连接状态。"""
-        return {
-            "servers": (
-                await app.state.agent_backend_client.get_json(
-                    "/internal/runtime/status"
-                )
-            ).get("mcpServers", []),
-            "loadResult": None,
-        }
-
     @app.get("/api/mcp/capabilities")
     async def get_mcp_capabilities():
         """代理读取 MCP tools/resources/prompts 能力。"""
@@ -682,7 +655,14 @@ def create_app() -> FastAPI:
     async def reload_mcp():
         """代理触发 Agent Backend 重新加载 MCP 连接。"""
         await app.state.agent_backend_client.post_json("/internal/mcp/reload")
-        return await get_mcp_status()
+        return {
+            "servers": (
+                await app.state.agent_backend_client.get_json(
+                    "/internal/runtime/status"
+                )
+            ).get("mcpServers", []),
+            "loadResult": None,
+        }
 
     @app.get("/api/config/skills")
     async def get_skills_config():
@@ -771,59 +751,10 @@ def create_app() -> FastAPI:
             "loadedSkills": skills,
         }
 
-    @app.post("/api/debug/prompt-cache/reset")
-    async def reset_prompt_cache():
-        """代理清理 Agent Backend 的 prompt 缓存。"""
-        await app.state.agent_backend_client.post_json("/internal/prompt/reset")
-        return {"ok": True}
-
-    @app.get("/api/debug/prompt-context")
-    async def debug_prompt_context():
-        """返回当前 prompt/memory/MCP 上下文调试信息。"""
-        return await app.state.agent_backend_client.get_json(
-            "/internal/prompt/context"
-        )
-
     @app.post("/api/agent")
     async def run_agui_agent(payload: RunAgentInput):
         """公开 AG-UI 入口：把 RunAgentInput 交给 AgentAccessLayer 编排。"""
         return await app.state.access_layer.run(payload)
-
-    @app.post("/api/approvals/{request_id}")
-    async def resolve_approval(
-        request_id: str, payload: ApprovalResolutionInput
-    ) -> dict:
-        """把工作台审批决定转发到私有 Agent Backend，并保留其后端状态码语义。"""
-
-        try:
-            return await app.state.agent_backend_client.post_json(
-                f"/internal/approvals/{request_id}",
-                payload.model_dump(by_alias=True),
-            )
-        except httpx.HTTPStatusError as exc:
-            # Preserve stale/mismatched approval semantics at the public edge;
-            # otherwise a backend 404 would be obscured as an Access Layer 500.
-            detail = "Approval request is no longer pending"
-            try:
-                backend_detail = exc.response.json().get("detail")
-                if isinstance(backend_detail, str) and backend_detail:
-                    detail = backend_detail
-            except (ValueError, AttributeError):
-                pass
-            raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
-
-    @app.get("/api/approvals/{request_id}")
-    async def get_approval_status(
-        request_id: str, threadId: str, runId: str
-    ) -> dict:
-        """Proxy a scoped liveness check so stale cards can close before a click."""
-
-        from urllib.parse import urlencode
-
-        query = urlencode({"threadId": threadId, "runId": runId})
-        return await app.state.agent_backend_client.get_json(
-            f"/internal/approvals/{request_id}?{query}"
-        )
 
     @app.get("/api/sessions")
     async def list_sessions():
