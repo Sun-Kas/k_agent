@@ -5,8 +5,7 @@ import { TERMINAL_DESIGN } from "../design.js";
 /**
  * 所有临时覆盖层共用的外框。
  *
- * 浮层固定使用双线边框，和常规圆角面板形成层级差；宽度集中在 design.ts 控制，
- * 避免每个对话框各自定义尺寸后在窄终端出现不一致的换行。
+ * 浮层用圆角框，和 REPL 提示符同一套边框语言。
  */
 export function Overlay({ title, children }: { title: string; children: React.ReactNode }): React.ReactElement {
   return (

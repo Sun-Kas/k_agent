@@ -13,7 +13,7 @@ export const TERMINAL_DESIGN = {
     sessionRailColumns: 26,
     inspectorColumns: 42,
     overlayColumns: 68,
-    composerMinRows: 3,
+    composerMinRows: 1,
     composerMaxRows: 8,
     contentPadding: 1,
     timelinePreviewLines: 4,
@@ -23,8 +23,9 @@ export const TERMINAL_DESIGN = {
     paletteVisibleRows: 10,
   },
   density: {
-    timelineGapRows: 1,
+    timelineGapRows: 0,
     timelineVisibleItems: 18,
+    timelineTextPreviewLines: 8,
     sessionVisibleRows: 12,
     toolPreviewRows: 3,
     thinkingPreviewRows: 2,
@@ -38,9 +39,9 @@ export const TERMINAL_DESIGN = {
     danger: "red" as const,
   },
   borders: {
-    /** 常规面板用圆角，浮层用双线，保证层级一眼可分。 */
+    /** REPL 提示符和浮层都用圆角，避免再做成 Web 面板的双边框。 */
     panel: "round" as const,
-    overlay: "double" as const,
+    overlay: "round" as const,
   },
   symbols: {
     brand: "✻",
@@ -76,6 +77,21 @@ export const TERMINAL_DESIGN = {
     brand: "K Agent",
     welcome: "欢迎使用 K Agent",
     tagline: "本地优先的 Agent 工作台",
+    version: "0.1.0",
+    /**
+     * 开场标用 3 行窄宽字符（与 Claude Code 同结构），禁止全角方块 █。
+     * █ 在不少终端按 2 列渲染，会撑破 Yoga 布局：模式行消失、输入框右边框对不齐。
+     */
+    logo: [
+      "  ▐▛███▜▌  ",
+      " ▝▜█████▛▘ ",
+      "   ▘▘ ▝▝   ",
+    ],
+    logoFallback: [
+      "  |\\  /|  ",
+      "  | \\/ |  ",
+      "  |    |  ",
+    ],
     connected: "已连接",
     disconnected: "连接已断开",
     running: "正在运行",
@@ -83,15 +99,15 @@ export const TERMINAL_DESIGN = {
     questionRequired: "Agent 正在等待你的回答",
     newActivity: "有新的运行活动",
     reviewPendingInput: "按 ! 返回待处理输入",
-    /** 输入框外的单行键位提示；输入框内部不放任何预置文案。 */
-    composerKeys: "/ 命令   Shift+Tab 模式   Ctrl+P 会话   Ctrl+O Inspector   Ctrl+C 停止   /help 帮助",
+    /** 提示符下方的 REPL 脚注，风格对齐 Claude Code：短、灰、可发现。 */
+    composerKeys: "? 帮助   / 命令   ↑ 历史   Ctrl+P 会话",
     slashKeys: "↑↓ 选择   Tab 补全   Enter 执行   Esc 收起",
     paletteKeys: "输入以过滤   ↑↓ 选择   Enter 执行   Esc 关闭",
     startGuideTitle: "开始",
     startGuide: [
-      "输入目标后回车，直接开始一次新的运行",
-      "输入 / 展开命令选择栏，Tab 补全命令",
-      "Shift+Tab 在 工作 / 团队 / 自动 / 诊断 之间切换",
+      "输入目标后回车即可开始",
+      "运行中仍可输入，回车后排队发送",
+      "终端滚动查看上文 · / 命令 · ↑ 历史 · Ctrl+P 会话 · Shift+Tab 切换模式",
     ],
   },
   keys: {

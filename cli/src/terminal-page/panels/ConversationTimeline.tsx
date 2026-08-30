@@ -7,41 +7,48 @@ import { ToolBlock } from "../renderers/ToolBlock.js";
 import { ErrorBlock } from "../renderers/ErrorBlock.js";
 import { TERMINAL_DESIGN } from "../design.js";
 
-export function ConversationTimeline({ items, selectedActivityId }: { items: TimelineItem[]; selectedActivityId?: string | undefined }): React.ReactElement {
-  const visible = items.slice(-TERMINAL_DESIGN.density.timelineVisibleItems);
+export function ConversationTimeline({ items, selectedActivityId, expanded }: {
+  items: TimelineItem[];
+  selectedActivityId?: string | undefined;
+  expanded: boolean;
+}): React.ReactElement | null {
+  if (items.length === 0) return null;
   return (
-    <Box flexDirection="column" flexGrow={1} paddingX={1}>
-      <Text bold color={TERMINAL_DESIGN.colors.muted}>CONVERSATION</Text>
-      {visible.length === 0 ? (
-        <Text color={TERMINAL_DESIGN.colors.muted}>输入目标开始新的运行。</Text>
-      ) : visible.map((item) => (
-        <Box key={`${item.id}-${item.sequence}`} flexDirection="column" marginTop={item.sequence === visible[0]?.sequence ? 0 : TERMINAL_DESIGN.density.timelineGapRows}>
-          <TimelineEntry item={item} selected={item.id === selectedActivityId} />
+    <Box flexDirection="column">
+      {items.map((item, index) => (
+        <Box key={`${item.id}-${item.sequence}`} flexDirection="column" width="100%" marginTop={index === 0 ? 0 : TERMINAL_DESIGN.density.timelineGapRows}>
+          <TimelineEntry item={item} expanded={expanded || item.id === selectedActivityId} />
         </Box>
       ))}
     </Box>
   );
 }
 
-function TimelineEntry({ item, selected }: { item: TimelineItem; selected: boolean }): React.ReactElement {
+export function TimelineEntry({ item, expanded }: {
+  item: TimelineItem;
+  expanded: boolean;
+}): React.ReactElement {
   if (item.kind === "user") {
+    const queued = item.id.startsWith("queued-");
     return (
-      <Box flexDirection="column">
-        <Text color={TERMINAL_DESIGN.colors.muted}>{TERMINAL_DESIGN.symbols.prompt} 你</Text>
-        <MarkdownBlock content={item.content} />
+      <Box width="100%">
+        <Text color={queued ? TERMINAL_DESIGN.colors.muted : TERMINAL_DESIGN.colors.accent}>{TERMINAL_DESIGN.symbols.prompt} </Text>
+        <Box flexDirection="column">
+          <MarkdownBlock content={item.content} />
+          {queued ? <Text color={TERMINAL_DESIGN.colors.muted}>排队发送</Text> : null}
+        </Box>
       </Box>
     );
   }
   if (item.kind === "text") {
     return (
-      <Box flexDirection="column">
-        <Text color={TERMINAL_DESIGN.colors.accent}>{TERMINAL_DESIGN.symbols.brand} {TERMINAL_DESIGN.copy.brand}</Text>
+      <Box flexDirection="column" paddingLeft={2}>
         <MarkdownBlock content={item.content || "…"} />
       </Box>
     );
   }
-  if (item.kind === "thinking") return <ThinkingBlock item={item} />;
-  if (item.kind === "tool") return <ToolBlock item={item} expanded={selected} />;
+  if (item.kind === "thinking") return <ThinkingBlock item={item} expanded={expanded} />;
+  if (item.kind === "tool") return <ToolBlock item={item} expanded={expanded} />;
   if (item.kind === "approval") {
     return <Text color={TERMINAL_DESIGN.colors.warning}>{TERMINAL_DESIGN.symbols.approval} {item.approval.title} · {item.approval.status}</Text>;
   }

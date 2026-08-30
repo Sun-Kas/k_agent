@@ -33,3 +33,7 @@ test("同一行原点下文本变长时立即算出新插入点，不沿用旧�
   assert.equal(after?.y, before?.y);
 });
 
+test("输入框内容节点直接决定光标纵坐标，不再手工上下调整", () => {
+  const contentLine = { x: 2, y: 21, width: 76, height: 1 };
+  assert.deepEqual(imeCursorPosition(contentLine, "❯ 吃"), { x: 6, y: 21 });
+});

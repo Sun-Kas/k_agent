@@ -1,9 +1,12 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { Box, Text, useInput, useStdout } from "ink";
-import { pendingApproval } from "../application/event-projector.js";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Box, Static, Text, useInput, useStdout } from "ink";
+import { pendingApproval, type TimelineItem } from "../application/event-projector.js";
 import { terminalLayout, TERMINAL_DESIGN } from "./design.js";
 import { HOME_MODES, homePickItems, nextSurface, surfaceFromDigit } from "./home-catalog.js";
+import { pushPromptHistory, promptHistoryText } from "./prompt-history.js";
+import { canFlushPromptQueue, splitSettledTimeline } from "./repl-view.js";
 import { filterSlashCommands, slashCommandAvailability, slashQuery } from "./slash-catalog.js";
+import { TimelineEntry } from "./panels/ConversationTimeline.js";
 import type { OverlayState, TerminalFocus, TerminalPageAction, TerminalPageProps } from "./types.js";
 import { GlobalBar } from "./panels/GlobalBar.js";
 import { Composer } from "./panels/Composer.js";
@@ -29,7 +32,8 @@ import { ErrorBlock } from "./renderers/ErrorBlock.js";
  */
 export function TerminalPage({ model, onAction }: TerminalPageProps): React.ReactElement {
   const { stdout } = useStdout();
-  const layout = terminalLayout(stdout.columns ?? 80);
+  const columns = stdout.columns ?? 80;
+  const layout = terminalLayout(columns);
   const [draft, setDraft] = useState("");
   const [homePick, setHomePick] = useState(0);
   const [focus, setFocus] = useState<TerminalFocus>("composer");
@@ -38,15 +42,42 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   const [dismissedInterruptId, setDismissedInterruptId] = useState<string>();
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
+  const staticItemsRef = useRef<TimelineItem[]>([]);
+  const seenStaticKeysRef = useRef(new Set<string>());
+  const [staticItems, setStaticItems] = useState<TimelineItem[]>([]);
+  const promptHistoryRef = useRef<string[]>([]);
+  const historyCursorRef = useRef(-1);
+  const historyStashRef = useRef("");
+  const [sendQueue, setSendQueue] = useState<string[]>([]);
+  const sendQueueRef = useRef<string[]>([]);
+  const [localRunning, setLocalRunning] = useState(false);
   const interrupt = pendingApproval(model.timeline);
   const interruptVisible = interrupt && interrupt.id !== dismissedInterruptId;
   const effectiveOverlay: OverlayState = interruptVisible
     ? { kind: isUserQuestion(interrupt.detail) ? "question" : "approval", approval: interrupt }
     : overlay;
+  const busy = localRunning || !canFlushPromptQueue(model.timeline.runStatus);
+  const wasBusy = useRef(busy);
+
+  useEffect(() => {
+    const status = model.timeline.runStatus;
+    if (status === "complete" || status === "error" || status === "stopped") setLocalRunning(false);
+  }, [model.timeline.runStatus]);
 
   useEffect(() => {
     if (interrupt && interrupt.id !== dismissedInterruptId) setFocus("overlay");
   }, [interrupt, dismissedInterruptId]);
+
+  useEffect(() => {
+    const previouslyBusy = wasBusy.current;
+    wasBusy.current = busy;
+    if (!previouslyBusy || busy) return;
+    const next = sendQueueRef.current[0];
+    if (!next) return;
+    sendQueueRef.current = sendQueueRef.current.slice(1);
+    setSendQueue(sendQueueRef.current);
+    onAction({ type: "submit_prompt", text: next });
+  }, [busy, onAction]);
 
   const picks = homePickItems(model);
   const selectedPick = picks[Math.min(homePick, Math.max(0, picks.length - 1))];
@@ -108,7 +139,7 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
       activateHomePick(selectedPick.id);
       return;
     }
-    if (input === "?" && focus !== "composer") return openOverlay("help");
+    if (input === "?" && !draft && !key.ctrl && !key.meta) return openOverlay("help");
   });
 
   function openOverlay(kind: OverlayState["kind"]): void {
@@ -123,11 +154,9 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   }
 
   function cycleFocus(direction: -1 | 1): void {
-    const visible: TerminalFocus[] = layout === "wide"
-      ? ["session-rail", "timeline", "inspector", "composer"]
-      : layout === "standard"
-        ? ["session-rail", "timeline", "composer"]
-        : ["timeline", "composer"];
+    const visible: TerminalFocus[] = showInspector
+      ? ["timeline", "inspector", "composer"]
+      : ["timeline", "composer"];
     const current = Math.max(0, visible.indexOf(focus));
     setFocus(visible[(current + direction + visible.length) % visible.length]!);
   }
@@ -142,16 +171,38 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     if (sessionId) onAction({ type: "select_session", sessionId });
   }
 
+  function navigateHistory(delta: 1 | -1, liveDraft: string): string | undefined {
+    const currentCursor = historyCursorRef.current;
+    const nextCursor = currentCursor + delta;
+    const stash = currentCursor === -1 ? liveDraft : historyStashRef.current;
+    const text = promptHistoryText(promptHistoryRef.current, nextCursor, stash);
+    if (text === undefined) return undefined;
+    if (currentCursor === -1) historyStashRef.current = liveDraft;
+    historyCursorRef.current = nextCursor;
+    return text;
+  }
+
   function submit(value: string): void {
     const text = value.trim();
     if (!text) return;
     setDraft("");
+    historyCursorRef.current = -1;
+    historyStashRef.current = "";
     if (text.startsWith("/")) {
       const [command, ...args] = text.slice(1).split(/\s+/);
       // 帮助是纯页面能力，不需要往 application 层发一次无副作用的命令。
       if (command === "help") return openOverlay("help");
       onAction({ type: "slash_command", command: command ?? "", arguments: args.join(" ") });
-    } else onAction({ type: "submit_prompt", text });
+      return;
+    }
+    promptHistoryRef.current = pushPromptHistory(promptHistoryRef.current, text);
+    if (busy) {
+      sendQueueRef.current = [...sendQueueRef.current, text];
+      setSendQueue(sendQueueRef.current);
+      return;
+    }
+    setLocalRunning(true);
+    onAction({ type: "submit_prompt", text });
   }
 
   /**
@@ -175,41 +226,80 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     if (model.surface === "team") return <TeamScreen teams={model.teams} />;
     if (model.surface === "automation") return <AutomationScreen automations={model.automations} />;
     if (model.surface === "doctor") return <DoctorScreen lines={model.doctorLines} />;
-    return <ChatScreen model={model} layout={layout} focus={focus} showInspector={showInspector} />;
-  }, [focus, layout, model, selectedPick?.id, showInspector]);
+    return (
+      <ChatScreen
+        model={model}
+        layout={layout}
+        focus={focus}
+        showInspector={showInspector}
+        pendingPrompts={sendQueue}
+      />
+    );
+  }, [focus, layout, model, selectedPick?.id, showInspector, sendQueue]);
 
   const overlayVisible = effectiveOverlay.kind !== "none";
+  const settledSignature = model.timeline.items.map((item) => `${item.id}:${item.sequence}`).join("|");
+  useEffect(() => {
+    const extra: TimelineItem[] = [];
+    const sessionKey = model.activeSessionId ?? "pending";
+    for (const item of splitSettledTimeline(model.timeline.items).settled) {
+      const key = `${sessionKey}:${item.id}:${item.sequence}`;
+      if (seenStaticKeysRef.current.has(key)) continue;
+      seenStaticKeysRef.current.add(key);
+      extra.push(item);
+    }
+    if (extra.length === 0) return;
+    staticItemsRef.current = [...staticItemsRef.current, ...extra];
+    setStaticItems(staticItemsRef.current);
+  }, [model.activeSessionId, model.timeline.items, settledSignature]);
+
   return (
-    <Box flexDirection="column" minWidth={Math.min(stdout.columns ?? 80, TERMINAL_DESIGN.layout.minimumColumns)}>
+    <Box
+      flexDirection="column"
+      minWidth={Math.min(columns, TERMINAL_DESIGN.layout.minimumColumns)}
+    >
+      <Static items={staticItems}>
+        {(item) => (
+          <Box key={`${item.id}-${item.sequence}`} flexDirection="column" paddingX={1} width="100%">
+            <TimelineEntry item={item} expanded={false} />
+          </Box>
+        )}
+      </Static>
       <GlobalBar model={model} />
       {model.error ? <ErrorBlock content={model.error} /> : null}
       {interrupt && dismissedInterruptId === interrupt.id ? <Text color={TERMINAL_DESIGN.colors.warning}>{TERMINAL_DESIGN.symbols.approval} 待处理输入仍存在 · {TERMINAL_DESIGN.copy.reviewPendingInput}</Text> : null}
       {overlayVisible ? (
-        <Box flexGrow={1} justifyContent="center" alignItems="center">
+        <Box justifyContent="center" paddingY={1}>
           <OverlayHost overlay={effectiveOverlay} model={model} onAction={onAction} onRunCommand={runCommand} onClose={closeOverlay} />
         </Box>
-      ) : main}
-      <StatusBar model={model} />
+      ) : (
+        <Box flexDirection="column">
+          {main}
+        </Box>
+      )}
       {!overlayVisible ? (
         <Box flexDirection="column">
           <Composer
             value={draft}
-            disabled={!model.connected || model.timeline.runStatus === "running"}
+            disabled={!model.connected}
             focused={focus === "composer" && effectiveOverlay.kind === "none"}
             captureDigits={modeKeysIdle}
             suppressKeys={slashOpen}
+            historyEnabled={!(model.surface === "home" && !draft)}
+            onHistory={(delta, liveDraft) => navigateHistory(delta, liveDraft)}
             onChange={setDraft}
             onSubmit={submit}
           />
           {slashOpen ? (
             <SlashMenu items={slashMatches} selected={Math.min(slashIndex, slashMatches.length - 1)} query={query ?? ""} model={model} />
           ) : (
-            <Box paddingX={1}>
-              <Text color={TERMINAL_DESIGN.colors.muted}>{TERMINAL_DESIGN.copy.composerKeys}</Text>
-            </Box>
+            <StatusBar model={model} queuedCount={sendQueue.length} />
           )}
         </Box>
       ) : null}
+      {/* Home 内容可能高于视口，Ink 此时不会在帧尾追加换行。保留一个结构化空行，
+          让终端光标坐标仍以完整输出为原点；输入框内部的 Y 无需任何补偿。 */}
+      {model.surface === "home" && !overlayVisible ? <Text> </Text> : null}
     </Box>
   );
 }

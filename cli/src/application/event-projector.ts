@@ -214,17 +214,18 @@ export function timelineFromSession(session: SessionState): TimelineState {
     return messageState;
   }
   let state = emptyTimeline();
-  const userByRun = new Map<string, ChatMessage>();
-  const userWithoutRun: ChatMessage[] = [];
-  for (const message of session.messages) {
-    if (message.role !== "user") continue;
-    const runId = message.meta?.runId;
-    if (runId) userByRun.set(runId, message);
-    else userWithoutRun.push(message);
-  }
+  const users = session.messages.filter((message) => message.role === "user");
+  const runIds = (session.events ?? [])
+    .filter((event): event is Extract<AgUiEvent, { type: "RUN_STARTED" }> => event.type === "RUN_STARTED")
+    .map((event) => event.runId);
+  const userByRun = assignUsersToRuns(users, runIds);
+  const assignedIds = new Set([...userByRun.values()].map((message) => message.id));
+  const firstAssigned = users.findIndex((message) => assignedIds.has(message.id));
+  const leadingUsers = users.filter((message, index) => !assignedIds.has(message.id) && (firstAssigned < 0 || index < firstAssigned));
 
-  for (const message of userWithoutRun) {
-    state = appendUserPrompt(state, message.id, message.content);
+  // Access Layer 落盘的 user 消息通常没有 meta.runId；不能先把整段用户历史堆到顶部。
+  for (const message of leadingUsers) {
+    state = appendUserPrompt(state, message.id, message.content, message.meta?.runId);
   }
   const insertedRuns = new Set<string>();
   for (const event of session.events ?? []) {
@@ -236,6 +237,11 @@ export function timelineFromSession(session: SessionState): TimelineState {
       }
     }
     state = projectEvent(state, event);
+  }
+  const presentUserIds = new Set(state.items.filter((item) => item.kind === "user").map((item) => item.id));
+  for (const message of users) {
+    if (presentUserIds.has(message.id)) continue;
+    state = appendUserPrompt(state, message.id, message.content, message.meta?.runId);
   }
 
   // openInterrupts 是 Access Layer 的当前 checkpoint 视图；即使旧事件窗口已裁剪，
@@ -260,6 +266,29 @@ export function timelineFromSession(session: SessionState): TimelineState {
     }
   }
   return state;
+}
+
+function assignUsersToRuns(users: ChatMessage[], runIds: string[]): Map<string, ChatMessage> {
+  const assigned = new Map<string, ChatMessage>();
+  const used = new Set<string>();
+  for (const runId of runIds) {
+    const labeled = users.find((message) => message.meta?.runId === runId && !used.has(message.id));
+    if (!labeled) continue;
+    assigned.set(runId, labeled);
+    used.add(labeled.id);
+  }
+  const unlabeled = users.filter((message) => !used.has(message.id));
+  const openRuns = runIds.filter((runId) => !assigned.has(runId));
+  // 事件窗口可能被裁成最近几轮：从尾部对齐，避免把更早的提问贴到当前 run 上。
+  let cursor = unlabeled.length - 1;
+  for (let index = openRuns.length - 1; index >= 0 && cursor >= 0; index -= 1) {
+    const user = unlabeled[cursor];
+    const runId = openRuns[index];
+    if (!user || !runId) break;
+    assigned.set(runId, user);
+    cursor -= 1;
+  }
+  return assigned;
 }
 
 function appendOpenInterrupt(

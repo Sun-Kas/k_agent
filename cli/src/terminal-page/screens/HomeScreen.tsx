@@ -3,10 +3,11 @@ import { Box, Text } from "ink";
 import type { TerminalPageViewModel } from "../types.js";
 import { TERMINAL_DESIGN } from "../design.js";
 import { HOME_MODES, HOME_RECENT_SESSION_LIMIT, homePickItems, type HomeSessionItem } from "../home-catalog.js";
+import { WelcomeBanner } from "../panels/WelcomeBanner.js";
 
 /**
- * 首页是“下一步做什么”的启动面板：先给可执行引导，再给模式与最近会话。
- * 这里不预置任何示例问题，避免用户把模板文案当成真实建议直接发给模型。
+ * 启动页先给 K Agent 欢迎框，再给最近会话。
+ * 不预置示例问题；模式用 Shift+Tab / 1–4，不做成工作台导航。
  */
 export function HomeScreen({ model, selectedId }: {
   model: TerminalPageViewModel;
@@ -14,32 +15,10 @@ export function HomeScreen({ model, selectedId }: {
 }): React.ReactElement {
   const sessions = homePickItems(model).filter((item): item is HomeSessionItem => item.kind === "session");
   return (
-    <Box flexDirection="column" flexGrow={1} paddingX={1}>
-      <Box
-        flexDirection="column"
-        borderStyle={TERMINAL_DESIGN.borders.panel}
-        borderColor={TERMINAL_DESIGN.colors.accent}
-        paddingX={1}
-      >
-        <Text>
-          <Text color={TERMINAL_DESIGN.colors.accent}>{TERMINAL_DESIGN.symbols.brand} </Text>
-          <Text bold>{TERMINAL_DESIGN.copy.welcome}</Text>
-          <Text color={TERMINAL_DESIGN.colors.muted}>  {TERMINAL_DESIGN.copy.tagline}</Text>
-        </Text>
-        <Text color={TERMINAL_DESIGN.colors.muted} wrap="truncate-end">
-          {model.runtime.endpoint} · {model.runtime.agentKind} · {model.runtime.modelId || "未选择模型"} · {model.runtime.permissionMode}
-        </Text>
-      </Box>
+    <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <WelcomeBanner model={model} />
 
       <Box flexDirection="column" marginTop={1}>
-        <Text bold color={TERMINAL_DESIGN.colors.accent}>{TERMINAL_DESIGN.copy.startGuideTitle}</Text>
-        {TERMINAL_DESIGN.copy.startGuide.map((line) => (
-          <Text key={line} color={TERMINAL_DESIGN.colors.muted}>  {TERMINAL_DESIGN.symbols.unread} {line}</Text>
-        ))}
-      </Box>
-
-      <Box flexDirection="column" marginTop={1}>
-        <Text bold color={TERMINAL_DESIGN.colors.accent}>模式</Text>
         {HOME_MODES.map((item) => (
           <PickRow
             key={item.id}
@@ -52,17 +31,14 @@ export function HomeScreen({ model, selectedId }: {
       </Box>
 
       <Box flexDirection="column" marginTop={1}>
-        <Box justifyContent="space-between">
-          <Text bold color={TERMINAL_DESIGN.colors.accent}>最近会话</Text>
-          <Text color={TERMINAL_DESIGN.colors.muted}>{TERMINAL_DESIGN.keys.sessionSwitcher} 全部</Text>
-        </Box>
+        <Text color={TERMINAL_DESIGN.colors.muted}>最近会话 · {TERMINAL_DESIGN.keys.sessionSwitcher}</Text>
         {sessions.length === 0
-          ? <Text color={TERMINAL_DESIGN.colors.muted}>  暂无会话，输入目标即可创建</Text>
+          ? <Text color={TERMINAL_DESIGN.colors.muted}>暂无会话，输入目标即可创建</Text>
           : sessions.slice(0, HOME_RECENT_SESSION_LIMIT).map((session) => (
             <PickRow
               key={session.id}
               selected={selectedId === session.id}
-              badge={TERMINAL_DESIGN.symbols.waiting}
+              badge=""
               label={session.title}
               detail={session.subtitle}
             />
@@ -79,11 +55,11 @@ function PickRow({ selected, badge, label, detail }: {
   detail: string;
 }): React.ReactElement {
   return (
-    <Box justifyContent="space-between">
+    <Box>
       <Text inverse={selected}>
-        {selected ? TERMINAL_DESIGN.symbols.pointer : " "} {badge}  {label}
+        {selected ? TERMINAL_DESIGN.symbols.pointer : " "} {badge ? `${badge} ` : ""}{label}
       </Text>
-      <Text color={TERMINAL_DESIGN.colors.muted} wrap="truncate-end">{detail}</Text>
+      <Text color={TERMINAL_DESIGN.colors.muted}>  {detail}</Text>
     </Box>
   );
 }

@@ -173,8 +173,8 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
       activeSessionRef.current = run.sessionId;
       const previous = timelineCacheRef.current.get(run.sessionId) ?? emptyTimeline();
       const timeline = appendUserPrompt(previous, run.userMessageId, action.text, run.runId);
-      timelineCacheRef.current.set(run.sessionId, timeline);
-      setModel((value) => ({ ...value, surface: "chat", activeSessionId: run.sessionId, activeSessionTitle: action.text.slice(0, 40), timeline, error: undefined }));
+      timelineCacheRef.current.set(run.sessionId, { ...timeline, runStatus: "running" });
+      setModel((value) => ({ ...value, surface: "chat", activeSessionId: run.sessionId, activeSessionTitle: action.text.slice(0, 40), timeline: { ...timeline, runStatus: "running" }, error: undefined }));
       await startRun(run.sessionId, run.input);
       return;
     }

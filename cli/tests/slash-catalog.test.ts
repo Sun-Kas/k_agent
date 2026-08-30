@@ -62,7 +62,10 @@ test("只读查询在运行中和断线时依然可用", () => {
 
 test("注解优先展示不可用原因，其次是当前值", () => {
   assert.equal(slashCommandAnnotation(command("stop"), model()), "没有运行中的任务");
-  assert.match(slashCommandAnnotation(command("model"), model()), /查看当前模型 · model-1/);
+  assert.match(slashCommandAnnotation(command("model"), model()), /查看当前模型.*model-1/);
+  assert.match(command("mcp").hint, /Web/);
+  assert.match(command("skill").hint, /Web/);
+  assert.match(command("permissions").hint, /Web/);
 });
 
 function command(name: string) {
