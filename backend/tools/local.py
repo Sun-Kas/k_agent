@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -9,11 +10,21 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from backend.memory import append_auto_memory, compact_auto_memory, read_auto_memory, search_auto_memory
+from backend.skills import SkillBodyError, load_skill_body
 from backend.tools.workspace import current_tool_workspace
 
 if TYPE_CHECKING:
     from backend.tools.catalog import SkillCatalog
 ToolExecutor = Callable[[dict[str, Any]], Awaitable[str]]
+
+
+# Skill 目录属于 request context。这里保持逐请求不变的调用协议，避免选择变化导致
+# Provider tools Schema 抖动并破坏 Prompt Cache。
+SKILL_TOOL_DESCRIPTION = (
+    "Load a K Agent skill or MCP prompt by exact name. Available K Agent skills "
+    "are listed in the request context. Invoke a matching skill before continuing "
+    "with the task; do not guess names."
+)
 
 
 @dataclass(slots=True)
@@ -67,14 +78,14 @@ async def compact_personal_memory(payload: dict[str, Any]) -> str:
 async def invoke_skill(
     payload: dict[str, Any], skills: list[dict[str, Any]] | None = None
 ) -> str:
-    """执行本轮请求随带的 Skill 定义（不扫描磁盘目录）。"""
+    """校验本轮 catalog 快照后，按 ID 懒加载 Skill 正文。"""
     # 容忍模型带上斜杠前缀（把 Skill 当斜杠命令写成 `/foo`）。
     skill_name = str(payload.get("skill", "")).strip().lstrip("/")
     args = str(payload.get("args", "")).strip()
     if not skill_name:
         return json.dumps({"success": False, "error": "skill is required"}, ensure_ascii=False)
-    # 只在本次请求传入的 skills 里查找。Agent Backend 不扫描 Skill 目录，
-    # 用户本轮没选中的 Skill 无法被模型调用起来。
+    # 先用本次请求的 catalog 快照做授权。只有匹配成功后才允许碰磁盘；
+    # 文件只贡献正文，参数、白名单和触发条件仍以请求 metadata 为准。
     skill = next(
         (
             item
@@ -85,17 +96,29 @@ async def invoke_skill(
     )
     if skill is None:
         return json.dumps({"success": False, "error": f"Unknown skill: {skill_name}"}, ensure_ascii=False)
-    if not skill.get("enabled", True):
+    if not skill.get("enabled", True) or skill.get("disableModelInvocation", False):
         return json.dumps({"success": False, "error": f"Skill {skill_name} cannot be invoked by the model"}, ensure_ascii=False)
+    try:
+        # 文件读取发生在工具已授权之后，并移出流式事件循环，避免较大的正文阻塞 SSE。
+        body = await asyncio.to_thread(
+            load_skill_body,
+            str(skill.get("id") or ""),
+        )
+    except SkillBodyError as exc:
+        return json.dumps(
+            {
+                "success": False,
+                "error": str(exc),
+            },
+            ensure_ascii=False,
+        )
     content = _render_skill_content(
-        str(skill.get("instructions") or ""),
+        body.instructions,
         args,
         tuple(str(value) for value in skill.get("argumentNames", [])),
-        str(skill.get("baseDir")) if skill.get("baseDir") else None,
+        str(body.base_dir),
     )
     hook_notes = _render_skill_hooks(skill.get("hooks", {}))
-    base_dir = str(skill.get("baseDir") or "").strip() or None
-    file_path = str(skill.get("filePath") or "").strip() or None
     return json.dumps(
         {
             "success": True,
@@ -103,8 +126,8 @@ async def invoke_skill(
             "status": skill.get("executionContext", "inline"),
             "allowedTools": list(skill.get("allowedTools", [])),
             "model": skill.get("model"),
-            "baseDir": base_dir,
-            "filePath": file_path,
+            "baseDir": str(body.base_dir),
+            "filePath": str(body.file_path),
             "content": content,
             "hooks": hook_notes,
         },
@@ -133,12 +156,6 @@ def build_skill_tool(
         bound_skills = list(skill_catalog.items) if skill_catalog is not None else skills
         return await invoke_skill(payload, bound_skills)
 
-    if skill_catalog is not None:
-        description = skill_catalog.tool_description()
-    else:
-        # Base registry construction has no request catalog yet. The definition
-        # is replaced before execution, so keep this description intentionally generic.
-        description = "Load a named K Agent skill or MCP prompt enabled for this run."
     skill_property: dict[str, Any] = {
         "type": "string",
         "description": "The skill or MCP prompt name, without a leading slash.",
@@ -148,7 +165,7 @@ def build_skill_tool(
 
     return ToolDefinition(
         name="Skill",
-        description=description,
+        description=SKILL_TOOL_DESCRIPTION,
         parameters={
             "type": "object",
             "properties": {

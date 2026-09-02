@@ -11,14 +11,11 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from backend.memory import get_memory_context, get_memory_files, get_nested_memory_files, is_memory_file
 from backend.prompts.mcp_prompt import McpPromptTool, build_mcp_dynamic_prompt
 from backend.prompts.sections import PromptSection, fingerprint_text, render_sections, SECTION_CACHE
-
-if TYPE_CHECKING:
-    from backend.skills.loader import SkillDefinition
 
 
 MEMORY_BEHAVIOR_PROMPT = """
@@ -41,7 +38,7 @@ class EffectivePrompt:
 def build_effective_system_prompt(
     base_prompt: str,
     *,
-    skills: list[dict | "SkillDefinition"] | None = None,
+    skills: list[dict] | None = None,
     override_system_prompt: str | None = None,
     append_system_prompt: str | None = None,
     custom_system_prompt: str | None = None,
@@ -76,7 +73,7 @@ def build_prompt_bundle(
     base_prompt: str,
     *,
     cwd: Path | None = None,
-    skills: list[dict | "SkillDefinition"] | None = None,
+    skills: list[dict] | None = None,
     custom_system_prompt: str | None = None,
     append_system_prompt: str | None = None,
     override_system_prompt: str | None = None,
@@ -220,7 +217,7 @@ def _default_system_prompt(base_prompt: str, *, mcp_tools: list[McpPromptTool] |
     return "\n\n".join(section for section in (static_prompt, dynamic_prompt) if section)
 
 
-def _append_skills(base_prompt: str, skills: list[dict | "SkillDefinition"]) -> str:
+def _append_skills(base_prompt: str, skills: list[dict]) -> str:
     """把可用 Skill 摘要追加到系统提示词。"""
     enabled = [skill for skill in skills if _skill_enabled(skill)]
     if not enabled:
@@ -238,27 +235,19 @@ def _append_skills(base_prompt: str, skills: list[dict | "SkillDefinition"]) -> 
     )
 
 
-def _skill_enabled(skill: dict | "SkillDefinition") -> bool:
+def _skill_enabled(skill: dict) -> bool:
     """判断 Skill 是否允许模型主动调用。"""
-    if not isinstance(skill, dict):
-        return not bool(getattr(skill, "disable_model_invocation", False))
-    return bool(skill.get("enabled", True)) and bool(skill.get("instructions", skill.get("description", "")).strip())
+    return bool(skill.get("enabled", True)) and bool(str(skill.get("description") or "").strip() or skill.get("name") or skill.get("id"))
 
 
-def _skill_summary(skill: dict | "SkillDefinition") -> str:
+def _skill_summary(skill: dict) -> str:
     """生成单个 Skill 的系统提示词摘要。"""
-    if not isinstance(skill, dict):
-        parts = [f"- {getattr(skill, 'name')}: {getattr(skill, 'description')}"]
-        if getattr(skill, "when_to_use", None):
-            parts.append(f"  when_to_use: {getattr(skill, 'when_to_use')}")
-        if getattr(skill, "argument_hint", None):
-            parts.append(f"  args: {getattr(skill, 'argument_hint')}")
-        if getattr(skill, "paths", None):
-            parts.append(f"  paths: {', '.join(getattr(skill, 'paths'))}")
-        return "\n".join(parts)
     name = skill.get("name") or skill.get("id")
-    description = skill.get("description") or skill.get("instructions", "").strip().splitlines()[0]
-    return f"- {name}: {description}"
+    description = str(skill.get("description") or "").strip()
+    when_to_use = str(skill.get("whenToUse") or skill.get("when_to_use") or "").strip()
+    if when_to_use and when_to_use not in description:
+        description = f"{description} - {when_to_use}" if description else when_to_use
+    return f"- {name}: {description}" if description else f"- {name}"
 
 
 def _dedupe_memory_files(memory_files: list) -> list:

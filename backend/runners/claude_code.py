@@ -193,31 +193,42 @@ def claude_sandbox_settings(
 
 
 def build_claude_skill_preamble(skills: list[dict[str, Any]]) -> str:
-    """Expose selected Skill packages using Claude Code-specific instructions."""
+    """List selected skills from request catalog metadata. Do not load SKILL.md."""
 
     parts: list[str] = []
     for skill in skills:
-        name = str(skill.get("name") or skill.get("id") or "").strip()
-        instructions = str(skill.get("instructions") or "").strip()
-        if not instructions:
-            continue
-        file_path = _single_line(skill.get("filePath"))
-        base_dir = _single_line(skill.get("baseDir"))
-        path_lines: list[str] = []
-        if file_path:
-            path_lines.append(f"SKILL.md absolute path: {file_path}")
-        if base_dir:
-            path_lines.append(f"Skill package root: {base_dir}")
-            # Claude runs in a per-session workspace, so relative paths from a
-            # Skill must be resolved against the package root, not process cwd.
-            path_lines.append(
-                "Resolve relative paths in this Skill (including scripts/, "
-                "references/, assets/, and templates/) against the Skill "
-                "package root above."
-            )
-        header = f"[Claude Code Skill: {name}]" if name else "[Claude Code Skill]"
-        parts.append("\n".join([header, *path_lines, instructions]))
+        block = _catalog_skill_block(skill, "Claude Code Skill")
+        if block:
+            parts.append(block)
     return "\n\n".join(parts)
+
+
+def _catalog_skill_block(skill: dict[str, Any], label: str) -> str:
+    name = str(skill.get("name") or skill.get("id") or "").strip()
+    if not name:
+        return ""
+    lines = [f"[{label}: {name}]"]
+    description = str(skill.get("description") or "").strip()
+    if description:
+        lines.append(description)
+    when_to_use = str(skill.get("whenToUse") or skill.get("when_to_use") or "").strip()
+    if when_to_use and when_to_use not in description:
+        lines.append(f"when_to_use: {when_to_use}")
+    hint = str(skill.get("argumentHint") or skill.get("argument_hint") or "").strip()
+    if hint:
+        lines.append(f"args: {hint}")
+    file_path = _single_line(skill.get("filePath"))
+    base_dir = _single_line(skill.get("baseDir"))
+    if file_path:
+        lines.append(f"SKILL.md absolute path: {file_path}")
+    if base_dir:
+        lines.append(f"Skill package root: {base_dir}")
+        lines.append(
+            "Resolve relative paths in this Skill (including scripts/, "
+            "references/, assets/, and templates/) against the Skill "
+            "package root above."
+        )
+    return "\n".join(lines)
 
 
 def _single_line(value: Any) -> str:

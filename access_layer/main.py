@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 
 from access_layer import AgentAccessLayer
 from access_layer.agent_backend_client import AgentBackendClient
-from access_layer.catalog import RuntimeCatalog
+from access_layer.catalog import RuntimeCatalog, catalog_fields_from_frontmatter, skill_catalog_row
 from access_layer.concurrency import RequestConcurrencyLimiter
 from access_layer.request_context import (
     get_request_context,
@@ -66,8 +66,11 @@ from access_layer.models_catalog import (
     model_api_key,
     write_models,
 )
-from access_layer.skills import SkillDefinition, clear_skill_caches, get_available_skills
-from access_layer.skills.frontmatter import parse_bool, parse_markdown_frontmatter
+from access_layer.skills.frontmatter import (
+    markdown_body_after_frontmatter,
+    parse_bool,
+    parse_markdown_frontmatter,
+)
 from access_layer.storage import create_storage, write_json_atomic
 
 
@@ -85,35 +88,12 @@ def _skills_dir() -> Path:
     return DATA_SKILLS_DIR if DATA_SKILLS_DIR is not None else skills_dir()
 
 
-def _all_skills() -> list[SkillDefinition]:
-    """汇总当前可编辑的 Skill 配置。"""
-    return get_available_skills(Path.cwd())
-
-
-def _public_skill(skill: SkillDefinition, *, editable: bool = False) -> dict:
-    """序列化已加载 Skill；可编辑项来自 `$K_AGENT_HOME/content/skills`，保留来源元数据供审计。"""
-    return {
-        "id": skill.id,
-        "name": skill.name,
-        "description": skill.description,
-        "instructions": skill.content if editable else "",
-        "enabled": not skill.disable_model_invocation,
-        "source": skill.source,
-        "loadedFrom": skill.loaded_from,
-        "filePath": skill.file_path,
-        "baseDir": skill.base_dir,
-        "paths": list(skill.paths),
-        "whenToUse": skill.when_to_use,
-        "userInvocable": skill.user_invocable,
-        "editable": editable,
-    }
-
-
-def _write_data_skills(skills: list[dict]) -> None:
-    """Persist the complete editable Skill set under content/skills/<id>/SKILL.md."""
+def _write_data_skills(skills: list[dict]) -> list[dict]:
+    """Persist SKILL.md packages and return catalog rows (no markdown body)."""
     root = _skills_dir()
     root.mkdir(parents=True, exist_ok=True)
     desired_ids: set[str] = set()
+    catalog_rows: list[dict] = []
     for skill in skills:
         skill_id = str(skill.get("id") or "").strip()
         normalized_id = _normalize_imported_skill_id(skill_id)
@@ -145,10 +125,22 @@ def _write_data_skills(skills: list[dict]) -> None:
             _render_skill_markdown(previous_frontmatter, str(skill.get("instructions") or "")),
             encoding="utf-8",
         )
+        catalog_rows.append(
+            skill_catalog_row(
+                {
+                    "id": skill_id,
+                    "name": str(skill.get("name") or skill_id),
+                    "description": str(skill.get("description") or ""),
+                    "enabled": bool(skill.get("enabled", True)),
+                    **catalog_fields_from_frontmatter(previous_frontmatter),
+                }
+            )
+        )
 
     for entry in _skills_dir().iterdir():
         if entry.is_dir() and entry.name not in desired_ids:
             shutil.rmtree(entry)
+    return catalog_rows
 
 
 def _render_skill_markdown(frontmatter: dict, instructions: str) -> str:
@@ -666,22 +658,25 @@ def create_app() -> FastAPI:
 
     @app.get("/api/config/skills")
     async def get_skills_config():
-        """由接入层读取 data 摘要，并按需附加可编辑 Skill 正文。"""
-        loaded = {skill.id: skill for skill in _all_skills()}
+        """由接入层读取 catalog 摘要；配置编辑才附加 SKILL.md 正文。"""
         skills = []
+        root = _skills_dir()
         for summary in app.state.runtime_catalog.skill_summaries():
-            skill = loaded.get(summary["id"])
+            skill_dir = root / str(summary["id"])
+            skill_file = skill_dir / "SKILL.md"
+            instructions = ""
+            if skill_file.is_file():
+                instructions = markdown_body_after_frontmatter(
+                    skill_file.read_text(encoding="utf-8", errors="replace")
+                ).strip()
             skills.append(
                 {
                     **summary,
-                    "instructions": skill.content if skill else "",
+                    "instructions": instructions,
                     "source": "home",
                     "loadedFrom": "skills",
-                    "filePath": skill.file_path if skill else None,
-                    "baseDir": skill.base_dir if skill else None,
-                    "paths": list(skill.paths) if skill else [],
-                    "whenToUse": skill.when_to_use if skill else None,
-                    "userInvocable": skill.user_invocable if skill else True,
+                    "filePath": str(skill_file) if skill_file.is_file() else None,
+                    "baseDir": str(skill_dir.resolve()) if skill_dir.is_dir() else None,
                     "editable": True,
                 }
             )
@@ -696,9 +691,8 @@ def create_app() -> FastAPI:
     async def update_skills_config(payload: SkillsConfigUpdate):
         """由接入层保存 Skill 正文和 data 摘要。"""
         skills = [skill.model_dump() for skill in payload.skills]
-        _write_data_skills(skills)
-        app.state.runtime_catalog.write_skill_summaries(skills)
-        clear_skill_caches("access_layer_skills_updated")
+        catalog_rows = _write_data_skills(skills)
+        app.state.runtime_catalog.write_skill_summaries(catalog_rows)
         result = await get_skills_config()
         return {
             "ok": True,
@@ -724,20 +718,22 @@ def create_app() -> FastAPI:
         skill_id, skill_name, skill_dir = _validate_and_install_skill_zip(
             archive, file.filename or "skill.zip"
         )
-        clear_skill_caches("access_layer_skill_imported")
         frontmatter, _ = parse_markdown_frontmatter(
             (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
         )
         summaries = app.state.runtime_catalog.skill_summaries()
         summaries.append(
-            {
-                "id": skill_id,
-                "name": skill_name,
-                "description": str(frontmatter.get("description") or ""),
-                "enabled": not parse_bool(
-                    frontmatter.get("disable-model-invocation"), False
-                ),
-            }
+            skill_catalog_row(
+                {
+                    "id": skill_id,
+                    "name": skill_name,
+                    "description": str(frontmatter.get("description") or ""),
+                    "enabled": not parse_bool(
+                        frontmatter.get("disable-model-invocation"), False
+                    ),
+                    **catalog_fields_from_frontmatter(frontmatter),
+                }
+            )
         )
         app.state.runtime_catalog.write_skill_summaries(summaries)
         skills_payload = await get_skills_config()

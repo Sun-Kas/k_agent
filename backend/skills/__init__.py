@@ -1,19 +1,5 @@
-"""Skill loading and execution."""
+"""Backend 的 Skill 正文懒加载边界；catalog 元数据始终来自请求。"""
 
-from backend.skills.loader import (
-    SKILL_REGISTRY,
-    SkillDefinition,
-    activate_skills_for_paths,
-    clear_skill_caches,
-    get_available_skills,
-    load_skill_registry,
-)
+from backend.skills.body import SkillBody, SkillBodyError, load_skill_body
 
-__all__ = [
-    "SKILL_REGISTRY",
-    "SkillDefinition",
-    "activate_skills_for_paths",
-    "clear_skill_caches",
-    "get_available_skills",
-    "load_skill_registry",
-]
+__all__ = ["SkillBody", "SkillBodyError", "load_skill_body"]

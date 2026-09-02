@@ -84,12 +84,138 @@ test("按 / 展开命令选择栏并用 Enter 执行选中命令", async () => {
   const frame = stripStyles(view.lastFrame() ?? "");
   assert.match(frame, /\/new/);
   assert.match(frame, /Tab 补全/);
-  view.stdin.write("model");
+  view.stdin.write("doctor");
   await flush();
-  assert.match(stripStyles(view.lastFrame() ?? ""), /\/model/);
+  assert.match(stripStyles(view.lastFrame() ?? ""), /\/doctor/);
   view.stdin.write("\r");
   await flush();
-  assert.deepEqual(actions, [{ type: "slash_command", command: "model", arguments: "" }]);
+  assert.deepEqual(actions, [{ type: "slash_command", command: "doctor", arguments: "" }]);
+  view.unmount();
+});
+
+test("/mcp 在输入框下方打开管理栏，输入框保持可见", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(
+    <TerminalPage
+      model={{
+        ...chatModel(),
+        runtime: {
+          ...chatModel().runtime,
+          mcpCount: 1,
+          mcpServers: [{ id: "calendar", name: "日历", enabled: true, status: "connected", toolCount: 2 }],
+        },
+      }}
+      onAction={(action) => actions.push(action)}
+    />,
+  );
+  view.stdin.write("/mcp");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /\bMCP\b/);
+  assert.match(frame, /日历/);
+  assert.match(frame, /Space 开关/);
+  assert.match(frame, /❯/);
+  assert.deepEqual(actions, [{ type: "refresh_mcp" }]);
+  view.stdin.write(" ");
+  await flush();
+  assert.deepEqual(actions, [{ type: "refresh_mcp" }, { type: "toggle_mcp", serverId: "calendar" }]);
+  view.unmount();
+});
+
+test("开始对话后清空 slash 只读列表", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("/trace");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.match(stripStyles(view.lastFrame() ?? ""), /时间线/);
+  view.stdin.write("检查项目");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.doesNotMatch(stripStyles(view.lastFrame() ?? ""), /时间线/);
+  assert.deepEqual(actions, [{ type: "submit_prompt", text: "检查项目" }]);
+  view.unmount();
+});
+
+test("/model 在输入框下方打开选择栏，Enter 切换", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(
+    <TerminalPage
+      model={{
+        ...chatModel(),
+        runtime: {
+          ...chatModel().runtime,
+          modelId: "sonnet",
+          models: [
+            { id: "sonnet", name: "Sonnet", enabled: true, note: "claude" },
+            { id: "opus", name: "Opus", enabled: true },
+          ],
+        },
+      }}
+      onAction={(action) => actions.push(action)}
+    />,
+  );
+  view.stdin.write("/model");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /\bModel\b/);
+  assert.match(frame, /Sonnet/);
+  assert.match(frame, /❯/);
+  view.stdin.write("\u001b[B");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, [{ type: "set_model", modelId: "opus" }]);
+  view.unmount();
+});
+
+test("/permissions 可切换 full_access", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("/permissions");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.match(stripStyles(view.lastFrame() ?? ""), /Permissions/);
+  view.stdin.write("\u001b[B");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, [{ type: "set_permission", permissionMode: "full_access" }]);
+  view.unmount();
+});
+
+test("/skill 在输入框下方打开管理栏", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(
+    <TerminalPage
+      model={{
+        ...chatModel(),
+        runtime: {
+          ...chatModel().runtime,
+          skills: [{ id: "writer", name: "writer", enabled: true }],
+        },
+      }}
+      onAction={(action) => actions.push(action)}
+    />,
+  );
+  view.stdin.write("/skill");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /\bSkill\b/);
+  assert.match(frame, /writer/);
+  assert.deepEqual(actions, [{ type: "refresh_skills" }]);
+  view.stdin.write(" ");
+  await flush();
+  assert.deepEqual(actions, [{ type: "refresh_skills" }, { type: "toggle_skill", skillId: "writer" }]);
   view.unmount();
 });
 

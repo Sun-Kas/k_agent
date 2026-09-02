@@ -127,6 +127,52 @@ export interface RuntimeCatalog {
   sources: { mcp: string; skills: string };
 }
 
+export interface McpServerConfig {
+  id: string;
+  name?: string;
+  description?: string;
+  type?: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  envPassthrough?: string[];
+  cwd?: string;
+  url?: string;
+  bearerTokenEnv?: string;
+  headers?: Record<string, string>;
+  envHeaders?: Record<string, string>;
+  enabled: boolean;
+  connected?: boolean;
+  status?: string;
+  scope?: string;
+  transport?: string;
+  toolCount?: number;
+  resourceCount?: number;
+  error?: string | null;
+}
+
+export interface McpConfigPayload {
+  path?: string;
+  source?: string;
+  servers: McpServerConfig[];
+  warnings?: string[];
+}
+
+export interface McpToolInfo {
+  serverId: string;
+  name: string;
+  description: string;
+}
+
+export interface McpCapabilities {
+  tools: Array<{
+    server_id?: string;
+    serverId?: string;
+    name: string;
+    description?: string | null;
+  }>;
+}
+
 export interface DetectedAgent {
   kind: AgentKind;
   name: string;
@@ -155,6 +201,20 @@ export interface ModelProfile {
   apiKeyConfigured: boolean;
   supportsReasoning: boolean;
   enabled: boolean;
+}
+
+export interface SkillConfigItem {
+  id: string;
+  name: string;
+  description?: string;
+  instructions?: string;
+  enabled: boolean;
+}
+
+export interface SkillsConfigPayload {
+  path?: string;
+  skillDir?: string;
+  skills: SkillConfigItem[];
 }
 
 export interface AgUiInterrupt {

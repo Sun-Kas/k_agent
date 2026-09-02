@@ -28,6 +28,7 @@ from backend.runners.cli_process import (
     emit_tool_result,
     resume_session_id,
 )
+from backend.runners.claude_code import _catalog_skill_block
 from backend.runners.codex_app_server import CodexStreamState, run_codex_app_server
 from backend.runners.codex_config import write_codex_mcp_config
 from backend.runners.network_policy import network_access_enabled
@@ -109,37 +110,14 @@ _CODEX_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
 
 
 def build_codex_skill_preamble(skills: list[dict[str, Any]]) -> str:
-    """Expose selected Skill packages using Codex-specific instructions."""
+    """List selected skills from request catalog metadata. Do not load SKILL.md."""
 
     parts: list[str] = []
     for skill in skills:
-        name = str(skill.get("name") or skill.get("id") or "").strip()
-        instructions = str(skill.get("instructions") or "").strip()
-        if not instructions:
-            continue
-        file_path = _single_line(skill.get("filePath"))
-        base_dir = _single_line(skill.get("baseDir"))
-        path_lines: list[str] = []
-        if file_path:
-            path_lines.append(f"SKILL.md absolute path: {file_path}")
-        if base_dir:
-            path_lines.append(f"Skill package root: {base_dir}")
-            # Codex is sandboxed with the session workspace as cwd. Preserve
-            # the package root explicitly so Skill-relative reads are exact.
-            path_lines.append(
-                "Resolve relative paths in this Skill (including scripts/, "
-                "references/, assets/, and templates/) against the Skill "
-                "package root above."
-            )
-        header = f"[Codex Skill: {name}]" if name else "[Codex Skill]"
-        parts.append("\n".join([header, *path_lines, instructions]))
+        block = _catalog_skill_block(skill, "Codex Skill")
+        if block:
+            parts.append(block)
     return "\n\n".join(parts)
-
-
-def _single_line(value: Any) -> str:
-    """Keep path metadata from altering the provider prompt structure."""
-
-    return " ".join(str(value or "").split()).strip()
 
 
 def _write_codex_reasoning(workspace: Path, effort: str | None) -> None:

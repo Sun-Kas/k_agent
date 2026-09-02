@@ -233,8 +233,8 @@ def create_app() -> FastAPI:
     async def run_agent(payload: AgentBackendRunInput, request: Request) -> StreamingResponse:
         """核心入口：按 agentKind 选 Runner，经 ApprovalBroker 合流后输出 AG-UI NDJSON。"""
         async def internal_events():
-            # 每次 run 只消费 Access Layer 已解析的 MCP/Skill 定义；
-            # Agent Backend 不读取列表 JSON，也不扫描 Skill 目录。
+            # 每次 run 只消费 Access Layer 已解析的 MCP/Skill 元数据；Backend
+            # 不读 catalog 或扫描目录，只有已授权的 Skill 工具调用会定点读取正文。
             """绑定 workspace/网络/共享 runtime env，驱动 Runner 并产出内部事件。"""
             request_id = request.headers.get("x-request-id", "")
             stream_started_at = time.perf_counter()

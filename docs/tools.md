@@ -83,7 +83,21 @@
 | `TodoWrite` | 生成或更新当前任务清单。 | 让模型拆解多步骤任务，并在执行过程中同步状态。 |
 | `Skill` | 加载并执行项目或用户定义的 Skill。 | 调用可复用工作流，例如特定业务流程、报告生成、固定操作手册。 |
 
-`Skill` 不是新增一个外部服务，而是读取本次请求随 `AgentRunRequest` 带过来的 Skill 定义。对于 MCP Prompt 转换出来的 Skill，执行时会绑定当前请求的 MCP manager。
+`Skill` 不是新增一个外部服务。`AgentRunRequest` 只携带本轮选中 Skill 的 catalog
+元数据；Backend 先用该快照确认调用权限，再按 id 从托管 Skill 包中读取正文。对于 MCP Prompt
+转换出来的 Skill，执行时会绑定当前请求的 MCP manager。
+
+`Skill` 工具自身的 Provider description 是固定调用协议，不会随本轮选择变化。当前已选且允许
+模型调用的 Skill，会以 `available_skills` context Section 注入现有 `<system-reminder>`；每项
+只包含名称、简介和可选 `whenToUse`。单项简介最多 400 字符，发现列表 description 总预算为
+模型上下文窗口的 2%，无法取得窗口时使用 15,000 字符。预算极小时保留精确名称并省略简介，
+避免模型猜测不可用的 Skill 名称。
+
+完整 `SKILL.md` 不会提前进入 Access Layer 请求、system、context 或工具 Schema。模型实际调用
+`Skill` 后，Backend 才读取正文，并通过与该 `tool_call_id` 配对的 `role=tool` Observation 加入
+上下文。发现列表和执行闭包消费
+同一个请求级 `SkillCatalog`；未选中、禁用或 `disableModelInvocation=true` 的 Skill 两边都
+不可见。
 
 ## MCP 资源工具
 

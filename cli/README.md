@@ -10,6 +10,13 @@ K Agent 的 TypeScript / Node.js 终端客户端。CLI 只通过 Access Layer �
 npm --prefix cli run dev:local
 ```
 
+如果已将 `scripts/dev-local.mjs` 链接到 `PATH` 中的 `k-agent`，则无需切换目录，在任意位置直接运行：
+
+```bash
+k-agent
+k-agent doctor
+```
+
 启动器会复用已经健康的本地服务，并只在退出时关闭本次由它启动的进程。Python 日志写入系统临时目录，不会污染 TUI。目标端口被其他服务占用时会直接报错。
 
 `dev:local` 只属于源码仓库开发流程，不随 npm 发布包提供。分别执行 CLI 开发命令时：
@@ -51,7 +58,21 @@ k-agent doctor
 - `Ctrl+C`：运行中执行 stop；空闲时退出
 - `Esc`：关闭普通覆盖层，不代表拒绝审批
 - `!`：返回仍待处理的审批或用户问题
-- `/model`、`/mcp`、`/skill`、`/permissions`：只读查看；改配置请用 Web
+- `/mcp`：管理 MCP（Space 开关、Enter 查看工具、`r` 重载）；也支持 `/mcp enable [name|all]`、`/mcp disable`、`/mcp reload`
+- `/model`、`/agent`、`/permissions`：切换本次会话的模型、Agent 与权限，下一轮发送生效
+- `/skill`：开关 Skill（写入 Access Layer，与 Web 配置中心同一份目录）
+
+```bash
+k-agent mcp list
+k-agent mcp enable calendar
+k-agent mcp disable all
+k-agent mcp reload
+k-agent model list
+k-agent agent list
+k-agent skill list
+k-agent skill enable writer
+k-agent skill disable all
+```
 
 ## 中文输入法与光标
 

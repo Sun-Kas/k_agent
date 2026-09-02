@@ -16,7 +16,9 @@ export function HelpOverlay({ onClose }: { onClose: () => void }): React.ReactEl
       <Text>↑↓        提示符历史（首页空输入时选功能）</Text>
       <Text>终端滚动 查看更早的对话，提示符保持在底部</Text>
       <Text>?         打开本页</Text>
-      <Text>Ctrl+P    Session 切换      Ctrl+O  展开工具/思考</Text>
+      <Text>/mcp      管理 MCP（Space 开关 · Enter 工具 · r 重载）</Text>
+      <Text>/model /agent /permissions  切换本次会话（下一轮生效）</Text>
+      <Text>/skill    开关 Skill（写入 Access Layer）</Text>
       <Text>Ctrl+C    停止当前 Run（无运行时退出）</Text>
       <Text> </Text>
       <Text color={TERMINAL_DESIGN.colors.accent}>输入框</Text>

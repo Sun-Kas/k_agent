@@ -5,9 +5,9 @@ import { terminalLayout, TERMINAL_DESIGN } from "./design.js";
 import { HOME_MODES, homePickItems, nextSurface, surfaceFromDigit } from "./home-catalog.js";
 import { pushPromptHistory, promptHistoryText } from "./prompt-history.js";
 import { canFlushPromptQueue, splitSettledTimeline } from "./repl-view.js";
-import { filterSlashCommands, slashCommandAvailability, slashQuery } from "./slash-catalog.js";
+import { filterSlashCommands, slashCommandAvailability, slashQuery, slashStatusPanel, type SlashStatusPanel } from "./slash-catalog.js";
 import { TimelineEntry } from "./panels/ConversationTimeline.js";
-import type { OverlayState, TerminalFocus, TerminalPageAction, TerminalPageProps } from "./types.js";
+import type { OverlayState, RuntimeChoice, TerminalFocus, TerminalPageAction, TerminalPageProps, TerminalPageViewModel } from "./types.js";
 import { GlobalBar } from "./panels/GlobalBar.js";
 import { Composer } from "./panels/Composer.js";
 import { SlashMenu } from "./panels/SlashMenu.js";
@@ -22,7 +22,14 @@ import { SessionSwitcher } from "./overlays/SessionSwitcher.js";
 import { ApprovalDialog } from "./overlays/ApprovalDialog.js";
 import { UserQuestionDialog } from "./overlays/UserQuestionDialog.js";
 import { HelpOverlay } from "./overlays/HelpOverlay.js";
+import { StatusPanel } from "./panels/StatusPanel.js";
+import { McpMenu } from "./panels/McpMenu.js";
+import { OptionMenu } from "./panels/OptionMenu.js";
+import { SkillMenu } from "./panels/SkillMenu.js";
 import { ErrorBlock } from "./renderers/ErrorBlock.js";
+import { PERMISSION_CHOICES } from "../application/runtime-switch.js";
+
+type ComposerMenu = "mcp" | "model" | "agent" | "permissions" | "skill";
 
 /**
  * 交互式终端页面的唯一根组件。
@@ -42,6 +49,10 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   const [dismissedInterruptId, setDismissedInterruptId] = useState<string>();
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
+  const [statusPanel, setStatusPanel] = useState<SlashStatusPanel>();
+  const [composerMenu, setComposerMenu] = useState<ComposerMenu>();
+  const [menuIndex, setMenuIndex] = useState(0);
+  const [mcpDetailId, setMcpDetailId] = useState<string>();
   const staticItemsRef = useRef<TimelineItem[]>([]);
   const seenStaticKeysRef = useRef(new Set<string>());
   const [staticItems, setStaticItems] = useState<TimelineItem[]>([]);
@@ -87,7 +98,8 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     && !slashDismissed
     && slashMatches.length > 0
     && effectiveOverlay.kind === "none";
-  const modeKeysIdle = effectiveOverlay.kind === "none" && !draft;
+  const composerMenuOpen = composerMenu !== undefined && effectiveOverlay.kind === "none";
+  const modeKeysIdle = effectiveOverlay.kind === "none" && !draft && !composerMenuOpen;
 
   // 草稿离开 `/` 状态时重置选择栏，避免下次打开时停在陈旧的高亮项。
   useEffect(() => {
@@ -95,10 +107,19 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     if (query === undefined) setSlashDismissed(false);
   }, [query]);
 
+  // 再打开 `/` 选择栏等于选下一项功能，收起上一份只读列表。
+  useEffect(() => {
+    if (slashOpen) {
+      setStatusPanel(undefined);
+      setComposerMenu(undefined);
+      setMcpDetailId(undefined);
+    }
+  }, [slashOpen]);
+
   useInput((input, key) => {
     if (effectiveOverlay.kind !== "none") return;
-    if (key.ctrl && input === "k") return openOverlay("commands");
-    if (key.ctrl && input === "p") return openOverlay("sessions");
+    if (key.ctrl && input === "k") return openOverlay({ kind: "commands" });
+    if (key.ctrl && input === "p") return openOverlay({ kind: "sessions" });
     if (key.ctrl && input === "o") return setShowInspector((value) => !value);
     if (key.ctrl && input === "c") {
       if (model.timeline.runStatus === "running") onAction({ type: "stop_run" });
@@ -118,6 +139,39 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
       }
       return;
     }
+    if (composerMenuOpen && composerMenu) {
+      if (key.escape) {
+        if (composerMenu === "mcp" && mcpDetailId) return setMcpDetailId(undefined);
+        return setComposerMenu(undefined);
+      }
+      if ((composerMenu === "mcp" || composerMenu === "skill") && model.mcpBusy) return;
+      if (composerMenu === "mcp" && mcpDetailId) return;
+      const items = menuItems(composerMenu, model);
+      if (composerMenu === "mcp" && input === "r") return onAction({ type: "reload_mcp" });
+      if (!items.length) return;
+      if (key.upArrow) return setMenuIndex((value) => (value + items.length - 1) % items.length);
+      if (key.downArrow) return setMenuIndex((value) => (value + 1) % items.length);
+      const current = items[Math.min(menuIndex, items.length - 1)];
+      if (!current) return;
+      if (composerMenu === "mcp") {
+        if (input === " ") return onAction({ type: "toggle_mcp", serverId: current.id });
+        if (key.return) return setMcpDetailId(current.id);
+        return;
+      }
+      if (composerMenu === "skill") {
+        if (input === " " || key.return) return onAction({ type: "toggle_skill", skillId: current.id });
+        return;
+      }
+      if (key.return || input === " ") {
+        if (!current.enabled) return;
+        if (composerMenu === "model") onAction({ type: "set_model", modelId: current.id });
+        if (composerMenu === "agent") onAction({ type: "set_agent", agentKind: current.id });
+        if (composerMenu === "permissions") onAction({ type: "set_permission", permissionMode: current.id });
+        setComposerMenu(undefined);
+      }
+      return;
+    }
+    if (statusPanel && key.escape) return setStatusPanel(undefined);
     if (input === "!" && interrupt) {
       setDismissedInterruptId(undefined);
       setFocus("overlay");
@@ -139,11 +193,11 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
       activateHomePick(selectedPick.id);
       return;
     }
-    if (input === "?" && !draft && !key.ctrl && !key.meta) return openOverlay("help");
+    if (input === "?" && !draft && !key.ctrl && !key.meta) return openOverlay({ kind: "help" });
   });
 
-  function openOverlay(kind: OverlayState["kind"]): void {
-    setOverlay({ kind });
+  function openOverlay(next: OverlayState): void {
+    setOverlay(next);
     setFocus("overlay");
   }
 
@@ -190,11 +244,38 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     historyStashRef.current = "";
     if (text.startsWith("/")) {
       const [command, ...args] = text.slice(1).split(/\s+/);
-      // 帮助是纯页面能力，不需要往 application 层发一次无副作用的命令。
-      if (command === "help") return openOverlay("help");
+      if (command === "help") {
+        setStatusPanel(undefined);
+        setComposerMenu(undefined);
+        return openOverlay({ kind: "help" });
+      }
+      if (command === "mcp" || command === "model" || command === "agent" || command === "permissions" || command === "skill") {
+        setStatusPanel(undefined);
+        if (args.length === 0) {
+          openComposerMenu(command, model, setComposerMenu, setMenuIndex, setMcpDetailId);
+          if (command === "mcp") onAction({ type: "refresh_mcp" });
+          if (command === "skill") onAction({ type: "refresh_skills" });
+          return;
+        }
+        setComposerMenu(undefined);
+        setMcpDetailId(undefined);
+        onAction({ type: "slash_command", command, arguments: args.join(" ") });
+        return;
+      }
+      const status = slashStatusPanel(command ?? "", model);
+      if (status) {
+        setStatusPanel(status);
+        return;
+      }
+      setStatusPanel(undefined);
+      setComposerMenu(undefined);
+      setMcpDetailId(undefined);
       onAction({ type: "slash_command", command: command ?? "", arguments: args.join(" ") });
       return;
     }
+    setStatusPanel(undefined);
+    setComposerMenu(undefined);
+    setMcpDetailId(undefined);
     promptHistoryRef.current = pushPromptHistory(promptHistoryRef.current, text);
     if (busy) {
       sendQueueRef.current = [...sendQueueRef.current, text];
@@ -211,6 +292,7 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
    */
   function runCommand(command: string, takesArguments: boolean): void {
     if (takesArguments) {
+      setStatusPanel(undefined);
       setDraft(`/${command} `);
       setOverlay({ kind: "none" });
       setFocus("composer");
@@ -284,7 +366,8 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
             disabled={!model.connected}
             focused={focus === "composer" && effectiveOverlay.kind === "none"}
             captureDigits={modeKeysIdle}
-            suppressKeys={slashOpen}
+            suppressKeys={slashOpen || composerMenuOpen}
+            lockInput={composerMenuOpen}
             historyEnabled={!(model.surface === "home" && !draft)}
             onHistory={(delta, liveDraft) => navigateHistory(delta, liveDraft)}
             onChange={setDraft}
@@ -292,8 +375,18 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
           />
           {slashOpen ? (
             <SlashMenu items={slashMatches} selected={Math.min(slashIndex, slashMatches.length - 1)} query={query ?? ""} model={model} />
+          ) : composerMenuOpen && composerMenu ? (
+            <ComposerMenuPanel
+              kind={composerMenu}
+              model={model}
+              selected={menuIndex}
+              {...(mcpDetailId ? { detailId: mcpDetailId } : {})}
+            />
           ) : (
-            <StatusBar model={model} queuedCount={sendQueue.length} />
+            <>
+              {statusPanel ? <StatusPanel panel={statusPanel} /> : null}
+              <StatusBar model={model} queuedCount={sendQueue.length} />
+            </>
           )}
         </Box>
       ) : null}
@@ -321,4 +414,88 @@ function OverlayHost({ overlay, model, onAction, onRunCommand, onClose }: {
 
 function isUserQuestion(detail: Record<string, unknown>): boolean {
   return Array.isArray(detail.questions) || detail.kind === "user_question" || detail.type === "user_question";
+}
+
+function menuItems(kind: ComposerMenu, model: TerminalPageViewModel): RuntimeChoice[] {
+  if (kind === "mcp") return model.runtime.mcpServers;
+  if (kind === "skill") return model.runtime.skills;
+  if (kind === "model") return model.runtime.models;
+  if (kind === "agent") return model.runtime.agents;
+  return PERMISSION_CHOICES;
+}
+
+function currentMenuIndex(kind: ComposerMenu, model: TerminalPageViewModel): number {
+  const id = kind === "model"
+    ? model.runtime.modelId
+    : kind === "agent"
+      ? model.runtime.agentKind
+      : kind === "permissions"
+        ? model.runtime.permissionMode
+        : "";
+  const items = menuItems(kind, model);
+  const index = items.findIndex((item) => item.id === id);
+  return index < 0 ? 0 : index;
+}
+
+function openComposerMenu(
+  kind: ComposerMenu,
+  model: TerminalPageViewModel,
+  setComposerMenu: (kind: ComposerMenu) => void,
+  setMenuIndex: (index: number) => void,
+  setMcpDetailId: (id: string | undefined) => void,
+): void {
+  setComposerMenu(kind);
+  setMenuIndex(currentMenuIndex(kind, model));
+  setMcpDetailId(undefined);
+}
+
+function ComposerMenuPanel({ kind, model, selected, detailId }: {
+  kind: ComposerMenu;
+  model: TerminalPageViewModel;
+  selected: number;
+  detailId?: string;
+}): React.ReactElement {
+  if (kind === "mcp") {
+    return (
+      <McpMenu
+        model={model}
+        selected={Math.min(selected, Math.max(0, model.runtime.mcpServers.length - 1))}
+        {...(detailId ? { detailId } : {})}
+      />
+    );
+  }
+  if (kind === "skill") {
+    return <SkillMenu model={model} selected={Math.min(selected, Math.max(0, model.runtime.skills.length - 1))} />;
+  }
+  if (kind === "model") {
+    return (
+      <OptionMenu
+        title="Model"
+        items={model.runtime.models}
+        selected={selected}
+        currentId={model.runtime.modelId}
+        hint="↑↓ 选择   Enter / Space 切换（下一轮生效）   Esc 关闭"
+      />
+    );
+  }
+  if (kind === "agent") {
+    return (
+      <OptionMenu
+        title="Agent"
+        items={model.runtime.agents}
+        selected={selected}
+        currentId={model.runtime.agentKind}
+        hint="↑↓ 选择   Enter / Space 切换（下一轮生效）   Esc 关闭"
+      />
+    );
+  }
+  return (
+    <OptionMenu
+      title="Permissions"
+      items={PERMISSION_CHOICES}
+      selected={selected}
+      currentId={model.runtime.permissionMode}
+      hint="↑↓ 选择   Enter / Space 切换（下一轮生效）   Esc 关闭"
+    />
+  );
 }

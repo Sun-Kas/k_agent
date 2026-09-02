@@ -520,6 +520,7 @@ class McpConfigAndSkillTests(unittest.TestCase):
         skills = [
             {
                 "name": "Search",
+                "description": "Find files",
                 "instructions": "Run scripts/search.py.",
                 "filePath": "/skills/search/SKILL.md",
                 "baseDir": "/skills/search",
@@ -530,12 +531,14 @@ class McpConfigAndSkillTests(unittest.TestCase):
         self.assertIn("SKILL.md absolute path: /skills/search/SKILL.md", result)
         self.assertIn("Skill package root: /skills/search", result)
         self.assertIn("against the Skill package root above", result)
-        self.assertIn("Run scripts/search.py.", result)
+        self.assertIn("Find files", result)
+        self.assertNotIn("Run scripts/search.py.", result)
 
     def test_codex_skill_preamble_includes_package_paths(self) -> None:
         skills = [
             {
                 "name": "Review",
+                "description": "Review diffs",
                 "instructions": "Read references/checklist.md.",
                 "filePath": "/skills/review/SKILL.md",
                 "baseDir": "/skills/review",
@@ -546,12 +549,12 @@ class McpConfigAndSkillTests(unittest.TestCase):
         self.assertIn("SKILL.md absolute path: /skills/review/SKILL.md", result)
         self.assertIn("Skill package root: /skills/review", result)
         self.assertIn("against the Skill package root above", result)
-        self.assertIn("Read references/checklist.md.", result)
+        self.assertIn("Review diffs", result)
+        self.assertNotIn("Read references/checklist.md.", result)
 
-    def test_provider_skill_preambles_skip_empty_instructions(self) -> None:
-        skills = [{"name": "empty", "instructions": ""}]
+    def test_provider_skill_preambles_skip_unnamed_skills(self) -> None:
         self.assertEqual(build_claude_skill_preamble([]), "")
-        self.assertEqual(build_codex_skill_preamble(skills), "")
+        self.assertEqual(build_codex_skill_preamble([{"instructions": "secret body"}]), "")
 
     def test_write_codex_mcp_config_stdio(self) -> None:
         with TemporaryDirectory() as tmp:

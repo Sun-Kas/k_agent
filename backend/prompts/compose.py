@@ -6,7 +6,7 @@ import hashlib
 import json
 from datetime import datetime
 
-from backend.prompts import contract, identity, mcp, persona, runtime_policy, style
+from backend.prompts import contract, identity, mcp, persona, runtime_policy, skills, style
 from backend.prompts import tool_guidance, tool_protocol
 from backend.prompts.context import render as render_context
 from backend.prompts.memory import build as build_memory
@@ -17,6 +17,7 @@ def compose_prompt(inputs: PromptInputs) -> PromptBundle:
     """Compile a request snapshot in one fixed, reviewable order."""
 
     memory = build_memory(inputs)
+    skill_listing = skills.build(inputs)
     system_sections = (
         *identity.build(inputs),
         *contract.build(inputs),
@@ -37,6 +38,9 @@ def compose_prompt(inputs: PromptInputs) -> PromptBundle:
             instruction_mode="context_only",
             source="backend.clock",
         ),
+        # Path disambiguation only. File bodies are loaded earlier as
+        # CLAUDE.md / CLAUDE.local.md / ~/.claude/CLAUDE.md / .claude/rules
+        # and rendered in memory.sections below — not inlined here.
         PromptSection(
             name="instruction_root",
             content=(
@@ -51,7 +55,11 @@ def compose_prompt(inputs: PromptInputs) -> PromptBundle:
             sensitive=True,
         ),
         *(item for item in memory.sections if item.channel == "context"),
+        # Skill 摘要用于发现，不进入动态 tool description，也不扩大执行白名单。
+        *skill_listing.sections,
+        # Selected connections (catalog metadata). Not tool schemas.
         *_mcp_server_context(inputs),
+        # Optional MCP handshake `instructions` (InitializeResult), if any.
         *mcp.build(inputs),
     )
     sections = tuple((*system_sections, *context_sections))
@@ -66,10 +74,14 @@ def compose_prompt(inputs: PromptInputs) -> PromptBundle:
         dynamic_fingerprint=_fingerprint(
             tuple(item for item in sections if item.volatility != "static")
         ),
+        skill_listing_chars=skill_listing.listing_chars,
+        skill_listing_count=skill_listing.included_count,
+        skill_listing_truncated_count=skill_listing.truncated_count,
     )
 
 
 def _mcp_server_context(inputs: PromptInputs) -> tuple[PromptSection, ...]:
+    """Which MCP connections were selected this run — capability context only."""
     if not inputs.mcp_servers:
         return ()
     lines = []

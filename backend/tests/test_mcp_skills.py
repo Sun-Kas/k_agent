@@ -15,7 +15,6 @@ from backend.api.schemas import ChatMessage
 from backend.mcp_tool.client import McpClientManager, McpServerConfig, McpSession
 from backend.mcp_tool.config import McpTransport, load_scoped_mcp_servers
 from backend.permissions import check_permission
-from backend.skills import clear_skill_caches, get_available_skills, activate_skills_for_paths
 from backend.tools import ToolDefinition
 from backend.tools.local import build_skill_tool, invoke_skill
 from backend.watchers import PollingChangeWatcher
@@ -38,9 +37,6 @@ def _agent_request() -> AgentRunRequest:
 
 
 class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
-    def tearDown(self) -> None:
-        clear_skill_caches()
-
     def test_scoped_mcp_config_deduplicates_by_command_signature(self) -> None:
         with TemporaryDirectory() as tmp:
             cwd = Path(tmp)
@@ -122,28 +118,6 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["errorType"], "McpToolError")
         self.assertEqual(result["error"], "remote validation failed")
 
-    def test_skill_dir_frontmatter_and_conditional_activation(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            data_skills = root / "data" / "skill"
-            skill_dir = data_skills / "planner"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\n"
-                "description: Plan markdown work\n"
-                "paths:\n"
-                "- \"**/*.md\"\n"
-                "argument-hint: <topic>\n"
-                "---\n"
-                "Plan $ARGUMENTS from ${K_AGENT_SKILL_DIR}",
-                encoding="utf-8",
-            )
-            with patch("backend.skills.loader.DATA_SKILLS_DIR", data_skills):
-                self.assertEqual(get_available_skills(root), [])
-                activated = activate_skills_for_paths([root / "notes.md"], root)
-                self.assertEqual([skill.id for skill in activated], ["planner"])
-                self.assertEqual(get_available_skills(root)[0].argument_hint, "<topic>")
-
     async def test_skill_tool_expands_content_on_invocation(self) -> None:
         with TemporaryDirectory() as tmp:
             data_skills = Path(tmp) / "data" / "skill"
@@ -153,90 +127,157 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 "---\ndescription: Remember things\narguments: item\n---\nRemember ${item}.",
                 encoding="utf-8",
             )
-            result = json.loads(
+            with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
+                result = json.loads(
+                    await invoke_skill(
+                        {"skill": "remember", "args": "tea"},
+                        [
+                            {
+                                "id": "remember",
+                                "name": "remember",
+                                "argumentNames": ["item"],
+                                "enabled": True,
+                            }
+                        ],
+                    )
+                )
+            self.assertTrue(result["success"])
+            self.assertIn("Remember tea.", result["content"])
+            self.assertEqual(result["baseDir"], str(skill_dir.resolve()))
+            self.assertIn("Skill package root:", result["content"])
+
+    async def test_skill_tool_reads_body_but_keeps_request_metadata(self) -> None:
+        with TemporaryDirectory() as tmp:
+            data_skills = Path(tmp) / "skills"
+            skill_dir = data_skills / "remember"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\narguments: ignored-from-file\n---\nRemember ${item}.",
+                encoding="utf-8",
+            )
+            with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
+                result = json.loads(
+                    await invoke_skill(
+                        {"skill": "remember", "args": "tea"},
+                        [
+                            {
+                                "id": "remember",
+                                "name": "remember",
+                                "enabled": True,
+                                "argumentNames": ["item"],
+                            }
+                        ],
+                    )
+                )
+            self.assertTrue(result["success"])
+            self.assertIn("Remember tea.", result["content"])
+            self.assertNotIn("ignored-from-file", result["content"])
+
+    async def test_skill_tool_does_not_read_body_before_authorization(self) -> None:
+        with patch("backend.tools.local.load_skill_body") as loader:
+            unknown = json.loads(
+                await invoke_skill({"skill": "unknown", "args": ""}, [])
+            )
+            disabled = json.loads(
                 await invoke_skill(
-                    {"skill": "remember", "args": "tea"},
+                    {"skill": "disabled", "args": ""},
                     [
                         {
-                            "id": "remember",
-                            "name": "remember",
-                            "instructions": "Remember ${item}.",
-                            "argumentNames": ["item"],
-                            "baseDir": str(skill_dir),
+                            "id": "disabled",
+                            "name": "disabled",
                             "enabled": True,
+                            "disableModelInvocation": True,
                         }
                     ],
                 )
             )
-            self.assertTrue(result["success"])
-            self.assertIn("Remember tea.", result["content"])
-            self.assertEqual(result["baseDir"], str(skill_dir))
-            self.assertIn("Skill package root:", result["content"])
+
+        loader.assert_not_called()
+        self.assertFalse(unknown["success"])
+        self.assertFalse(disabled["success"])
+
+    async def test_skill_tool_rejects_unsafe_catalog_id(self) -> None:
+        result = json.loads(
+            await invoke_skill(
+                {"skill": "escape", "args": ""},
+                [{"id": "../escape", "name": "escape", "enabled": True}],
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("Invalid Skill id", result["error"])
 
     async def test_skill_tool_expands_community_skill_dir_placeholders(self) -> None:
         with TemporaryDirectory() as tmp:
-            skill_dir = Path(tmp) / "steam-daily-deals"
+            data_skills = Path(tmp) / "skills"
+            skill_dir = data_skills / "steam-daily-deals"
             skill_dir.mkdir(parents=True)
-            result = json.loads(
-                await invoke_skill(
-                    {"skill": "steam-daily-deals", "args": "今天的Steam优惠"},
-                    [
-                        {
-                            "id": "steam-daily-deals",
-                            "name": "steam-daily-deals",
-                            "instructions": (
-                                "Run:\n"
-                                "python3 {SKILL_DIR}/scripts/fetch_steam_deals.py\n"
-                                "Also ${SKILL_DIR}/refs and $SKILL_DIR/assets"
-                            ),
-                            "argumentNames": [],
-                            "baseDir": str(skill_dir),
-                            "filePath": str(skill_dir / "SKILL.md"),
-                            "enabled": True,
-                        }
-                    ],
-                )
+            (skill_dir / "SKILL.md").write_text(
+                "Run:\n"
+                "python3 {SKILL_DIR}/scripts/fetch_steam_deals.py\n"
+                "Also ${SKILL_DIR}/refs and $SKILL_DIR/assets",
+                encoding="utf-8",
             )
+            with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
+                result = json.loads(
+                    await invoke_skill(
+                        {"skill": "steam-daily-deals", "args": "今天的Steam优惠"},
+                        [
+                            {
+                                "id": "steam-daily-deals",
+                                "name": "steam-daily-deals",
+                                "argumentNames": [],
+                                "enabled": True,
+                            }
+                        ],
+                    )
+                )
             self.assertTrue(result["success"])
-            self.assertEqual(result["baseDir"], str(skill_dir))
-            self.assertEqual(result["filePath"], str(skill_dir / "SKILL.md"))
+            resolved_skill_dir = skill_dir.resolve()
+            self.assertEqual(result["baseDir"], str(resolved_skill_dir))
+            self.assertEqual(result["filePath"], str(resolved_skill_dir / "SKILL.md"))
             self.assertNotIn("{SKILL_DIR}", result["content"])
             self.assertNotIn("${SKILL_DIR}", result["content"])
             self.assertNotIn("$SKILL_DIR", result["content"])
-            self.assertIn(f"python3 {skill_dir}/scripts/fetch_steam_deals.py", result["content"])
-            self.assertIn(f"{skill_dir}/refs", result["content"])
-            self.assertIn(f"{skill_dir}/assets", result["content"])
+            self.assertIn(
+                f"python3 {resolved_skill_dir}/scripts/fetch_steam_deals.py",
+                result["content"],
+            )
+            self.assertIn(f"{resolved_skill_dir}/refs", result["content"])
+            self.assertIn(f"{resolved_skill_dir}/assets", result["content"])
 
     async def test_skill_tool_rewrites_tmp_outputs_into_session_workspace(self) -> None:
         from backend.tools.workspace import reset_tool_workspace, set_tool_workspace
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            skill_dir = root / "skill"
+            data_skills = root / "skills"
+            skill_dir = data_skills / "steam-daily-deals"
             workspace = root / "workspace"
-            skill_dir.mkdir()
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "python3 {SKILL_DIR}/scripts/fetch.py "
+                "--output-file /tmp/steam_deals_today.md\n"
+                "Read /tmp/steam_deals_today.md",
+                encoding="utf-8",
+            )
             workspace.mkdir()
             token = set_tool_workspace(workspace)
             try:
-                result = json.loads(
-                    await invoke_skill(
-                        {"skill": "steam-daily-deals", "args": ""},
-                        [
-                            {
-                                "id": "steam-daily-deals",
-                                "name": "steam-daily-deals",
-                                "instructions": (
-                                    "python3 {SKILL_DIR}/scripts/fetch.py "
-                                    "--output-file /tmp/steam_deals_today.md\n"
-                                    "Read /tmp/steam_deals_today.md"
-                                ),
-                                "argumentNames": [],
-                                "baseDir": str(skill_dir),
-                                "enabled": True,
-                            }
-                        ],
+                with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
+                    result = json.loads(
+                        await invoke_skill(
+                            {"skill": "steam-daily-deals", "args": ""},
+                            [
+                                {
+                                    "id": "steam-daily-deals",
+                                    "name": "steam-daily-deals",
+                                    "argumentNames": [],
+                                    "enabled": True,
+                                }
+                            ],
+                        )
                     )
-                )
             finally:
                 reset_tool_workspace(token)
             self.assertTrue(result["success"])
@@ -248,27 +289,39 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 result["content"],
             )
 
-    def test_only_data_skill_directory_is_loaded(self) -> None:
+    async def test_backend_body_wins_but_request_metadata_controls_arguments(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            data_skills = root / "data" / "skill"
-            data_skill = data_skills / "writer"
-            project_skill = root / ".k_agent" / "skills" / "ignored"
-            user_skill = root / "user-skills" / "ignored-user"
-            for directory, name in (
-                (data_skill, "写作助手"),
-                (project_skill, "项目 Skill"),
-                (user_skill, "用户 Skill"),
-            ):
-                directory.mkdir(parents=True)
-                (directory / "SKILL.md").write_text(
-                    f"---\nname: {name}\ndescription: test\n---\nDo work.",
-                    encoding="utf-8",
+            data_skills = root / "skills"
+            skill_dir = data_skills / "writer"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: disk-version\narguments: disk-argument\n---\nDISK BODY ${topic}.",
+                encoding="utf-8",
+            )
+            with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
+                result = json.loads(
+                    await invoke_skill(
+                        {"skill": "writer", "args": "report"},
+                        [
+                            {
+                                "id": "writer",
+                                "name": "writer",
+                                "enabled": True,
+                                # 旧客户端即使夹带正文或路径，Backend 也不能信任。
+                                "instructions": "REQUEST BODY MUST NOT WIN.",
+                                "argumentNames": ["topic"],
+                                "filePath": "/poison/SKILL.md",
+                                "baseDir": "/poison",
+                            }
+                        ],
+                    )
                 )
-            with patch("backend.skills.loader.DATA_SKILLS_DIR", data_skills):
-                clear_skill_caches()
-                loaded = get_available_skills(root)
-            self.assertEqual([(skill.id, skill.name) for skill in loaded], [("writer", "写作助手")])
+            self.assertTrue(result["success"])
+            self.assertIn("DISK BODY report.", result["content"])
+            self.assertNotIn("REQUEST BODY MUST NOT WIN", result["content"])
+            self.assertNotIn("disk-argument", result["content"])
+            self.assertEqual(result["filePath"], str(skill_dir.resolve() / "SKILL.md"))
 
     async def test_skill_tool_can_call_mcp_prompt(self) -> None:
         async def call_prompt(server_id: str, prompt_name: str, arguments: dict):
@@ -283,26 +336,33 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         skill = {
             "id": "find-skill-skillhub",
             "name": "find-skill-skillhub",
-            "instructions": "Search SkillHub for $ARGUMENTS.",
             "enabled": True,
         }
-        agent = OpenAIAgent()
-        runtime = await agent.create_runtime(
-            _agent_request(),
-            [build_skill_tool(skills=[skill])],
-            McpClientManager([]),
-            skills=[skill],
-        )
-
-        result = json.loads(
-            await agent._run_tool(
-                runtime=runtime,
-                iteration=0,
-                call_id="call-skill",
-                tool_name="find-skill-skillhub",
-                arguments={"skill": "外卖 点餐 订餐 food delivery"},
+        with TemporaryDirectory() as tmp:
+            data_skills = Path(tmp) / "skills"
+            skill_dir = data_skills / "find-skill-skillhub"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "Search SkillHub for $ARGUMENTS.", encoding="utf-8"
             )
-        )
+            agent = OpenAIAgent()
+            runtime = await agent.create_runtime(
+                _agent_request(),
+                [build_skill_tool(skills=[skill])],
+                McpClientManager([]),
+                skills=[skill],
+            )
+
+            with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
+                result = json.loads(
+                    await agent._run_tool(
+                        runtime=runtime,
+                        iteration=0,
+                        call_id="call-skill",
+                        tool_name="find-skill-skillhub",
+                        arguments={"skill": "外卖 点餐 订餐 food delivery"},
+                    )
+                )
 
         self.assertTrue(result["success"])
         self.assertEqual(result["commandName"], "find-skill-skillhub")
@@ -320,15 +380,17 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             skills=[],
         )
 
-        result = json.loads(
-            await agent._run_tool(
-                runtime=runtime,
-                iteration=0,
-                call_id="call-unknown",
-                tool_name="find-skill-skillhub",
-                arguments={"skill": "外卖"},
+        with patch("backend.tools.local.load_skill_body") as loader:
+            result = json.loads(
+                await agent._run_tool(
+                    runtime=runtime,
+                    iteration=0,
+                    call_id="call-unknown",
+                    tool_name="find-skill-skillhub",
+                    arguments={"skill": "外卖"},
+                )
             )
-        )
+        loader.assert_not_called()
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["tool"], "find-skill-skillhub")

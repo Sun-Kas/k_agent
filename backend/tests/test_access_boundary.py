@@ -148,6 +148,37 @@ class AccessBoundaryTests(unittest.TestCase):
         self.assertNotIn('"/internal/config/skills"', backend_main)
         self.assertNotIn('"/internal/config/mcp"', backend_main)
 
+    def test_skill_body_is_lazy_loaded_only_at_backend_tool_boundary(self) -> None:
+        """Access 只传 metadata；Backend 仅在 Skill 工具边界按 id 读取正文。"""
+
+        project_root = Path(__file__).resolve().parents[2]
+        backend_root = Path(__file__).resolve().parents[1]
+        for relative in (
+            "skills/frontmatter.py",
+            "skills/hydrate.py",
+            "skills/loader.py",
+        ):
+            self.assertFalse((backend_root / relative).exists(), relative)
+
+        access_catalog = (project_root / "access_layer" / "catalog.py").read_text(
+            encoding="utf-8"
+        )
+        selected_runtime = access_catalog.split("def selected_runtime", 1)[1].split(
+            "@staticmethod", 1
+        )[0]
+        self.assertNotIn("read_text(", selected_runtime)
+        self.assertNotIn("parse_markdown_frontmatter", selected_runtime)
+        self.assertNotIn("_skill_runtime", selected_runtime)
+
+        body_loader = (backend_root / "skills" / "body.py").read_text(encoding="utf-8")
+        self.assertIn("read_text(", body_loader)
+        self.assertNotIn("parse_markdown_frontmatter", body_loader)
+        self.assertNotIn("access_layer", body_loader)
+        local_tool = (backend_root / "tools" / "local.py").read_text(encoding="utf-8")
+        self.assertNotIn("parse_markdown_frontmatter", local_tool)
+        self.assertNotIn("read_text(", local_tool)
+        self.assertIn("load_skill_body", local_tool)
+
     def test_agent_backend_runtime_does_not_derive_session_storage_paths(self) -> None:
         """Conversation storage is an Access Layer concern, including workspace lookup."""
 

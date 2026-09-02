@@ -148,6 +148,7 @@ class KAgentRunner:
                 local_tools=tools,
                 mcp_tools=mcp_tools,
             )
+            # InitializeResult.instructions for selected servers — not tool descriptions.
             instructions = tuple(
                 McpInstruction(server_id=server_id, content=value)
                 for server_id, value in mcp_manager.connected_instructions().items()
@@ -162,6 +163,12 @@ class KAgentRunner:
                     output_workspace=ctx.workspace_dir,
                     memory_files=tuple(memory_files),
                     tool_catalog=tool_catalog,
+                    skill_catalog=skill_catalog,
+                    context_window_tokens=(
+                        model.get("contextWindow")
+                        if isinstance(model.get("contextWindow"), int)
+                        else None
+                    ),
                     mcp_instructions=instructions,
                     mcp_servers=tuple(dict(server) for server in ctx.mcp_servers),
                     persona=PersonaInputs(custom=settings.persona_override),
@@ -219,6 +226,11 @@ class KAgentRunner:
                     "loadedMemoryPathCount": len(prompt_bundle.initial_memory_paths),
                     "stablePromptFingerprint": prompt_bundle.stable_fingerprint,
                     "dynamicPromptFingerprint": prompt_bundle.dynamic_fingerprint,
+                    "skillListingChars": prompt_bundle.skill_listing_chars,
+                    "skillListingCount": prompt_bundle.skill_listing_count,
+                    "skillListingTruncatedCount": (
+                        prompt_bundle.skill_listing_truncated_count
+                    ),
                     "requestId": ctx.request_id,
                     "promptComposeMs": round(
                         (time.perf_counter() - prompt_started_at) * 1000, 3

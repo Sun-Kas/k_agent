@@ -1,4 +1,7 @@
-"""Parse the supported YAML-like frontmatter subset used by Skill markdown files."""
+"""YAML-like Skill frontmatter. Used only when writing catalog (import / save / first bootstrap).
+
+Run-time listing and Agent Backend requests read catalog JSON, not this parser.
+"""
 
 from __future__ import annotations
 
@@ -6,18 +9,31 @@ import re
 from typing import Any
 
 
+def markdown_body_after_frontmatter(content: str) -> str:
+    """Drop the YAML fence; do not parse keys."""
+    _raw, body = _split_frontmatter_block(content)
+    return body
+
+
 def parse_markdown_frontmatter(content: str) -> tuple[dict[str, Any], str]:
-    """拆分 SKILL.md frontmatter 和正文。"""
-    if not content.startswith("---\n"):
+    """拆分 SKILL.md YAML 和正文。仅导入、配置保存、catalog 初次生成使用。"""
+    raw, body = _split_frontmatter_block(content)
+    if raw is None:
         return {}, content
+    return _parse_simple_yaml(raw), body
+
+
+def _split_frontmatter_block(content: str) -> tuple[str | None, str]:
+    if not content.startswith("---\n"):
+        return None, content
     end = content.find("\n---", 4)
     if end == -1:
-        return {}, content
+        return None, content
     raw = content[4:end]
     body = content[end + len("\n---") :]
     if body.startswith("\n"):
         body = body[1:]
-    return _parse_simple_yaml(raw), body
+    return raw, body
 
 
 def split_frontmatter_list(value: Any) -> list[str]:

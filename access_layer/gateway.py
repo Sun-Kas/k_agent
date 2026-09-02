@@ -454,8 +454,9 @@ class AgentAccessLayer:
                                 if message.carries_context()
                             ],
                             "modelId": forwarded.get("modelId"),
-                            # Access Layer owns selection and sends self-contained
-                            # runtime entries. Agent Backend never reads list data.
+                            # Access Layer only forwards selected catalog metadata.
+                            # Backend lazily reads the body after an actual Skill call;
+                            # it never uses file frontmatter to rewrite this metadata.
                             "mcpServers": mcp_servers,
                             "skills": skills,
                             "reasoningEffort": forwarded.get("reasoningEffort"),

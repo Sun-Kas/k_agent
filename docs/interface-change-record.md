@@ -183,9 +183,10 @@
   Agent Backend 重载列表。
 - `POST /internal/agent/run` 不再接收 `mcpServerIds`、`skillIds`，改为接收由
   Access Layer 校验并解析好的 `mcpServers`、`skills` 对象数组。
-- Access Layer 仅在发起运行时读取被选中 Skill 的 `SKILL.md`，并把摘要、指令及
-  执行元数据一并发送。Agent Backend 的 Skill 工具只使用请求内定义，不访问
-  Skill 目录。
+- Access Layer 发起运行时只从 `config/catalog/skills.json` 选择并发送 Skill
+  元数据，不读取 `SKILL.md`，也不发送正文或包路径。Agent Backend 的 Skill
+  工具先按本轮请求快照完成授权，确认调用后才从 `content/skills/<id>/SKILL.md`
+  读取正文；文件 frontmatter 不参与运行时元数据。
 - 每次运行的 MCP manager 只使用请求内携带的选中 MCP 连接定义；MCP/Skill
   摘要同时进入本轮上下文，Agent Backend 不再提供内部配置列表接口。
 - MCP 配置保存或重新载入后，Access Layer 会把 Agent Backend 的真实连接状态

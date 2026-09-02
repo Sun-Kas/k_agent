@@ -7,6 +7,10 @@ import { deleteSession, forkSession, listSessions, showSession } from "./command
 import { teamCommand, teamList, teamOpen } from "./commands/teams.js";
 import { automationAction, automationHistory, automationList, automationShow } from "./commands/automations.js";
 import { showConfig } from "./commands/config.js";
+import { mcpDisable, mcpEnable, mcpList, mcpReload } from "./commands/mcp.js";
+import { modelList, modelShow } from "./commands/model.js";
+import { agentList } from "./commands/agent.js";
+import { skillDisable, skillEnable, skillList } from "./commands/skill.js";
 import { EXIT_CODES } from "./output/exit-codes.js";
 
 const program = new Command();
@@ -76,6 +80,24 @@ const automationHistoryCommand = automation.command("history <task-id>").action(
 
 const config = program.command("config").description("显示 CLI 有效配置（不含服务端凭据）");
 config.command("show").action(() => showConfig(config));
+
+const mcp = program.command("mcp").description("查看和管理 MCP 连接（经 Access Layer）");
+mcp.command("list").description("列出已配置 MCP 及连接状态").action(async () => mcpList(mcp));
+mcp.command("enable [name]").description("启用 MCP（默认 all）").action(async (name?: string) => mcpEnable(name ?? "all", mcp));
+mcp.command("disable [name]").description("关闭 MCP（默认 all）").action(async (name?: string) => mcpDisable(name ?? "all", mcp));
+mcp.command("reload").description("通知 Agent Backend 按最新配置重连").action(async () => mcpReload(mcp));
+
+const model = program.command("model").description("查看 Access Layer 已配置模型；交互切换请用 TUI /model");
+model.command("list").description("列出模型及启用状态").action(async () => modelList(model));
+model.command("show").description("显示 CLI 当前选用的模型").action(async () => modelShow(model));
+
+const agent = program.command("agent").description("查看可用 Agent 类型；交互切换请用 TUI /agent");
+agent.command("list").description("列出探测到的 Agent").action(async () => agentList(agent));
+
+const skill = program.command("skill").description("查看和管理 Skill（经 Access Layer）");
+skill.command("list").description("列出已配置 Skill").action(async () => skillList(skill));
+skill.command("enable [name]").description("启用 Skill（默认 all）").action(async (name?: string) => skillEnable(name ?? "all", skill));
+skill.command("disable [name]").description("关闭 Skill（默认 all）").action(async (name?: string) => skillDisable(name ?? "all", skill));
 
 try {
   await program.parseAsync(process.argv);
