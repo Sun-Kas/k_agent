@@ -25,6 +25,16 @@ class StorageBackend(Protocol):
         """把文本写入指定 key。"""
         ...
 
+    async def append_text(self, key: str, content: str) -> None:
+        """以追加方式写入一个完整文本批次。"""
+        ...
+
+    async def read_text_range(
+        self, key: str, *, start_line: int = 0, limit: int | None = None
+    ) -> list[str]:
+        """按行读取追加日志范围。"""
+        ...
+
     async def read_json(self, key: str) -> dict[str, Any] | list[Any] | None:
         """读取并解析指定 key 的 JSON 内容。"""
         ...

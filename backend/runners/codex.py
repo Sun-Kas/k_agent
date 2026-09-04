@@ -204,23 +204,11 @@ def map_codex_event(payload: dict[str, Any], state: _CliStreamState) -> list[dic
         thread_id = payload.get("thread_id") or payload.get("threadId")
         if isinstance(thread_id, str) and thread_id:
             state.provider_session_id = thread_id
-            events.append(
-                {
-                    "type": "status",
-                    "payload": {"message": f"Codex thread {thread_id}"},
-                }
-            )
         return events
 
     if event_type in {"turn.started", "turn.completed"}:
         if event_type == "turn.completed":
             events.extend(close_thinking(state))
-        events.append(
-            {
-                "type": "trace",
-                "payload": {"entry": f"codex.{event_type}"},
-            }
-        )
         return events
 
     if event_type == "turn.failed":
@@ -395,18 +383,6 @@ def map_codex_event(payload: dict[str, Any], state: _CliStreamState) -> list[dic
             return events
 
         # ── Other item types (todo_list, etc.) ────────────────────
-        events.append(
-            {
-                "type": "trace",
-                "payload": {"entry": f"codex.{event_type}", "output": item_type},
-            }
-        )
         return events
 
-    events.append(
-        {
-            "type": "trace",
-            "payload": {"entry": f"codex.{event_type or 'event'}"},
-        }
-    )
     return events

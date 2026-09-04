@@ -627,13 +627,17 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 storage = FileStorage(settings.storage_base_dir)
                 store = SessionStore(storage)
                 session = await store.create_session(session_id="abc-123", title="t")
-                path = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "abc-123.json"
+                path = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "session.json"
+                history = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "history.jsonl"
                 workspace = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "workspace"
                 self.assertTrue(path.is_file())
+                self.assertTrue(history.is_file())
                 self.assertTrue(workspace.is_dir())
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(payload["id"], session.id)
                 self.assertIn("cliSessions", payload)
+                self.assertNotIn("messages", payload)
+                self.assertNotIn("events", payload)
 
     async def test_migrates_flat_session_file(self) -> None:
         from access_layer.storage import FileStorage
@@ -673,7 +677,9 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 assert session is not None
                 self.assertEqual(session.title, "old")
                 self.assertFalse(flat.exists())
-                self.assertTrue((root / "legacy" / "legacy.json").is_file())
+                self.assertTrue((root / "legacy" / "session.json").is_file())
+                self.assertTrue((root / "legacy" / "history.jsonl").is_file())
+                self.assertTrue((root / "legacy" / "legacy.json.bak").is_file())
                 self.assertTrue((root / "legacy" / "workspace").is_dir())
 
 

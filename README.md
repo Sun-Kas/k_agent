@@ -11,7 +11,7 @@
   [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](requirements.txt)
   [![React](https://img.shields.io/badge/React-18-149ECA?logo=react&logoColor=white)](frontend/package.json)
   [![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688?logo=fastapi&logoColor=white)](requirements.txt)
-  [![AG--UI](https://img.shields.io/badge/Protocol-AG--UI-6C63FF)](docs/ag-ui-protocol.md)
+  [![AG--UI](https://img.shields.io/badge/Protocol-AG--UI-6C63FF)](docs/architecture/ag-ui-protocol.md)
 
   [快速开始](#-快速开始) · [功能概览](#-功能概览) · [系统架构](#-系统架构) · [项目文档](#-项目文档)
 </div>
@@ -93,7 +93,7 @@ Frontend → Access Layer (:3001) → Stateless Agent Backend (:3002)
 - 两个服务通过内部 NDJSON 流式 HTTP 通信，不是进程内函数调用。
 - 默认仅允许本机访问。内部请求可能携带模型凭据，请勿直接暴露到公网或局域网。
 
-更多设计细节见[接口与架构变更记录](docs/interface-change-record.md)。
+更多设计细节见[接口与架构变更记录](docs/reference/interface-change-record.md)。
 
 ## 快速开始
 
@@ -173,7 +173,7 @@ npm run deploy:local
 
 部署模式下 Access Layer 会在 `http://127.0.0.1:3001` 同源托管 `frontend/dist`，Agent Backend 继续运行在 `127.0.0.1:3002`。
 
-需要容器化部署时，请参阅 [Docker 部署指南](docs/docker-deployment.md)。镜像不会包含 `.env`、API Key 或 `.k_agent` 数据；凭据在运行时注入，状态保存在独立 Docker Volume 中。
+需要容器化部署时，请参阅 [Docker 部署指南](docs/guides/docker-deployment.md)。镜像不会包含 `.env`、API Key 或 `.k_agent` 数据；凭据在运行时注入，状态保存在独立 Docker Volume 中。
 
 ### Docker 运行流程
 
@@ -248,23 +248,26 @@ k_agent/
 ├── frontend/                 # React / Vite 工作台
 ├── access_layer/             # 公开 API、会话、Team、自动化与持久化
 ├── backend/                  # 无状态 Agent、模型、工具、MCP 与上下文管理
-├── docs/                     # 协议与技术方案
+├── docs/                     # 按架构、功能、指南、调研等主题分类的项目文档
 ├── requirements.txt
 └── README.md
 ```
 
 ## 项目文档
 
+完整分类见 [文档索引](docs/README.md)。
+
 | 文档 | 内容 |
 | --- | --- |
-| [AG-UI 协议约定](docs/ag-ui-protocol.md) | SSE 事件顺序、状态机与持久化规则 |
-| [工具系统](docs/tools.md) | 本地工具、MCP 与错误返回契约 |
-| [上下文管理](docs/context-management.md) | 指令、记忆、预算、裁剪与压缩 |
-| [Agent Hook 与 Middleware 技术方案](docs/agent-hooks-and-middleware-technical-solution.md) | 声明式 Hook、Observer/Middleware 分层、流式与安全执行管线 |
-| [权限模式与 HITL 技术方案](docs/permission-and-hitl-technical-solution.md) | 默认/完全权限、单次越权审批、沙箱与生命周期 |
-| [Agent Team 技术方案](docs/agent-team-technical-solution.md) | Supervisor、DAG、Mailbox 与 Artifact |
-| [定时任务技术方案](docs/scheduled-task-technical-solution.md) | 调度、租约、Session 隔离与运行记录 |
-| [接口变更记录](docs/interface-change-record.md) | Access Layer / Backend 服务边界 |
+| [AG-UI 协议约定](docs/architecture/ag-ui-protocol.md) | SSE 事件顺序、状态机与持久化规则 |
+| [上下文压缩、完整对话存储与 AG-UI 重构计划](docs/architecture/context-compaction-conversation-storage-refactor-plan.md) | 完整历史、compact boundary、删除 status/trace 与统一事件投影 |
+| [工具系统](docs/guides/tools.md) | 本地工具、MCP 与错误返回契约 |
+| [上下文管理](docs/architecture/context-management.md) | 指令、记忆、预算、裁剪与压缩 |
+| [Agent Hook 与 Middleware 技术方案](docs/architecture/agent-hooks-and-middleware-technical-solution.md) | 声明式 Hook、Observer/Middleware 分层、流式与安全执行管线 |
+| [权限模式与 HITL 技术方案](docs/architecture/permission-and-hitl-technical-solution.md) | 默认/完全权限、单次越权审批、沙箱与生命周期 |
+| [Agent Team 技术方案](docs/features/agent-team-technical-solution.md) | Supervisor、DAG、Mailbox 与 Artifact |
+| [定时任务技术方案](docs/features/scheduled-task-technical-solution.md) | 调度、租约、Session 隔离与运行记录 |
+| [接口变更记录](docs/reference/interface-change-record.md) | Access Layer / Backend 服务边界 |
 
 ## 开发与验证
 

@@ -34,6 +34,9 @@ class ToolDefinition:
     description: str
     parameters: dict[str, Any]
     execute: ToolExecutor
+    # 只影响 Provider Observation，不改变公开工具结果或真实执行语义。
+    # 未声明（尤其 MCP）必须按 retain 处理，不能猜测可重放性。
+    context_policy: dict[str, Any] | None = None
 
 
 async def get_current_time(_: dict[str, Any]) -> str:

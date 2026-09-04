@@ -20,6 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from openai import AsyncOpenAI
 
 from backend.agui import translate_agent_events
 from backend.approvals import ApprovalBroker
@@ -48,6 +49,8 @@ from backend.runners import RunnerContext, get_default_registry
 from backend.runners.network_policy import network_access_enabled
 from backend.runners.detect import detect_agents_payload
 from backend.tools import load_local_tools
+from backend.runtime_config import select_compact_model, select_model
+from backend.context import generate_compaction, compose_api_messages
 from backend.tools.workspace import (
     reset_tool_permission_mode,
     reset_tool_network_access,
@@ -65,6 +68,11 @@ class AgentBackendRunInput(BaseModel):
     thread_id: str = Field(alias="threadId")
     run_id: str = Field(alias="runId")
     messages: list[ChatMessage]
+    context_summary: str = Field(default="", alias="contextSummary")
+    context_state: dict[str, Any] = Field(default_factory=dict, alias="contextState")
+    continuation_checkpoint: dict[str, Any] | None = Field(
+        default=None, alias="continuationCheckpoint"
+    )
     model_id: str | None = Field(default=None, alias="modelId")
     mcp_servers: list[dict[str, Any]] = Field(default_factory=list, alias="mcpServers")
     skills: list[dict[str, Any]] = Field(default_factory=list)
@@ -81,6 +89,17 @@ class AgentBackendRunInput(BaseModel):
     team_agent_id: str | None = Field(default=None, alias="teamAgentId")
     attempt_id: str | None = Field(default=None, alias="attemptId")
     workspace_dir: str = Field(alias="workspaceDir", min_length=1)
+
+
+class AgentBackendCompactInput(BaseModel):
+    """Access Layer 发起的 compact-only 请求；浏览器不能直达该入口。"""
+
+    thread_id: str = Field(alias="threadId")
+    source_run_id: str = Field(alias="sourceRunId")
+    messages: list[ChatMessage]
+    context_state: dict[str, Any] = Field(default_factory=dict, alias="contextState")
+    instructions: str = Field(default="", max_length=4_000)
+    model_id: str | None = Field(default=None, alias="modelId")
 
 
 def _resolve_run_workspace(raw_path: str, *, is_team_run: bool) -> Path:
@@ -229,6 +248,30 @@ def create_app() -> FastAPI:
         )
         return status
 
+    @app.post("/internal/context/compact")
+    async def compact_context(payload: AgentBackendCompactInput) -> dict[str, Any]:
+        """执行禁止工具、单轮、结构化输出的手动 full compact。"""
+
+        main_model = select_model(payload.model_id, settings)
+        compact_model = select_compact_model(main_model, settings)
+        client = AsyncOpenAI(
+            api_key=compact_model.get("apiKey") or settings.openai_api_key,
+            base_url=compact_model.get("baseUrl") or settings.openai_base_url,
+        )
+        provider_messages = compose_api_messages(payload.messages)
+        result = await generate_compaction(
+            client=client,
+            model_config=compact_model,
+            target_model_config=main_model,
+            messages=provider_messages,
+            context_state=payload.context_state,
+            source_run_id=payload.source_run_id,
+            trigger="manual",
+            instructions=payload.instructions,
+            continuation=False,
+        )
+        return {"proposal": result.proposal}
+
     @app.post("/internal/agent/run")
     async def run_agent(payload: AgentBackendRunInput, request: Request) -> StreamingResponse:
         """核心入口：按 agentKind 选 Runner，经 ApprovalBroker 合流后输出 AG-UI NDJSON。"""
@@ -260,6 +303,9 @@ def create_app() -> FastAPI:
                 run_id=payload.run_id,
                 request_id=request_id,
                 messages=payload.messages,
+                context_summary=payload.context_summary,
+                context_state=payload.context_state,
+                continuation_checkpoint=payload.continuation_checkpoint,
                 model_id=payload.model_id,
                 mcp_servers=payload.mcp_servers,
                 skills=payload.skills,

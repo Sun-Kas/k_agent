@@ -1,21 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
 import { timelineFromSession, type TimelineItem } from "../src/application/event-projector.js";
 import type { AgUiEvent, ChatMessage, SessionState } from "../src/protocol/index.js";
 
-test("多轮回放把提问插回对应 RUN_STARTED，而不是堆在时间线顶部", () => {
-  const timeline = timelineFromSession(session({
-    messages: [
-      user("u1", "你是谁"),
-      assistant("a1", "我是 K Agent", "r1"),
-      user("u2", "你的作者是谁"),
-      assistant("a2", "Aokai", "r2"),
-    ],
-    events: [
-      ...turn("r1", "t1", "我是 K Agent"),
-      ...turn("r2", "t2", "Aokai"),
-    ],
-  }));
+test("多轮回放严格保留 input_message 与 RUN_STARTED 的历史顺序", () => {
+  const timeline = timelineFromSession(session([
+    input("u1", "你是谁", "r1"),
+    ...turn("r1", "t1", "我是 K Agent"),
+    input("u2", "你的作者是谁", "r2"),
+    ...turn("r2", "t2", "Aokai"),
+  ]));
   assert.deepEqual(kinds(timeline.items), [
     "user", "thinking", "text",
     "user", "thinking", "text",
@@ -30,37 +25,41 @@ test("多轮回放把提问插回对应 RUN_STARTED，而不是堆在时间线�
   ]);
 });
 
-test("带 runId 的用户消息仍按匹配的 run 插入", () => {
-  const timeline = timelineFromSession(session({
-    messages: [
-      user("u1", "第一问", "r1"),
-      user("u2", "第二问", "r2"),
-    ],
-    events: [
-      ...turn("r1", "t1", "答一"),
-      ...turn("r2", "t2", "答二"),
-    ],
-  }));
-  assert.equal(timeline.items[0]?.kind, "user");
-  assert.equal(timeline.items[0] && timeline.items[0].kind === "user" ? timeline.items[0].content : "", "第一问");
-  const secondUser = timeline.items.find((item, index) => item.kind === "user" && index > 0);
-  assert.equal(secondUser && secondUser.kind === "user" ? secondUser.content : "", "第二问");
+test("读历史时把累计 CONTENT 整块赋值，而不是再拼 token", () => {
+  const timeline = timelineFromSession(session([
+    input("u1", "hi", "r1"),
+    { type: "RUN_STARTED", threadId: "s1", runId: "r1" },
+    { type: "TEXT_MESSAGE_START", messageId: "a1", role: "assistant" },
+    { type: "TEXT_MESSAGE_CONTENT", messageId: "a1", delta: "hello world" },
+    { type: "TEXT_MESSAGE_END", messageId: "a1" },
+    { type: "RUN_FINISHED", threadId: "s1", runId: "r1" },
+  ]));
+  const text = timeline.items.find((item) => item.kind === "text");
+  assert.equal(text && text.kind === "text" ? text.content : "", "hello world");
 });
 
-test("事件窗口只保留最近一轮时，更早的提问留在窗口前面", () => {
-  const timeline = timelineFromSession(session({
-    messages: [
-      user("u1", "旧问题"),
-      user("u2", "新问题"),
-    ],
-    events: [...turn("r2", "t2", "新回答")],
-  }));
-  assert.deepEqual(contents(timeline.items.filter((item) => item.kind === "user" || item.kind === "text")), [
-    "旧问题",
-    "新问题",
-    "新回答",
-  ]);
+test("工具、错误与下一轮提问不按类型重排", () => {
+  const timeline = timelineFromSession(session([
+    input("u1", "first", "r1"),
+    { type: "RUN_STARTED", threadId: "s1", runId: "r1" },
+    { type: "TOOL_CALL_START", toolCallId: "call-1", toolCallName: "Read" },
+    { type: "TOOL_CALL_END", toolCallId: "call-1" },
+    { type: "RUN_ERROR", message: "failed" },
+    input("u2", "second", "r2"),
+  ]));
+  assert.deepEqual(kinds(timeline.items), ["user", "tool", "error", "user"]);
+  assert.deepEqual(contents(timeline.items), ["first", "", "failed", "second"]);
 });
+
+function input(id: string, content: string, runId: string): AgUiEvent {
+  const message: ChatMessage = {
+    id,
+    role: "user",
+    content,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  };
+  return { type: "input_message", runId, message };
+}
 
 function turn(runId: string, textId: string, text: string): AgUiEvent[] {
   return [
@@ -74,35 +73,8 @@ function turn(runId: string, textId: string, text: string): AgUiEvent[] {
   ];
 }
 
-function session(input: { messages: ChatMessage[]; events: AgUiEvent[] }): SessionState {
-  return {
-    sessionId: "s1",
-    messages: input.messages,
-    trace: [],
-    tasks: [],
-    thinking: [],
-    events: input.events,
-  };
-}
-
-function user(id: string, content: string, runId?: string): ChatMessage {
-  return {
-    id,
-    role: "user",
-    content,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    ...(runId ? { meta: { runId } } : {}),
-  };
-}
-
-function assistant(id: string, content: string, runId: string): ChatMessage {
-  return {
-    id,
-    role: "assistant",
-    content,
-    createdAt: "2026-01-01T00:00:00.000Z",
-    meta: { runId },
-  };
+function session(events: AgUiEvent[]): SessionState {
+  return { sessionId: "s1", events };
 }
 
 function kinds(items: TimelineItem[]): Array<TimelineItem["kind"]> {

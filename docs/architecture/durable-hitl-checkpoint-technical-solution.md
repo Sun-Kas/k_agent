@@ -371,7 +371,7 @@ ApprovalRecord。前端不能因为历史里存在一张 pending Activity 就假
 
 但单元测试只证明事件链路，不能证明真实浏览器已经完成 React commit。实现本方案前，
 必须先完成第 15 节的真实 HTTP + 浏览器验收；在验收通过前，
-`docs/streaming-approval-card-todo.md` 保持“未解决”。
+`docs/features/streaming-approval-card-todo.md` 保持“未解决”。
 
 采用 terminal interrupt 后，审批 Activity 后很快会到达 `RUN_FINISHED` 并关闭本次流，
 不再依赖一条无限空闲的 SSE 连接，这会减少中间层长期缓冲风险，但不能代替浏览器验收。
@@ -588,7 +588,7 @@ Codex/Claude UI 应描述为“重新开始并继续”，不能声称原地恢�
 
 验收通过后才允许：
 
-- 把 `docs/streaming-approval-card-todo.md` 改为已解决；
+- 把 `docs/features/streaming-approval-card-todo.md` 改为已解决；
 - 声称审批卡支持实时显示；
 - 开始依赖该能力承载定时任务和 Team 的长期审批。
 
@@ -748,7 +748,7 @@ Codex/Claude UI 应描述为“重新开始并继续”，不能声称原地恢�
 
 当前环境没有可连接的 in-app/扩展浏览器，因此第 15 节的真实 DOM、截图、窄屏、
 深浅主题和后台标签页验收尚未执行。自动化证明协议和状态投影链路成立，但在完成
-真实浏览器验收前，`docs/streaming-approval-card-todo.md` 仍保持“未解决”，不能仅凭
+真实浏览器验收前，`docs/features/streaming-approval-card-todo.md` 仍保持“未解决”，不能仅凭
 本次自动化结果宣称实时卡片问题已最终关闭。
 
 文件式 SessionStore 的 ResumeIntent CAS 仍限定单 Access Layer worker；多 worker

@@ -2,6 +2,15 @@
 
 > 维护约定：后续涉及前后端接口、MCP/Skill/Memory 加载链路、系统提示词拼接、权限边界或缓存策略的重要修改，都需要在本文追加记录。
 
+## 2026-09-03 删除旧 Prompt 拼接器
+
+- 删除仅由兼容导出和旧测试保活的 `backend/prompts/prompting.py`，以及只服务于该旧链路的
+  `mcp_prompt.py`、`sections.py`。这些模块不在 K Agent 生产调用链中，删除不改变 Provider 请求。
+- `backend.prompts` 不再导出 `build_prompt_bundle`、`build_effective_system_prompt` 等旧函数；
+  唯一 Prompt 编译入口继续是 `compose_prompt(PromptInputs) -> PromptBundle`。
+- 原有 lazy nested-memory 测试改为覆盖生产实际使用的
+  `load_fresh_nested_memory()` 与 `render_nested_reminder()`，不再通过旧拼接器间接验证。
+
 ## 2026-08-24 AskUserQuestion 持久化用户输入 HITL
 
 - K Agent 的 `coding` 工具预设新增 `AskUserQuestion`。一次调用可包含 1–4 个
@@ -21,7 +30,7 @@
 ## 2026-08-11 会话、Team 与定时任务统一权限模式
 
 > 设计依据、完整审批时序、Runner 映射与失败恢复见
-> [权限模式与 HITL 技术方案](permission-and-hitl-technical-solution.md)。
+> [权限模式与 HITL 技术方案](../architecture/permission-and-hitl-technical-solution.md)。
 
 - 三类运行入口统一新增 `permissionMode: "default" | "full_access"`。省略时为
   `default`，旧会话、旧 Team 与旧定时任务通过数据库/JSON 迁移继续沿用原沙箱行为。

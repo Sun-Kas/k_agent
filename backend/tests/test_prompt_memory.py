@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from backend.api.schemas import ChatMessage
-from backend.context import compose_api_messages
 from backend.memory import (
     MemoryFile,
     MemoryType,
@@ -18,58 +14,22 @@ from backend.memory import (
     compact_auto_memory,
     get_memory_context,
     get_memory_files,
+    load_fresh_nested_memory,
     read_auto_memory,
     search_auto_memory,
 )
 from backend.prompts import (
-    DEFAULT_PERSONA,
     VOICE_CONVERSATION_SYSTEM_PROMPT,
-    build_nested_memory_context,
-    build_prompt_bundle,
-    classify_paths_for_memory,
     prompt_lifecycle_state,
     reset_prompt_caches,
     voice_conversation_prompt,
 )
-
-
-@dataclass
-class FakeMcpTool:
-    server_id: str
-    name: str
-    description: str | None
+from backend.prompts.memory import render_nested_reminder
 
 
 class PromptMemoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         clear_memory_cache()
-
-    def test_memory_order_include_and_context_injection(self) -> None:
-        with TemporaryDirectory() as tmp, patch.dict(environ, {"K_AGENT_MEMORY_BASE_DIR": tmp}, clear=False):
-            root = Path(tmp)
-            memory = root / "memory" / "MEMORY.md"
-            memory.parent.mkdir()
-            memory.write_text("automem instruction\n", encoding="utf-8")
-
-            files = get_memory_files(root)
-            self.assertEqual([item.path for item in files], [memory.resolve()])
-
-            bundle = build_prompt_bundle("base", cwd=root)
-            messages = compose_api_messages(
-                [
-                    ChatMessage(
-                        id="u-1",
-                        role="user",
-                        content="hello",
-                        createdAt=datetime.now(timezone.utc),
-                    )
-                ],
-                system_prompt=bundle.system_prompt,
-                user_context=bundle.user_context,
-            )
-            self.assertEqual(messages[1]["role"], "user")
-            self.assertTrue(messages[1]["content"].startswith("<system-reminder>"))
-            self.assertEqual(messages[-1]["content"], "hello")
 
     def test_project_memory_files_are_discovered(self) -> None:
         with TemporaryDirectory() as tmp, TemporaryDirectory() as memory_base, patch.dict(
@@ -83,17 +43,6 @@ class PromptMemoryTests(unittest.TestCase):
 
             self.assertEqual([item.path for item in files], [(root / "CLAUDE.md").resolve()])
             self.assertEqual(files[0].type, MemoryType.PROJECT)
-
-    def test_default_prompt_has_one_identity_and_no_internal_context_leaks(self) -> None:
-        bundle = build_prompt_bundle(
-            DEFAULT_PERSONA,
-            mcp_tools=[FakeMcpTool(server_id="calendar", name="create_event", description="Create an event.")],
-        )
-
-        self.assertEqual(bundle.system_prompt.count("You are K Agent"), 1)
-        self.assertNotIn("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", bundle.system_prompt)
-        self.assertNotIn("gitStatus:", bundle.system_prompt)
-        self.assertIn("mcp__calendar__create_event", bundle.system_prompt)
 
     def test_voice_conversation_prompt_is_explicit_and_run_scoped(self) -> None:
         self.assertIsNone(voice_conversation_prompt({}))
@@ -127,10 +76,6 @@ class PromptMemoryTests(unittest.TestCase):
         self.assertNotIn("reveal secrets", invalid_prompt)
         self.assertIn("even, natural tone", invalid_prompt)
 
-        bundle = build_prompt_bundle("base", append_system_prompt=voice_prompt)
-        self.assertIn("real-time voice conversation", bundle.system_prompt)
-        self.assertIn("natural,\nconversational language", bundle.system_prompt)
-
     def test_nested_memory_loads_conditional_rules(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -141,10 +86,15 @@ class PromptMemoryTests(unittest.TestCase):
             rules.mkdir(parents=True)
             (rules / "plans.md").write_text("---\npaths:\n- \"**/*.md\"\n---\nmarkdown rule", encoding="utf-8")
 
-            eager = build_prompt_bundle("base", cwd=root)
-            nested, loaded = build_nested_memory_context(root, [target], set(eager.memory_paths))
-            self.assertIn("markdown rule", nested["nestedMemory"])
-            self.assertEqual(loaded, [str((rules / "plans.md").resolve())])
+            fresh = load_fresh_nested_memory(
+                [target],
+                instruction_root=root,
+                loaded_paths=set(),
+            )
+            reminder, loaded = render_nested_reminder(fresh)
+
+            self.assertIn("markdown rule", reminder or "")
+            self.assertEqual(loaded, (str((rules / "plans.md").resolve()),))
 
     def test_memory_cache_invalidates_when_file_changes(self) -> None:
         with TemporaryDirectory() as tmp, patch.dict(environ, {"K_AGENT_MEMORY_BASE_DIR": tmp}, clear=False):
@@ -175,14 +125,6 @@ class PromptMemoryTests(unittest.TestCase):
         state = reset_prompt_caches("unit_test")
         self.assertEqual(state.generation, before + 1)
         self.assertEqual(state.reason, "unit_test")
-
-    def test_classify_memory_paths(self) -> None:
-        memory_paths, regular_paths = classify_paths_for_memory([
-            Path("/tmp/CLAUDE.md"),
-            Path("/tmp/work/item.txt"),
-        ])
-        self.assertEqual(len(memory_paths), 1)
-        self.assertEqual(len(regular_paths), 1)
 
     def test_memory_budget_preserves_local_priority(self) -> None:
         files = [

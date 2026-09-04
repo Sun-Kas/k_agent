@@ -81,17 +81,11 @@ export interface ApprovalActivity {
 
 export interface SessionState {
   sessionId: string;
-  messages: ChatMessage[];
-  trace: string[];
-  tasks: string[];
-  thinking: Array<Record<string, unknown>>;
-  events?: AgUiEvent[];
+  events: AgUiEvent[];
   openInterrupts?: Array<Omit<ApprovalActivity, "sequence"> & {
     requestHash?: string;
     toolCallId?: string;
   }>;
-  contextSummary?: string;
-  contextStats?: Record<string, unknown>;
   capabilities?: {
     mcpServerIds: string[];
     skillIds: string[];
@@ -231,6 +225,7 @@ export interface AgUiInterrupt {
  * 联合类型保持服务端原始生命周期，页面不得根据内容猜测 start/end。
  */
 export type AgUiEvent =
+  | { type: "input_message"; runId?: string; message: ChatMessage }
   | { type: "RUN_STARTED"; threadId: string; runId: string }
   | { type: "RUN_FINISHED"; threadId: string; runId: string; result?: unknown; outcome?: { type: "interrupt"; interrupts: AgUiInterrupt[] } }
   | { type: "RUN_ERROR"; message: string; code?: string }
@@ -244,11 +239,6 @@ export type AgUiEvent =
   | { type: "REASONING_MESSAGE_CONTENT"; messageId: string; delta: string; rawEvent?: unknown }
   | { type: "REASONING_MESSAGE_END"; messageId: string; rawEvent?: unknown }
   | { type: "REASONING_END"; messageId: string }
-  | { type: "THINKING_START"; title?: string }
-  | { type: "THINKING_TEXT_MESSAGE_START"; rawEvent?: unknown }
-  | { type: "THINKING_TEXT_MESSAGE_CONTENT"; delta: string; rawEvent?: unknown }
-  | { type: "THINKING_TEXT_MESSAGE_END"; rawEvent?: unknown }
-  | { type: "THINKING_END" }
   | { type: "TOOL_CALL_START"; toolCallId: string; toolCallName: string }
   | { type: "TOOL_CALL_ARGS"; toolCallId: string; delta: string }
   | { type: "TOOL_CALL_END"; toolCallId: string }

@@ -159,7 +159,7 @@ export function ScheduledTasksView({ models, agents, mcpServers, skills }: Props
 
   return (
     <section className="scheduled-page">
-      <header className="scheduled-topbar">
+      <header className="scheduled-topbar work-page-header">
         <div><small>自动执行</small><h1>定时任务</h1><p>在指定时间自动开始一轮新会话</p></div>
         <button className="scheduled-primary" type="button" onClick={beginCreate}>＋ 创建任务</button>
       </header>

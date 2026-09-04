@@ -62,6 +62,24 @@ def select_model(model_id: str | None, settings: Settings) -> dict[str, Any]:
     return {**selected, "apiKey": api_key or settings.openai_api_key}
 
 
+def select_compact_model(main_model: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """精确选择主模型声明的 compact 模型；禁止静默回退到另一目录项。"""
+
+    compact_id = str(main_model.get("compactModelId") or main_model.get("id") or "")
+    selected = next(
+        (
+            model for model in load_models()
+            if model.get("id") == compact_id and model.get("enabled", True)
+        ),
+        None,
+    )
+    if selected is None:
+        raise ValueError(f'Configured compact model "{compact_id}" is unavailable')
+    env_name = selected.get("apiKeyEnv")
+    api_key = os.getenv(env_name) if env_name else selected.get("apiKey")
+    return {**selected, "apiKey": api_key or settings.openai_api_key}
+
+
 def normalize_reasoning_effort(model: dict[str, Any], effort: object) -> str | None:
     """根据模型能力校验并规范化思考强度。"""
     if not model.get("supportsReasoning", False):

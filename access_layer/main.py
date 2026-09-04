@@ -14,14 +14,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import io
 import json
 import os
 from pathlib import Path
 import shutil
-import stat
-import tempfile
-import zipfile
+import uuid
 
 from ag_ui.core import RunAgentInput
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -31,7 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from access_layer import AgentAccessLayer
 from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import RuntimeCatalog, catalog_fields_from_frontmatter, skill_catalog_row
-from access_layer.concurrency import RequestConcurrencyLimiter
+from access_layer.concurrency import RequestConcurrencyLimiter, SessionAlreadyRunning
 from access_layer.request_context import (
     get_request_context,
     new_request_context,
@@ -52,6 +49,8 @@ from access_layer.schemas import (
     McpConfigUpdate,
     ModelsConfigUpdate,
     SessionRunCancelInput,
+    SessionCompactInput,
+    SessionContextStatus,
     SessionSummary,
     SessionState,
     SessionCapabilities,
@@ -60,25 +59,29 @@ from access_layer.schemas import (
 from access_layer.settings import Settings, get_or_init_settings
 from access_layer.home import ensure_home_layout, skills_dir, teams_dir
 from access_layer.logging_config import configure_agent_backend_logging
+from access_layer.storage import create_storage, write_json_atomic
 from access_layer.models_catalog import (
     models_path,
     load_models,
     model_api_key,
     write_models,
 )
+from access_layer.skills.archive import (
+    is_relative_to,
+    normalize_imported_skill_id,
+    validate_and_install_skill_zip,
+)
 from access_layer.skills.frontmatter import (
     markdown_body_after_frontmatter,
     parse_bool,
     parse_markdown_frontmatter,
 )
-from access_layer.storage import create_storage, write_json_atomic
+from access_layer.marketplace.router import build_marketplace_router
+from access_layer.marketplace.service import MarketplaceService
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
-MAX_SKILL_ZIP_BYTES = 20 * 1024 * 1024
-MAX_SKILL_UNPACKED_BYTES = 50 * 1024 * 1024
-MAX_SKILL_ZIP_FILES = 500
 
 # Tests may patch this; production reads `$K_AGENT_HOME/content/skills`.
 DATA_SKILLS_DIR: Path | None = None
@@ -96,7 +99,7 @@ def _write_data_skills(skills: list[dict]) -> list[dict]:
     catalog_rows: list[dict] = []
     for skill in skills:
         skill_id = str(skill.get("id") or "").strip()
-        normalized_id = _normalize_imported_skill_id(skill_id)
+        normalized_id = normalize_imported_skill_id(skill_id)
         if not skill_id or normalized_id != skill_id:
             raise HTTPException(
                 status_code=400,
@@ -107,7 +110,7 @@ def _write_data_skills(skills: list[dict]) -> list[dict]:
         desired_ids.add(skill_id)
 
         skill_dir = (root / skill_id).resolve()
-        if not _is_relative_to(skill_dir, root.resolve()):
+        if not is_relative_to(skill_dir, root.resolve()):
             raise HTTPException(status_code=400, detail=f"Invalid Skill ID: {skill_id}")
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_file = skill_dir / "SKILL.md"
@@ -173,158 +176,9 @@ def _yaml_scalar(value: object) -> str:
 
 
 def _validate_and_install_skill_zip(archive: bytes, filename: str) -> tuple[str, str, Path]:
-    """校验上传的 Skill zip（大小/路径穿越/特殊文件），再原子安装到唯一根目录。"""
+    """校验上传的 Skill zip，再原子安装到本机 skills 目录。"""
 
-    if not filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="请上传 .zip 格式的 Skill 压缩包")
-    if not archive:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    if len(archive) > MAX_SKILL_ZIP_BYTES:
-        raise HTTPException(status_code=413, detail="压缩包超过 20MB 限制")
-
-    try:
-        with zipfile.ZipFile(io.BytesIO(archive)) as zip_file:
-            entries = _validated_skill_zip_entries(zip_file)
-            skill_md = _find_skill_entry(entries)
-            raw_skill = zip_file.read(skill_md).decode("utf-8", errors="replace")
-            frontmatter, _ = parse_markdown_frontmatter(raw_skill)
-            skill_name = str(frontmatter.get("name") or "").strip()
-            description = str(frontmatter.get("description") or "").strip()
-            if not skill_name:
-                raise HTTPException(status_code=400, detail="SKILL.md frontmatter 必须包含 name")
-            if not description:
-                raise HTTPException(status_code=400, detail="SKILL.md frontmatter 必须包含 description")
-
-            skill_root = _skill_archive_root(skill_md)
-            _validate_single_skill_root(entries, skill_root)
-            skill_id = _normalize_imported_skill_id(skill_name)
-            destination = _skills_dir() / skill_id
-            if destination.exists():
-                raise HTTPException(status_code=409, detail=f'Skill "{skill_id}" 已存在')
-
-            with tempfile.TemporaryDirectory(prefix="k-agent-skill-") as tmp:
-                staging = Path(tmp) / skill_id
-                staging.mkdir(parents=True)
-                # Extract entries one by one after validation. ``extractall`` is
-                # intentionally avoided because archive paths are untrusted input.
-                for entry in entries:
-                    if entry.is_dir():
-                        continue
-                    relative = _relative_skill_member(entry.filename, skill_root)
-                    if relative is None:
-                        continue
-                    target = (staging / relative).resolve()
-                    if not _is_relative_to(target, staging):
-                        raise HTTPException(status_code=400, detail=f"压缩包包含非法路径：{entry.filename}")
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with zip_file.open(entry) as source, target.open("wb") as handle:
-                        shutil.copyfileobj(source, handle)
-                if not (staging / "SKILL.md").is_file():
-                    raise HTTPException(status_code=400, detail="压缩包根目录必须包含 SKILL.md")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(staging), str(destination))
-            return skill_id, skill_name, destination
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=400, detail="压缩包无法读取，请确认文件是有效 zip") from exc
-
-
-def _validated_skill_zip_entries(zip_file: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-    """Enforce file-count, entry-type, and expanded-size limits before extraction."""
-
-    entries = [entry for entry in zip_file.infolist() if not _is_ignored_zip_entry(entry.filename)]
-    files = [entry for entry in entries if not entry.is_dir()]
-    if not files:
-        raise HTTPException(status_code=400, detail="压缩包中没有可导入的文件")
-    if len(files) > MAX_SKILL_ZIP_FILES:
-        raise HTTPException(status_code=413, detail=f"压缩包文件数量超过 {MAX_SKILL_ZIP_FILES} 个")
-    total_size = 0
-    for entry in files:
-        _validate_zip_member(entry)
-        total_size += entry.file_size
-        if total_size > MAX_SKILL_UNPACKED_BYTES:
-            raise HTTPException(status_code=413, detail="压缩包解压后超过 50MB 限制")
-    return entries
-
-
-def _validate_zip_member(entry: zipfile.ZipInfo) -> None:
-    """Reject traversal paths, links, devices, and malformed archive metadata."""
-
-    path = Path(entry.filename)
-    parts = path.parts
-    if path.is_absolute() or ".." in parts:
-        raise HTTPException(status_code=400, detail=f"压缩包包含非法路径：{entry.filename}")
-    if entry.file_size < 0 or entry.compress_size < 0:
-        raise HTTPException(status_code=400, detail=f"压缩包条目异常：{entry.filename}")
-    mode = (entry.external_attr >> 16) & 0o170000
-    if mode in {stat.S_IFLNK, stat.S_IFCHR, stat.S_IFBLK, stat.S_IFIFO, stat.S_IFSOCK}:
-        raise HTTPException(status_code=400, detail=f"压缩包不能包含链接或特殊文件：{entry.filename}")
-
-
-def _find_skill_entry(entries: list[zipfile.ZipInfo]) -> str:
-    """Return the sole SKILL.md path or reject multi-Skill archives."""
-
-    skill_files = [entry.filename for entry in entries if not entry.is_dir() and Path(entry.filename).name == "SKILL.md"]
-    if not skill_files:
-        raise HTTPException(status_code=400, detail="压缩包必须包含 SKILL.md")
-    roots = {_skill_archive_root(path) for path in skill_files}
-    if len(skill_files) > 1 or len(roots) > 1:
-        raise HTTPException(status_code=400, detail="一个压缩包只能包含一个 Skill")
-    return skill_files[0]
-
-
-def _validate_single_skill_root(entries: list[zipfile.ZipInfo], root: tuple[str, ...]) -> None:
-    """Require every imported file to live beneath the selected Skill root."""
-
-    for entry in entries:
-        if entry.is_dir():
-            continue
-        if _relative_skill_member(entry.filename, root) is None:
-            raise HTTPException(status_code=400, detail=f"压缩包包含 Skill 目录外的文件：{entry.filename}")
-
-
-def _skill_archive_root(skill_path: str) -> tuple[str, ...]:
-    """根据压缩包中的 SKILL.md 路径计算 Skill 根目录。"""
-    parts = Path(skill_path).parts
-    return tuple(parts[:-1])
-
-
-def _relative_skill_member(filename: str, root: tuple[str, ...]) -> Path | None:
-    """把压缩包条目转换为相对 Skill 根目录的安全路径。"""
-    parts = Path(filename).parts
-    if root:
-        if tuple(parts[: len(root)]) != root:
-            return None
-        parts = parts[len(root) :]
-    if not parts:
-        return None
-    return Path(*parts)
-
-
-def _is_ignored_zip_entry(filename: str) -> bool:
-    """识别 zip 中应忽略的系统元数据文件。"""
-    parts = Path(filename).parts
-    return not parts or parts[0] == "__MACOSX" or any(part == ".DS_Store" for part in parts)
-
-
-def _normalize_imported_skill_id(name: str) -> str:
-    """把导入的 Skill 名称规范化为 content/skills 下的目录 ID。"""
-    normalized = "".join(
-        char.lower()
-        if char.isascii() and (char.isalnum() or char == "_")
-        else "-"
-        for char in name
-    )
-    normalized = "-".join(part for part in normalized.split("-") if part)
-    return normalized[:80] or "skill"
-
-
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    """判断一个路径是否位于另一个路径之下。"""
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
+    return validate_and_install_skill_zip(archive, filename, skills_root=_skills_dir())
 
 
 def _serialize_mcp_server(server: dict) -> dict:
@@ -422,6 +276,10 @@ def create_app() -> FastAPI:
     """构造有状态的公开 Access Layer 应用（会话、配置、Team、AG-UI）。"""
 
     settings = Settings()
+    if settings.server_workers > 1:
+        raise RuntimeError(
+            "File-backed session/context CAS requires SERVER_WORKERS=1 until a distributed lease is configured"
+        )
     # 复用后端日志配置：压制第三方噪音，并过滤高频 health/catalog 访问行。
     configure_agent_backend_logging(settings.agent_backend_log_level)
 
@@ -441,6 +299,7 @@ def create_app() -> FastAPI:
         )
         app.state.runtime_catalog = RuntimeCatalog()
         app.state.runtime_catalog.ensure()
+        app.state.marketplace = MarketplaceService(app.state.runtime_catalog)
         app.state.access_layer = AgentAccessLayer(
             session_store=app.state.session_store,
             request_limiter=app.state.request_limiter,
@@ -466,6 +325,9 @@ def create_app() -> FastAPI:
         )
         await app.state.scheduled_task_runtime.start()
         await app.state.team_runtime.start()
+        # 服务对外 ready 前先恢复已提交但未完成的 compact continuation；若后端
+        # 暂不可用，checkpoint 会保留，网关也会阻止新输入越过该执行段。
+        await app.state.access_layer.recover_pending_context_continuations()
         try:
             yield
         finally:
@@ -513,6 +375,7 @@ def create_app() -> FastAPI:
             return getattr(app.state.scheduled_task_runtime, name)
 
     app.include_router(build_scheduled_task_router(_ScheduledRuntimeProxy()))
+    app.include_router(build_marketplace_router())
 
     @app.get("/api/health", response_model=HealthResponse)
     async def health_check() -> HealthResponse:
@@ -562,6 +425,16 @@ def create_app() -> FastAPI:
                 model["apiKey"] = previous.get(profile.id, {}).get("apiKey")
             models.append(model)
         write_models(models)
+        previous_compact = {
+            model_id: (item.get("compactModelId"), item.get("autoCompactEnabled", True))
+            for model_id, item in previous.items()
+        }
+        current_compact = {
+            item["id"]: (item.get("compactModelId"), item.get("autoCompactEnabled", True))
+            for item in models
+        }
+        if previous_compact != current_compact:
+            await app.state.session_store.clear_all_context_failures()
         return {"ok": True, "models": _public_models(app.state.settings)}
 
     @app.get("/api/config/mcp")
@@ -581,6 +454,7 @@ def create_app() -> FastAPI:
                 "description": summaries.get(str(server.get("id")), {}).get(
                     "description", ""
                 ),
+                "marketplace": summaries.get(str(server.get("id")), {}).get("marketplace"),
                 "scope": "local",
                 "transport": server.get("type", "stdio"),
                 "toolCount": 0,
@@ -759,17 +633,13 @@ def create_app() -> FastAPI:
 
     @app.get("/api/sessions/{session_id}", response_model=SessionState)
     async def get_session(session_id: str) -> SessionState:
-        """返回指定会话的完整状态和 AG-UI events。"""
+        """返回元数据与可重放 history；Provider messages 不暴露给 UI。"""
         session = await app.state.session_store.get(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
         open_interrupts = await app.state.session_store.list_open_interrupts(session_id)
         return SessionState(
             sessionId=session.id,
-            messages=session.messages,
-            trace=session.trace,
-            tasks=session.tasks,
-            thinking=session.thinking,
             events=session.events,
             openInterrupts=open_interrupts,
             capabilities=(
@@ -800,6 +670,103 @@ def create_app() -> FastAPI:
             updatedAt=branch.updated_at,
             messageCount=len(branch.messages),
         )
+
+    @app.get(
+        "/api/sessions/{session_id}/context",
+        response_model=SessionContextStatus,
+    )
+    async def get_session_context(session_id: str) -> SessionContextStatus:
+        """只公开 compact 指标；摘要正文和恢复 checkpoint 永不出 Access Layer。"""
+
+        status = await app.state.session_store.context_status(session_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return SessionContextStatus.model_validate(status)
+
+    @app.post(
+        "/api/sessions/{session_id}/compact",
+        response_model=SessionContextStatus,
+    )
+    async def compact_session(
+        session_id: str, payload: SessionCompactInput
+    ) -> SessionContextStatus:
+        """对空闲 K Agent 会话执行一次 compact-only 模型调用与 CAS 提交。"""
+
+        try:
+            async with app.state.request_limiter.protect_idle_session(session_id):
+                session = await app.state.session_store.get(session_id)
+                if session is None:
+                    raise HTTPException(status_code=404, detail="Session not found")
+                if session.open_interrupt_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Resolve or cancel the open interrupt before compacting",
+                    )
+                if session.agent_kind != "k_agent":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Context compaction is available only for K Agent sessions",
+                    )
+                if payload.reset:
+                    await app.state.session_store.reset_context(session_id)
+                messages, context_state = (
+                    await app.state.session_store.provider_context_state(session_id)
+                )
+                source_run_id = f"manual-compact-{uuid.uuid4()}"
+                try:
+                    result = await app.state.agent_backend_client.post_json(
+                        "/internal/context/compact",
+                        {
+                            "threadId": session_id,
+                            "sourceRunId": source_run_id,
+                            "messages": [
+                                message.model_dump(by_alias=True, mode="json")
+                                for message in messages
+                                if message.carries_context()
+                            ],
+                            "contextState": context_state,
+                            "instructions": payload.instructions,
+                            "modelId": session.model_id,
+                        },
+                    )
+                    await app.state.session_store.commit_context_compaction(
+                        session_id, dict(result.get("proposal") or {}), None
+                    )
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    await app.state.session_store.record_context_failure(
+                        session_id,
+                        code="manual_compact_failed",
+                        automatic=False,
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "Context compaction failed; the complete history was preserved: "
+                            f"{exc}"
+                        ),
+                    ) from exc
+                status = await app.state.session_store.context_status(session_id)
+                return SessionContextStatus.model_validate(status or {})
+        except SessionAlreadyRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/sessions/{session_id}/context")
+    async def reset_session_context(session_id: str) -> dict[str, bool]:
+        """删除可重建派生 state，不触碰完整 history。"""
+
+        try:
+            async with app.state.request_limiter.protect_idle_session(session_id):
+                session = await app.state.session_store.get(session_id)
+                if session is None:
+                    raise HTTPException(status_code=404, detail="Session not found")
+                if session.open_interrupt_ids:
+                    raise HTTPException(status_code=409, detail="Open interrupt blocks context reset")
+                await app.state.session_store.reset_context(session_id)
+                return {"reset": True}
+        except SessionAlreadyRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, bool]:

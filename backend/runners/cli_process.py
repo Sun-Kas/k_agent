@@ -149,10 +149,7 @@ async def run_cli_jsonl(
     """Spawn a CLI, parse stdout JSONL, and yield internal agent events."""
 
     state = state_factory()
-    yield {
-        "type": "status",
-        "payload": {"message": f"Starting {kind} ({argv[0]})"},
-    }
+    logger.info("Starting %s CLI (%s)", kind, argv[0])
     # Headless runners receive the prompt through their arguments. Close stdin
     # so an open pipe cannot be mistaken for additional turn input or hang.
     process = await asyncio.create_subprocess_exec(
@@ -191,10 +188,7 @@ async def run_cli_jsonl(
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError:
-                yield {
-                    "type": "trace",
-                    "payload": {"entry": f"{kind}.stdout", "output": text[:2000]},
-                }
+                logger.debug("%s non-JSON stdout: %s", kind, text[:2000])
                 continue
             if not isinstance(payload, dict):
                 continue
@@ -238,7 +232,7 @@ async def run_cli_jsonl(
             yield {"type": "message_end", "payload": {"messageId": message_id}}
         yield {
             "type": "final",
-            "payload": {"messages": [], "trace": [], "tasks": [], "thinking": []},
+            "payload": {},
         }
     except asyncio.CancelledError:
         await _stop_process(process)

@@ -26,6 +26,10 @@ def main() -> None:
     parser.add_argument("--reload", action="store_true", default=settings.reload)
     parser.add_argument("--workers", "-w", type=int, default=settings.server_workers)
     args = parser.parse_args()
+    if args.workers > 1:
+        parser.error(
+            "--workers must be 1 while sessions use the file-backed context store"
+        )
 
     uvicorn.run(
         "access_layer.main:create_app",

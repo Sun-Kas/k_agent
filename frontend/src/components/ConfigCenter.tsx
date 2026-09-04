@@ -14,7 +14,7 @@ import {
   saveModelsConfig,
   saveSkillsConfig
 } from "../api/agui";
-import type { McpCapabilities, McpServerConfig, ModelProfile, SkillConfig } from "../types";
+import type { HealthState, McpCapabilities, McpServerConfig, ModelProfile, SkillConfig } from "../types";
 import {
   readVoiceConfig,
   VOICE_STYLES,
@@ -24,7 +24,15 @@ import {
 
 type ConfigTab = "model" | "mcp" | "skills" | "voice";
 
-export function ConfigCenter({ onBack }: { onBack: () => void }) {
+export function ConfigCenter({
+  onBack,
+  health,
+  onRefreshHealth
+}: {
+  onBack: () => void;
+  health: HealthState | null;
+  onRefreshHealth: () => void;
+}) {
   const [tab, setTab] = useState<ConfigTab>("model");
   const [models, setModels] = useState<ModelProfile[]>([]);
   const [mcpIsTemplate, setMcpIsTemplate] = useState(false);
@@ -140,6 +148,28 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
       </header>
       <div className="config-layout">
         <nav className="config-nav" aria-label="配置分类">
+          <button className="config-health" type="button" onClick={() => void onRefreshHealth()}>
+            <span className={`connection-dot ${health?.ok ? "online" : ""}`} />
+            <span>
+              <strong>{health?.ok ? "后端已连接" : "后端未连接"}</strong>
+              <small>
+                {health
+                  ? `${health.model} · ${health.localToolCount + health.mcpToolCount} 个工具 · ${
+                      health.bashSandbox?.available
+                        ? "沙箱就绪"
+                        : health.bashSandbox?.mode === "off"
+                          ? "沙箱关闭"
+                          : health.bashSandbox?.needsInstall
+                            ? "沙箱未安装"
+                            : health.bashSandbox
+                              ? "沙箱不可用"
+                              : "沙箱未知"
+                    }`
+                  : "点击检查连接"}
+              </small>
+            </span>
+            <i>↻</i>
+          </button>
           <p>Agent 设置</p>
           <button className={tab === "model" ? "active" : ""} type="button" onClick={() => { setTab("model"); setNotice(""); }}>
             <i>AI</i><span><strong>模型管理</strong><small>多模型与能力配置</small></span><b>{models.length}</b>
@@ -167,7 +197,7 @@ export function ConfigCenter({ onBack }: { onBack: () => void }) {
                     {models.map((model, index) => (
                       <ModelCard key={index} model={model} onChange={(next) => setModels(models.map((item, i) => i === index ? next : item))} onRemove={() => setModels(models.filter((_, i) => i !== index))} />
                     ))}
-                    <button className="add-config" type="button" onClick={() => setModels([...models, { id: nextId("model", models), name: "新模型", model: "", baseUrl: "https://api.openai.com/v1", apiKeyConfigured: false, apiKey: "", apiKeyEnv: "OPENAI_API_KEY", multimodal: false, supportsReasoning: false, contextWindow: 128000, maxOutputTokens: 8192, contextSafetyTokens: 4096, enabled: true, isNew: true }])}>
+                    <button className="add-config" type="button" onClick={() => setModels([...models, { id: nextId("model", models), name: "新模型", model: "", baseUrl: "https://api.openai.com/v1", apiKeyConfigured: false, apiKey: "", apiKeyEnv: "OPENAI_API_KEY", multimodal: false, supportsReasoning: false, contextWindow: 128000, maxOutputTokens: 8192, contextSafetyTokens: 4096, autoCompactEnabled: true, compactModelId: null, enabled: true, isNew: true }])}>
                       <span>＋</span><strong>添加模型</strong><small>配置 URL、模型名、密钥和能力</small>
                     </button>
                   </div>
@@ -524,10 +554,14 @@ function ModelCard({ model, onChange, onRemove }: { model: ModelProfile; onChang
         <Field label="上下文安全余量" hint="避免在压缩前撞到模型上限">
           <input type="number" min={0} step={256} value={model.contextSafetyTokens ?? 4096} onChange={(e) => onChange({ ...model, contextSafetyTokens: Number(e.target.value) })} />
         </Field>
+        <Field label="压缩模型配置 ID" hint="留空时使用当前主模型；必须来自同一模型目录">
+          <input value={model.compactModelId ?? ""} onChange={(e) => onChange({ ...model, compactModelId: e.target.value || null })} placeholder={model.id} />
+        </Field>
         <div className="capability-switches">
           <label><span><strong>图片输入</strong><small>允许在对话中添加图片</small></span><Toggle checked={(model.inputModalities ?? (model.multimodal ? ["text", "image"] : ["text"])).includes("image")} onChange={(enabled) => onChange(updateModelInputModality(model, "image", enabled))} /></label>
           <label><span><strong>视频输入</strong><small>仅为明确支持 video_url 的模型开启</small></span><Toggle checked={(model.inputModalities ?? []).includes("video")} onChange={(enabled) => onChange(updateModelInputModality(model, "video", enabled))} /></label>
           <label><span><strong>思考强度</strong><small>支持 reasoning_effort 参数</small></span><Toggle checked={model.supportsReasoning} onChange={(supportsReasoning) => onChange({ ...model, supportsReasoning })} /></label>
+          <label><span><strong>自动压缩</strong><small>到达阈值后自动 compact 并继续当前任务</small></span><Toggle checked={model.autoCompactEnabled !== false} onChange={(autoCompactEnabled) => onChange({ ...model, autoCompactEnabled })} /></label>
         </div>
       </div>}
     </article>
@@ -569,6 +603,9 @@ function McpCard({ server, onChange, onRemove }: { server: McpServerConfig; onCh
         <Field label="MCP ID"><input required value={server.id} onChange={(e) => onChange({ ...server, id: e.target.value })} placeholder="MCP server ID" /></Field>
       </div>
       <Field label="简介"><input value={server.description ?? ""} onChange={(e) => onChange({ ...server, description: e.target.value })} placeholder="这个 MCP 服务提供什么能力？" /></Field>
+      {server.marketplace && (
+          <p className="marketplace-origin">来自魔搭 MCP 广场 · {server.marketplace.sourceId}{server.marketplace.version ? ` · ${server.marketplace.version}` : ""}</p>
+      )}
       <div className="mcp-type-row">
         <strong>类型</strong>
         <div className="mcp-type-switch" role="group" aria-label="MCP 类型">
@@ -647,6 +684,9 @@ function SkillCard({ skill, onChange, onRemove }: { skill: SkillConfig; onChange
           <Field label="Skill ID"><input required value={skill.id} onChange={(e) => onChange({ ...skill, id: e.target.value })} /></Field>
         </div>
         <Field label="简介"><input value={skill.description} onChange={(e) => onChange({ ...skill, description: e.target.value })} placeholder="这个 Skill 擅长什么？" /></Field>
+        {skill.marketplace && (
+          <p className="marketplace-origin">来自 SkillHub · {skill.marketplace.sourceId}{skill.marketplace.version ? ` · ${skill.marketplace.version}` : ""}</p>
+        )}
         <Field label="Skill 指令" hint="启用后会注入系统上下文">
           <textarea className="config-editor" rows={8} value={skill.instructions} onChange={(e) => onChange({ ...skill, instructions: e.target.value })} placeholder="描述角色、工作流程、输出要求和限制…" />
         </Field>

@@ -68,6 +68,23 @@ class RequestConcurrencyLimiter:
                 self._session_locks[session_id] = lock
             return lock
 
+    @asynccontextmanager
+    async def protect_idle_session(self, session_id: str) -> AsyncIterator[None]:
+        """控制面操作只接受空闲会话；不等待正在运行的 Agent。"""
+
+        session_lock = await self._get_session_lock(session_id)
+        if session_lock.locked():
+            raise SessionAlreadyRunning("Session has an active run")
+        await session_lock.acquire()
+        try:
+            yield
+        finally:
+            session_lock.release()
+
 
 class ConcurrencyLimitExceeded(RuntimeError):
     """在超时内未能获得请求槽或会话锁时抛出，由网关映射为 HTTP 429。"""
+
+
+class SessionAlreadyRunning(RuntimeError):
+    """手动 compact 等控制操作不能与同会话 run 并发。"""

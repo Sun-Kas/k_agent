@@ -39,6 +39,10 @@ class RunnerContext:
     skills: list[dict[str, Any]]
     reasoning_effort: str | None
     attachments: list[dict[str, Any]]
+    # Access Layer 已验证 compact boundary 后下发的派生摘要；Runner 不读会话文件。
+    context_summary: str = ""
+    context_state: dict[str, Any] = field(default_factory=dict)
+    continuation_checkpoint: dict[str, Any] | None = None
     # 标准 AG-UI Resume 决议及 Access Layer 可信 checkpoint；Runner 不读磁盘。
     resume: list[dict[str, Any]] = field(default_factory=list)
     resume_checkpoints: list[dict[str, Any]] = field(default_factory=list)

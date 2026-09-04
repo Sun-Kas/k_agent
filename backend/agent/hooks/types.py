@@ -127,6 +127,7 @@ class ModelResultPayload:
     elapsed_ms: float
     tool_calls: tuple[Mapping[str, Any], ...] = ()
     operation_id: str = ""
+    input_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -158,7 +158,7 @@ Runtime 不做固定按秒轮询。它查询最近的 `next_run_at` 后动态休
 未在默认 600 秒期限内处理则本次失败。任务也可以由用户显式选择 `full_access`；
 该选择持久化在任务上，并在以后每次计划或手动触发时关闭沙箱和审批。前端必须持续
 告知这是无人值守的高风险授权，不得把它伪装成普通的“自动批准”。完整安全边界和
-时序见[权限模式与 HITL 技术方案](permission-and-hitl-technical-solution.md)。
+时序见[权限模式与 HITL 技术方案](../architecture/permission-and-hitl-technical-solution.md)。
 
 ## 6. API 契约
 

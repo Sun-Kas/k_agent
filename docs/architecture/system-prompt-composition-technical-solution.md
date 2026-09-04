@@ -1,8 +1,8 @@
 # 系统提示词分层与拼接技术方案
 
-> 状态：Prompt 分层与 Skill 发现通道均已落地（2026-08-31）
+> 状态：Prompt 分层、Skill 发现通道和旧拼接器清理均已落地（2026-09-03）
 >
-> 代码基线：2026-08-31 当前工作区
+> 代码基线：2026-09-03 当前工作区
 >
 > 适用范围：K Agent 主 ReAct Runner（`agentKind=k_agent`）
 >
@@ -676,9 +676,9 @@ client.chat.completions.create(model=..., messages=messages, tools=tool_specs, t
 
 ## 9. 和现状的对照
 
-| 现状 | 目标 |
+| 迁移前问题 | 当前结果 |
 | --- | --- |
-| `prompting.py` 一个文件又拼 system 又读 Memory | 删掉或只留极薄 re-export；逻辑进子目录，顺序只在 `compose.py` |
+| `prompting.py` 一个文件又拼 system 又读 Memory | 已删除；逻辑进入子目录，拼接顺序只在 `compose.py` |
 | `create_runtime` 拼完 Prompt 再改 `user_context` | 先绑工具，再 `compose_prompt`，不再手改 |
 | MCP 工具清单进 system，同时又进 `tools` | system 不再列 MCP 工具 |
 | Skill 摘要放在请求级 `Skill.description` | `Skill.description` 固定；摘要由 `prompts/skills/` 生成 context reminder |
@@ -751,8 +751,8 @@ client.chat.completions.create(model=..., messages=messages, tools=tool_specs, t
 当前已经完成：typed `PromptSection/PromptBundle`、唯一 `compose_prompt()`、
 `SkillCatalog/ToolCatalog`、`instruction_root/output_workspace` 分离、Memory 权限分层、MCP
 去重、trusted tool argument 驱动的 lazy rules、HITL checkpoint 去重状态，以及 Access Layer
-重复 Prompt 配置清理。旧 `prompting.py` 目前仅作为已有内部调用与回归测试的过渡兼容入口；
-K Agent 生产调用链不再使用它。
+重复 Prompt 配置清理，以及旧 `prompting.py` / `mcp_prompt.py` / `sections.py` 清理。
+K Agent 只保留 `compose_prompt(PromptInputs) -> PromptBundle` 这一条生产和测试入口。
 
 2026-08-31 新增的 Skill 发现通道迁移已按以下顺序落地：
 
@@ -762,7 +762,7 @@ K Agent 生产调用链不再使用它。
 4. `build_skill_tool()` 的 description 改成固定协议，删除动态 `tool_description()` 拼装路径；
    同步修改 `tool_guidance`，让它引用 request context 而不是工具 description。
 5. 增加通道、预算、未选中 Skill、Schema 稳定性和正文懒加载回归测试。
-6. 更新 `docs/tools.md` 的当前行为说明和 Prompt 观测指标。
+6. 更新 `docs/guides/tools.md` 的当前行为说明和 Prompt 观测指标。
 
 下面是 2026-08-27 Prompt 收口时已经执行完的历史步骤；其中第 4 步的 Skill description
 方案将由上面的 2026-08-31 迁移替换：

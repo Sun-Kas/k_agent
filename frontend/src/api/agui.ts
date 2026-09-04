@@ -15,6 +15,7 @@ import type {
   RuntimeOption,
   SkillConfig,
   SessionState,
+  SessionContextStatus,
   SessionSummary,
   SessionWorkspaceFileContent,
   SessionWorkspaceListing
@@ -234,6 +235,26 @@ export async function getSession(sessionId: string): Promise<SessionState> {
     throw new Error(`Unable to load session (${response.status})`);
   }
   return response.json() as Promise<SessionState>;
+}
+
+export async function getSessionContext(sessionId: string): Promise<SessionContextStatus> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/context`));
+  if (!response.ok) throw new Error(await sessionActionError(response, "无法读取上下文状态"));
+  return response.json() as Promise<SessionContextStatus>;
+}
+
+export async function compactSession(
+  sessionId: string,
+  instructions = "",
+  reset = false
+): Promise<SessionContextStatus> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/compact`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instructions, reset })
+  });
+  if (!response.ok) throw new Error(await sessionActionError(response, "上下文压缩失败"));
+  return response.json() as Promise<SessionContextStatus>;
 }
 
 export async function forkSession(sessionId: string): Promise<SessionSummary> {

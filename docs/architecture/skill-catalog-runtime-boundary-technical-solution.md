@@ -2,7 +2,8 @@
 
 > 状态：K Agent 主链核心边界已按本方案落地  
 > 基线：2026-09-02 当前工作区  
-> 范围：Access Layer catalog、Backend Prompt discovery、Backend `Skill` 工具
+> 范围：Access Layer catalog、Backend Prompt discovery、Backend `Skill` 工具  
+> 公网发现与安装见 [Skill / MCP 广场技术方案](../features/marketplace-skill-mcp-technical-solution.md)；广场条目不得写入本方案的运行时 catalog，除非安装校验已成功。
 
 ## 1. 最终结论
 

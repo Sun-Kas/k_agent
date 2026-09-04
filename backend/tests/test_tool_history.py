@@ -7,8 +7,8 @@ import unittest
 from access_layer.sessions.store import SessionStore
 from backend.api.schemas import ChatMessage, ChatMeta, ToolCallRecord
 from backend.context import (
-    build_context_plan,
     compose_api_messages,
+    group_api_rounds,
     pair_tool_messages,
 )
 
@@ -134,22 +134,17 @@ class ToolPairingTests(unittest.TestCase):
         for index in range(6):
             messages.append(message(f"u-{index}", "user", "ask " + "x" * 4000))
             messages.extend(tool_turn(f"c-{index}", output="y" * 4000))
-        plan = build_context_plan(
-            messages,
-            system_prompt="system",
-            user_context={},
-            model_config={
-                "contextWindow": 12_000,
-                "maxOutputTokens": 1_000,
-                "contextSafetyTokens": 1_000,
-            },
-        )
-        self.assertTrue(plan.auto_compacted)
-        announced: set[str] = set()
-        for item in plan.messages:
-            announced.update(call.id for call in item.tool_calls)
-            if item.role == "tool":
-                self.assertIn(item.meta.tool_call_id, announced)
+        provider = compose_api_messages(messages, system_prompt="system", user_context={})
+        groups = group_api_rounds([item for item in provider if item["role"] != "system"])
+        for group in groups:
+            announced = {
+                str(call.get("id"))
+                for item in group
+                for call in item.get("tool_calls") or []
+            }
+            for item in group:
+                if item["role"] == "tool":
+                    self.assertIn(item["tool_call_id"], announced)
 
 
 if __name__ == "__main__":

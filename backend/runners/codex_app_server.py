@@ -91,7 +91,7 @@ async def run_codex_app_server(
             deferred.append(message)
 
     try:
-        yield {"type": "status", "payload": {"message": "Starting codex app-server"}}
+        logger.info("Starting codex app-server")
         await call(
             "initialize",
             {
@@ -212,7 +212,6 @@ async def run_codex_app_server(
                     yield event
                 continue
             if method == "turn/started":
-                yield {"type": "trace", "payload": {"entry": "codex.turn.started"}}
                 continue
             if method == "turn/completed":
                 turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
@@ -231,14 +230,11 @@ async def run_codex_app_server(
                 }
                 yield {
                     "type": "final",
-                    "payload": {"messages": [], "trace": [], "tasks": [], "thinking": []},
+                    "payload": {},
                 }
                 return
             if method in {"warning", "configWarning", "deprecationNotice"}:
-                yield {
-                    "type": "status",
-                    "payload": {"message": str(params.get("message") or method)},
-                }
+                logger.warning("Codex app-server %s: %s", method, params.get("message") or method)
             elif method == "error":
                 yield emit_error(str(params.get("message") or params))
                 return

@@ -5,6 +5,21 @@
 并在实际 Skill 工具调用后自行读取正文。
 """
 
-from access_layer.gateway import AgentAccessLayer
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from access_layer.gateway import AgentAccessLayer
+
+
+def __getattr__(name: str) -> Any:
+    """延迟导入网关，避免 `python -m access_layer.sessions.migrate_history`
+    在包初始化时又反向加载迁移模块。
+    """
+
+    if name == "AgentAccessLayer":
+        from access_layer.gateway import AgentAccessLayer
+
+        return AgentAccessLayer
+    raise AttributeError(name)
 
 __all__ = ["AgentAccessLayer"]

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import hashlib
 import logging
 import os
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from backend.agent import AgentRunRequest, OpenAIAgent
@@ -32,7 +34,8 @@ from backend.prompts import (
 )
 from backend.prompts.memory import render_nested_reminder
 from backend.runners.base import RunnerContext
-from backend.runtime_config import normalize_reasoning_effort, select_model
+from backend.runtime_config import normalize_reasoning_effort, select_compact_model, select_model
+from backend.context.projection import render_working_set
 from backend.tools import (
     SkillCatalog,
     bind_request_scoped_tools,
@@ -43,6 +46,17 @@ from backend.permissions import PermissionDecision
 
 
 logger = logging.getLogger("k_agent.runners.k_agent")
+
+
+def _observed_file_digest(path: Path) -> str | None:
+    """只记录可信本地路径的内容摘要；失败不把文件正文塞进 state。"""
+
+    try:
+        if not path.is_file():
+            return None
+        return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 class KAgentRunner:
@@ -86,6 +100,7 @@ class KAgentRunner:
             await mcp_manager.connect_all()
             # 请求未指定模型时回落到 settings 默认；返回的是本轮要用的模型目录项。
             model = select_model(ctx.model_id, settings)
+            compact_model = select_compact_model(model, settings)
             # 把对话里所有附件摊平成一份清单，用来校验模型是否吃得下这些模态。
             media = [
                 attachment
@@ -190,6 +205,17 @@ class KAgentRunner:
                 # 会话历史（含用户输入）；不是 user_context。Access Layer 已按 carries_context 过滤。
                 messages=ctx.messages,
                 model_config=model,
+                context_summary=ctx.context_summary,
+                context_state=copy.deepcopy(ctx.context_state),
+                continuation_checkpoint=copy.deepcopy(ctx.continuation_checkpoint),
+                working_set_context=render_working_set(
+                    ctx.context_state,
+                    allowed_roots=[instruction_root, ctx.workspace_dir],
+                    authorized_skill_ids={
+                        str(skill.get("id") or "") for skill in skills if skill.get("id")
+                    },
+                    context_window=int(model.get("contextWindow") or 128_000),
+                ),
                 prompt=prompt_bundle,
                 attachments=ctx.attachments,
                 mcp_server_ids=selected_mcp_ids,
@@ -209,6 +235,7 @@ class KAgentRunner:
                 "settings": settings,
                 "mcp_manager": mcp_manager,
                 "model": model,
+                "compact_model": compact_model,
                 "skills": skills,
                 "tools": tools,
                 "run_request": run_request,
@@ -263,6 +290,19 @@ class KAgentRunner:
             agent_runtime = agent_runtime_ref.get("value")
             if not isinstance(agent_runtime, dict):
                 return tool_result
+            working_set = agent_runtime.setdefault(
+                "working_set",
+                copy.deepcopy(ctx.context_state.get("workingSet") or {
+                    "recentFiles": [], "invokedSkillIds": [], "plan": None
+                }),
+            )
+            if tool_name == "Skill":
+                skill_id = str(arguments.get("skill") or "").strip().lstrip("/")
+                invoked = list(working_set.get("invokedSkillIds") or [])
+                if skill_id and skill_id not in invoked:
+                    working_set["invokedSkillIds"] = [*invoked, skill_id]
+            if tool_name == "TodoWrite" and isinstance(arguments.get("todos"), list):
+                working_set["plan"] = copy.deepcopy(arguments["todos"])
             paths = trusted_tool_paths(
                 tool_name,
                 arguments,
@@ -271,6 +311,20 @@ class KAgentRunner:
             )
             if not paths:
                 return tool_result
+            recent_files = list(working_set.get("recentFiles") or [])
+            by_path = {
+                str(item.get("path")): item
+                for item in recent_files
+                if isinstance(item, dict) and isinstance(item.get("path"), str)
+            }
+            for raw_path in paths:
+                path = Path(raw_path)
+                digest = await asyncio.to_thread(_observed_file_digest, path)
+                by_path[str(path)] = {
+                    "path": str(path),
+                    "observedDigest": digest,
+                }
+            working_set["recentFiles"] = list(by_path.values())[-5:]
             loaded: set[str] = agent_runtime["loaded_memory_paths"]
             fresh = await asyncio.to_thread(
                 load_fresh_nested_memory,
@@ -372,6 +426,11 @@ class KAgentRunner:
                 # The generic Agent core does not import Prompt/Memory modules;
                 # this request callback owns K Agent's lazy-rule semantics.
                 agent_runtime["observation_enricher"] = enrich_observation
+                agent_runtime["working_set"] = copy.deepcopy(
+                    ctx.context_state.get("workingSet") or {
+                        "recentFiles": [], "invokedSkillIds": [], "plan": None
+                    }
+                )
                 agent_runtime_ref["value"] = agent_runtime
                 if ctx.resume_checkpoints:
                     # Access Layer 已验证 resume 完整覆盖开放 Interrupt；K Agent
@@ -386,6 +445,11 @@ class KAgentRunner:
                     agent_runtime["resume_checkpoint"] = copy.deepcopy(checkpoint)
                     agent_runtime["resume_decision"] = copy.deepcopy(decision)
                     agent_runtime["resume_request_hash"] = resume_record.get("requestHash")
+                if isinstance(ctx.continuation_checkpoint, dict):
+                    agent_runtime["continuation_checkpoint"] = copy.deepcopy(
+                        ctx.continuation_checkpoint
+                    )
+                agent_runtime["compact_model"] = runtime["compact_model"]
                 async for event in self._agent.run_stream_react(agent_runtime):
                     yield event
         finally:

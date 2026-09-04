@@ -1,7 +1,13 @@
 # K Agent 上下文管理系统
 
-压缩策略、与 Claude Code 源码的对照和数字以
-[上下文压缩技术方案](context-compaction-technical-solution.md) 为准。本文是组成与数据流总览。
+> 当前状态：已按 2026-09-03 工作区重新核对。
+
+压缩的目标架构、Claude Code 对照和迁移步骤见
+[上下文压缩最终技术方案](context-compaction-technical-solution.md)。该方案尚未实现；本文只说明 K Agent 当前实际行为。
+
+当前策略没有升级成 Claude Code 式的持久化 compact。它仍然是：每次 HTTP run 根据 Access Layer
+传来的完整历史重新规划一次活动上下文；较早历史通过确定性文本抽取变短，摘要不跨 run 保存；
+ReAct 循环中只清理旧工具结果，不再次压缩整段对话。
 
 本系统参考 Claude Code 的公开上下文模型实现，但保持 K Agent 的双进程边界：
 
@@ -50,9 +56,14 @@
 
 输入预算计算：
 
-``text
-inputBudget = contextWindow - maxOutputTokens - contextSafetyTokens
-``
+```text
+inputBudget = max(8,000, contextWindow - maxOutputTokens - contextSafetyTokens)
+
+messageBudget = max(
+  1,000,
+  inputBudget - system - contextMessage - existingSummary - toolDefinitions
+)
+```
 
 系统按分类估算：
 
@@ -69,17 +80,22 @@ inputBudget = contextWindow - maxOutputTokens - contextSafetyTokens
 
 当未压缩消息超过剩余输入预算时：
 
-1. 至少保留最近六条消息。
-2. 将更早的用户、助手与工具消息写入结构化摘要。
-3. 记录已压缩消息 ID。
-4. 摘要仅存在于本次 Agent Backend 的活动模型上下文。
-5. 下一轮由 Agent Backend 根据 Access Layer 传来的完整历史重新规划上下文。
+1. 先修复不完整的 `assistant.tool_calls` / `tool` 配对，避免把孤立工具消息发给 Provider。
+2. 消息超过六条时，初始保留最近六条，再在预算允许时向前回扩，目标占消息预算的 70%～78%。
+3. 消息总数不超过六条但本身已经超限时，退化为保留最后两条，而不是强行保留六条。
+4. 更早消息不会交给另一个模型总结；Backend 只按角色抽取、折叠空白并拼成 bullet 摘要。
+5. 压缩切点会越过连续的工具结果，避免把 tool call 与其结果拆开。
+6. 摘要和已压缩消息 ID 只属于本次 `ContextPlan`，不会写回 Access Layer。
+7. 下一次用户消息仍由 Backend 根据完整历史从零重新规划。
 
-摘要最大 16KB，单条历史内容最多保留 1,500 字符。完整原消息仍保存在会话的 `messages` 中。
+摘要最多保留 100,000 字符，单条历史内容最多保留 10,000 字符。完整原消息仍保存在会话的 `messages` 中。
+
+这意味着当前“摘要”更接近有界历史摘录，不是语义重写后的任务状态。优点是不增加一次模型调用、
+Backend 继续无状态；缺点是用户意图、失败原因和待办可能被长 bullet 淹没，并且每个新 run 都会重复计算。
 
 ## 工具结果清理
 
-同一 Agent 运行内，工具结果累计超过 48KB 时：
+同一 Agent 运行内，工具结果累计超过 50,000 字符时：
 
 - 保留最近两个工具结果。
 - 优先把更早工具结果替换为清理标记。
@@ -87,11 +103,12 @@ inputBudget = contextWindow - maxOutputTokens - contextSafetyTokens
 
 该处理只修改当前模型请求中的临时消息，不修改 AG-UI 事件或后端持久化记录。
 
-## 接口
+需要注意：本 run 内每次 Reason 前只执行工具结果清理，不会再次调用 `build_context_plan()`。
+如果一次长工具链的非工具消息或最近两个工具结果本身继续膨胀，仍可能触碰 Provider 上下文上限。
 
 ## 双进程数据流
 
-``text
+```text
 Access Layer
   读取并发送完整会话 + model/MCP/Skill ID
         |
@@ -105,7 +122,7 @@ Agent Backend
         v
 Access Layer
   原样透传并持久化 Event
-``
+```
 
 ## 与 Claude Code 的对应关系
 
@@ -115,5 +132,8 @@ Access Layer
 | Auto memory | `$K_AGENT_HOME/content/memory/MEMORY.md` |
 | `.claude/rules` | `.claude/rules` |
 | Auto compact | 上下文预算超限自动压缩 |
-| Clear old tool outputs | 48KB 工具结果预算与优先裁剪 |
+| Clear old tool outputs | 50,000 字符工具结果预算与优先裁剪 |
 | Skill descriptions | `$K_AGENT_HOME/content/skills` 中已启用 Skill 摘要 |
+
+这里的“对应”只表示解决同一类问题，不表示实现等价。Claude Code 的 full compact 会调用专用模型生成
+结构化摘要、建立 boundary、补回文件与 Skill，并在同一用户 turn 继续；K Agent 当前没有这些生命周期状态。

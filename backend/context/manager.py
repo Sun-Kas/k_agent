@@ -1,7 +1,7 @@
-"""在模型上下文窗口内估算用量并压缩较旧对话。
+"""Provider 消息投影、tool 配对与保守 token 估算公共函数。
 
-pipeline：`OpenAIAgent.run_stream` 每轮先 `build_context_plan`，再在迭代前
-`prune_old_tool_outputs`。启发式 token 估算留安全余量，避免估少触发 provider 报错。
+持久化摘要由 ``backend.context.compact`` 的 LLM compact-only 调用生成；本模块
+不再拥有机械 bullet 摘要或按消息 ID 累积的临时压缩状态。
 """
 
 from __future__ import annotations
@@ -23,10 +23,6 @@ DEFAULT_MAX_OUTPUT_TOKENS = 50_000
 DEFAULT_SAFETY_TOKENS = 200_000
 # 压缩后至少保留的最近消息数。低于这个数，模型会丢失当前任务的直接上下文
 # （例如刚提的问题和刚回的工具结果），压缩反而比超预算更有害。
-MIN_RECENT_MESSAGES = 6
-MAX_SUMMARY_CHARS = 100_000
-MAX_SUMMARY_MESSAGE_CHARS = 10_000
-MAX_TOOL_CONTEXT_CHARS = 50_000
 
 
 @dataclass(frozen=True)
@@ -45,23 +41,19 @@ class ContextBudget:
 
 @dataclass(frozen=True)
 class ContextPlan:
-    """本轮选用的消息与摘要，附可审计的预算 breakdown。"""
+    """Runtime 创建时的未压缩输入快照；真正预算在每次 Reason 前计算。"""
 
     messages: list[ChatMessage]
     summary: str
-    compacted_message_ids: list[str]
     budget: ContextBudget
     breakdown: dict[str, int]
-    auto_compacted: bool
 
     def as_dict(self) -> dict[str, Any]:
         """把对象转换为可序列化字典。"""
         return {
             "summary": self.summary,
-            "compactedMessageIds": self.compacted_message_ids,
             "budget": self.budget.as_dict(),
             "breakdown": self.breakdown,
-            "autoCompacted": self.auto_compacted,
             "messageCount": len(self.messages),
         }
 
@@ -73,18 +65,13 @@ def build_context_plan(
     system_prompt: str = "",
     user_context: dict[str, str] | None = None,
     model_config: dict[str, Any],
-    existing_summary: str = "",
-    compacted_message_ids: list[str] | None = None,
+    context_summary: str = "",
     tool_definition_tokens: int = 0,
-    force_compact: bool = False,
 ) -> ContextPlan:
-    """构建上下文窗口计划；超预算时压缩较旧消息为摘要。"""
+    """构建初始投影但绝不压缩；ContextController 在每次 Reason 决策。"""
 
     budget = _context_budget(model_config)
-    compacted = set(compacted_message_ids or [])
-    active = pair_tool_messages(
-        [message for message in messages if message.id not in compacted]
-    )
+    active = pair_tool_messages(messages)
     effective_system = prompt.system_prompt if prompt is not None else system_prompt
     effective_context = (
         prompt.context_message or ""
@@ -93,29 +80,8 @@ def build_context_plan(
     )
     system_tokens = estimate_text_tokens(effective_system)
     memory_tokens = estimate_text_tokens(effective_context)
-    summary_tokens = estimate_text_tokens(existing_summary)
+    summary_tokens = estimate_text_tokens(context_summary)
     message_tokens = estimate_message_tokens(active)
-    # 系统提示词、记忆、摘要和工具定义都是本轮无法裁剪的固定开销，
-    # 只有对话消息可以被压缩，所以先扣掉固定部分再算消息可用额度。
-    fixed_tokens = system_tokens + memory_tokens + summary_tokens + tool_definition_tokens
-    # 即使固定开销已经吃满预算也保底给 1000，避免额度为 0 时把消息全部压缩掉。
-    available_for_messages = max(1_000, budget.input_budget - fixed_tokens)
-    should_compact = force_compact or message_tokens > available_for_messages
-
-    summary = existing_summary
-    newly_compacted: list[str] = []
-    # 少于 3 条时无可压缩空间：压缩至少要留下最后一轮问答。
-    if should_compact and len(active) > 2:
-        summary, newly_compacted, active = compact_messages(
-            active,
-            existing_summary=existing_summary,
-            message_token_budget=available_for_messages,
-            force=force_compact,
-        )
-        compacted.update(newly_compacted)
-        summary_tokens = estimate_text_tokens(summary)
-        message_tokens = estimate_message_tokens(active)
-
     breakdown = {
         "system": system_tokens,
         "memory": memory_tokens,
@@ -136,11 +102,9 @@ def build_context_plan(
     }
     return ContextPlan(
         messages=active,
-        summary=summary,
-        compacted_message_ids=sorted(compacted),
+        summary=context_summary,
         budget=budget,
         breakdown=breakdown,
-        auto_compacted=bool(newly_compacted),
     )
 
 
@@ -185,92 +149,6 @@ def pair_tool_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
     return repaired
 
 
-def compact_messages(
-    messages: list[ChatMessage],
-    *,
-    existing_summary: str = "",
-    message_token_budget: int = 24_000,
-    force: bool = False,
-) -> tuple[str, list[str], list[ChatMessage]]:
-    """Summarize older messages while preserving a minimum recent-message tail."""
-
-    if len(messages) <= 2:
-        return existing_summary, [], messages
-    # split 是保留原文的分界点：[:split] 进摘要，[split:] 保留原文。
-    split = max(1, len(messages) - MIN_RECENT_MESSAGES)
-    if not force and estimate_message_tokens(messages) <= message_token_budget:
-        return existing_summary, [], messages
-    # 消息总数还不到保留下限时，退化为只压缩最后两条之前的内容。
-    if len(messages) <= MIN_RECENT_MESSAGES:
-        split = max(1, len(messages) - 2)
-    if not force:
-        # 上面的分界点按条数切，往往会压缩掉本可以放下的消息。这里在预算内
-        # 逐条往回扩大保留窗口：低于 70% 才继续尝试，一旦某次扩展会越过 78%
-        # 就停手。两个阈值留出的间隙是给后续轮次的模型输出和新工具结果的，
-        # 否则下一轮立刻又要压缩，形成反复摘要、上下文持续劣化。
-        recent = messages[split:]
-        while split > 0 and estimate_message_tokens(recent) < message_token_budget * 0.7:
-            candidate = messages[split - 1 :]
-            if estimate_message_tokens(candidate) > message_token_budget * 0.78:
-                break
-            split -= 1
-            recent = candidate
-    split = _tool_safe_split(messages, split)
-    older = messages[:split]
-    if not older:
-        return existing_summary, [], messages
-    summary = _merge_summary(existing_summary, older)
-    return summary, [message.id for message in older], messages[split:]
-
-
-def _tool_safe_split(messages: list[ChatMessage], split: int) -> int:
-    """Move a compaction boundary forward past a tool result run.
-
-    A tool message belongs to the assistant turn that requested it. Splitting
-    between them would summarize the request while keeping an orphan result.
-    """
-
-    while split < len(messages) and messages[split].role == "tool":
-        split += 1
-    return split
-
-
-def prune_old_tool_outputs(
-    messages: list[dict[str, Any]],
-    *,
-    max_tool_chars: int = MAX_TOOL_CONTEXT_CHARS,
-    keep_recent: int = 2,
-) -> list[dict[str, Any]]:
-    """Replace oldest large tool outputs while retaining recent exact results."""
-
-    tool_indexes = [
-        index
-        for index, message in enumerate(messages)
-        if message.get("role") == "tool" and isinstance(message.get("content"), str)
-    ]
-    total = sum(len(str(messages[index].get("content") or "")) for index in tool_indexes)
-    if total <= max_tool_chars:
-        return messages
-    # 最近几条工具结果是模型当前推理的直接依据，必须保留原文；
-    # 更早的可以换成占位符，模型需要时会重新调用工具。
-    protected = set(tool_indexes[-keep_recent:])
-    # 拷贝后再改，避免污染调用方持有的消息列表（主循环会跨迭代复用它）。
-    pruned = [dict(message) for message in messages]
-    for index in tool_indexes:
-        # 从最老的开始裁，一旦降到阈值以下就停，尽量多保留原文。
-        if total <= max_tool_chars or index in protected:
-            continue
-        content = str(pruned[index].get("content") or "")
-        total -= len(content)
-        pruned[index]["content"] = (
-            f"[Older tool output cleared from active context: {len(content)} characters. "
-            "Run the tool again if the exact output is needed.]"
-        )
-        # 占位符本身也占字符，计回总量后才能正确判断是否还需继续裁剪。
-        total += len(pruned[index]["content"])
-    return pruned
-
-
 def compose_api_messages(
     messages: list[ChatMessage],
     *,
@@ -279,6 +157,7 @@ def compose_api_messages(
     user_context: dict[str, str] | None = None,
     context_summary: str = "",
     attachments: list[dict[str, Any]] | None = None,
+    working_set_context: str = "",
 ) -> list[dict[str, Any]]:
     """组装 provider 请求需要的 system/user/context/messages/attachments。"""
     body: list[dict[str, Any]] = []
@@ -305,6 +184,7 @@ def compose_api_messages(
                 "role": "tool",
                 "tool_call_id": message.meta.tool_call_id if message.meta else "",
                 "content": message.content,
+                "_message_id": message.id,
             })
             continue
         if message.tool_calls:
@@ -313,6 +193,7 @@ def compose_api_messages(
             body.append({
                 "role": "assistant",
                 "content": message.content or None,
+                "_message_id": message.id,
                 "tool_calls": [
                     {
                         "id": call.id,
@@ -323,7 +204,7 @@ def compose_api_messages(
                 ],
             })
             continue
-        body.append({"role": message.role, "content": content})
+        body.append({"role": message.role, "content": content, "_message_id": message.id})
     if prompt is not None:
         reminder = prompt.context_message or ""
     else:
@@ -335,11 +216,17 @@ def compose_api_messages(
             f"{context_summary}\n</system-reminder>"
         )
         reminder = "\n\n".join(item for item in (reminder, summary_block) if item)
+    if working_set_context:
+        working_block = (
+            "<system-reminder>\n# post_compact_working_set\n"
+            f"{working_set_context}\n</system-reminder>"
+        )
+        reminder = "\n\n".join(item for item in (reminder, working_block) if item)
     # 记忆和动态上下文作为独立的 user 消息插在历史之前，而不是拼进 system：
     # 这样 system 提示词保持稳定，可被 provider 端前缀缓存复用。
     return [
         {"role": "system", "content": prompt.system_prompt if prompt is not None else system_prompt},
-        *([{"role": "user", "content": reminder}] if reminder else []),
+        *([{"role": "user", "content": reminder, "_request_context": True}] if reminder else []),
         *body,
     ]
 
@@ -393,33 +280,6 @@ def _positive_int(value: object, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _merge_summary(existing: str, messages: list[ChatMessage]) -> str:
-    """把旧消息合并进上下文摘要。"""
-    sections = [existing.strip()] if existing.strip() else []
-    sections.append("# Compacted conversation")
-    for message in messages:
-        content = " ".join(message.content.split())
-        if message.tool_calls:
-            names = ", ".join(call.name for call in message.tool_calls)
-            content = f"{content} (called {names})".strip()
-        if len(content) > MAX_SUMMARY_MESSAGE_CHARS:
-            content = content[:MAX_SUMMARY_MESSAGE_CHARS].rstrip() + "…"
-        label = {
-            "user": "User request",
-            "assistant": "Assistant result",
-            "tool": f"Tool result ({message.meta.tool_name if message.meta else 'tool'})",
-            "system": "System note",
-        }.get(message.role, message.role)
-        sections.append(f"- {label}: {content}")
-    merged = "\n".join(section for section in sections if section)
-    # 摘要会被反复追加，长会话下自身也可能膨胀。截断时保留尾部，
-    # 因为越靠近当前轮次的内容对后续推理越有用。
-    if len(merged) > MAX_SUMMARY_CHARS:
-        merged = merged[-MAX_SUMMARY_CHARS:]
-        merged = "# Earlier compacted context omitted\n" + merged
-    return merged
 
 
 def _render_user_context(context: dict[str, str]) -> str:

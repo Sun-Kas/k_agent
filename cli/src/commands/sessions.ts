@@ -23,7 +23,7 @@ export async function showSession(sessionId: string, command: Command): Promise<
     const session = await clientFor(command).getSession(sessionId);
     if (command.opts<{ json?: boolean }>().json) return printJson(session);
     const timeline = timelineFromSession(session);
-    process.stdout.write(`Session ${session.sessionId}\nMessages ${session.messages.length}\nEvents ${session.events?.length ?? 0}\nStatus ${timeline.runStatus}\nOpen interrupts ${session.openInterrupts?.length ?? 0}\n`);
+    process.stdout.write(`Session ${session.sessionId}\nTimeline items ${timeline.items.length}\nEvents ${session.events.length}\nStatus ${timeline.runStatus}\nOpen interrupts ${session.openInterrupts?.length ?? 0}\n`);
   } catch (error) { commandFailure(error); }
 }
 

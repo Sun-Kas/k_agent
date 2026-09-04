@@ -81,12 +81,8 @@ class SessionCapabilities(BaseModel):
 
 
 class SessionState(BaseModel):
-    """描述单个会话详情和原始 AG-UI events。"""
+    """会话详情只返回完整历史事件、开放审批与运行能力元数据。"""
     session_id: str = Field(alias="sessionId")
-    messages: list[ChatMessage]
-    trace: list[str]
-    tasks: list[str]
-    thinking: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
     # 开放审批是服务端恢复真相源的只读投影，不包含可执行 checkpoint。
     open_interrupts: list[dict[str, Any]] = Field(
@@ -100,6 +96,31 @@ class SessionRunCancelInput(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
     run_id: str = Field(alias="runId", min_length=1)
+
+
+class SessionCompactInput(BaseModel):
+    """手动 compact 只允许附加一次性关注点，不能提交可信状态字段。"""
+
+    instructions: str = Field(default="", max_length=4_000)
+    reset: bool = False
+
+
+class SessionContextStatus(BaseModel):
+    """不含摘要正文、digest、replacement/checkpoint 的公开状态。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+    generation: int = 0
+    boundary_id: str | None = Field(default=None, alias="boundaryId")
+    last_compacted_at: str | None = Field(default=None, alias="lastCompactedAt")
+    trigger: str | None = None
+    before_tokens: int | None = Field(default=None, alias="beforeTokens")
+    after_tokens: int | None = Field(default=None, alias="afterTokens")
+    saved_tokens: int | None = Field(default=None, alias="savedTokens")
+    warning: bool = False
+    auto_disabled: bool = Field(default=False, alias="autoDisabled")
+    consecutive_auto_failures: int = Field(default=0, alias="consecutiveAutoFailures")
+    last_failure_code: str | None = Field(default=None, alias="lastFailureCode")
+    pending_continuation: bool = Field(default=False, alias="pendingContinuation")
 
 
 class BashSandboxHealth(BaseModel):
@@ -147,6 +168,8 @@ class ModelProfileInput(BaseModel):
     context_window: int = Field(default=128_000, alias="contextWindow", ge=8_000)
     max_output_tokens: int = Field(default=8_192, alias="maxOutputTokens", ge=256)
     context_safety_tokens: int = Field(default=4_096, alias="contextSafetyTokens", ge=0)
+    auto_compact_enabled: bool = Field(default=True, alias="autoCompactEnabled")
+    compact_model_id: str | None = Field(default=None, alias="compactModelId", max_length=80)
     enabled: bool = True
 
     @model_validator(mode="after")
@@ -157,12 +180,38 @@ class ModelProfileInput(BaseModel):
         elif "text" not in self.input_modalities:
             self.input_modalities.insert(0, "text")
         self.multimodal = "image" in self.input_modalities or "video" in self.input_modalities
+        if self.context_window < self.max_output_tokens + self.context_safety_tokens + 8_000:
+            raise ValueError(
+                "contextWindow must be at least maxOutputTokens + contextSafetyTokens + 8000"
+            )
         return self
 
 
 class ModelsConfigUpdate(BaseModel):
     """描述模型配置更新请求。"""
     models: list[ModelProfileInput]
+
+    @model_validator(mode="after")
+    def validate_compact_models(self) -> "ModelsConfigUpdate":
+        """压缩模型只能引用同一受控目录，浏览器不能注入 Provider 参数。"""
+
+        ids = {model.id for model in self.models}
+        missing = sorted({
+            model.compact_model_id
+            for model in self.models
+            if model.compact_model_id and model.compact_model_id not in ids
+        })
+        if missing:
+            raise ValueError("Unknown compactModelId: " + ", ".join(missing))
+        disabled = sorted({
+            model.compact_model_id
+            for model in self.models
+            if model.compact_model_id
+            and not next(item for item in self.models if item.id == model.compact_model_id).enabled
+        })
+        if disabled:
+            raise ValueError("compactModelId must reference an enabled model: " + ", ".join(disabled))
+        return self
 
 
 class McpServerInput(BaseModel):

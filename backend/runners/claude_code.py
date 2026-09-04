@@ -244,34 +244,9 @@ def map_claude_event(payload: dict[str, Any], state: _CliStreamState) -> list[di
     events: list[dict[str, Any]] = []
 
     if event_type == "system":
-        subtype = str(payload.get("subtype") or "")
         session_id = payload.get("session_id") or payload.get("sessionId")
         if isinstance(session_id, str) and session_id:
             state.provider_session_id = session_id
-        if subtype == "init":
-            mcp_servers = payload.get("mcp_servers")
-            needs_auth = [
-                str(server.get("name") or "")
-                for server in mcp_servers or []
-                if isinstance(server, dict)
-                and str(server.get("status") or "") == "needs-auth"
-                and server.get("name")
-            ]
-            message = f"Claude Code ready" + (
-                f" ({session_id})" if session_id else ""
-            )
-            if needs_auth:
-                message += " · MCP 需要认证: " + ", ".join(needs_auth)
-            events.append(
-                {
-                    "type": "status",
-                    "payload": {
-                        "message": message,
-                        "mcpServers": mcp_servers if isinstance(mcp_servers, list) else [],
-                        "mcpNeedsAuth": needs_auth,
-                    },
-                }
-            )
         return events
 
     # ── Streaming deltas (real-time incremental content) ──────────────
@@ -394,12 +369,6 @@ def map_claude_event(payload: dict[str, Any], state: _CliStreamState) -> list[di
             events.append(emit_error(str(payload.get("result") or "Claude Code reported an error")))
         return events
 
-    events.append(
-        {
-            "type": "trace",
-            "payload": {"entry": f"claude_code.{event_type or 'event'}"},
-        }
-    )
     return events
 
 

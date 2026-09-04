@@ -350,7 +350,7 @@ Team Control MCP 的约束：
 并在越权时进入 HITL，`full_access` 则对 Supervisor 和所有 Worker 关闭沙箱与审批。
 Team 内并行运行必须从同一持久化快照读取该值，不能让单个 Worker 私自扩大权限。
 完整运行时映射、审批时序和清理规则见
-[权限模式与 HITL 技术方案](permission-and-hitl-technical-solution.md)。
+[权限模式与 HITL 技术方案](../architecture/permission-and-hitl-technical-solution.md)。
 
 每个 Agent 创建时生成不可变的 `AgentProfileSnapshot`：
 

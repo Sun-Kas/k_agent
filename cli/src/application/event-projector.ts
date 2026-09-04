@@ -1,7 +1,6 @@
 import type {
   AgUiEvent,
   ApprovalActivity,
-  ChatMessage,
   SessionState,
 } from "../protocol/index.js";
 
@@ -45,8 +44,17 @@ export function appendUserPrompt(state: TimelineState, id: string, content: stri
  * 原始 AG-UI 事件按到达顺序投影，不能按 Thinking、Tool、Text 类型重新分组。
  * 更新只修改原位置的活动；新生命周期才追加新项目，保证实时流和历史回放一致。
  */
-export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineState {
+export function projectEvent(
+  state: TimelineState,
+  event: AgUiEvent,
+  options: { history?: boolean } | number = {},
+): TimelineState {
+  const history = typeof options === "object" && options.history === true;
+  const applyDelta = (previous: string, delta: string) =>
+    history ? delta : previous + delta;
   switch (event.type) {
+    case "input_message":
+      return appendUserPrompt(state, event.message.id, event.message.content, event.runId);
     case "RUN_STARTED":
       return { ...state, runId: event.runId, runStatus: "running" };
     case "REASONING_START": {
@@ -64,30 +72,11 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
       return { ...state, activeThinkingStepId: event.messageId };
     case "REASONING_MESSAGE_CONTENT":
       return updateItem(state, state.activeReasoningId ?? event.messageId, (item) =>
-        item.kind === "thinking" ? { ...item, content: item.content + event.delta } : item,
+        item.kind === "thinking" ? { ...item, content: applyDelta(item.content, event.delta) } : item,
       );
     case "REASONING_MESSAGE_END":
       return { ...state, activeThinkingStepId: undefined };
     case "REASONING_END":
-      return closeThinking(state);
-    case "THINKING_START": {
-      const id = `legacy-thinking-${state.sequence + 1}`;
-      const next = appendItem(state, {
-        kind: "thinking",
-        id,
-        title: event.title || "思考过程",
-        content: "",
-        status: "active",
-        ...(state.runId ? { runId: state.runId } : {}),
-      });
-      return { ...next, activeReasoningId: id };
-    }
-    case "THINKING_TEXT_MESSAGE_CONTENT":
-      return state.activeReasoningId
-        ? updateItem(state, state.activeReasoningId, (item) =>
-          item.kind === "thinking" ? { ...item, content: item.content + event.delta } : item)
-        : state;
-    case "THINKING_END":
       return closeThinking(state);
     case "TOOL_CALL_START": {
       // 工具开始后前一个 Thinking 块不可继续追加；即使旧事件缺少 END 也必须封口。
@@ -103,7 +92,7 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
     }
     case "TOOL_CALL_ARGS":
       return updateItem(state, event.toolCallId, (item) =>
-        item.kind === "tool" ? { ...item, arguments: item.arguments + event.delta, status: "active" } : item,
+        item.kind === "tool" ? { ...item, arguments: applyDelta(item.arguments, event.delta), status: "active" } : item,
       );
     case "TOOL_CALL_END":
       return updateItem(state, event.toolCallId, (item) =>
@@ -139,7 +128,7 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
           ...(state.runId ? { runId: state.runId } : {}),
         });
       const next = updateItem(target, event.messageId, (item) =>
-        item.kind === "text" ? { ...item, content: item.content + event.delta } : item,
+        item.kind === "text" ? { ...item, content: applyDelta(item.content, event.delta) } : item,
       );
       return { ...next, activeTextId: event.messageId };
     }
@@ -186,64 +175,16 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
     }
     case "STATE_SNAPSHOT":
     case "MESSAGES_SNAPSHOT":
-    case "THINKING_TEXT_MESSAGE_START":
-    case "THINKING_TEXT_MESSAGE_END":
       return state;
   }
 }
 
 export function timelineFromSession(session: SessionState): TimelineState {
-  if (!(session.events?.length)) {
-    let messageState = emptyTimeline();
-    for (const message of session.messages) {
-      if (message.role === "user") {
-        messageState = appendUserPrompt(messageState, message.id, message.content, message.meta?.runId);
-      } else if (message.role === "assistant" && message.content) {
-        messageState = appendItem(messageState, {
-          kind: "text",
-          id: message.id,
-          content: message.content,
-          status: "complete",
-          ...(message.meta?.runId ? { runId: message.meta.runId } : {}),
-        });
-      }
-    }
-    for (const interrupt of session.openInterrupts ?? []) {
-      messageState = appendOpenInterrupt(messageState, interrupt);
-    }
-    return messageState;
-  }
   let state = emptyTimeline();
-  const users = session.messages.filter((message) => message.role === "user");
-  const runIds = (session.events ?? [])
-    .filter((event): event is Extract<AgUiEvent, { type: "RUN_STARTED" }> => event.type === "RUN_STARTED")
-    .map((event) => event.runId);
-  const userByRun = assignUsersToRuns(users, runIds);
-  const assignedIds = new Set([...userByRun.values()].map((message) => message.id));
-  const firstAssigned = users.findIndex((message) => assignedIds.has(message.id));
-  const leadingUsers = users.filter((message, index) => !assignedIds.has(message.id) && (firstAssigned < 0 || index < firstAssigned));
-
-  // Access Layer 落盘的 user 消息通常没有 meta.runId；不能先把整段用户历史堆到顶部。
-  for (const message of leadingUsers) {
-    state = appendUserPrompt(state, message.id, message.content, message.meta?.runId);
+  for (const event of session.events) {
+    // 落盘 events 已是累计块；history 模式整段赋值，实时流仍走 projectEvent 默认拼接。
+    state = projectEvent(state, event, { history: true });
   }
-  const insertedRuns = new Set<string>();
-  for (const event of session.events ?? []) {
-    if (event.type === "RUN_STARTED") {
-      const user = userByRun.get(event.runId);
-      if (user && !insertedRuns.has(event.runId)) {
-        state = appendUserPrompt(state, user.id, user.content, event.runId);
-        insertedRuns.add(event.runId);
-      }
-    }
-    state = projectEvent(state, event);
-  }
-  const presentUserIds = new Set(state.items.filter((item) => item.kind === "user").map((item) => item.id));
-  for (const message of users) {
-    if (presentUserIds.has(message.id)) continue;
-    state = appendUserPrompt(state, message.id, message.content, message.meta?.runId);
-  }
-
   // openInterrupts 是 Access Layer 的当前 checkpoint 视图；即使旧事件窗口已裁剪，
   // CLI 仍必须把待处理输入恢复出来，并继续保持 fail-closed。
   for (const interrupt of session.openInterrupts ?? []) {
@@ -251,44 +192,7 @@ export function timelineFromSession(session: SessionState): TimelineState {
     state = appendOpenInterrupt(state, interrupt);
   }
 
-  // 旧会话可能没有完整 events；保留消息正文作为只读降级路径。
-  if (!state.items.some((item) => item.kind === "text")) {
-    for (const message of session.messages) {
-      if (message.role === "assistant" && message.content) {
-        state = appendItem(state, {
-          kind: "text",
-          id: message.id,
-          content: message.content,
-          status: "complete",
-          ...(message.meta?.runId ? { runId: message.meta.runId } : {}),
-        });
-      }
-    }
-  }
   return state;
-}
-
-function assignUsersToRuns(users: ChatMessage[], runIds: string[]): Map<string, ChatMessage> {
-  const assigned = new Map<string, ChatMessage>();
-  const used = new Set<string>();
-  for (const runId of runIds) {
-    const labeled = users.find((message) => message.meta?.runId === runId && !used.has(message.id));
-    if (!labeled) continue;
-    assigned.set(runId, labeled);
-    used.add(labeled.id);
-  }
-  const unlabeled = users.filter((message) => !used.has(message.id));
-  const openRuns = runIds.filter((runId) => !assigned.has(runId));
-  // 事件窗口可能被裁成最近几轮：从尾部对齐，避免把更早的提问贴到当前 run 上。
-  let cursor = unlabeled.length - 1;
-  for (let index = openRuns.length - 1; index >= 0 && cursor >= 0; index -= 1) {
-    const user = unlabeled[cursor];
-    const runId = openRuns[index];
-    if (!user || !runId) break;
-    assigned.set(runId, user);
-    cursor -= 1;
-  }
-  return assigned;
 }
 
 function appendOpenInterrupt(

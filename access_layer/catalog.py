@@ -114,11 +114,21 @@ class RuntimeCatalog:
 
     def write_mcp_summaries(self, servers: list[dict[str, Any]]) -> None:
         """原子写入 MCP 摘要列表（配置中心保存后调用）。"""
-        _write_list(self.mcp_catalog_path, "servers", [_mcp_summary(item) for item in servers])
+        previous = {str(item.get("id")): item for item in self.mcp_summaries()}
+        _write_list(
+            self.mcp_catalog_path,
+            "servers",
+            [_mcp_summary(_retain_marketplace(item, previous)) for item in servers],
+        )
 
     def write_skill_summaries(self, skills: list[dict[str, Any]]) -> None:
         """原子写入 Skill 目录。不得写入 SKILL.md 正文。"""
-        _write_list(self.skill_catalog_path, "skills", [skill_catalog_row(item) for item in skills])
+        previous = {str(item.get("id")): item for item in self.skill_summaries()}
+        _write_list(
+            self.skill_catalog_path,
+            "skills",
+            [skill_catalog_row(_retain_marketplace(item, previous)) for item in skills],
+        )
 
     def selected_runtime(
         self, mcp_ids: list[str], skill_ids: list[str]
@@ -196,7 +206,8 @@ class RuntimeCatalog:
         ]
         # 这里故意直接返回 catalog 行：Access Layer 的 run 路径不得根据 ID
         # 打开 Skill 包，否则正文会在模型尚未决定使用 Skill 前被提前加载。
-        return selected_mcp, skill_summaries
+        # marketplace 溯源只属于本机 catalog，不能进入 Backend 载荷。
+        return selected_mcp, [_without_marketplace(item) for item in skill_summaries]
 
     @staticmethod
     def _select(
@@ -274,23 +285,64 @@ def catalog_fields_from_frontmatter(frontmatter: dict[str, Any]) -> dict[str, An
 def skill_catalog_row(item: dict[str, Any]) -> dict[str, Any]:
     """规范化 catalog 一行；丢弃 instructions 等正文。"""
     item_id = str(item.get("id") or "").strip()
-    return {
+    row = {
         "id": item_id,
         "name": str(item.get("name") or item_id),
         "description": str(item.get("description") or ""),
         "enabled": bool(item.get("enabled", True)),
         **catalog_fields_from_frontmatter(item),
     }
+    marketplace = _marketplace_block(item)
+    if marketplace:
+        row["marketplace"] = marketplace
+    return row
 
 
 def _mcp_summary(item: dict[str, Any]) -> dict[str, Any]:
     item_id = str(item.get("id") or "").strip()
-    return {
+    row = {
         "id": item_id,
         "name": str(item.get("name") or item_id),
         "description": str(item.get("description") or ""),
         "enabled": bool(item.get("enabled", True)),
     }
+    marketplace = _marketplace_block(item)
+    if marketplace:
+        row["marketplace"] = marketplace
+    return row
+
+
+def _marketplace_block(item: dict[str, Any]) -> dict[str, Any] | None:
+    raw = item.get("marketplace")
+    if not isinstance(raw, dict):
+        return None
+    source = str(raw.get("source") or "").strip()
+    source_id = str(raw.get("sourceId") or "").strip()
+    if not source or not source_id:
+        return None
+    block = {"source": source, "sourceId": source_id}
+    version = str(raw.get("version") or "").strip()
+    installed_at = str(raw.get("installedAt") or "").strip()
+    if version:
+        block["version"] = version
+    if installed_at:
+        block["installedAt"] = installed_at
+    return block
+
+
+def _retain_marketplace(item: dict[str, Any], previous: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """配置中心保存时保留已有 marketplace 溯源，避免被表单漏字段清掉。"""
+    row = dict(item)
+    if _marketplace_block(row):
+        return row
+    prior = previous.get(str(row.get("id") or ""))
+    if prior and _marketplace_block(prior):
+        row["marketplace"] = prior["marketplace"]
+    return row
+
+
+def _without_marketplace(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if key != "marketplace"}
 
 
 def _optional_str(value: Any) -> str | None:

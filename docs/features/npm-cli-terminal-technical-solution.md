@@ -1375,8 +1375,8 @@ k-agent run "输出一行测试文本" --plain
 
 ## 17. 与现有文档的关系
 
-- AG-UI 事件生命周期和顺序以 [`ag-ui-protocol.md`](ag-ui-protocol.md) 为准。
-- 服务边界和接口历史以 [`interface-change-record.md`](interface-change-record.md) 为准。
+- AG-UI 事件生命周期和顺序以 [`ag-ui-protocol.md`](../architecture/ag-ui-protocol.md) 为准。
+- 服务边界和接口历史以 [`interface-change-record.md`](../reference/interface-change-record.md) 为准。
 - Web 工作台视觉背景可参考 [`frontend-design-review-and-improvement-plan.md`](frontend-design-review-and-improvement-plan.md)，但 CLI 不复制浏览器布局实现。
 - Team 和 Automation 的业务语义仍由现有服务端技术方案定义，CLI 只做公共 API 客户端。
 
