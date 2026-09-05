@@ -12,6 +12,7 @@ from backend.agent.hooks.middleware import AsyncToolCallHandler
 from backend.agent.hooks.types import ToolCallRequest, ToolCallResult
 
 
+# 只读本地工具：历史会话里可能残留已废弃的提权字段，业务上它们不该出现。
 _READ_ONLY_LOCAL_TOOLS = frozenset({"Read", "Glob", "Grep", "LS"})
 _LEGACY_ESCALATION_FIELDS = frozenset(
     {"sandbox_permissions", "escalation_scope", "escalation_resource"}

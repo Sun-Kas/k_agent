@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -116,36 +117,24 @@ async def _detect_cli(
     binary_name = Path(command).name
     model_fields = _model_fields(kind)
     try:
-        process = await asyncio.create_subprocess_exec(
-            command,
-            *version_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # Use a worker thread + subprocess.run. On Windows, uvicorn --reload
+        # often runs under SelectorEventLoop, where create_subprocess_exec
+        # raises NotImplementedError and would 500 /internal/agents.
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [command, *version_args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            return DetectedAgent(
-                kind=kind,
-                name=name,
-                available=False,
-                command=command,
-                requires_cli=True,
-                supports_resume=True,
-                default_cli_session_mode="ephemeral",
-                detail=f"{binary_name} --version timed out",
-                supports_model_switch=True,
-                **model_fields,
-            )
-        text = (stdout or b"").decode("utf-8", errors="replace").strip()
+        text = (completed.stdout or "").strip()
         if not text:
-            text = (stderr or b"").decode("utf-8", errors="replace").strip()
+            text = (completed.stderr or "").strip()
         version = text.splitlines()[0][:120] if text else None
-        if process.returncode not in (0, None) and not version:
+        if completed.returncode not in (0, None) and not version:
             return DetectedAgent(
                 kind=kind,
                 name=name,
@@ -155,10 +144,23 @@ async def _detect_cli(
                 requires_cli=True,
                 supports_resume=True,
                 default_cli_session_mode="ephemeral",
-                detail=f"{binary_name} exited with code {process.returncode}",
+                detail=f"{binary_name} exited with code {completed.returncode}",
                 supports_model_switch=True,
                 **model_fields,
             )
+    except subprocess.TimeoutExpired:
+        return DetectedAgent(
+            kind=kind,
+            name=name,
+            available=False,
+            command=command,
+            requires_cli=True,
+            supports_resume=True,
+            default_cli_session_mode="ephemeral",
+            detail=f"{binary_name} --version timed out",
+            supports_model_switch=True,
+            **model_fields,
+        )
     except OSError as exc:
         return DetectedAgent(
             kind=kind,

@@ -202,7 +202,30 @@ def create_app() -> FastAPI:
     async def list_agents() -> dict[str, Any]:
         """探测本机可用的内置/CLI Agent（k_agent、codex、claude_code 等）。"""
 
-        return await detect_agents_payload()
+        try:
+            return await detect_agents_payload()
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Failed to detect agents: %s", exc)
+            # Keep the UI usable even if CLI probing fails on this host.
+            return {
+                "defaultKind": "k_agent",
+                "agents": [
+                    {
+                        "kind": "k_agent",
+                        "name": "K Agent",
+                        "available": True,
+                        "command": None,
+                        "version": None,
+                        "detail": f"CLI detection failed: {exc}",
+                        "requires_cli": False,
+                        "supports_resume": False,
+                        "default_cli_session_mode": "ephemeral",
+                        "supportsModelSwitch": True,
+                        "defaultModelId": None,
+                        "models": [],
+                    }
+                ],
+            }
 
     @app.get("/internal/runtime/status")
     async def runtime_status() -> dict[str, Any]:
