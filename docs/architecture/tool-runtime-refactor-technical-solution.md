@@ -213,7 +213,7 @@ ToolKey(mcp, "search", "github")         → provider_name = "mcp__github__searc
 class ToolSpec:
     key: ToolKey
     provider_name: str
-    description: str
+    provider_description: str
     input_schema: Mapping[str, Any]
     context_policy: ToolContextPolicy
     execution_policy: ToolExecutionPolicy
@@ -238,6 +238,11 @@ class ToolExecutionPolicy:
 Schema 和嵌套策略在构造时 defensive-copy 并 deep-freeze；`frozen=True` 不能替代深层不可变。
 Provider 转换时返回新字典，调用方不能拿到内部引用。
 
+`provider_description` 只回答“这个函数做什么、何时调用、参数语义是什么”，必须短小、稳定并直接进入
+Provider tools schema。平台规则、审批要求和较长使用说明仍由 `backend/prompts/tool_protocol/`、
+`backend/prompts/tool_guidance/` 持有，并根据 `ToolCapabilityView` 条件投影；它们不能继续塞进 Bash 等
+单个 Tool 的 description。UI 若需要中文名称或图标，应使用独立 `ToolDisplayMetadata`，不能复用模型提示。
+
 ### 4.3 `ToolBinding`
 
 `ToolBinding` 将 Spec 与本次请求资源绑定：
@@ -254,7 +259,30 @@ class ToolBinding:
     permission_subjects: PermissionSubjects
 ```
 
-请求级资源通过 `ToolExecutionContext` 或闭包注入，例如：
+Binding factory 与单次调用使用两个不同的上下文，不能再从 `Settings` 或 ContextVar 临时拼请求状态：
+
+```python
+@dataclass(frozen=True, slots=True)
+class ToolBindingDependencies:
+    workspace: ToolWorkspace
+    network_access: bool
+    output_limits: ToolOutputLimits
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionContext:
+    request_id: str
+    run_id: str
+    workspace: ToolWorkspace
+    output_limits: ToolOutputLimits
+    emit_output: ToolOutputEmitter
+```
+
+`ToolBindingDependencies` 用于 `RequestToolSet` 构建期；`ToolExecutionContext` 由 Dispatcher 为每次物理
+执行创建。MCP manager、Skill body loader 等只有特定 adapter 使用的端口由对应 Binding 闭包捕获，不扩大
+所有本地 Tool 的公共上下文。
+
+请求级资源通过 ExecutionContext 或 Binding 闭包注入，例如：
 
 - 当前 workspace 与 network policy；
 - 当前 `McpClientManager`；
@@ -543,6 +571,19 @@ provider_tools = tool_set.provider_specs()
 生成。删除 `OpenAIAgent._build_tool_specs()`。Local/MCP 的不同仅体现在构建 Binding 时，投影阶段不再
 维护两段 list comprehension。
 
+`provider_specs()` 的字段映射是固定协议，不允许调用方另行拼接：
+
+```python
+{
+    "type": "function",
+    "function": {
+        "name": binding.spec.provider_name,
+        "description": binding.spec.provider_description,
+        "parameters": thaw_json_schema(binding.spec.input_schema),
+    },
+}
+```
+
 ## 7. sealed 执行协议
 
 ### 7.1 固定顺序
@@ -722,6 +763,25 @@ Observer/Langfuse 使用 `ToolExecutionStarted/Succeeded/Failed`，因此 denied
 
 ## 10. 包与文件规划
 
+### 10.1 现行实际代码在哪里
+
+当前 Tool 并不是没有实际实现，而是“实现函数”和“ToolDefinition 声明”混在少数几个大文件中：
+
+| Tool | 当前实现 | 当前声明 |
+| --- | --- | --- |
+| `Read/Write/Edit/Glob/Grep/Bash/TodoWrite` | `backend/tools/cc_like.py` 的 `cc_*` 函数 | 同文件 `CC_LIKE_TOOLS` |
+| `LS/WebFetch/WebSearch/NotebookEdit` | `backend/tools/cc_extra.py` 的 `cc_*` 函数 | 同文件 `CC_EXTRA_TOOLS` |
+| `get_current_time`、Memory、`Skill` | `backend/tools/local.py` | 同文件 `LEGACY_TOOLS` / `build_skill_tool()` |
+| `AskUserQuestion` | `backend/tools/user_question.py` | 同文件 `ASK_USER_QUESTION_TOOL` |
+| MCP 普通 Tool | `backend/mcp_tool/client.py::McpClientManager.call_tool()` | `McpToolDescriptor`，运行时转换 |
+| MCP Resource/Prompt | `backend/tools/cc_extra.py` / `backend/tools/local.py` 的请求级闭包 | Registry 按名字替换绑定 |
+
+例如，现行 `Read` 的真实代码是 `backend/tools/cc_like.py::cc_read()`，下面的 `CC_LIKE_TOOLS` 再把它与
+description、parameters 和 context policy 拼成 `ToolDefinition`。方案中的 `builtins/filesystem.py` 是
+迁移后的目标位置，不是当前已经存在的文件。
+
+### 10.2 目标目录
+
 目标目录：
 
 ```text
@@ -748,6 +808,226 @@ backend/tools/
 ├── streaming.py
 └── workspace.py
 ```
+
+### 10.3 一个完整 Tool 文件的目标形态
+
+实际工具代码放在 `backend/tools/builtins/` 的领域文件中。以下 `Read` 示例同时展示 Spec、权限对象提取、
+executor 和 Binding；`contracts.py`/`dispatcher.py` 只提供公共协议，不承载文件读取业务。
+
+```python
+# backend/tools/builtins/filesystem.py
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from backend.tools.contracts import (
+    ToolBinding,
+    ToolBindingDependencies,
+    ToolContextPolicy,
+    ToolExecutionContext,
+    ToolExecutionPolicy,
+    ToolKey,
+    ToolOutcome,
+    ToolSpec,
+)
+from backend.tools.validation import freeze_json_schema
+
+
+READ_SPEC = ToolSpec(
+    key=ToolKey(source="local", name="Read"),
+    provider_name="Read",
+    provider_description=(
+        "Read a UTF-8 text file and return bounded text with path and "
+        "truncation metadata."
+    ),
+    input_schema=freeze_json_schema(
+        {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute or workspace-relative file path.",
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": False,
+        }
+    ),
+    context_policy=ToolContextPolicy(
+        mode="rerunnable",
+        max_result_chars=30_000,
+    ),
+    execution_policy=ToolExecutionPolicy(side_effect="read"),
+)
+
+
+def _read_permission_subjects(arguments: Mapping[str, Any]) -> Sequence[str]:
+    """权限规则只匹配已通过 Schema 校验的规范路径字段。"""
+
+    return (str(arguments["file_path"]),)
+
+
+async def _execute_read(
+    context: ToolExecutionContext,
+    arguments: Mapping[str, Any],
+) -> ToolOutcome:
+    """执行文件读取；不处理 Provider、AG-UI、审批或 Observer。"""
+
+    try:
+        # workspace policy 负责 resolve、符号链接和允许读取范围；Tool 不从全局
+        # ContextVar 或 Settings 重新取得另一份请求状态。
+        path = context.workspace.resolve_read_path(str(arguments["file_path"]))
+        content = await asyncio.to_thread(
+            path.read_text,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return ToolOutcome.failed(
+            code="FILE_NOT_FOUND",
+            message=f"File not found: {arguments['file_path']}",
+            kind="execution",
+        )
+    except OSError as exc:
+        return ToolOutcome.failed(
+            code="FILE_READ_FAILED",
+            message=str(exc),
+            kind="execution",
+        )
+
+    bounded, truncated = context.output_limits.truncate(content)
+    rendered = json.dumps(
+        {
+            "ok": True,
+            "path": str(path),
+            "content": bounded,
+            "truncated": truncated,
+        },
+        ensure_ascii=False,
+    )
+    return ToolOutcome.succeeded(
+        public_content=rendered,
+        model_content=rendered,
+        metadata={"path": str(path), "truncated": truncated},
+    )
+
+
+def bind_read_tool(_: ToolBindingDependencies) -> ToolBinding:
+    """构造本轮 Binding；Read 本身不捕获任何进程级可变状态。"""
+
+    return ToolBinding(
+        spec=READ_SPEC,
+        execute=_execute_read,
+        permission_subjects=_read_permission_subjects,
+    )
+```
+
+这里的职责分界是：
+
+| 内容 | 所在位置 |
+| --- | --- |
+| Tool 名、Provider description、参数 Schema、上下文/副作用策略 | `READ_SPEC` |
+| 文件读取与领域错误 | `_execute_read()` |
+| 工作区、输出上限、live output 等请求资源 | `ToolExecutionContext` |
+| 权限匹配对象 | `_read_permission_subjects()` |
+| Schema、allowlist、HITL、计时、effect、Observer | `ToolDispatcher` sealed gate |
+| Provider function schema | `RequestToolSet.provider_specs()` 自动投影 |
+| Prompt 长规则 | `backend/prompts/tool_protocol/`、`tool_guidance/` |
+
+`ToolOutcome.succeeded()` / `failed()` 是 `contracts.py` 提供的规范构造器。`failed()` 统一生成内部
+`ToolError` 和兼容的 `{"ok": false, ...}` model/public content，具体 Tool 不再各自发明错误 JSON。
+
+### 10.4 实际注册代码
+
+内置 Tool 通过一个显式、不可变的 factory 列表注册，不使用 decorator 自动发现，也不扫描目录：
+
+```python
+# backend/tools/builtins/__init__.py
+
+from backend.tools.builtins.filesystem import (
+    bind_edit_tool,
+    bind_glob_tool,
+    bind_grep_tool,
+    bind_ls_tool,
+    bind_notebook_edit_tool,
+    bind_read_tool,
+    bind_write_tool,
+)
+from backend.tools.builtins.memory import MEMORY_TOOL_FACTORIES
+from backend.tools.builtins.misc import MISC_TOOL_FACTORIES
+from backend.tools.builtins.shell import SHELL_TOOL_FACTORIES
+from backend.tools.builtins.task import TASK_TOOL_FACTORIES
+from backend.tools.builtins.web import WEB_TOOL_FACTORIES
+
+
+LOCAL_TOOL_FACTORIES = (
+    bind_read_tool,
+    bind_write_tool,
+    bind_edit_tool,
+    bind_glob_tool,
+    bind_grep_tool,
+    bind_ls_tool,
+    bind_notebook_edit_tool,
+    *SHELL_TOOL_FACTORIES,
+    *WEB_TOOL_FACTORIES,
+    *MEMORY_TOOL_FACTORIES,
+    *TASK_TOOL_FACTORIES,
+    *MISC_TOOL_FACTORIES,
+)
+```
+
+factory 列表本身不再重复写 Tool 名。`RequestToolSetBuilder` 调用 factory 后，从
+`binding.spec.provider_name` 建索引，再应用 preset/config 选择：
+
+```python
+# backend/tools/toolset.py
+
+async def build_request_tool_set(inputs: ToolSetBuildInputs) -> RequestToolSet:
+    local = tuple(factory(inputs.local_dependencies) for factory in LOCAL_TOOL_FACTORIES)
+    selected_local = select_local_bindings(
+        local,
+        preset=inputs.preset,
+        configured_names=inputs.configured_names,
+    )
+    mcp = build_mcp_bindings(inputs.mcp_snapshot, inputs.mcp_manager)
+    special = build_special_bindings(
+        skill_catalog=inputs.skill_catalog,
+        skill_body_loader=inputs.skill_body_loader,
+        user_input_port=inputs.user_input_port,
+    )
+    return RequestToolSet.create((*selected_local, *mcp, *special))
+```
+
+`RequestToolSet.create()` 在这里一次性检查重名、Schema、Provider name 和授权 server，然后冻结
+`by_provider_name`。以后调用 `Read` 时只有一条路径：
+
+```text
+ProviderToolCall(name="Read")
+  → request_tool_set.resolve("Read")
+  → bind_read_tool 产生的 ToolBinding
+  → sealed gate
+  → _execute_read(context, validated_arguments)
+  → ToolOutcome
+```
+
+### 10.5 MCP、Skill 与用户输入工具的实际代码位置
+
+它们不是内置文件工具，因此放在 adapter，而不是塞进 `filesystem.py` 或 Agent：
+
+| 类型 | 目标代码位置 | executor 绑定内容 |
+| --- | --- | --- |
+| MCP 普通 Tool | `backend/tools/adapters/mcp.py` | 本轮 `McpClientManager` + 单次 `list_tools()` descriptor |
+| MCP Resource/Prompt | `backend/tools/adapters/mcp.py` | manager 的 resource/prompt port |
+| `Skill` | `backend/tools/adapters/skill.py` | 同一个 `SkillCatalog` + `backend/skills/body.py` loader |
+| `AskUserQuestion` | `backend/tools/adapters/user_input.py` | 本轮 `UserInputPort`，校验后抛 `UserInputInterrupt` |
+
+MCP Binding 的 executor 调 `mcp_manager.call_tool()`，Skill Binding 的 executor 在 catalog 授权后调
+`load_skill_body()`；两者都返回 `ToolOutcome`。真正的网络协议与 Skill 文件解析仍留在各自领域模块，adapter
+只负责把它们接入统一 Tool Runtime。
 
 迁移完成后：
 
