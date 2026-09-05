@@ -1,6 +1,8 @@
+#!/usr/bin/env node
+
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { closeSync, existsSync, openSync, realpathSync } from "node:fs";
 import { mkdtemp, readFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -305,7 +307,19 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === SCRIPT_PATH) {
+/**
+ * 全局命令通常通过 PATH 中的符号链接进入；比较真实路径才能同时识别直接执行与链接执行。
+ */
+function isDirectInvocation(entryPath) {
+  if (!entryPath) return false;
+  try {
+    return realpathSync(entryPath) === realpathSync(SCRIPT_PATH);
+  } catch {
+    return path.resolve(entryPath) === SCRIPT_PATH;
+  }
+}
+
+if (isDirectInvocation(process.argv[1])) {
   try {
     await runDevLocal();
   } catch (error) {

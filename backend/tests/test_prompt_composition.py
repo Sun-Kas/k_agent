@@ -12,6 +12,7 @@ from backend.prompts import (
     PromptInputs,
     compose_prompt,
 )
+from backend.prompts.skills import MAX_LISTING_DESC_CHARS
 from backend.tools import SkillCatalog, build_tool_catalog
 from backend.tools.local import ToolDefinition, build_skill_tool
 
@@ -45,6 +46,22 @@ class PromptCompositionTests(unittest.TestCase):
             ]
             mcp_tools = [McpToolDescriptor("calendar", "create_event", "create", {})]
             catalog = build_tool_catalog(local_tools=local_tools, mcp_tools=mcp_tools)
+            skills = SkillCatalog.from_skills(
+                [
+                    {
+                        "id": "writer",
+                        "name": "writer",
+                        "description": "Draft reports",
+                        "instructions": "FULL SKILL BODY MUST STAY LAZY",
+                        "enabled": True,
+                    },
+                    {
+                        "id": "hidden",
+                        "description": "Must not be visible",
+                        "enabled": False,
+                    },
+                ]
+            )
 
             bundle = compose_prompt(
                 PromptInputs(
@@ -52,6 +69,8 @@ class PromptCompositionTests(unittest.TestCase):
                     output_workspace=root / "session-output",
                     memory_files=(managed, project, auto),
                     tool_catalog=catalog,
+                    skill_catalog=skills,
+                    context_window_tokens=128_000,
                     mcp_instructions=(
                         McpInstruction("calendar", "external server guidance"),
                     ),
@@ -75,24 +94,144 @@ class PromptCompositionTests(unittest.TestCase):
             self.assertIn("project instruction", bundle.context_message or "")
             self.assertIn("background preference", bundle.context_message or "")
             self.assertIn("external server guidance", bundle.context_message or "")
+            self.assertIn("available_skills", bundle.context_message or "")
+            self.assertIn("- writer: Draft reports", bundle.context_message or "")
+            self.assertNotIn("hidden", bundle.context_message or "")
+            self.assertNotIn("FULL SKILL BODY", bundle.context_message or "")
+            self.assertNotIn("writer", bundle.system_prompt)
+            self.assertEqual(bundle.skill_listing_count, 1)
+            self.assertEqual(bundle.skill_listing_truncated_count, 0)
             self.assertEqual(
                 set(bundle.initial_memory_paths),
                 {str(managed.path.resolve()), str(project.path.resolve()), str(auto.path.resolve())},
             )
 
-    def test_skill_catalog_owns_request_scoped_skill_description(self) -> None:
-        skills = SkillCatalog.from_skills(
+    def test_skill_tool_description_is_stable_across_request_catalogs(self) -> None:
+        writer_skills = SkillCatalog.from_skills(
             [
                 {"id": "writer", "name": "writer", "description": "Draft reports", "enabled": True},
-                {"id": "hidden", "description": "No", "enabled": False},
+            ]
+        )
+        reviewer_skills = SkillCatalog.from_skills(
+            [
+                {"id": "reviewer", "name": "reviewer", "description": "Review reports", "enabled": True},
             ]
         )
 
-        tool = build_skill_tool(skill_catalog=skills)
+        writer_tool = build_skill_tool(skill_catalog=writer_skills)
+        reviewer_tool = build_skill_tool(skill_catalog=reviewer_skills)
 
-        self.assertIn("writer", tool.description)
-        self.assertNotIn("hidden", tool.description)
-        self.assertNotIn("enum", tool.parameters["properties"]["skill"])
+        self.assertEqual(writer_tool.description, reviewer_tool.description)
+        self.assertNotIn("writer", writer_tool.description)
+        self.assertNotIn("reviewer", reviewer_tool.description)
+        self.assertIn("request context", writer_tool.description)
+        self.assertNotIn("enum", writer_tool.parameters["properties"]["skill"])
+
+    def test_skill_listing_applies_entry_and_total_budgets(self) -> None:
+        root = Path("/tmp/project")
+        local_tools = [ToolDefinition("Skill", "stable", {}, _noop)]
+        tool_catalog = build_tool_catalog(local_tools=local_tools, mcp_tools=[])
+        long_description = "界" * (MAX_LISTING_DESC_CHARS + 50)
+        skill_catalog = SkillCatalog.from_skills(
+            [
+                {
+                    "id": "writer",
+                    "description": long_description,
+                    "enabled": True,
+                },
+                {
+                    "id": "reviewer",
+                    "description": "Review reports",
+                    "whenToUse": "Use for final reviews",
+                    "enabled": True,
+                },
+            ]
+        )
+
+        roomy = compose_prompt(
+            PromptInputs(
+                instruction_root=root,
+                output_workspace=None,
+                memory_files=(),
+                tool_catalog=tool_catalog,
+                skill_catalog=skill_catalog,
+                context_window_tokens=128_000,
+            )
+        )
+        roomy_context = roomy.context_message or ""
+        self.assertIn("- writer: " + "界" * (MAX_LISTING_DESC_CHARS - 1) + "…", roomy_context)
+        self.assertIn("Review reports - Use for final reviews", roomy_context)
+        self.assertEqual(roomy.skill_listing_truncated_count, 1)
+
+        constrained = compose_prompt(
+            PromptInputs(
+                instruction_root=root,
+                output_workspace=None,
+                memory_files=(),
+                tool_catalog=tool_catalog,
+                skill_catalog=skill_catalog,
+                context_window_tokens=200,
+            )
+        )
+        constrained_context = constrained.context_message or ""
+        self.assertIn("- writer", constrained_context)
+        self.assertIn("- reviewer", constrained_context)
+        self.assertNotIn("Review reports", constrained_context)
+        self.assertEqual(constrained.skill_listing_truncated_count, 2)
+
+    def test_skill_listing_requires_provider_visible_skill_tool(self) -> None:
+        root = Path("/tmp/project")
+        skill_catalog = SkillCatalog.from_skills(
+            [{"id": "writer", "description": "Draft reports", "enabled": True}]
+        )
+        tool_catalog = build_tool_catalog(local_tools=[], mcp_tools=[])
+
+        bundle = compose_prompt(
+            PromptInputs(
+                instruction_root=root,
+                output_workspace=None,
+                memory_files=(),
+                tool_catalog=tool_catalog,
+                skill_catalog=skill_catalog,
+                context_window_tokens=128_000,
+            )
+        )
+
+        self.assertNotIn("available_skills", bundle.context_message or "")
+        self.assertNotIn("writer", bundle.context_message or "")
+        self.assertEqual(bundle.skill_listing_count, 0)
+
+    def test_skill_listing_uses_when_to_use_not_instruction_body(self) -> None:
+        root = Path("/tmp/project")
+        tool_catalog = build_tool_catalog(
+            local_tools=[ToolDefinition("Skill", "stable", {}, _noop)],
+            mcp_tools=[],
+        )
+        skill_catalog = SkillCatalog.from_skills(
+            [
+                {
+                    "id": "writer",
+                    "description": "",
+                    "whenToUse": "Draft the requested report.",
+                    "instructions": "\n\nFULL BODY MUST NOT APPEAR\n",
+                    "enabled": True,
+                }
+            ]
+        )
+
+        bundle = compose_prompt(
+            PromptInputs(
+                instruction_root=root,
+                output_workspace=None,
+                memory_files=(),
+                tool_catalog=tool_catalog,
+                skill_catalog=skill_catalog,
+                context_window_tokens=None,
+            )
+        )
+
+        self.assertIn("- writer: Draft the requested report.", bundle.context_message or "")
+        self.assertNotIn("FULL BODY", bundle.context_message or "")
 
     def test_relative_session_paths_cannot_trigger_project_rules(self) -> None:
         with TemporaryDirectory() as project_tmp, TemporaryDirectory() as session_tmp:

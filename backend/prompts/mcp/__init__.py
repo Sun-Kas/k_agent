@@ -1,9 +1,14 @@
-"""MCP initialize text is external context, never platform policy."""
+"""MCP initialize `instructions` as external context, never platform policy.
+
+Protocol: optional string on InitializeResult. Clients MAY inject it as a
+model hint. We keep it in the context channel because the server wrote it.
+"""
 
 from backend.prompts.models import PromptInputs, PromptSection
 
 
 def build(inputs: PromptInputs) -> tuple[PromptSection, ...]:
+    # One section per server that actually returned handshake instructions.
     return tuple(
         PromptSection(
             name=f"mcp_instruction_{index}",

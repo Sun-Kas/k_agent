@@ -2,6 +2,7 @@ import type { TimelineItem, TimelineState } from "../application/event-projector
 import type {
   ApprovalActivity,
   HealthState,
+  McpToolInfo,
   ScheduledTaskSummary,
   SessionSummary,
   SessionWorkspaceFileContent,
@@ -13,6 +14,23 @@ import type {
 export type TerminalSurface = "home" | "chat" | "team" | "automation" | "doctor";
 export type TerminalFocus = "session-rail" | "timeline" | "inspector" | "composer" | "overlay";
 
+export interface RuntimeCatalogItem {
+  id: string;
+  name: string;
+  enabled: boolean;
+  status?: string;
+  toolCount?: number;
+  description?: string;
+  error?: string;
+}
+
+export interface RuntimeChoice {
+  id: string;
+  name: string;
+  enabled: boolean;
+  note?: string;
+}
+
 export interface RuntimeSummary {
   endpoint: string;
   agentKind: string;
@@ -21,6 +39,15 @@ export interface RuntimeSummary {
   permissionMode: string;
   mcpCount: number;
   skillCount: number;
+  /** Catalog snapshot for read-only `/mcp` / `/skill` listings. */
+  mcpServers: RuntimeCatalogItem[];
+  skills: RuntimeCatalogItem[];
+  /** Non-empty means this run only selected these ids, not every enabled catalog row. */
+  selectedMcpIds: string[];
+  selectedSkillIds: string[];
+  mcpTools: McpToolInfo[];
+  models: RuntimeChoice[];
+  agents: RuntimeChoice[];
 }
 
 export interface TerminalPageViewModel {
@@ -41,6 +68,7 @@ export interface TerminalPageViewModel {
   doctorLines: string[];
   notice: string | undefined;
   error: string | undefined;
+  mcpBusy: boolean;
 }
 
 export interface TerminalPageProps {
@@ -62,6 +90,14 @@ export type TerminalPageAction =
   | { type: "cancel_run" }
   | { type: "answer_interrupt"; interruptId: string; payload: InterruptAnswer }
   | { type: "retry_connection" }
+  | { type: "refresh_mcp" }
+  | { type: "toggle_mcp"; serverId: string }
+  | { type: "reload_mcp" }
+  | { type: "set_model"; modelId: string }
+  | { type: "set_agent"; agentKind: string }
+  | { type: "set_permission"; permissionMode: string }
+  | { type: "refresh_skills" }
+  | { type: "toggle_skill"; skillId: string }
   | { type: "quit" };
 
 export type InterruptAnswer =

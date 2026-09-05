@@ -13,6 +13,7 @@ import {
   useState
 } from "react";
 import {
+  compactSession,
   deleteSession,
   forkSession,
   getAgentsCatalog,
@@ -20,6 +21,7 @@ import {
   getModelsConfig,
   getRuntimeCatalog,
   getSession,
+  getSessionContext,
   getSessionWorkspace,
   getSessionWorkspaceFile,
   listSessions,
@@ -29,13 +31,13 @@ import {
 import { MarkdownContent } from "./components/MarkdownContent";
 import { groupDisplayMessages, InlineToolActivity, toolResultFailed } from "./components/ConversationTranscript";
 import { ConfigCenter } from "./components/ConfigCenter";
+import { Marketplace } from "./components/Marketplace";
 import { ContentStage, type ContentStageItem } from "./components/ContentStage";
 import { TeamWorkbench } from "./components/TeamWorkbench";
 import { ScheduledTasksView } from "./components/ScheduledTasksView";
 import { UserQuestionForm } from "./components/UserQuestionForm";
 import { DesktopPet } from "./components/DesktopPet";
 import { appConfig } from "./config";
-import { mergeHistoricalMessages } from "./history";
 import { createClientId } from "./id";
 import { bindApprovalRunToAssistant } from "./live-approval";
 import { keepStoppedRunMessages } from "./run-visibility";
@@ -57,6 +59,7 @@ import type {
   ReasoningEffort,
   RuntimeOption,
   SessionSummary,
+  SessionContextStatus,
   TextActivity,
   ThinkingActivity,
   ToolActivity,
@@ -231,10 +234,6 @@ function normalizeSessionSummaries(sessions: unknown): SessionSummary[] {
   });
 }
 
-function normalizeStringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
-}
-
 function normalizeThinking(value: unknown): ThinkingActivity[] {
   if (!Array.isArray(value)) return [];
 
@@ -305,8 +304,6 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [trace, setTrace] = useState<string[]>([]);
-  const [tasks, setTasks] = useState<string[]>([]);
   const [thinking, setThinking] = useState<ThinkingActivity[]>([]);
   const [thinkingBlocks, setThinkingBlocks] = useState<ThinkingBlock[]>([]);
   const [tools, setTools] = useState<ToolActivity[]>([]);
@@ -315,6 +312,7 @@ export function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
   const [status, setStatus] = useState<string>(appConfig.status.idle);
+  const [contextStatus, setContextStatus] = useState<SessionContextStatus | null>(null);
   const [input, setInput] = useState("");
   // Voice recognition can outlive the render that started a model run. Keep
   // the current composer value outside that stale closure so a new transcript
@@ -348,9 +346,10 @@ export function App() {
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const workspaceCacheRef = useRef<Map<string, string>>(new Map());
   const selectedWorkspacePathRef = useRef<string | null>(null);
-  const [view, setView] = useState<"chat" | "config" | "team" | "scheduled">(() => (
+  const [view, setView] = useState<"chat" | "config" | "marketplace" | "team" | "scheduled">(() => (
     localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) === "scheduled" ? "scheduled" : "chat"
   ));
+  const [marketplaceTab, setMarketplaceTab] = useState<"skill" | "mcp">("skill");
   const [models, setModels] = useState<ModelProfile[]>([]);
   const [agents, setAgents] = useState<DetectedAgent[]>([]);
   const [agentKind, setAgentKind] = useState<AgentKind>(() => localStorage.getItem(AGENT_KIND_STORAGE_KEY) || "k_agent");
@@ -426,7 +425,6 @@ export function App() {
   const voiceGenerationRef = useRef(0);
   const pendingAssistantIdRef = useRef<string | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
-  const persistedMessageIdsRef = useRef<Set<string>>(new Set());
   const replayingHistoryRef = useRef(false);
   const activeTextActivityIdRef = useRef<string | null>(null);
   const activeTextMessageIdRef = useRef<string | null>(null);
@@ -705,6 +703,7 @@ export function App() {
     if (message.meta?.runId && activityTurnIds.has(message.meta.runId)) return true;
     return loading && index === groupedMessages.length - 1;
   });
+  const inspectorTimeline = inlineTimeline(textBlocks, thinkingBlocks, tools, approvals);
 
   async function refreshHealth() {
     try {
@@ -861,6 +860,9 @@ export function App() {
       const data = await getSession(nextId);
       if (sessionNavigationTokenRef.current !== navigationToken) return;
       setSessionId(data.sessionId);
+      void getSessionContext(data.sessionId)
+        .then(setContextStatus)
+        .catch(() => setContextStatus(null));
       activeSessionIdRef.current = data.sessionId;
       localStorage.setItem(appConfig.storageKey, data.sessionId);
       const remembered = data.capabilities ?? null;
@@ -884,18 +886,9 @@ export function App() {
         setPermissionMode("default");
       }
       resetRunViewState();
-      const normalizedMessages = normalizeMessages(data.messages);
-      persistedMessageIdsRef.current = new Set(normalizedMessages.map((message) => message.id));
       const historicalEvents = Array.isArray(data.events) ? data.events : [];
-      // messages 是紧凑模型上下文；失败 run 可能只在 events 里，需合成错误气泡。
-      setMessages(mergeHistoricalMessages(
-        normalizedMessages,
-        historicalEvents,
-        appConfig.text.requestErrorPrefix
-      ));
       if (Array.isArray(data.events) && data.events.length) {
-        setTasks(normalizeStringList(data.tasks));
-        // 重放时跳过已持久化文本气泡，避免与 messages 重复；仍重建 thinking/tools。
+        // 历史和实时流走同一个事件状态机；落盘 delta 在 history 模式下整段赋值。
         replayingHistoryRef.current = true;
         data.events.forEach((event) => applyAgUiEvent(event));
         replayingHistoryRef.current = false;
@@ -905,17 +898,12 @@ export function App() {
       for (const interrupt of data.openInterrupts ?? []) {
         applyApprovalSnapshot(interrupt as unknown as Record<string, unknown>);
       }
-      if (!Array.isArray(data.events) || !data.events.length) {
-        setTrace(normalizeStringList(data.trace));
-        setTasks(normalizeStringList(data.tasks));
-        setThinking(normalizeThinking(data.thinking));
-      }
       // getSession 飞行期间到达的事件比快照新；只重放尾部，避免缺口与重复 delta。
       bufferedRun?.events.slice(bufferedEventCount).forEach((event) => applyAgUiEvent(event));
       const isRunning = activeRunsRef.current.has(data.sessionId);
       setSessionLoading(false);
       setLoading(isRunning);
-      setStatus(isRunning ? appConfig.status.processing : appConfig.status.idle);
+      if (isRunning) setStatus(appConfig.status.processing);
     } catch {
       if (sessionNavigationTokenRef.current !== navigationToken) return;
       const localRun = activeRunsRef.current.get(nextId);
@@ -951,7 +939,6 @@ export function App() {
     setSelectedMcp(mcpServers.map((server) => server.id));
     setSelectedSkills([]);
     setPermissionMode("default");
-    persistedMessageIdsRef.current = new Set();
     resetRunViewState();
     setSessionLoading(false);
     setLoading(false);
@@ -961,8 +948,6 @@ export function App() {
 
   function resetRunViewState() {
     setMessages([]);
-    setTrace([]);
-    setTasks([]);
     setThinking([]);
     setThinkingBlocks([]);
     setTextBlocks([]);
@@ -1383,7 +1368,28 @@ export function App() {
       voiceRecognitionStopReasonRef.current = "submit";
       speechRef.current.stop();
     }
+    if (/^\/compact(?:\s|$)/i.test(prompt)) {
+      const instructions = prompt.replace(/^\/compact\s*/i, "").trim();
+      void runManualCompact(instructions, false);
+      return;
+    }
     void submitConversation(prompt);
+  }
+
+  async function runManualCompact(instructions: string, reset: boolean) {
+    if (!sessionId || loading || sessionLoading) {
+      setStatus(!sessionId ? "请先开始一个会话" : "当前会话仍在运行");
+      return;
+    }
+    setStatus(reset ? "正在重新建立上下文" : "正在压缩上下文");
+    try {
+      const next = await compactSession(sessionId, instructions, reset);
+      setContextStatus(next);
+      updateComposerInput("");
+      setStatus(`上下文已压缩至第 ${next.generation} 代`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "上下文压缩失败");
+    }
   }
 
   /**
@@ -1615,6 +1621,14 @@ export function App() {
 
   function applyAgUiEvent(event: AgUiEvent) {
     switch (event.type) {
+      case "input_message": {
+        const [message] = normalizeMessages([event.message]);
+        if (!message) break;
+        setMessages((current) => current.some((item) => item.id === message.id)
+          ? current.map((item) => item.id === message.id ? message : item)
+          : [...current, message]);
+        break;
+      }
       case "RUN_STARTED":
         activeRunIdRef.current = event.runId;
         setActiveRunId(event.runId);
@@ -1630,10 +1644,15 @@ export function App() {
                 : message
             ));
           }
+        } else {
+          setMessages((current) => current.some((message) => message.meta?.runId === event.runId)
+            ? current
+            : [...current, createStreamingMessage(`history-run-${event.runId}`, event.runId)]);
         }
         break;
       case "TEXT_MESSAGE_START":
       {
+        setStatus("正在回复");
         const textTurnId = activeRunIdRef.current ?? event.messageId;
         const textSequence = activitySequenceRef.current + 1;
         activitySequenceRef.current = textSequence;
@@ -1650,9 +1669,6 @@ export function App() {
             sequence: textSequence
           }
         ]);
-        if (replayingHistoryRef.current && persistedMessageIdsRef.current.has(event.messageId)) {
-          break;
-        }
         // 占位 assistant id 换成服务端 messageId，后续 CONTENT delta 按该 id 拼接。
         setMessages((current) => {
           const pendingAssistantId = pendingAssistantIdRef.current;
@@ -1699,7 +1715,12 @@ export function App() {
         setTextBlocks((current) => {
           if (current.some((text) => text.id === event.messageId)) {
             return current.map((text) =>
-              text.id === event.messageId ? { ...text, content: text.content + event.delta } : text
+              text.id === event.messageId
+                ? {
+                  ...text,
+                  content: replayingHistoryRef.current ? event.delta : text.content + event.delta
+                }
+                : text
             );
           }
           activitySequenceRef.current += 1;
@@ -1715,14 +1736,14 @@ export function App() {
             }
           ];
         });
-        if (replayingHistoryRef.current && persistedMessageIdsRef.current.has(event.messageId)) {
-          break;
-        }
         setMessages((current) => {
           if (current.some((message) => message.id === event.messageId)) {
             return current.map((message) =>
               message.id === event.messageId
-                ? { ...message, content: message.content + event.delta }
+                ? {
+                  ...message,
+                  content: replayingHistoryRef.current ? event.delta : message.content + event.delta
+                }
                 : message
             );
           }
@@ -1754,7 +1775,8 @@ export function App() {
         break;
       }
       case "REASONING_START":
-        // 新协议：REASONING_*；旧协议：THINKING_*（下方分支）。二者都写入 thinkingBlocks。
+        setStatus("正在思考");
+        // 旧 THINKING_* 已由磁盘迁移器规范化；运行时只投影 AG-UI REASONING_*。
         activeThinkingTitleRef.current = "思考过程";
         activeThinkingStepIdRef.current = null;
         beginThinkingBlock(
@@ -1780,7 +1802,7 @@ export function App() {
         break;
       }
       case "REASONING_MESSAGE_CONTENT":
-        appendThinkingStepDetail(event.messageId, event.delta);
+        appendThinkingStepDetail(event.messageId, event.delta, replayingHistoryRef.current);
         break;
       case "REASONING_MESSAGE_END": {
         const rawStep = normalizeThinkingStep(event.rawEvent);
@@ -1790,49 +1812,6 @@ export function App() {
         break;
       }
       case "REASONING_END":
-        activeThinkingStepIdRef.current = null;
-        closeActiveThinkingBlock();
-        break;
-      case "THINKING_START": {
-        const legacyBlockId = createClientId();
-        activeThinkingTitleRef.current = event.title || "思考过程";
-        activeThinkingStepIdRef.current = null;
-        beginThinkingBlock(
-          legacyBlockId,
-          activeRunIdRef.current ?? legacyBlockId
-        );
-        break;
-      }
-      case "THINKING_TEXT_MESSAGE_START": {
-        const rawStep = normalizeThinkingStep(event.rawEvent);
-        const step = rawStep
-          ? { ...rawStep, detail: "", status: "active" as const }
-          : {
-            id: createClientId(),
-            phase: "reasoning" as const,
-            title: activeThinkingTitleRef.current,
-            detail: "",
-            status: "active" as const,
-            iteration: thinking.length + 1,
-            createdAt: new Date().toISOString()
-          };
-        activeThinkingStepIdRef.current = step.id;
-        upsertThinkingStep(step);
-        break;
-      }
-      case "THINKING_TEXT_MESSAGE_CONTENT":
-        if (activeThinkingStepIdRef.current) {
-          appendThinkingStepDetail(activeThinkingStepIdRef.current, event.delta);
-        }
-        break;
-      case "THINKING_TEXT_MESSAGE_END": {
-        const rawStep = normalizeThinkingStep(event.rawEvent);
-        const stepId = rawStep?.id ?? activeThinkingStepIdRef.current;
-        if (stepId) completeThinkingStep(stepId, rawStep);
-        activeThinkingStepIdRef.current = null;
-        break;
-      }
-      case "THINKING_END":
         activeThinkingStepIdRef.current = null;
         closeActiveThinkingBlock();
         break;
@@ -1864,11 +1843,15 @@ export function App() {
         break;
       }
       case "TOOL_CALL_ARGS":
+        setStatus("正在准备工具调用");
         updateTool(event.toolCallId, (tool) => ({
-          ...tool, arguments: tool.arguments + event.delta, status: "running"
+          ...tool,
+          arguments: replayingHistoryRef.current ? event.delta : tool.arguments + event.delta,
+          status: "running"
         }));
         break;
       case "TOOL_CALL_END":
+        setStatus("正在执行工具");
         updateTool(event.toolCallId, (tool) => ({ ...tool, status: "waiting" }));
         break;
       case "TOOL_CALL_RESULT":
@@ -1900,18 +1883,31 @@ export function App() {
             }));
           }
         }
-        if (event.name === "status") {
-          setStatus(String(event.value.message ?? appConfig.status.processing));
-        }
-        if (event.name === "trace") {
-          const entry = String(event.value.entry ?? "");
-          if (entry) setTrace((current) => [...current, entry]);
-        }
         if (event.name === "approval_request") {
           applyApprovalSnapshot({ ...event.value, status: "pending" });
         }
         if (event.name === "approval_resolved") {
           applyApprovalSnapshot(event.value);
+        }
+        if (event.name === "context_warning") {
+          setStatus("上下文接近上限，将在需要时自动压缩");
+          setContextStatus((current) => current ? { ...current, warning: true } : current);
+        }
+        if (event.name === "context_compacted") {
+          const generation = Number(event.value.generation ?? 0);
+          setContextStatus((current) => ({
+            ...current,
+            generation,
+            warning: false,
+            autoDisabled: false,
+            consecutiveAutoFailures: 0,
+            pendingContinuation: false,
+            trigger: String(event.value.trigger ?? "auto"),
+            beforeTokens: Number(event.value.beforeTokens ?? 0),
+            afterTokens: Number(event.value.afterTokens ?? 0),
+            savedTokens: Number(event.value.savedTokens ?? 0)
+          }));
+          setStatus("上下文已压缩，正在继续当前任务");
         }
         break;
       case "RUN_FINISHED": {
@@ -1952,8 +1948,6 @@ export function App() {
         activeRunIdRef.current = null;
         setActiveRunId(null);
         setStatus(appConfig.status.failed);
-        // 历史错误气泡已在 mergeHistoricalMessages 按原 run 位置插入；重放时再 append 会错序。
-        if (replayingHistoryRef.current) break;
         setMessages((current) =>
           pendingAssistantId && current.some((message) => message.id === pendingAssistantId)
             ? current.map((message) =>
@@ -2225,14 +2219,14 @@ export function App() {
     });
   }
 
-  function appendThinkingStepDetail(id: string, delta: string) {
+  function appendThinkingStepDetail(id: string, delta: string, replace = false) {
     setThinking((current) => current.map((step) =>
-      step.id === id ? { ...step, detail: step.detail + delta } : step
+      step.id === id ? { ...step, detail: replace ? delta : step.detail + delta } : step
     ));
     setThinkingBlocks((current) => current.map((block) => ({
       ...block,
       steps: block.steps.map((step) =>
-        step.id === id ? { ...step, detail: step.detail + delta } : step
+        step.id === id ? { ...step, detail: replace ? delta : step.detail + delta } : step
       )
     })));
   }
@@ -2586,7 +2580,10 @@ export function App() {
   if (view === "config") {
     return (
       <>
-        <ConfigCenter onBack={() => {
+        <ConfigCenter
+          health={health}
+          onRefreshHealth={() => { void refreshHealth(); }}
+          onBack={() => {
           // ConfigCenter persists device-local voices independently of server catalogs.
           setVoiceConfig(readVoiceConfig());
           setView("chat");
@@ -2656,19 +2653,43 @@ export function App() {
           <div><strong>K Agent</strong><small>本地执行台</small></div>
         </div>
         <nav className="workspace-switch" aria-label="工作模式">
-          <button className="active" type="button" aria-current="page" onClick={() => setView("chat")}>
+          <button className={view === "chat" ? "active" : ""} type="button" aria-current={view === "chat" ? "page" : undefined} onClick={() => setView("chat")}>
             <span>◉</span><strong>Work</strong>
           </button>
           <button type="button" onClick={() => setView("team")}>
             <span>⌘</span><strong>Agent Team</strong>
           </button>
         </nav>
-        <button className="new-session" type="button" onClick={() => { setView("chat"); startNewSession(); }}>
-          <span>＋</span> 新建会话 <kbd>⌘ N</kbd>
-        </button>
-        <button className={`new-session scheduled-session-entry ${view === "scheduled" ? "active" : ""}`} type="button" onClick={() => setView("scheduled")}>
-          <span>◷</span> 定时任务
-        </button>
+        <nav className="sidebar-nav" aria-label="功能入口">
+          <button
+            className={`sidebar-nav-item ${view === "marketplace" && marketplaceTab === "skill" ? "active" : ""}`}
+            type="button"
+            onClick={() => { setMarketplaceTab("skill"); setView("marketplace"); }}
+          >
+            <SidebarSkillIcon />
+            <strong>技能</strong>
+          </button>
+          <button
+            className={`sidebar-nav-item ${view === "marketplace" && marketplaceTab === "mcp" ? "active" : ""}`}
+            type="button"
+            onClick={() => { setMarketplaceTab("mcp"); setView("marketplace"); }}
+          >
+            <SidebarConnectorIcon />
+            <strong>连接器</strong>
+          </button>
+          <button
+            className={`sidebar-nav-item ${view === "scheduled" ? "active" : ""}`}
+            type="button"
+            onClick={() => setView("scheduled")}
+          >
+            <SidebarClockIcon />
+            <strong>定时任务</strong>
+          </button>
+        </nav>
+        <div className="history-head">
+          <span>会话 ({sessions.length})</span>
+          <button type="button" aria-label="新建会话" title="新建会话 ⌘N" onClick={() => { setView("chat"); startNewSession(); }}>＋</button>
+        </div>
         <label className="session-search">
           <span>⌕</span>
           <input
@@ -2678,7 +2699,6 @@ export function App() {
             aria-label="搜索会话"
           />
         </label>
-        <div className="section-label"><span>最近会话</span><b>{sessions.length}</b></div>
         <nav className="session-list" aria-label="会话列表">
           {filteredSessions.length === 0 && (
             <p className="empty-note">{query ? "没有匹配的会话" : "你的对话会显示在这里"}</p>
@@ -2695,51 +2715,42 @@ export function App() {
                 key={session.id}
               >
                 <button
-                  className={`session-item ${session.id === sessionId ? "active" : ""} ${running ? "running" : ""}`}
+                  className={`session-item ${session.id === sessionId && view === "chat" ? "active" : ""} ${running ? "running" : ""}`}
                   type="button"
                   onClick={() => { setView("chat"); void openSession(session.id); }}
                 >
-                  {running
-                    ? (
-                      <span
-                        className="session-run-indicator"
-                        role="status"
-                        aria-label="正在流式执行"
-                        title="正在流式执行"
-                      />
-                    )
-                    : <span className="session-glyph">◫</span>}
-                  <span className="session-copy">
-                    <strong>{session.title}</strong>
-                    <small>
-                      {running
-                        ? "正在流式执行"
-                        : `${formatRelativeTime(session.updatedAt)} · ${session.messageCount} 条`}
-                    </small>
-                  </span>
+                  {running ? <span className="session-run-indicator" role="status" aria-label="正在流式执行" title="正在流式执行" /> : null}
+                  <span className="session-title">{session.title}</span>
                 </button>
-                <button
-                  className="session-more"
-                  type="button"
-                  aria-label={`管理对话：${session.title}`}
-                  aria-expanded={menuOpen}
-                  aria-haspopup="menu"
-                  onClick={(event) => {
-                    const row = event.currentTarget.closest(".session-row");
-                    const list = event.currentTarget.closest(".session-list");
-                    const rowRect = row?.getBoundingClientRect();
-                    const listRect = list?.getBoundingClientRect();
-                    const requiredMenuHeight = 116;
-                    const roomBelow = rowRect && listRect ? listRect.bottom - rowRect.bottom : requiredMenuHeight;
-                    const roomAbove = rowRect && listRect ? rowRect.top - listRect.top : 0;
-                    setSessionMenuId(menuOpen ? null : session.id);
-                    setSessionMenuOpensUp(!menuOpen && roomBelow < requiredMenuHeight && roomAbove > roomBelow);
-                    setSessionDeleteConfirmId(null);
-                    setSessionActionError(null);
-                  }}
+                <span
+                  className="session-meta"
+                  onClick={() => { setView("chat"); void openSession(session.id); }}
                 >
-                  <SessionMoreIcon />
-                </button>
+                  <span className="session-time">{running ? "进行中" : formatRelativeTime(session.updatedAt)}</span>
+                  <button
+                    className="session-more"
+                    type="button"
+                    aria-label={`管理对话：${session.title}`}
+                    aria-expanded={menuOpen}
+                    aria-haspopup="menu"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      const row = event.currentTarget.closest(".session-row");
+                      const list = event.currentTarget.closest(".session-list");
+                      const rowRect = row?.getBoundingClientRect();
+                      const listRect = list?.getBoundingClientRect();
+                      const requiredMenuHeight = 116;
+                      const roomBelow = rowRect && listRect ? listRect.bottom - rowRect.bottom : requiredMenuHeight;
+                      const roomAbove = rowRect && listRect ? rowRect.top - listRect.top : 0;
+                      setSessionMenuId(menuOpen ? null : session.id);
+                      setSessionMenuOpensUp(!menuOpen && roomBelow < requiredMenuHeight && roomAbove > roomBelow);
+                      setSessionDeleteConfirmId(null);
+                      setSessionActionError(null);
+                    }}
+                  >
+                    <SessionMoreIcon />
+                  </button>
+                </span>
                 {menuOpen && (
                   <section className={`session-actions-menu ${sessionMenuOpensUp ? "opens-up" : ""}`} role="menu" aria-label={`对话操作：${session.title}`}>
                     {confirmingDelete
@@ -2772,39 +2783,10 @@ export function App() {
             );
           })}
         </nav>
-        <button
-          className="connection"
-          type="button"
-          onClick={() => void refreshHealth()}
-          title={
-            health?.bashSandbox?.userSummary
-            || health?.bashSandbox?.reason
-            || (health?.ok ? "点击重新检查服务与沙箱状态" : "点击重新检查")
-          }
-        >
-          <span className={`connection-dot ${health?.ok ? "online" : ""}`} />
-          <span>
-            <strong>{health?.ok ? "服务运行正常" : "后端未连接"}</strong>
-            <small>
-              {health
-                ? `${health.model} · ${health.localToolCount + health.mcpToolCount} 个工具 · ${
-                    health.bashSandbox?.available
-                      ? "沙箱就绪"
-                      : health.bashSandbox?.mode === "off"
-                        ? "沙箱关闭"
-                        : health.bashSandbox?.needsInstall
-                          ? "沙箱未安装（悬停看安装说明）"
-                          : health.bashSandbox
-                            ? "沙箱不可用（悬停看说明）"
-                            : "沙箱未知"
-                  }`
-                : "点击重新检查"}
-            </small>
-          </span>
-          <i>↻</i>
-        </button>
-        <button className="settings-link" type="button" onClick={() => setView("config")}>
-          <span>⚙</span><strong>配置中心</strong><small>MCP · Skills · 模型</small><i>→</i>
+        <button className="settings-link sidebar-config" type="button" onClick={() => setView("config")}>
+          <span>⚙</span>
+          <strong>配置中心</strong>
+          <i>→</i>
         </button>
       </aside>
       <div
@@ -2817,13 +2799,20 @@ export function App() {
         onKeyDown={(event) => resizeWithKeyboard("sidebar", event)}
       />
 
-      <main className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""} ${view === "scheduled" ? "scheduled-conversation" : ""}`}>
+      <main className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""} ${view === "scheduled" ? "scheduled-conversation" : ""} ${view === "marketplace" ? "marketplace-conversation" : ""}`}>
         {view === "scheduled" ? (
           <ScheduledTasksView
             models={models}
             agents={agents}
             mcpServers={mcpServers}
             skills={skills}
+          />
+        ) : view === "marketplace" ? (
+          <Marketplace
+            key={marketplaceTab}
+            kind={marketplaceTab}
+            onOpenConfig={() => setView("config")}
+            onInstalled={() => { void refreshOptions(); }}
           />
         ) : (
         <>
@@ -2851,6 +2840,17 @@ export function App() {
             <span className={`status-pill ${loading ? "running" : ""}`}>
               <i />{status}
             </span>
+            {agentKind === "k_agent" && contextStatus && (
+              <button
+                className="status-pill"
+                type="button"
+                disabled={loading || sessionLoading || !sessionId}
+                onClick={() => { void runManualCompact("", true); }}
+                title="删除派生摘要并从完整历史重新建立上下文"
+              >
+                上下文 G{contextStatus.generation}{contextStatus.autoDisabled ? " · 自动压缩已停用" : ""}
+              </button>
+            )}
             <button
               className={`topbar-icon-button desktop-pet-toggle ${desktopPetEnabled ? "active" : ""}`}
               type="button"
@@ -3250,62 +3250,27 @@ export function App() {
               <p>{status}</p>
               <dl>
                 <div><dt>工具调用</dt><dd>{tools.length}</dd></div>
-                <div><dt>轨迹事件</dt><dd>{trace.length}</dd></div>
-                <div><dt>思考阶段</dt><dd>{thinking.length}</dd></div>
+                <div><dt>Reasoning</dt><dd>{thinkingBlocks.length}</dd></div>
+                <div><dt>时间线节点</dt><dd>{inspectorTimeline.length}</dd></div>
               </dl>
             </section>
-            <InspectorSection title="思考过程" count={thinking.length}>
-              {thinking.length ? (
-                <div className="thinking-list">
-                  {thinking.map((step) => (
-                    <article className={`thinking-step ${step.status}`} key={step.id}>
-                      <span className="thinking-icon">{thinkingIcon(step.phase)}</span>
-                      <div>
-                        <strong>{step.title}</strong>
-                        <p>{step.detail}</p>
-                      </div>
-                      <i />
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <EmptyInspector text="开始任务后会显示执行思路" />
-              )}
-            </InspectorSection>
-            <InspectorSection title="任务计划" count={tasks.length}>
-              {tasks.length ? tasks.map((task, index) => (
-                <div className="task-row" key={`${task}-${index}`}>
-                  <span>{String(index + 1).padStart(2, "0")}</span>
-                  <p>{task}</p>
-                </div>
-              )) : (
-                <EmptyInspector text="任务开始后会生成执行步骤" />
-              )}
-            </InspectorSection>
-            <InspectorSection title="工具活动" count={tools.length}>
-              {tools.length ? tools.map((tool) => (
-                <details className="tool-row" key={tool.id}>
-                  <summary>
-                    <ToolIcon className="tool-row-icon" />
-                    <strong>{tool.name}</strong>
-                    <i className={tool.status} />
-                  </summary>
-                  {tool.arguments && <code>{tool.arguments}</code>}
-                  {tool.result && <p>{tool.result}</p>}
-                </details>
-              )) : (
-                <EmptyInspector text="暂时没有工具调用" />
-              )}
-            </InspectorSection>
-            <InspectorSection title="执行轨迹" count={trace.length}>
-              {trace.length ? (
+            <InspectorSection title="事件时间线" count={inspectorTimeline.length}>
+              {inspectorTimeline.length ? (
                 <ol className="timeline">
-                  {trace.map((entry, index) => (
-                    <li key={`${entry}-${index}`}>{entry}</li>
+                  {inspectorTimeline.map((activity) => (
+                    <li key={`${activity.type}-${activity.sequence}`}>
+                      {activity.type === "thinking"
+                        ? `思考 · ${activity.block.steps[activity.block.steps.length - 1]?.title ?? "思考过程"}`
+                        : activity.type === "tool"
+                          ? `工具 · ${activity.tool.name}`
+                          : activity.type === "approval"
+                            ? `人工交互 · ${activity.approval.title}`
+                            : "已生成回复"}
+                    </li>
                   ))}
                 </ol>
               ) : (
-                <EmptyInspector text="运行轨迹会实时显示" />
+                <EmptyInspector text="运行后会按事件到达顺序显示" />
               )}
             </InspectorSection>
           </div>
@@ -3483,8 +3448,9 @@ function formatRelativeTime(value: string) {
   if (Number.isNaN(date.getTime())) return "未知时间";
   const delta = Date.now() - date.getTime();
   if (delta < 60_000) return "刚刚";
-  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`;
-  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`;
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}分钟前`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}小时前`;
+  if (delta < 7 * 86_400_000) return `${Math.floor(delta / 86_400_000)}天前`;
   return date.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 
@@ -3748,6 +3714,33 @@ function ComposerSelectionRail({ items }: { items: ComposerSelectionItem[] }) {
 
 function SessionMoreIcon() {
   return <svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="2.25" cy="6" r=".8" /><circle cx="6" cy="6" r=".8" /><circle cx="9.75" cy="6" r=".8" /></svg>;
+}
+
+function SidebarSkillIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M10 3.5 11.4 7.4H15.5L12.3 9.8 13.6 13.7 10 11.4 6.4 13.7 7.7 9.8 4.5 7.4H8.6Z" />
+    </svg>
+  );
+}
+
+function SidebarConnectorIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <rect x="3.2" y="7" width="5.2" height="6" rx="1.2" />
+      <rect x="11.6" y="7" width="5.2" height="6" rx="1.2" />
+      <path d="M8.4 10h3.2" />
+    </svg>
+  );
+}
+
+function SidebarClockIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="10" cy="10" r="6.25" />
+      <path d="M10 6.75V10l2.35 1.55" />
+    </svg>
+  );
 }
 
 function SessionBranchIcon() {

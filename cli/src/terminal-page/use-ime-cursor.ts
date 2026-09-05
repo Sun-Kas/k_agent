@@ -68,6 +68,10 @@ export function useImeCursor(
   const metricsRef = useRef<BoxMetrics | undefined>(undefined);
   const [, setLayoutTick] = useState(0);
 
+  function positionFrom(metrics: BoxMetrics): { x: number; y: number } | undefined {
+    return imeCursorPosition(metrics, renderedValue);
+  }
+
   useLayoutEffect(() => {
     if (!active || !lineRef.current) {
       metricsRef.current = undefined;
@@ -76,7 +80,7 @@ export function useImeCursor(
       return;
     }
     const metrics = measureElement(lineRef.current);
-    const next = imeCursorPosition(metrics, renderedValue);
+    const next = positionFrom(metrics);
     if (!next) return;
     const previous = metricsRef.current;
     metricsRef.current = metrics;
@@ -87,7 +91,7 @@ export function useImeCursor(
 
   if (!active) setCursorPosition(undefined);
   else if (metricsRef.current) {
-    const next = imeCursorPosition(metricsRef.current, renderedValue);
+    const next = positionFrom(metricsRef.current);
     if (next) setCursorPosition(next);
   }
 

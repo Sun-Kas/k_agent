@@ -11,7 +11,7 @@ def build(inputs: PromptInputs) -> tuple[PromptSection, ...]:
         )
     if inputs.tool_catalog.has("Skill"):
         guidance.append(
-            "Use the `Skill` tool when its request-scoped description lists a skill that matches the task; load the body only when needed."
+            "Use the `Skill` tool when the request context lists a skill that matches the task; load the body only when needed."
         )
     if not guidance:
         return ()

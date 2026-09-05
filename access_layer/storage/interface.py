@@ -25,12 +25,32 @@ class StorageBackend(Protocol):
         """把文本写入指定 key。"""
         ...
 
+    async def append_text(self, key: str, content: str) -> None:
+        """以追加方式写入文本；一批 history record 必须在一次调用中提交。"""
+        ...
+
+    async def read_text_range(
+        self, key: str, *, start_line: int = 0, limit: int | None = None
+    ) -> list[str]:
+        """按行读取追加日志；第一版允许全量读取，接口为后续分页保留边界。"""
+        ...
+
     async def read_json(self, key: str) -> dict[str, Any] | list[Any] | None:
         """读取并解析指定 key 的 JSON 内容。"""
         ...
 
     async def write_json(self, key: str, payload: dict[str, Any] | list[Any]) -> None:
         """把对象序列化为 JSON 后写入指定 key。"""
+        ...
+
+    async def compare_and_swap_json(
+        self,
+        key: str,
+        *,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> bool:
+        """按顶层 ``revision`` 做存储级 CAS，成功时原子替换整个 JSON。"""
         ...
 
     async def delete(self, key: str) -> None:

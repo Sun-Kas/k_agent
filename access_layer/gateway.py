@@ -18,6 +18,7 @@ import copy
 import json
 import logging
 import time
+import uuid
 from typing import Any
 
 from ag_ui.core import RunAgentInput
@@ -42,6 +43,7 @@ from access_layer.sessions.store import (
     ResumeConflictError,
     SessionStore,
 )
+from access_layer.sessions.history import is_public_event
 
 
 class AgentAccessLayer:
@@ -60,6 +62,163 @@ class AgentAccessLayer:
         self._request_limiter = request_limiter
         self._agent_backend_client = agent_backend_client
         self._runtime_catalog = runtime_catalog
+
+    async def recover_pending_context_continuations(self) -> None:
+        """启动时续跑已原子提交的 compact checkpoint，再开放普通新输入。"""
+
+        for session_id, state in await self._session_store.pending_context_continuations():
+            try:
+                async with self._request_limiter.protect(session_id):
+                    log_event(
+                        "context_continuation_started", threadId=session_id,
+                        runId=(state.get("pendingContinuation") or {}).get("resumeContext", {}).get("publicRunId"),
+                        generation=state.get("generation", 0), trigger="restart",
+                    )
+                    await self._recover_context_continuation(session_id, state)
+                    log_event(
+                        "context_continuation_finished", threadId=session_id,
+                        generation=state.get("generation", 0), trigger="restart",
+                    )
+            except Exception:
+                # checkpoint 保持原样，gateway 的执行锁内检查会拒绝新输入，避免
+                # 用户回合越过未完成的同一 public run。下次重启仍可继续恢复。
+                logging.getLogger("k_agent.access.gateway").exception(
+                    "Failed to recover compact continuation for session %s", session_id
+                )
+
+    async def _recover_context_continuation(
+        self, session_id: str, initial_state: dict[str, Any]
+    ) -> None:
+        """消费无浏览器订阅的内部续跑流，并保持与在线续跑相同提交规则。"""
+
+        session = await self._session_store.get(session_id)
+        if session is None:
+            return
+        state = initial_state
+        checkpoint = state.get("pendingContinuation")
+        if not isinstance(checkpoint, dict):
+            return
+        resume_context = checkpoint.get("resumeContext")
+        if not isinstance(resume_context, dict):
+            raise RuntimeError("Pending context continuation has no trusted resume context")
+        mcp_ids = self._string_list(resume_context.get("mcpServerIds"), "mcpServerIds")
+        skill_ids = self._string_list(resume_context.get("skillIds"), "skillIds")
+        mcp_servers, skills = self._runtime_catalog.selected_runtime(mcp_ids, skill_ids)
+        boundary = state.get("boundary") if isinstance(state.get("boundary"), dict) else {}
+        run_id = str(
+            resume_context.get("publicRunId")
+            or boundary.get("sourceRunId")
+            or f"recovered-{uuid.uuid4()}"
+        )
+        agent_options = resume_context.get("agentOptions")
+        agent_options = dict(agent_options) if isinstance(agent_options, dict) else {}
+        request_id = f"context-recovery-{uuid.uuid4()}"
+
+        while True:
+            provider_messages, state = await self._session_store.provider_context_state(session_id)
+            checkpoint = state.get("pendingContinuation")
+            if not isinstance(checkpoint, dict):
+                return
+            summary = state.get("summary")
+            backend_payload = {
+                "threadId": session_id,
+                "runId": run_id,
+                "messages": [
+                    message.model_dump(by_alias=True, mode="json")
+                    for message in provider_messages if message.carries_context()
+                ],
+                "contextSummary": (
+                    str(summary.get("text") or "") if isinstance(summary, dict) else ""
+                ),
+                "contextState": state,
+                "continuationCheckpoint": checkpoint,
+                "modelId": resume_context.get("modelId") or session.model_id,
+                "mcpServers": mcp_servers,
+                "skills": skills,
+                "reasoningEffort": resume_context.get("reasoningEffort"),
+                "attachments": [],
+                "agentKind": "k_agent",
+                "agentOptions": agent_options,
+                "resume": [],
+                "resumeCheckpoints": [],
+                "workspaceDir": to_managed_path(session_workspace_dir(session_id)),
+            }
+            nested_compact = False
+            terminal = False
+            async for event in self._agent_backend_client.stream(backend_payload, request_id):
+                private_name = (
+                    str(event.get("name") or "").removeprefix("__private_")
+                    if event.get("type") == "CUSTOM"
+                    and str(event.get("name") or "").startswith("__private_")
+                    else ""
+                )
+                if private_name == "context_compaction_required":
+                    value = event.get("value")
+                    if not isinstance(value, dict):
+                        raise RuntimeError("Recovered Backend returned an invalid compact proposal")
+                    next_checkpoint = (
+                        copy.deepcopy(value.get("continuationCheckpoint"))
+                        if isinstance(value.get("continuationCheckpoint"), dict)
+                        else None
+                    )
+                    if next_checkpoint is not None:
+                        next_checkpoint["resumeContext"] = copy.deepcopy(resume_context)
+                    committed = await self._session_store.commit_context_compaction(
+                        session_id, dict(value.get("proposal") or {}), next_checkpoint
+                    )
+                    boundary = committed.get("boundary") or {}
+                    stats = committed.get("stats") or {}
+                    await self._session_store.append_event(session_id, {
+                        "type": "CUSTOM", "name": "context_compacted",
+                        "threadId": session_id, "runId": run_id,
+                        "value": {
+                            "generation": committed.get("generation"),
+                            "trigger": boundary.get("trigger"),
+                            "beforeTokens": stats.get("beforeTokens"),
+                            "afterTokens": stats.get("afterTokens"),
+                            "savedTokens": stats.get("savedTokens"),
+                            "durationMs": stats.get("durationMs"),
+                            "modelId": stats.get("modelId"),
+                        },
+                    })
+                    nested_compact = True
+                    break
+                if private_name == "context_patch":
+                    try:
+                        await self._session_store.commit_context_patch(
+                            session_id, dict(event.get("value") or {})
+                        )
+                    except Exception:
+                        logging.getLogger("k_agent.access.gateway").info(
+                            "Discarded stale recovered context patch for session %s", session_id
+                        )
+                    continue
+                if private_name == "context_compact_failed":
+                    value = event.get("value")
+                    if isinstance(value, dict):
+                        await self._session_store.record_context_failure(
+                            session_id,
+                            code=str(value.get("code") or "compact_failed"),
+                            automatic=bool(value.get("automatic", True)),
+                        )
+                    continue
+                if private_name:
+                    continue
+                # 原 RUN_STARTED 已在崩溃前公开/落盘；恢复流不能制造第二个生命周期开头。
+                if event.get("type") == "RUN_STARTED":
+                    continue
+                if is_public_event(event):
+                    await self._session_store.append_event(session_id, event)
+                if event.get("type") in {"RUN_FINISHED", "RUN_ERROR"}:
+                    terminal = True
+            if nested_compact:
+                continue
+            if terminal:
+                await self._session_store.clear_context_continuation(
+                    session_id, int(state.get("generation", 0))
+                )
+                return
+            raise RuntimeError("Recovered continuation ended without a terminal event")
 
     async def run(self, payload: RunAgentInput) -> StreamingResponse:
         """处理一次公开 Agent 运行：校验、加锁、落盘用户轮次并返回 SSE 流。
@@ -399,6 +558,13 @@ class AgentAccessLayer:
                         },
                     )
                 else:
+                    pending_check = getattr(
+                        self._session_store, "has_pending_context_continuation", None
+                    )
+                    if callable(pending_check) and await pending_check(session.id):
+                        raise ResumeConflictError(
+                            "A compact continuation is still being recovered; retry shortly"
+                        )
                     await self._session_store.ensure_accepts_new_input(session.id)
                     session = await self._session_store.save_run_start(
                         session.id,
@@ -407,6 +573,12 @@ class AgentAccessLayer:
                         mcp_server_ids=mcp_ids,
                         skill_ids=skill_ids,
                         permission_mode=permission_mode,
+                        model_id=(
+                            str(forwarded.get("modelId"))
+                            if forwarded.get("modelId")
+                            else None
+                        ),
+                        agent_kind=agent_kind,
                     )
             except (OpenInterruptError, ResumeConflictError) as exc:
                 await stream_guard.__aexit__(None, None, None)
@@ -430,9 +602,21 @@ class AgentAccessLayer:
                 request_context = get_request_context()
                 request_id = request_context.request_id if request_context else "-"
                 try:
-                    history_count = sum(
-                        1 for message in session.messages if message.carries_context()
-                    )
+                    provider_context = getattr(self._session_store, "provider_context_state", None)
+                    context_state: dict[str, Any] = {}
+                    if agent_kind == "k_agent" and callable(provider_context):
+                        provider_messages, context_state = await provider_context(session.id)
+                        summary = context_state.get("summary")
+                        context_summary = (
+                            str(summary.get("text") or "")
+                            if isinstance(summary, dict)
+                            else ""
+                        )
+                    else:
+                        # compact state 只属于 K Agent 的 Provider 上下文。CLI runner
+                        # 依赖各自原生会话恢复，不能误用 K Agent 的压缩边界。
+                        provider_messages, context_summary = list(session.messages), ""
+                    history_count = sum(1 for message in provider_messages if message.carries_context())
                     log_event(
                         "access.run.accepted",
                         requestId=request_id,
@@ -443,19 +627,23 @@ class AgentAccessLayer:
                         mcpCount=len(mcp_servers),
                         skillCount=len(skills),
                     )
-                    backend_events = self._agent_backend_client.stream(
-                        {
+                    backend_payload = {
                             "threadId": session.id,
                             "runId": payload.run_id,
-                            # 发给后端的是完整会话历史；本层只装配载荷，不拼系统提示。
+                            # 只发送 compact boundary 后的活动尾部；完整 history 永不离开
+                            # Access Layer，也不会被压缩覆盖。
                             "messages": [
                                 message.model_dump(by_alias=True, mode="json")
-                                for message in session.messages
+                                for message in provider_messages
                                 if message.carries_context()
                             ],
+                            "contextSummary": context_summary,
+                            "contextState": context_state,
+                            "continuationCheckpoint": None,
                             "modelId": forwarded.get("modelId"),
-                            # Access Layer owns selection and sends self-contained
-                            # runtime entries. Agent Backend never reads list data.
+                            # Access Layer only forwards selected catalog metadata.
+                            # Backend lazily reads the body after an actual Skill call;
+                            # it never uses file frontmatter to rewrite this metadata.
                             "mcpServers": mcp_servers,
                             "skills": skills,
                             "reasoningEffort": forwarded.get("reasoningEffort"),
@@ -475,66 +663,223 @@ class AgentAccessLayer:
                             "workspaceDir": to_managed_path(
                                 session_workspace_dir(session.id)
                             ),
-                        },
-                        request_id,
-                    )
+                        }
                     # 落盘走后台队列，SSE 帧立刻 yield，避免磁盘 I/O 卡住流式体验。
                     # 单 worker 串行写盘以保持事件顺序。
                     persist_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+                    persist_failures: list[BaseException] = []
 
                     async def _persist_worker():
                         while True:
                             event = await persist_queue.get()
                             if event is None:
+                                persist_queue.task_done()
                                 break
                             try:
                                 await self._session_store.append_event(session.id, event)
-                            except Exception:
+                            except Exception as exc:
+                                persist_failures.append(exc)
                                 logging.getLogger("k_agent.access.gateway").warning(
                                     "Failed to persist event for session %s",
                                     session.id,
                                     exc_info=True,
                                 )
+                            finally:
+                                persist_queue.task_done()
 
                     persist_task = asyncio.create_task(_persist_worker())
                     resume_succeeded = False
                     resume_known_failure = False
                     try:
-                        async for event in backend_events:
-                            public_event = event
-                            if self._is_durable_interrupt_activity(event):
-                                event = copy.deepcopy(event)
-                                private_content = event.get("content")
-                                private_checkpoint = (
-                                    private_content.get("_checkpoint")
-                                    if isinstance(private_content, dict)
-                                    else None
+                        continue_run = True
+                        seen_run_started = False
+                        while continue_run:
+                            continue_run = False
+                            backend_events = self._agent_backend_client.stream(
+                                backend_payload, request_id
+                            )
+                            async for event in backend_events:
+                                private_name = (
+                                    str(event.get("name") or "").removeprefix("__private_")
+                                    if event.get("type") == "CUSTOM"
+                                    and str(event.get("name") or "").startswith("__private_")
+                                    else ""
                                 )
-                                if isinstance(private_checkpoint, dict):
-                                    # 恢复必须沿用产生工具调用时的运行选择，不能信任
-                                    # 若干小时后浏览器当前下拉框里的模型或 MCP。
-                                    private_checkpoint["resumeContext"] = {
-                                        "modelId": forwarded.get("modelId"),
-                                        "mcpServerIds": list(mcp_ids),
-                                        "skillIds": list(skill_ids),
-                                        "reasoningEffort": forwarded.get("reasoningEffort"),
-                                        "agentKind": agent_kind,
-                                        "agentOptions": copy.deepcopy(agent_options),
+                                if private_name == "context_compaction_required":
+                                    value = event.get("value")
+                                    if not isinstance(value, dict):
+                                        raise RuntimeError("Backend returned an invalid compaction proposal")
+                                    # proposal 可以引用本段刚完成的工具结果；提交前必须等
+                                    # 公共事件全部落盘，Access Layer 才能计算真实 seq/digest。
+                                    await persist_queue.join()
+                                    if persist_failures:
+                                        raise RuntimeError(
+                                            "Context compaction durability barrier failed; "
+                                            "the complete pre-compaction history remains authoritative"
+                                        ) from persist_failures[-1]
+                                    checkpoint = (
+                                        copy.deepcopy(value.get("continuationCheckpoint"))
+                                        if isinstance(value.get("continuationCheckpoint"), dict)
+                                        else None
+                                    )
+                                    if checkpoint is not None:
+                                        checkpoint["resumeContext"] = {
+                                            "publicRunId": payload.run_id,
+                                            "modelId": forwarded.get("modelId"),
+                                            "mcpServerIds": list(mcp_ids),
+                                            "skillIds": list(skill_ids),
+                                            "reasoningEffort": forwarded.get("reasoningEffort"),
+                                            "agentOptions": copy.deepcopy(agent_options),
+                                        }
+                                    committed = await self._session_store.commit_context_compaction(
+                                        session.id,
+                                        dict(value.get("proposal") or {}),
+                                        checkpoint,
+                                    )
+                                    log_event(
+                                        "context_compact_committed", threadId=session.id,
+                                        runId=payload.run_id,
+                                        generation=committed.get("generation"),
+                                        revision=committed.get("revision"),
+                                        trigger=(committed.get("boundary") or {}).get("trigger"),
+                                    )
+                                    boundary = committed.get("boundary") or {}
+                                    stats = committed.get("stats") or {}
+                                    compacted_event = {
+                                        "type": "CUSTOM",
+                                        "name": "context_compacted",
+                                        "threadId": session.id,
+                                        "runId": payload.run_id,
+                                        "value": {
+                                            "generation": committed.get("generation"),
+                                            "trigger": boundary.get("trigger"),
+                                            "beforeTokens": stats.get("beforeTokens"),
+                                            "afterTokens": stats.get("afterTokens"),
+                                            "savedTokens": stats.get("savedTokens"),
+                                            "durationMs": stats.get("durationMs"),
+                                            "modelId": stats.get("modelId"),
+                                        },
                                     }
-                                # durable-before-visible：卡片一旦可点击，其 checkpoint
-                                # 已经存在；同时剥离私有执行状态后再交给浏览器。
-                                public_event = await self._session_store.persist_interrupt(
-                                    session.id, event
-                                )
-                            yield self._encode_sse(public_event)
-                            if self._is_approval_activity(public_event):
-                                yield self._encode_sse_comment("flush", pad_bytes=2048)
-                                await asyncio.sleep(0)
-                            persist_queue.put_nowait(public_event)
-                            if event.get("type") == "RUN_FINISHED":
-                                resume_succeeded = True
-                            elif event.get("type") == "RUN_ERROR":
-                                resume_known_failure = True
+                                    yield self._encode_sse(compacted_event)
+                                    persist_queue.put_nowait(compacted_event)
+                                    provider_messages, committed = (
+                                        await self._session_store.provider_context_state(session.id)
+                                    )
+                                    summary = committed.get("summary")
+                                    backend_payload.update({
+                                        "messages": [
+                                            message.model_dump(by_alias=True, mode="json")
+                                            for message in provider_messages
+                                            if message.carries_context()
+                                        ],
+                                        "contextSummary": (
+                                            str(summary.get("text") or "")
+                                            if isinstance(summary, dict)
+                                            else ""
+                                        ),
+                                        "contextState": committed,
+                                        "continuationCheckpoint": committed.get("pendingContinuation"),
+                                        # continuation 不是用户 HITL resume，不能重复消费审批决定。
+                                        "resume": [],
+                                        "resumeCheckpoints": [],
+                                    })
+                                    log_event(
+                                        "context_continuation_started", threadId=session.id,
+                                        runId=payload.run_id,
+                                        generation=committed.get("generation"), trigger="online",
+                                    )
+                                    continue_run = True
+                                    break
+                                if private_name == "context_patch":
+                                    await persist_queue.join()
+                                    try:
+                                        await self._session_store.commit_context_patch(
+                                            session.id, dict(event.get("value") or {})
+                                        )
+                                    except Exception:
+                                        # microcompact patch 是可重建派生数据；CAS 冲突时
+                                        # 丢弃，绝不能覆盖一个更新后的 full compact。
+                                        logging.getLogger("k_agent.access.gateway").info(
+                                            "Discarded stale context patch for session %s",
+                                            session.id,
+                                        )
+                                    continue
+                                if private_name == "context_compact_failed":
+                                    value = event.get("value")
+                                    if isinstance(value, dict):
+                                        await self._session_store.record_context_failure(
+                                            session.id,
+                                            code=str(value.get("code") or "compact_failed"),
+                                            automatic=bool(value.get("automatic", True)),
+                                        )
+                                    continue
+                                if private_name in {"context_budget", "context_state"}:
+                                    continue
+                                if (
+                                    event.get("type") == "CUSTOM"
+                                    and event.get("name") == "__private_cli_session"
+                                ):
+                                    value = event.get("value")
+                                    if isinstance(value, dict):
+                                        await self._session_store.apply_private_control(
+                                            session.id, "cli_session", value
+                                        )
+                                    continue
+                                if event.get("type") == "RUN_STARTED":
+                                    if seen_run_started:
+                                        continue
+                                    seen_run_started = True
+                                if not is_public_event(event):
+                                    logging.getLogger("k_agent.access.gateway").warning(
+                                        "Dropped non-public backend event type=%s name=%s session=%s",
+                                        event.get("type"),
+                                        event.get("name"),
+                                        session.id,
+                                    )
+                                    continue
+                                public_event = event
+                                if self._is_durable_interrupt_activity(event):
+                                    event = copy.deepcopy(event)
+                                    private_content = event.get("content")
+                                    private_checkpoint = (
+                                        private_content.get("_checkpoint")
+                                        if isinstance(private_content, dict)
+                                        else None
+                                    )
+                                    if isinstance(private_checkpoint, dict):
+                                        # 恢复必须沿用产生工具调用时的运行选择，不能信任
+                                        # 若干小时后浏览器当前下拉框里的模型或 MCP。
+                                        private_checkpoint["resumeContext"] = {
+                                            "modelId": forwarded.get("modelId"),
+                                            "mcpServerIds": list(mcp_ids),
+                                            "skillIds": list(skill_ids),
+                                            "reasoningEffort": forwarded.get("reasoningEffort"),
+                                            "agentKind": agent_kind,
+                                            "agentOptions": copy.deepcopy(agent_options),
+                                        }
+                                    public_event = await self._session_store.persist_interrupt(
+                                        session.id, event
+                                    )
+                                yield self._encode_sse(public_event)
+                                if self._is_approval_activity(public_event):
+                                    yield self._encode_sse_comment("flush", pad_bytes=2048)
+                                    await asyncio.sleep(0)
+                                persist_queue.put_nowait(public_event)
+                                if event.get("type") == "RUN_FINISHED":
+                                    resume_succeeded = True
+                                elif event.get("type") == "RUN_ERROR":
+                                    resume_known_failure = True
+                                if event.get("type") in {"RUN_FINISHED", "RUN_ERROR"}:
+                                    generation = backend_payload.get("contextState", {}).get("generation")
+                                    if isinstance(generation, int) and backend_payload.get("continuationCheckpoint"):
+                                        await self._session_store.clear_context_continuation(
+                                            session.id, generation
+                                        )
+                                        log_event(
+                                            "context_continuation_finished", threadId=session.id,
+                                            runId=payload.run_id, generation=generation,
+                                            outcome=event.get("type"), trigger="online",
+                                        )
                     finally:
                         await persist_queue.put(None)
                         await persist_task

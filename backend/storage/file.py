@@ -55,6 +55,22 @@ class FileStorage:
         path = self.resolve(key)
         await asyncio.to_thread(write_text_atomic, path, content)
 
+    async def append_text(self, key: str, content: str) -> None:
+        """使用 O_APPEND 一次写入完整批次。"""
+
+        await asyncio.to_thread(append_text_durable, self.resolve(key), content)
+
+    async def read_text_range(
+        self, key: str, *, start_line: int = 0, limit: int | None = None
+    ) -> list[str]:
+        if start_line < 0 or (limit is not None and limit < 0):
+            return []
+        content = await self.read_text(key)
+        if content is None:
+            return []
+        lines = content.splitlines()
+        return lines[start_line:] if limit is None else lines[start_line : start_line + limit]
+
     async def read_json(self, key: str) -> dict[str, Any] | list[Any] | None:
         """读取并解析指定 key 的 JSON 内容。"""
         content = await self.read_text(key)
@@ -95,6 +111,23 @@ def write_text_atomic(path: Path, content: str) -> None:
         handle.write(content)
         temp_name = handle.name
     os.replace(temp_name, path)
+
+
+def append_text_durable(path: Path, content: str) -> None:
+    """单次追加并 fsync，避免 history 批次被截成半条 JSON。"""
+
+    if not content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        data = content.encode("utf-8")
+        written = 0
+        while written < len(data):
+            written += os.write(descriptor, data[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:

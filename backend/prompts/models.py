@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Literal, Mapping
 from backend.memory.models import MemoryFile
 
 if TYPE_CHECKING:
-    from backend.tools.catalog import ToolCatalog
+    from backend.tools.catalog import SkillCatalog, ToolCatalog
 
 
 # Channel：这段碎片走哪条 API 通道（发给谁）。
@@ -85,7 +85,12 @@ class PersonaInputs:
 
 @dataclass(frozen=True, slots=True)
 class McpInstruction:
-    """不可信的 MCP server 指令，只进 context 通道。"""
+    """MCP `initialize` 响应里的可选 `instructions` 字符串。
+
+    这是协议字段（InitializeResult.instructions），不是 tools/list 的
+    description，也不是我们配置里的 server 简介。Server 用它提示「怎么用
+    我」；多数 server 不设。内容来自外部进程，只进 context，不当平台政策。
+    """
 
     server_id: str
     content: str
@@ -104,7 +109,13 @@ class PromptInputs:
     output_workspace: Path | None
     memory_files: tuple[MemoryFile, ...]
     tool_catalog: "ToolCatalog"
+    # 同一份请求级快照同时驱动发现列表和 Skill 执行白名单，禁止各自重新筛选。
+    skill_catalog: "SkillCatalog"
+    # 仅用于限制发现列表体积；无效或缺失时由 skills 模块使用保守默认值。
+    context_window_tokens: int | None
+    # Handshake `instructions` per selected server; empty when the server omitted it.
     mcp_instructions: tuple[McpInstruction, ...] = ()
+    # Access Layer 本轮勾选的连接（id/name/description），不是工具 schema。
     mcp_servers: tuple[Mapping[str, object], ...] = ()
     persona: PersonaInputs = field(default_factory=PersonaInputs)
     permission_mode: str = "default"
@@ -128,6 +139,10 @@ class PromptBundle:
     initial_memory_paths: tuple[str, ...]
     stable_fingerprint: str
     dynamic_fingerprint: str
+    # Skill 发现列表只记录体积指标，不记录名称、简介或完整正文。
+    skill_listing_chars: int = 0
+    skill_listing_count: int = 0
+    skill_listing_truncated_count: int = 0
 
     @classmethod
     def rendered(
@@ -147,3 +162,13 @@ class MemoryPromptContribution:
     sections: tuple[PromptSection, ...]
     loaded_paths: tuple[str, ...]
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SkillPromptContribution:
+    """Skill 发现列表及其无内容观测指标。"""
+
+    sections: tuple[PromptSection, ...]
+    listing_chars: int = 0
+    included_count: int = 0
+    truncated_count: int = 0

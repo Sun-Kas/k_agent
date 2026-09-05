@@ -16,6 +16,13 @@ export function emptyViewModel(config: CliRuntimeConfig): TerminalPageViewModel 
       permissionMode: config.permissionMode,
       mcpCount: config.mcpServerIds.length,
       skillCount: config.skillIds.length,
+      mcpServers: [],
+      skills: [],
+      selectedMcpIds: [...config.mcpServerIds],
+      selectedSkillIds: [...config.skillIds],
+      mcpTools: [],
+      models: [],
+      agents: [],
     },
     sessions: [],
     activeSessionId: undefined,
@@ -29,5 +36,6 @@ export function emptyViewModel(config: CliRuntimeConfig): TerminalPageViewModel 
     doctorLines: [],
     notice: undefined,
     error: undefined,
+    mcpBusy: false,
   };
 }

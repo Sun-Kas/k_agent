@@ -10,6 +10,13 @@ K Agent 的 TypeScript / Node.js 终端客户端。CLI 只通过 Access Layer �
 npm --prefix cli run dev:local
 ```
 
+如果已将 `scripts/dev-local.mjs` 链接到 `PATH` 中的 `k-agent`，则无需切换目录，在任意位置直接运行：
+
+```bash
+k-agent
+k-agent doctor
+```
+
 启动器会复用已经健康的本地服务，并只在退出时关闭本次由它启动的进程。Python 日志写入系统临时目录，不会污染 TUI。目标端口被其他服务占用时会直接报错。
 
 `dev:local` 只属于源码仓库开发流程，不随 npm 发布包提供。分别执行 CLI 开发命令时：
@@ -40,14 +47,48 @@ k-agent doctor
 
 交互页面快捷键：
 
-- `1`–`4`：工作 / 团队 / 自动 / 诊断
-- `5`–`7`：首页快捷提问
+- `?`：快捷键说明
+- `1`–`4`：工作 / 团队 / 自动 / 诊断（输入框为空时）
+- `↑` / `↓`：提示符历史（首页空输入时选择功能）
+- 终端滚动查看更早的对话，提示符保持在底部
+- 运行中仍可输入，回车后排队，当前 Run 结束后再发送
 - `Ctrl+K`：命令面板
 - `Ctrl+P`：会话切换
-- `Ctrl+O`：Activity / Workspace Inspector
+- `Ctrl+O`：展开工具调用与思考详情
 - `Ctrl+C`：运行中执行 stop；空闲时退出
 - `Esc`：关闭普通覆盖层，不代表拒绝审批
 - `!`：返回仍待处理的审批或用户问题
+- `/mcp`：管理 MCP（Space 开关、Enter 查看工具、`r` 重载）；也支持 `/mcp enable [name|all]`、`/mcp disable`、`/mcp reload`
+- `/model`、`/agent`、`/permissions`：切换本次会话的模型、Agent 与权限，下一轮发送生效
+- `/skill`：开关 Skill（写入 Access Layer，与 Web 配置中心同一份目录）
+
+```bash
+k-agent mcp list
+k-agent mcp enable calendar
+k-agent mcp disable all
+k-agent mcp reload
+k-agent model list
+k-agent agent list
+k-agent skill list
+k-agent skill enable writer
+k-agent skill disable all
+```
+
+## 中文输入法与光标
+
+CLI 使用真实终端光标作为输入法候选窗的定位锚点，不再在页面里绘制假的光标字符。该行为同时覆盖：
+
+- 页面底部的主输入框
+- 用户问题弹窗中的“补充说明”输入行
+
+光标位置按终端显示列宽计算，已处理中文、Emoji、组合字符、换行和自动折行。因此在 macOS 中文输入法中，候选窗应跟随当前插入点，而不是停留在终端底部；使用方向键移动插入点后，候选窗也会跟随新的位置。
+
+输入法需要终端提供真实的 TTY 和 ANSI 光标定位能力。请直接在 Terminal、iTerm2、WezTerm 等交互式终端中运行，不要把 CLI 输出通过管道重定向到文件或非交互式输出面板。如果候选窗仍未对齐，请先在仓库根目录更新依赖并重新启动：
+
+```bash
+npm --prefix cli install
+npm --prefix cli run dev:local
+```
 
 终端页面的颜色、宽度阈值、文案和密度集中在 `src/terminal-page/design.ts`。页面组件不直接访问 HTTP；所有网络请求仍由 application/client 层完成。
 

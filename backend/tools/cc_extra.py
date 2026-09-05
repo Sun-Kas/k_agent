@@ -339,6 +339,7 @@ CC_EXTRA_TOOLS: list[ToolDefinition] = [
             "additionalProperties": False,
         },
         execute=cc_ls,
+        context_policy={"mode": "rerunnable", "maxResultChars": 30_000},
     ),
     ToolDefinition(
         name="WebFetch",
@@ -354,6 +355,7 @@ CC_EXTRA_TOOLS: list[ToolDefinition] = [
             "additionalProperties": False,
         },
         execute=cc_web_fetch,
+        context_policy={"mode": "rerunnable", "maxResultChars": 30_000},
     ),
     ToolDefinition(
         name="WebSearch",
@@ -368,6 +370,7 @@ CC_EXTRA_TOOLS: list[ToolDefinition] = [
             "additionalProperties": False,
         },
         execute=cc_web_search,
+        context_policy={"mode": "rerunnable", "maxResultChars": 30_000},
     ),
     ToolDefinition(
         name="NotebookEdit",
@@ -386,5 +389,6 @@ CC_EXTRA_TOOLS: list[ToolDefinition] = [
             "additionalProperties": False,
         },
         execute=cc_notebook_edit,
+        context_policy={"mode": "receipt", "maxResultChars": 12_000},
     ),
 ]

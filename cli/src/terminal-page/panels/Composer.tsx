@@ -30,7 +30,7 @@ import {
  * 输入法预编辑画在真实光标上，不进草稿。确认后的汉字必须按行编辑光标插入。
  * 父层改写草稿时不能把光标甩到行尾，否则会出现「拼音显示在中间、上屏却接到末尾」。
  */
-export function Composer({ value, disabled, focused, captureDigits, suppressKeys, onChange, onSubmit }: {
+export function Composer({ value, disabled, focused, captureDigits, suppressKeys, lockInput = false, historyEnabled = false, onHistory, onChange, onSubmit }: {
   value: string;
   disabled: boolean;
   focused: boolean;
@@ -38,6 +38,11 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
   captureDigits: boolean;
   /** `/` 选择栏打开时，导航键归选择栏所有，输入框只处理正文编辑。 */
   suppressKeys: boolean;
+  /** MCP 管理栏打开时，全部按键归管理栏，草稿不能被 Space / r 污染。 */
+  lockInput?: boolean;
+  /** 首页空输入时 ↑↓ 选功能，不召回历史。 */
+  historyEnabled?: boolean;
+  onHistory?: (delta: 1 | -1, liveDraft: string) => string | undefined;
   onChange: (value: string) => void;
   onSubmit: (value: string) => void;
 }): React.ReactElement {
@@ -61,6 +66,7 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
   const before = textBeforeCursor(editor);
   const after = `${graphemeAtCursor(editor)}${textAfterCursor(editor)}`;
   const prompt = `${TERMINAL_DESIGN.symbols.prompt} `;
+  // ref 属于输入框内容行，真实光标直接继承该子节点的 Y；边框不能参与纵向坐标换算。
   useImeCursor(inputLineRef, `${prompt}${before}`, active);
 
   function apply(next: LineEditorState): void {
@@ -82,8 +88,16 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
 
   useInput((input, key) => {
     if (!focused || disabled) return;
+    if (lockInput) return;
     if (suppressKeys && (key.return || key.tab || key.escape || key.upArrow || key.downArrow)) return;
     if (captureDigits && !editorRef.current.value && !key.ctrl && !key.meta && /^[1-4]$/.test(input)) return;
+    if (!editorRef.current.value && !key.ctrl && !key.meta && input === "?") return;
+    if ((key.upArrow || key.downArrow) && historyEnabled && onHistory) {
+      const text = onHistory(key.upArrow ? 1 : -1, editorRef.current.value);
+      if (text === undefined) return;
+      apply(createLineEditor(text));
+      return;
+    }
     if (key.upArrow || key.downArrow || key.tab || key.escape) return;
 
     if (key.leftArrow) return apply(key.meta ? moveWordLeft(editorRef.current) : moveLeft(editorRef.current));
@@ -119,6 +133,7 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
 
   return (
     <Box
+      width="100%"
       borderStyle={TERMINAL_DESIGN.borders.panel}
       borderColor={focused && !disabled ? TERMINAL_DESIGN.colors.accent : TERMINAL_DESIGN.colors.muted}
       paddingX={1}

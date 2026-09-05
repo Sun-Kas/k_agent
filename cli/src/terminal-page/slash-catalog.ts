@@ -29,11 +29,11 @@ export const SLASH_COMMANDS: readonly SlashCommandItem[] = [
   { name: "stop", group: "运行", hint: "停止当前 Run，保留已产生内容" },
   { name: "cancel", group: "运行", hint: "请求服务端取消并回滚本轮" },
   { name: "trace", group: "运行", hint: "查看当前时间线概况", readOnly: true },
-  { name: "model", group: "运行时", hint: "查看当前模型", readOnly: true },
-  { name: "agent", group: "运行时", hint: "查看当前 Agent 类型", readOnly: true },
-  { name: "mcp", group: "运行时", hint: "查看已启用 MCP 数量", readOnly: true },
-  { name: "skill", group: "运行时", hint: "查看已启用 Skill 数量", readOnly: true },
-  { name: "permissions", group: "运行时", hint: "查看权限模式", readOnly: true },
+  { name: "model", group: "运行时", hint: "切换本次会话模型（下一轮生效）", readOnly: true },
+  { name: "agent", group: "运行时", hint: "切换 Agent 类型（下一轮生效）", readOnly: true },
+  { name: "mcp", group: "运行时", hint: "管理 MCP 连接（开关 / 重载 / 查看工具）", readOnly: true },
+  { name: "skill", group: "运行时", hint: "管理 Skill（开关写入 Access Layer）", readOnly: true },
+  { name: "permissions", group: "运行时", hint: "切换权限模式（下一轮生效）", readOnly: true },
   { name: "help", group: "其他", hint: "列出全部快捷键", readOnly: true },
   { name: "quit", group: "其他", hint: "退出终端工作台", readOnly: true },
 ];
@@ -108,6 +108,24 @@ export function slashCommandAnnotation(item: SlashCommandItem, model: TerminalPa
   if (!availability.enabled) return availability.reason ?? "当前不可用";
   const value = slashCommandValue(item, model);
   return value ? `${item.hint} · ${value}` : item.hint;
+}
+
+export interface SlashStatusPanel {
+  title: string;
+  lines: string[];
+}
+
+/**
+ * 只读 slash 命令的可见内容。底栏 notice 会被截成一行，所以这些查询走浮层。
+ */
+export function slashStatusPanel(command: string, model: TerminalPageViewModel): SlashStatusPanel | undefined {
+  if (command === "trace") {
+    return {
+      title: "时间线",
+      lines: [`${model.timeline.items.length} 条`, model.timeline.runStatus],
+    };
+  }
+  return undefined;
 }
 
 function matchScore(item: SlashCommandItem, needle: string): number {

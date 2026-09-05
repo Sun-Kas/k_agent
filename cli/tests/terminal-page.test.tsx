@@ -11,11 +11,14 @@ import type { TerminalPageAction } from "../src/terminal-page/index.js";
 test("TerminalPage 在紧凑终端保持主内容和 Composer 可见", () => {
   const view = render(<TerminalPage model={chatModel()} onAction={() => {}} />);
   const frame = view.lastFrame() ?? "";
-  assert.match(frame, /K Agent/);
-  assert.match(frame, /CONVERSATION/);
+  assert.match(frame, /欢迎使用 K Agent/);
+  assert.match(frame, /v0\.1\.0/);
+  assert.match(stripStyles(frame), /▐▛███▜▌|\\  \//);
+  assert.match(frame, /输入目标后回车/);
   assert.match(frame, /❯/);
   assert.doesNotMatch(frame, /描述目标、约束或下一步/);
   assert.doesNotMatch(frame, /SESSIONS/);
+  assert.doesNotMatch(frame, /CONVERSATION/);
   view.unmount();
 });
 
@@ -81,12 +84,138 @@ test("按 / 展开命令选择栏并用 Enter 执行选中命令", async () => {
   const frame = stripStyles(view.lastFrame() ?? "");
   assert.match(frame, /\/new/);
   assert.match(frame, /Tab 补全/);
-  view.stdin.write("model");
+  view.stdin.write("doctor");
   await flush();
-  assert.match(stripStyles(view.lastFrame() ?? ""), /\/model/);
+  assert.match(stripStyles(view.lastFrame() ?? ""), /\/doctor/);
   view.stdin.write("\r");
   await flush();
-  assert.deepEqual(actions, [{ type: "slash_command", command: "model", arguments: "" }]);
+  assert.deepEqual(actions, [{ type: "slash_command", command: "doctor", arguments: "" }]);
+  view.unmount();
+});
+
+test("/mcp 在输入框下方打开管理栏，输入框保持可见", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(
+    <TerminalPage
+      model={{
+        ...chatModel(),
+        runtime: {
+          ...chatModel().runtime,
+          mcpCount: 1,
+          mcpServers: [{ id: "calendar", name: "日历", enabled: true, status: "connected", toolCount: 2 }],
+        },
+      }}
+      onAction={(action) => actions.push(action)}
+    />,
+  );
+  view.stdin.write("/mcp");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /\bMCP\b/);
+  assert.match(frame, /日历/);
+  assert.match(frame, /Space 开关/);
+  assert.match(frame, /❯/);
+  assert.deepEqual(actions, [{ type: "refresh_mcp" }]);
+  view.stdin.write(" ");
+  await flush();
+  assert.deepEqual(actions, [{ type: "refresh_mcp" }, { type: "toggle_mcp", serverId: "calendar" }]);
+  view.unmount();
+});
+
+test("开始对话后清空 slash 只读列表", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("/trace");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.match(stripStyles(view.lastFrame() ?? ""), /时间线/);
+  view.stdin.write("检查项目");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.doesNotMatch(stripStyles(view.lastFrame() ?? ""), /时间线/);
+  assert.deepEqual(actions, [{ type: "submit_prompt", text: "检查项目" }]);
+  view.unmount();
+});
+
+test("/model 在输入框下方打开选择栏，Enter 切换", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(
+    <TerminalPage
+      model={{
+        ...chatModel(),
+        runtime: {
+          ...chatModel().runtime,
+          modelId: "sonnet",
+          models: [
+            { id: "sonnet", name: "Sonnet", enabled: true, note: "claude" },
+            { id: "opus", name: "Opus", enabled: true },
+          ],
+        },
+      }}
+      onAction={(action) => actions.push(action)}
+    />,
+  );
+  view.stdin.write("/model");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /\bModel\b/);
+  assert.match(frame, /Sonnet/);
+  assert.match(frame, /❯/);
+  view.stdin.write("\u001b[B");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, [{ type: "set_model", modelId: "opus" }]);
+  view.unmount();
+});
+
+test("/permissions 可切换 full_access", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("/permissions");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.match(stripStyles(view.lastFrame() ?? ""), /Permissions/);
+  view.stdin.write("\u001b[B");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, [{ type: "set_permission", permissionMode: "full_access" }]);
+  view.unmount();
+});
+
+test("/skill 在输入框下方打开管理栏", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(
+    <TerminalPage
+      model={{
+        ...chatModel(),
+        runtime: {
+          ...chatModel().runtime,
+          skills: [{ id: "writer", name: "writer", enabled: true }],
+        },
+      }}
+      onAction={(action) => actions.push(action)}
+    />,
+  );
+  view.stdin.write("/skill");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /\bSkill\b/);
+  assert.match(frame, /writer/);
+  assert.deepEqual(actions, [{ type: "refresh_skills" }]);
+  view.stdin.write(" ");
+  await flush();
+  assert.deepEqual(actions, [{ type: "refresh_skills" }, { type: "toggle_skill", skillId: "writer" }]);
   view.unmount();
 });
 
@@ -120,14 +249,15 @@ test("Ctrl+K 面板与 / 选择栏共用同一命令目录，可搜索并执行"
   view.unmount();
 });
 
-test("Ctrl+K 在 Run 运行中仍可用，此时 / 无法展开", async () => {
+test("Ctrl+K 在 Run 运行中仍可用，输入框也可展开 /", async () => {
   const running = { ...chatModel(), timeline: { ...chatModel().timeline, runStatus: "running" as const } };
   const actions: TerminalPageAction[] = [];
   const view = render(<TerminalPage model={running} onAction={(action) => actions.push(action)} />);
-  // 运行中输入框被禁用，`/` 进不去草稿，选择栏不会展开。
   view.stdin.write("/");
   await flush();
-  assert.doesNotMatch(stripStyles(view.lastFrame() ?? ""), /Tab 补全/);
+  assert.match(stripStyles(view.lastFrame() ?? ""), /Tab 补全/);
+  view.stdin.write("\u001b");
+  await flush();
   view.stdin.write("\u000b");
   await flush();
   view.stdin.write("stop");
@@ -135,6 +265,54 @@ test("Ctrl+K 在 Run 运行中仍可用，此时 / 无法展开", async () => {
   view.stdin.write("\r");
   await flush();
   assert.deepEqual(actions, [{ type: "slash_command", command: "stop", arguments: "" }]);
+  view.unmount();
+});
+
+test("运行中提交的正文先排队，Run 结束后再交给 application 层", async () => {
+  const running = { ...chatModel(), timeline: { ...chatModel().timeline, runStatus: "running" as const } };
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={running} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("下一句");
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, []);
+  assert.match(stripStyles(view.lastFrame() ?? ""), /排队 1/);
+  view.rerender(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  await flush();
+  assert.deepEqual(actions, [{ type: "submit_prompt", text: "下一句" }]);
+  view.unmount();
+});
+
+test("↑ 召回本进程内上一条已发送提示", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("检查项目");
+  view.stdin.write("\r");
+  await flush();
+  view.rerender(<TerminalPage model={{ ...chatModel(), timeline: { ...chatModel().timeline, runStatus: "complete" } }} onAction={(action) => actions.push(action)} />);
+  await flush();
+  view.stdin.write("\u001b[A");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, [
+    { type: "submit_prompt", text: "检查项目" },
+    { type: "submit_prompt", text: "检查项目" },
+  ]);
+  view.unmount();
+});
+
+test("第一轮尚未标成 running 时第二句先排队，避免两个用户问题叠在一起", async () => {
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
+  view.stdin.write("你是谁");
+  view.stdin.write("\r");
+  await flush();
+  view.stdin.write("你的作者是谁");
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions, [{ type: "submit_prompt", text: "你是谁" }]);
+  assert.match(stripStyles(view.lastFrame() ?? ""), /排队 1/);
   view.unmount();
 });
 
@@ -166,6 +344,26 @@ test("需要参数的命令只补全草稿，不提交缺参数动作", async ()
   await flush();
   assert.deepEqual(actions, []);
   assert.match(stripStyles(view.lastFrame() ?? ""), /\/workspace /);
+  view.unmount();
+});
+
+test("已完成的多轮对话不靠 PgUp 裁切历史", () => {
+  const model = {
+    ...chatModel(),
+    timeline: {
+      ...chatModel().timeline,
+      items: [
+        { kind: "user" as const, id: "u1", content: "你是谁", sequence: 1 },
+        { kind: "text" as const, id: "a1", content: "我是 K Agent", status: "complete" as const, sequence: 2 },
+        { kind: "user" as const, id: "u2", content: "你的作者是谁", sequence: 3 },
+        { kind: "text" as const, id: "a2", content: "Aokai", status: "complete" as const, sequence: 4 },
+      ],
+    },
+  };
+  const view = render(<TerminalPage model={model} onAction={() => {}} />);
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.doesNotMatch(frame, /PgUp/);
+  assert.doesNotMatch(frame, /更早/);
   view.unmount();
 });
 
@@ -202,11 +400,18 @@ test("首页提供操作引导、模式切换和最近会话，不预置示例�
   const actions: TerminalPageAction[] = [];
   const view = render(<TerminalPage model={model} onAction={(action) => actions.push(action)} />);
   const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /欢迎使用 K Agent/);
   assert.match(frame, /开始/);
-  assert.match(frame, /展开命令选择栏/);
-  assert.match(frame, /模式/);
+  assert.match(frame, /\/ 命令/);
+  assert.match(frame, /切换模式/);
+  assert.match(frame, /1 工作/);
+  assert.match(frame, /2 团队/);
+  assert.match(frame, /3 自动/);
+  assert.match(frame, /4 诊断/);
   assert.match(frame, /最近会话/);
   assert.match(frame, /昨晚的任务/);
+  // Home 容易高于视口；帧尾空行让 Ink 的真实光标原点与输入内容节点保持一致。
+  assert.equal(frame.endsWith("\n"), true);
   assert.doesNotMatch(frame, /快捷提问/);
   assert.doesNotMatch(frame, /今天想完成什么/);
   view.stdin.write("2");

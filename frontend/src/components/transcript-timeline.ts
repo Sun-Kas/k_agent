@@ -1,8 +1,11 @@
 import type { AgUiEvent, ToolActivity } from "../types";
 
 export type StaticTimelineActivity =
+  | { type: "user"; id: string; content: string }
   | { type: "thinking"; id: string; title: string; detail: string; status: "running" | "complete" | "stopped" }
   | { type: "tool"; id: string; tool: ToolActivity }
+  | { type: "approval"; id: string }
+  | { type: "error"; id: string; content: string }
   | { type: "text"; id: string; content: string };
 
 function toolResultFailed(content: string): boolean {
@@ -13,17 +16,20 @@ function toolResultFailed(content: string): boolean {
 }
 
 /**
- * 定时任务详情没有实时 React 状态可复用，因此直接按落盘 AG-UI 的到达顺序投影。
+ * 定时任务/历史会话按落盘块投影：CONTENT/ARGS 已是全文，直接赋值。
  * thinking、工具和正文都是硬边界，不能从 messages 按类型重新分组。
  */
 export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[] {
   const timeline: StaticTimelineActivity[] = [];
   const tools = new Map<string, ToolActivity>();
   const texts = new Map<string, Extract<StaticTimelineActivity, { type: "text" }>>();
+  const approvals = new Set<string>();
   let runId = "scheduled";
   let activeThinking: Extract<StaticTimelineActivity, { type: "thinking" }> | null = null;
   for (const event of events) {
-    if (event.type === "RUN_STARTED") runId = event.runId;
+    if (event.type === "input_message") {
+      timeline.push({ type: "user", id: event.message.id, content: event.message.content });
+    } else if (event.type === "RUN_STARTED") runId = event.runId;
     if (event.type === "REASONING_START") {
       activeThinking = { type: "thinking", id: event.messageId, title: "思考过程", detail: "", status: "running" };
       timeline.push(activeThinking);
@@ -35,7 +41,7 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
       }
       if (typeof raw.title === "string" && raw.title) activeThinking.title = raw.title;
     } else if (event.type === "REASONING_MESSAGE_CONTENT" && activeThinking) {
-      activeThinking.detail += event.delta;
+      activeThinking.detail = event.delta;
     } else if (event.type === "REASONING_MESSAGE_END" && activeThinking) {
       const raw = event.rawEvent && typeof event.rawEvent === "object" ? event.rawEvent as Record<string, unknown> : {};
       if (!activeThinking.detail && typeof raw.detail === "string") activeThinking.detail = raw.detail;
@@ -53,7 +59,7 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
         texts.set(event.messageId, text);
         timeline.push(text);
       }
-      text.content += event.delta;
+      text.content = event.delta;
     } else if (event.type === "TOOL_CALL_START") {
       // Some providers omit REASONING_END before starting a tool. The hard
       // timeline boundary still means the preceding reasoning block finished.
@@ -62,11 +68,21 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
       tools.set(event.toolCallId, tool);
       timeline.push({ type: "tool", id: event.toolCallId, tool });
       activeThinking = null;
-    } else if (event.type === "TOOL_CALL_ARGS") { const tool = tools.get(event.toolCallId); if (tool) Object.assign(tool, { arguments: tool.arguments + event.delta, status: "running" }); }
+    } else if (event.type === "TOOL_CALL_ARGS") { const tool = tools.get(event.toolCallId); if (tool) Object.assign(tool, { arguments: event.delta, status: "running" }); }
     else if (event.type === "TOOL_CALL_END") { const tool = tools.get(event.toolCallId); if (tool) Object.assign(tool, { status: "waiting" }); }
     else if (event.type === "TOOL_CALL_RESULT") {
       const tool = tools.get(event.toolCallId);
       if (tool) Object.assign(tool, { result: event.content, status: toolResultFailed(event.content) ? "error" : "complete" });
+    } else if (event.type === "ACTIVITY_SNAPSHOT" && event.activityType === "approval") {
+      const content = event.content && typeof event.content === "object"
+        ? event.content as Record<string, unknown>
+        : {};
+      const approvalId = String(content.id ?? event.messageId);
+      // 同一审批后续快照只更新状态，不改变它首次出现的时间线位置。
+      if (approvalId && !approvals.has(approvalId)) {
+        approvals.add(approvalId);
+        timeline.push({ type: "approval", id: approvalId });
+      }
     } else if (event.type === "RUN_FINISHED" || event.type === "RUN_ERROR") {
       const stopped = event.type === "RUN_FINISHED"
         && event.result
@@ -79,6 +95,9 @@ export function timelineFromEvents(events: AgUiEvent[]): StaticTimelineActivity[
       }
       if (activeThinking) activeThinking.status = stopped ? "stopped" : "complete";
       activeThinking = null;
+      if (event.type === "RUN_ERROR") {
+        timeline.push({ type: "error", id: `run-error-${runId}`, content: event.message });
+      }
     }
   }
   return timeline.filter((activity) => activity.type !== "text" || activity.content.length > 0);

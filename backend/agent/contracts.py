@@ -25,6 +25,11 @@ class AgentRunRequest:
 
     messages: list[ChatMessage]
     model_config: dict[str, Any]
+    context_summary: str = ""
+    # Access Layer 已校验的完整派生状态；Backend 只读并据此生成 CAS proposal。
+    context_state: dict[str, Any] = field(default_factory=dict)
+    continuation_checkpoint: dict[str, Any] | None = None
+    working_set_context: str = ""
     prompt: CompiledPrompt | None = None
     attachments: list[dict[str, Any]] = field(default_factory=list)
     mcp_server_ids: set[str] = field(default_factory=set)

@@ -10,6 +10,9 @@ const forbiddenPatterns = [
   /\/internal\//,
   /localhost:3002/,
   /127\.0\.0\.1:3002/,
+  /skillhub\.cn/,
+  /registry\.modelcontextprotocol\.io/,
+  /modelscope\.cn/,
   /\bAGENT_BACKEND\b/,
   /\bfs\b/,
   /readFile|writeFile/

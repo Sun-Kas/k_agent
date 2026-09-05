@@ -13,6 +13,8 @@ from pathlib import Path
 import tempfile
 from typing import Any
 
+import fcntl
+
 
 class FileStorage:
     """把逻辑 string key 映射到 `base_dir` 下文件；可替换为 DB 等同源接口实现。"""
@@ -55,6 +57,25 @@ class FileStorage:
         path = self.resolve(key)
         await asyncio.to_thread(write_text_atomic, path, content)
 
+    async def append_text(self, key: str, content: str) -> None:
+        """使用 O_APPEND 一次写入一个完整批次，避免并发覆盖已有历史。"""
+
+        path = self.resolve(key)
+        await asyncio.to_thread(append_text_durable, path, content)
+
+    async def read_text_range(
+        self, key: str, *, start_line: int = 0, limit: int | None = None
+    ) -> list[str]:
+        """按 JSONL 行号读取范围；非法范围返回空列表。"""
+
+        if start_line < 0 or (limit is not None and limit < 0):
+            return []
+        content = await self.read_text(key)
+        if content is None:
+            return []
+        lines = content.splitlines()
+        return lines[start_line:] if limit is None else lines[start_line : start_line + limit]
+
     async def read_json(self, key: str) -> dict[str, Any] | list[Any] | None:
         """读取并解析指定 key 的 JSON 内容。"""
         content = await self.read_text(key)
@@ -65,6 +86,23 @@ class FileStorage:
     async def write_json(self, key: str, payload: dict[str, Any] | list[Any]) -> None:
         """把对象序列化为 JSON 后写入指定 key。"""
         await self.write_text(key, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+    async def compare_and_swap_json(
+        self,
+        key: str,
+        *,
+        expected_revision: int,
+        payload: dict[str, Any],
+    ) -> bool:
+        """用独立锁文件保护跨进程的 revision 检查与原子替换。"""
+
+        path = self.resolve(key)
+        return await asyncio.to_thread(
+            compare_and_swap_json_atomic,
+            path,
+            expected_revision,
+            payload,
+        )
 
     async def delete(self, key: str) -> None:
         """删除指定 key 对应的文件。"""
@@ -95,6 +133,56 @@ def write_text_atomic(path: Path, content: str) -> None:
         handle.write(content)
         temp_name = handle.name
     os.replace(temp_name, path)
+
+
+def append_text_durable(path: Path, content: str) -> None:
+    """单次追加并 fsync；调用方负责让 content 只包含完整 JSONL 记录。"""
+
+    if not content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        data = content.encode("utf-8")
+        written = 0
+        while written < len(data):
+            written += os.write(descriptor, data[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def compare_and_swap_json_atomic(
+    path: Path,
+    expected_revision: int,
+    payload: dict[str, Any],
+) -> bool:
+    """跨进程锁内完成 read-check-replace，避免两个 worker 后写覆盖先写。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            current_revision = 0
+            if path.is_file():
+                try:
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    return False
+                if not isinstance(current, dict):
+                    return False
+                raw_revision = current.get("revision", 0)
+                current_revision = raw_revision if isinstance(raw_revision, int) else -1
+            if current_revision != expected_revision:
+                return False
+            write_text_atomic(
+                path,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            return True
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:

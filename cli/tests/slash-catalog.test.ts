@@ -6,6 +6,7 @@ import {
   slashCommandAnnotation,
   slashCommandAvailability,
   slashQuery,
+  slashStatusPanel,
 } from "../src/terminal-page/slash-catalog.js";
 import { resolveCliConfig } from "../src/config/index.js";
 import { emptyViewModel } from "../src/application/view-model.js";
@@ -62,7 +63,18 @@ test("只读查询在运行中和断线时依然可用", () => {
 
 test("注解优先展示不可用原因，其次是当前值", () => {
   assert.equal(slashCommandAnnotation(command("stop"), model()), "没有运行中的任务");
-  assert.match(slashCommandAnnotation(command("model"), model()), /查看当前模型 · model-1/);
+  assert.match(slashCommandAnnotation(command("model"), model()), /切换本次会话模型.*model-1/);
+  assert.match(command("mcp").hint, /管理 MCP/);
+  assert.match(command("skill").hint, /Skill/);
+  assert.match(command("permissions").hint, /切换权限/);
+});
+
+test("运行时管理命令不再走只读状态面板", () => {
+  assert.equal(slashStatusPanel("mcp", model()), undefined);
+  assert.equal(slashStatusPanel("model", model()), undefined);
+  assert.equal(slashStatusPanel("agent", model()), undefined);
+  assert.equal(slashStatusPanel("skill", model()), undefined);
+  assert.equal(slashStatusPanel("permissions", model()), undefined);
 });
 
 function command(name: string) {

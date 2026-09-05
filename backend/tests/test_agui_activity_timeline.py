@@ -141,7 +141,10 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             [message.id for message in session.messages],
             ["user-1", "assistant-1", "user-2"],
         )
-        self.assertEqual([event["type"] for event in session.events], ["RUN_STARTED"])
+        self.assertEqual(
+            [event["type"] for event in session.events],
+            ["input_message", "RUN_STARTED", "input_message"],
+        )
 
     async def test_cancel_run_removes_only_aborted_user_turn_and_events(self) -> None:
         store = SessionStore()
@@ -208,7 +211,7 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [(event["type"], event.get("runId")) for event in cancelled.events],
-            [("RUN_FINISHED", "run-1")],
+            [("input_message", "run-1"), ("RUN_FINISHED", "run-1")],
         )
         await store.append_event(
             "thread-cancel",
@@ -222,7 +225,7 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [(event["type"], event.get("runId")) for event in after_late_event.events],
-            [("RUN_FINISHED", "run-1")],
+            [("input_message", "run-1"), ("RUN_FINISHED", "run-1")],
         )
 
     async def test_stop_run_persists_user_partial_output_and_rejects_late_events(self) -> None:
@@ -273,6 +276,14 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
                 "runId": "run-stop",
                 "result": {"status": "stopped", "stopped": True},
             })
+            self.assertEqual(
+                [
+                    event.get("delta")
+                    for event in stopped.events
+                    if event.get("type") == "TEXT_MESSAGE_CONTENT"
+                ],
+                ["partial answer"],
+            )
 
             # Backend cancellation can race with already queued deltas. They must
             # not alter the durable snapshot after the manual-stop boundary.
@@ -385,13 +396,10 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
                 source.id,
                 {"type": "RUN_STARTED", "threadId": source.id, "runId": "run-source"},
             )
-            await store.append_event(
+            await store.apply_private_control(
                 source.id,
-                {
-                    "type": "CUSTOM",
-                    "name": "cli_session",
-                    "value": {"kind": "codex", "sessionId": "provider-source"},
-                },
+                "cli_session",
+                {"kind": "codex", "sessionId": "provider-source"},
             )
             await store.append_event(
                 source.id,

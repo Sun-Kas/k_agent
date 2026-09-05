@@ -520,6 +520,7 @@ class McpConfigAndSkillTests(unittest.TestCase):
         skills = [
             {
                 "name": "Search",
+                "description": "Find files",
                 "instructions": "Run scripts/search.py.",
                 "filePath": "/skills/search/SKILL.md",
                 "baseDir": "/skills/search",
@@ -530,12 +531,14 @@ class McpConfigAndSkillTests(unittest.TestCase):
         self.assertIn("SKILL.md absolute path: /skills/search/SKILL.md", result)
         self.assertIn("Skill package root: /skills/search", result)
         self.assertIn("against the Skill package root above", result)
-        self.assertIn("Run scripts/search.py.", result)
+        self.assertIn("Find files", result)
+        self.assertNotIn("Run scripts/search.py.", result)
 
     def test_codex_skill_preamble_includes_package_paths(self) -> None:
         skills = [
             {
                 "name": "Review",
+                "description": "Review diffs",
                 "instructions": "Read references/checklist.md.",
                 "filePath": "/skills/review/SKILL.md",
                 "baseDir": "/skills/review",
@@ -546,12 +549,12 @@ class McpConfigAndSkillTests(unittest.TestCase):
         self.assertIn("SKILL.md absolute path: /skills/review/SKILL.md", result)
         self.assertIn("Skill package root: /skills/review", result)
         self.assertIn("against the Skill package root above", result)
-        self.assertIn("Read references/checklist.md.", result)
+        self.assertIn("Review diffs", result)
+        self.assertNotIn("Read references/checklist.md.", result)
 
-    def test_provider_skill_preambles_skip_empty_instructions(self) -> None:
-        skills = [{"name": "empty", "instructions": ""}]
+    def test_provider_skill_preambles_skip_unnamed_skills(self) -> None:
         self.assertEqual(build_claude_skill_preamble([]), "")
-        self.assertEqual(build_codex_skill_preamble(skills), "")
+        self.assertEqual(build_codex_skill_preamble([{"instructions": "secret body"}]), "")
 
     def test_write_codex_mcp_config_stdio(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -624,13 +627,17 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 storage = FileStorage(settings.storage_base_dir)
                 store = SessionStore(storage)
                 session = await store.create_session(session_id="abc-123", title="t")
-                path = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "abc-123.json"
+                path = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "session.json"
+                history = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "history.jsonl"
                 workspace = Path(settings.storage_base_dir) / "sessions" / "abc-123" / "workspace"
                 self.assertTrue(path.is_file())
+                self.assertTrue(history.is_file())
                 self.assertTrue(workspace.is_dir())
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(payload["id"], session.id)
                 self.assertIn("cliSessions", payload)
+                self.assertNotIn("messages", payload)
+                self.assertNotIn("events", payload)
 
     async def test_migrates_flat_session_file(self) -> None:
         from access_layer.storage import FileStorage
@@ -670,7 +677,9 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 assert session is not None
                 self.assertEqual(session.title, "old")
                 self.assertFalse(flat.exists())
-                self.assertTrue((root / "legacy" / "legacy.json").is_file())
+                self.assertTrue((root / "legacy" / "session.json").is_file())
+                self.assertTrue((root / "legacy" / "history.jsonl").is_file())
+                self.assertTrue((root / "legacy" / "legacy.json.bak").is_file())
                 self.assertTrue((root / "legacy" / "workspace").is_dir())
 
 

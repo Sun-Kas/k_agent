@@ -37,12 +37,21 @@ from backend.agent.hooks import (
 )
 from backend.agent.contracts import AgentRunRequest
 from backend.context import (
+    CompactError,
     build_context_plan,
+    calculate_context_budget,
     compose_api_messages as compose_messages,
+    estimate_message_tokens,
     estimate_text_tokens,
-    prune_old_tool_outputs,
+    generate_compaction,
+    is_context_length_error,
+    limit_tool_result,
+    microcompact,
+    policy_for_tool,
+    sanitize_provider_messages,
 )
 from backend.config.config import Settings
+from backend.logging_config import log_event
 from backend.mcp_tool import McpClientManager, McpToolDescriptor
 from backend.permissions import PermissionDecision, check_permission, check_permissions
 from backend.approvals import canonical_json_sha256
@@ -58,6 +67,18 @@ from backend.user_questions import (
 
 _READ_ONLY_LOCAL_TOOLS = frozenset({"Read", "Glob", "Grep", "LS"})
 _ESCALATABLE_LOCAL_TOOLS = frozenset({"Bash", "Write", "Edit", "NotebookEdit"})
+
+
+def _merge_tool_replacements(
+    existing: object, pending: Any
+) -> list[dict[str, Any]]:
+    """按消息 ID 合并 replacement，避免 full compact 丢掉已提交旧 patch。"""
+
+    merged: dict[str, dict[str, Any]] = {}
+    for item in [*(existing if isinstance(existing, list) else []), *list(pending)]:
+        if isinstance(item, dict) and isinstance(item.get("messageId"), str):
+            merged[item["messageId"]] = dict(item)
+    return list(merged.values())
 
 
 class OpenAIAgent:
@@ -109,6 +130,7 @@ class OpenAIAgent:
                 [message for message in request.messages if message.carries_context()],
                 prompt=request.prompt,
                 model_config=request.model_config,
+                context_summary=request.context_summary,
                 tool_definition_tokens=tool_definition_tokens,
             )
             # compose 后的 messages 含 system 和 provider 协议消息，是唯一驱动
@@ -118,6 +140,7 @@ class OpenAIAgent:
                 prompt=request.prompt,
                 context_summary=context_plan.summary,
                 attachments=request.attachments,
+                working_set_context=request.working_set_context,
             )
             selected_model = request.model_config.get(
                 "model", runtime_config.openai_model
@@ -154,6 +177,15 @@ class OpenAIAgent:
             "context_plan": context_plan,
             "messages": messages,
             "selected_model": selected_model,
+            "tool_definition_tokens": tool_definition_tokens,
+            "tool_policies": {
+                tool.name: policy_for_tool(
+                    tool.name,
+                    tool.context_policy,
+                    source="local",
+                )
+                for tool in runtime_tools
+            },
             "client": client,
             "loaded_memory_paths": set(
                 [
@@ -224,6 +256,14 @@ class OpenAIAgent:
         # 含 system 的 provider 协议列表，也是 ReAct 循环唯一的消息状态。
         messages: list[dict[str, Any]] = runtime["messages"]
         loaded_memory_paths: set[str] = runtime["loaded_memory_paths"]
+        context_state = dict(request.context_state or {})
+        tool_definition_tokens = int(runtime.get("tool_definition_tokens", 0))
+        tool_policies = dict(runtime.get("tool_policies") or {})
+        pending_replacements: dict[str, dict[str, Any]] = {}
+        reactive_attempted = False
+        auto_compact_attempted = False
+        latest_input_usage: int | None = None
+        usage_baseline_estimate: int | None = None
         resume_checkpoint = runtime.get("resume_checkpoint")
         if isinstance(resume_checkpoint, dict):
             restored_paths = resume_checkpoint.get("loadedMemoryPaths", [])
@@ -244,12 +284,10 @@ class OpenAIAgent:
                     input_message_count=len(request.messages),
                     active_message_count=len(context_plan.messages),
                     provider_message_count=len(messages),
-                    compacted_message_count=len(
-                        context_plan.compacted_message_ids
-                    ),
+                    compacted_message_count=0,
                     summary_chars=len(context_plan.summary),
                     attachment_count=len(request.attachments),
-                    auto_compacted=context_plan.auto_compacted,
+                    auto_compacted=False,
                     budget=context_plan.budget.as_dict(),
                     breakdown=dict(context_plan.breakdown),
                 ),
@@ -265,15 +303,12 @@ class OpenAIAgent:
                     "loadedMemoryPaths": sorted(loaded_memory_paths),
                 },
             }
-            yield self._run_trace(trace[-1])
             if loaded_memory_paths:
                 trace.append(
                     f"memory:eager_loaded:{len(loaded_memory_paths)} files"
                 )
-                yield self._run_trace(trace[-1])
             if mcp_tools:
                 trace.append(f"tools:mcp_catalog:{len(mcp_tools)} tools")
-                yield self._run_trace(trace[-1])
             preparation = self._thinking_step(
                 thinking,
                 phase="analysis",
@@ -283,7 +318,6 @@ class OpenAIAgent:
                 iteration=0,
             )
             yield {"type": "thinking", "payload": preparation}
-            yield self._run_status(config.status_model_started)
 
             # -----------------------------------------------------------------
             # 可选：从 HITL 中断点续跑 Act（不重放 Reason）
@@ -293,6 +327,32 @@ class OpenAIAgent:
             # Observation 写回 messages，然后从 iteration+1 再 Reason。
             # -----------------------------------------------------------------
             start_iteration = 0
+            continuation_checkpoint = runtime.get("continuation_checkpoint")
+            if isinstance(continuation_checkpoint, dict):
+                if continuation_checkpoint.get("kind") != "context_continuation":
+                    raise RuntimeError("K Agent continuation checkpoint is invalid")
+                if continuation_checkpoint.get("contextGeneration") != context_state.get("generation"):
+                    raise RuntimeError("K Agent continuation generation is stale")
+                checkpoint_messages = continuation_checkpoint.get("modelMessages")
+                if not isinstance(checkpoint_messages, list):
+                    raise RuntimeError("K Agent continuation messages are missing")
+                # system/request context 使用本次重新编译的最新内容；只用 checkpoint
+                # 恢复 boundary 后同一执行段的会话消息，绝不复用旧 system prompt。
+                prefix = [
+                    dict(message) for message in messages
+                    if message.get("role") == "system"
+                    or message.get("_request_context") is True
+                ]
+                messages = [*prefix, *[dict(message) for message in checkpoint_messages]]
+                start_iteration = int(continuation_checkpoint.get("iteration", 0))
+                loaded_memory_paths.update(
+                    str(item)
+                    for item in continuation_checkpoint.get("loadedMemoryPaths", [])
+                    if isinstance(item, str)
+                )
+                reactive_attempted = bool(
+                    continuation_checkpoint.get("reactiveAttempted", False)
+                )
             if isinstance(resume_checkpoint, dict):
                 if resume_checkpoint.get("kind") != "react_tool_boundary":
                     raise RuntimeError("K Agent checkpoint is not a ReAct tool boundary")
@@ -428,14 +488,23 @@ class OpenAIAgent:
                         if tool_executed
                         else tool_result
                     )
+                    observation, replacement = limit_tool_result(
+                        observation,
+                        tool_name=tool_name,
+                        message_id=tool_message_id,
+                        tool_call_id=call_id,
+                        policy=tool_policies.get(tool_name, policy_for_tool(tool_name)),
+                    )
+                    if replacement is not None:
+                        pending_replacements[tool_message_id] = replacement
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
                         "content": observation,
+                        "_message_id": tool_message_id,
                     })
                 # 本轮 Reason 已在旧 run 完成；从下一 iteration 重新 Reason。
                 start_iteration = checkpoint_iteration + 1
-                yield self._run_status(config.status_model_started)
 
             # -----------------------------------------------------------------
             # ReAct 主循环
@@ -451,26 +520,162 @@ class OpenAIAgent:
                 # 工具结果是上下文增长最快的来源。必须在 Reason 之前裁剪：若等
                 # 超预算再处理，本轮请求已经发不出去。这里只压缩旧 Observation
                 # 正文，不删除 tool 消息本身，以免破坏 tool_call_id 配对。
-                before_tool_chars = self._tool_output_chars(messages)
-                before_tool_outputs = self._tool_output_contents(messages)
-                messages = prune_old_tool_outputs(messages)
-                after_tool_chars = self._tool_output_chars(messages)
-                after_tool_outputs = self._tool_output_contents(messages)
-                pruned_output_count = sum(
-                    before != after
-                    for before, after in zip(
-                        before_tool_outputs,
-                        after_tool_outputs,
+                micro = microcompact(messages, policies=tool_policies)
+                messages = micro.messages
+                for replacement in micro.replacements:
+                    pending_replacements[str(replacement["messageId"])] = replacement
+                if micro.replacements:
+                    log_event(
+                        "context_microcompacted", threadId=context.thread_id,
+                        runId=context.run_id, generation=context_state.get("generation", 0),
+                        iteration=iteration, replacementCount=len(micro.replacements),
+                        beforeChars=micro.before_chars, afterChars=micro.after_chars,
                     )
-                )
-                if pruned_output_count:
                     await pipeline.emit_context_pruned(
                         ContextPrunePayload(
                             iteration=iteration,
-                            pruned_output_count=pruned_output_count,
-                            before_chars=before_tool_chars,
-                            after_chars=after_tool_chars,
+                            pruned_output_count=len(micro.replacements),
+                            before_chars=micro.before_chars,
+                            after_chars=micro.after_chars,
                         ),
+                    )
+
+                # 每次 Reason 都重新计量，包含本轮刚产生的工具结果。旧实现只在
+                # create_runtime 检查一次，无法阻止一个长工具链在同 turn 撑爆窗口。
+                decision = calculate_context_budget(
+                    model_config=request.model_config,
+                    messages=messages,
+                    tool_definition_tokens=tool_definition_tokens,
+                    latest_input_usage=latest_input_usage,
+                    usage_baseline_estimate=usage_baseline_estimate,
+                )
+                log_event(
+                    "context_budget_checked",
+                    threadId=context.thread_id,
+                    runId=context.run_id,
+                    iteration=iteration,
+                    generation=context_state.get("generation", 0),
+                    estimatedInput=decision.budget.estimated_input,
+                    warning=decision.warning,
+                    needsCompact=decision.needs_compact,
+                    hardLimit=decision.hard_limit,
+                )
+                yield {
+                    "type": "context_budget",
+                    "payload": {
+                        **decision.budget.as_dict(),
+                        "warning": decision.warning,
+                        "iteration": iteration,
+                    },
+                }
+                if decision.warning:
+                    yield {
+                        "type": "context_warning",
+                        "payload": {
+                            "estimatedInput": decision.budget.estimated_input,
+                            "warningThreshold": decision.budget.warning_threshold,
+                            "autoCompactThreshold": decision.budget.auto_compact_threshold,
+                        },
+                    }
+                failure_state = context_state.get("failureState")
+                auto_disabled = bool(
+                    failure_state.get("autoDisabled")
+                    if isinstance(failure_state, dict)
+                    else False
+                )
+                auto_enabled = request.model_config.get("autoCompactEnabled", True) is not False
+                if (
+                    decision.needs_compact
+                    and auto_enabled
+                    and not auto_disabled
+                    and not auto_compact_attempted
+                ):
+                    auto_compact_attempted = True
+                    compact_model = dict(runtime.get("compact_model") or request.model_config)
+                    compact_client = AsyncOpenAI(
+                        api_key=compact_model.get("apiKey") or config.openai_api_key,
+                        base_url=compact_model.get("baseUrl") or config.openai_base_url,
+                    )
+                    log_event(
+                        "context_compact_started", threadId=context.thread_id,
+                        runId=context.run_id, generation=context_state.get("generation", 0),
+                        model=compact_model.get("id") or compact_model.get("model"), trigger="auto",
+                    )
+                    try:
+                        compact_result = await generate_compaction(
+                            client=compact_client,
+                            model_config=compact_model,
+                            target_model_config=request.model_config,
+                            messages=messages,
+                            context_state=context_state,
+                            source_run_id=context.run_id,
+                            trigger="auto",
+                            continuation=True,
+                            iteration=iteration,
+                            loaded_memory_paths=sorted(loaded_memory_paths),
+                            approved_targets=sorted(runtime.get("approved_targets") or []),
+                            working_set=runtime.get("working_set"),
+                        )
+                    except CompactError as exc:
+                        log_event(
+                            "context_compact_failed", threadId=context.thread_id,
+                            runId=context.run_id, generation=context_state.get("generation", 0),
+                            trigger="auto", errorCode=exc.code,
+                        )
+                        yield {
+                            "type": "context_compact_failed",
+                            "payload": {
+                                "code": exc.code,
+                                "automatic": True,
+                                "hardLimit": decision.hard_limit,
+                            },
+                        }
+                        if decision.hard_limit:
+                            raise RuntimeError(
+                                "Context compaction failed at the hard request limit; "
+                                "the full conversation history is still preserved. "
+                                "Retry /compact or reduce the current attachment."
+                            ) from exc
+                    else:
+                        log_event(
+                            "context_compact_succeeded", threadId=context.thread_id,
+                            runId=context.run_id, generation=context_state.get("generation", 0),
+                            **dict(compact_result.proposal.get("stats") or {}),
+                        )
+                        proposal = dict(compact_result.proposal)
+                        proposal["toolReplacements"] = _merge_tool_replacements(
+                            context_state.get("toolReplacements"),
+                            pending_replacements.values(),
+                        )
+                        checkpoint = dict(compact_result.continuation_checkpoint or {})
+                        checkpoint["compactCount"] = int(
+                            (continuation_checkpoint or {}).get("compactCount", 0)
+                        ) + 1
+                        if checkpoint["compactCount"] > 2:
+                            raise RuntimeError(
+                                "A public run cannot perform more than two full compactions"
+                            )
+                        yield {
+                            "type": "context_compaction_required",
+                            "payload": {
+                                "proposal": proposal,
+                                "continuationCheckpoint": checkpoint,
+                            },
+                        }
+                        return
+                elif decision.hard_limit:
+                    if not reactive_attempted and not isinstance(
+                        continuation_checkpoint, dict
+                    ):
+                        # 统一交给外层精确的 context-length 分支做一次 reactive
+                        # compact；continuation 的首轮仍超 hard 时禁止再循环逃生。
+                        raise RuntimeError(
+                            "context length hard request threshold reached"
+                        )
+                    reason = "automatic compaction is disabled" if auto_disabled else "automatic compaction is not enabled"
+                    raise RuntimeError(
+                        f"Context reached the hard request limit and {reason}; "
+                        "the full history is preserved. Run /compact manually."
                     )
 
                 # ----- Reason -----
@@ -481,6 +686,10 @@ class OpenAIAgent:
                     tools=tuple(tool_specs),
                     reasoning_effort=request.reasoning_effort,
                 )
+                usage_baseline_estimate = (
+                    estimate_message_tokens(list(model_request.messages))
+                    + tool_definition_tokens
+                )
                 # provider reasoning 直接映射为 start/delta/end，不再造
                 # thinking 快照、写死标题或在 Agent 内累加展示文本。
                 # 一次 model call 只有一条 reasoning message，内外层事件共用同一 ID。
@@ -489,8 +698,6 @@ class OpenAIAgent:
                 message_id = str(uuid.uuid4())
                 # 还没出过可见文字。只思考/只调工具时不要发空的 message_start。
                 message_started = False
-                # 「正在思考...」只发一次，避免每个 reasoning delta 刷一条 status。
-                reasoning_status_sent = False
                 # 等管道最后一帧 ModelCallCompleted；没有这一帧就当模型管线失败。
                 model_result: ModelResultPayload | None = None
 
@@ -526,9 +733,6 @@ class OpenAIAgent:
                                 "type": "reasoning_start",
                                 "payload": {"reasoningId": reasoning_id},
                             }
-                        if not reasoning_status_sent:
-                            reasoning_status_sent = True
-                            yield self._run_status("正在思考...")
                         yield {
                             "type": "reasoning_delta",
                             "payload": {
@@ -563,6 +767,7 @@ class OpenAIAgent:
                 if model_result is None:
                     raise RuntimeError("Model pipeline finished without a result")
                 tool_calls = [dict(item) for item in model_result.tool_calls]
+                latest_input_usage = model_result.input_tokens
 
                 # 没有正文时，Completed 才是 reasoning 的终止边界。
                 if reasoning_id is not None:
@@ -579,8 +784,16 @@ class OpenAIAgent:
                     result = self._final_state(model_result.output_text, trace, thinking)
                     agent_scope.complete(result)
                     await agent_scope.__aexit__(None, None, None)
-                    yield self._run_trace(trace[-1])
-                    yield {"type": "final", "payload": result}
+                    if pending_replacements:
+                        yield {
+                            "type": "context_patch",
+                            "payload": {
+                                "proposalId": str(uuid.uuid4()),
+                                "expectedRevision": int(context_state.get("revision", 0)),
+                                "toolReplacements": list(pending_replacements.values()),
+                            },
+                        }
+                    yield {"type": "final", "payload": {"output": result["output"]}}
                     return
 
                 # ----- Act：按顺序执行本轮全部 tool_calls（不并行）-----
@@ -591,6 +804,7 @@ class OpenAIAgent:
                 assistant_message: dict[str, Any] = {
                     "role": "assistant",
                     "content": model_result.output_text or None,
+                    "_message_id": message_id,
                     "tool_calls": [
                         {
                             "id": tc["id"],
@@ -626,7 +840,6 @@ class OpenAIAgent:
                             "arguments": tc["arguments"] or "{}",
                         },
                     }
-                    yield self._run_status(f"调用工具 {tool_name}")
                     if argument_error is not None:
                         await pipeline.emit_failure(
                             argument_error,
@@ -682,12 +895,11 @@ class OpenAIAgent:
                             "content": tool_result,
                         },
                     }
-                    yield self._run_trace(trace[-1], output=tool_result)
                     notice = self._sandbox_user_notice(
                         context, tool_name, tool_result, config
                     )
                     if notice is not None:
-                        yield self._run_status(notice)
+                        logger.info("Sandbox notice: %s", notice)
                     observation = (
                         await self._observation_with_lazy_memory(
                             runtime,
@@ -697,13 +909,29 @@ class OpenAIAgent:
                         if tool_executed
                         else tool_result
                     )
+                    observation, replacement = limit_tool_result(
+                        observation,
+                        tool_name=tool_name,
+                        message_id=tool_message_id,
+                        tool_call_id=tc["id"],
+                        policy=tool_policies.get(tool_name, policy_for_tool(tool_name)),
+                    )
+                    if replacement is not None:
+                        pending_replacements[tool_message_id] = replacement
+                        log_event(
+                            "context_tool_result_limited", threadId=context.thread_id,
+                            runId=context.run_id, generation=context_state.get("generation", 0),
+                            iteration=iteration, tool=tool_name,
+                            originalChars=replacement.get("originalChars"),
+                            retainedChars=len(observation),
+                        )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": observation,
+                        "_message_id": tool_message_id,
                     })
                 # 本轮 Act 全部 Observe 完毕；status 切回「正在调用模型」，进入下一 Reason。
-                yield self._run_status(config.status_model_started)
 
             # ----- Finish：迭代上限（兜底，不是模型主动结束）-----
             # 最后一轮 Reason 仍请求了工具，但不再 Act，以免无限转。上限文案
@@ -725,21 +953,99 @@ class OpenAIAgent:
             result = self._final_state(limit_message, trace, thinking)
             agent_scope.complete(result)
             await agent_scope.__aexit__(None, None, None)
-            yield self._run_trace(trace[-1])
-            yield {"type": "final", "payload": result}
+            if pending_replacements:
+                yield {
+                    "type": "context_patch",
+                    "payload": {
+                        "proposalId": str(uuid.uuid4()),
+                        "expectedRevision": int(context_state.get("revision", 0)),
+                        "toolReplacements": list(pending_replacements.values()),
+                    },
+                }
+            yield {"type": "final", "payload": {"output": result["output"]}}
         except (asyncio.CancelledError, GeneratorExit) as exc:
             # 取消必须关掉模型/Agent 观测，但绝不能变成模型可见的 tool 错误，
             # 也不能伪装成 AG-UI 成功 Finish。
             await agent_scope.__aexit__(type(exc), exc, exc.__traceback__)
             raise
         except Exception as exc:
+            if is_context_length_error(exc) and not reactive_attempted:
+                compact_model = dict(runtime.get("compact_model") or request.model_config)
+                compact_client = AsyncOpenAI(
+                    api_key=compact_model.get("apiKey") or config.openai_api_key,
+                    base_url=compact_model.get("baseUrl") or config.openai_base_url,
+                )
+                log_event(
+                    "context_compact_started", threadId=context.thread_id,
+                    runId=context.run_id, generation=context_state.get("generation", 0),
+                    model=compact_model.get("id") or compact_model.get("model"), trigger="reactive",
+                )
+                try:
+                    compact_result = await generate_compaction(
+                        client=compact_client,
+                        model_config=compact_model,
+                        target_model_config=request.model_config,
+                        messages=messages,
+                        context_state=context_state,
+                        source_run_id=context.run_id,
+                        trigger="reactive",
+                        continuation=True,
+                        iteration=locals().get("iteration", 0),
+                        loaded_memory_paths=sorted(loaded_memory_paths),
+                        approved_targets=sorted(runtime.get("approved_targets") or []),
+                        working_set=runtime.get("working_set"),
+                    )
+                except CompactError as compact_exc:
+                    log_event(
+                        "context_compact_failed", threadId=context.thread_id,
+                        runId=context.run_id, generation=context_state.get("generation", 0),
+                        trigger="reactive", errorCode=compact_exc.code,
+                    )
+                    yield {
+                        "type": "context_compact_failed",
+                        "payload": {
+                            "code": compact_exc.code,
+                            "automatic": True,
+                            "hardLimit": True,
+                        },
+                    }
+                    await agent_scope.__aexit__(type(compact_exc), compact_exc, compact_exc.__traceback__)
+                    raise RuntimeError(
+                        "Reactive context compaction failed; full conversation history is preserved."
+                    ) from compact_exc
+                proposal = dict(compact_result.proposal)
+                log_event(
+                    "context_compact_succeeded", threadId=context.thread_id,
+                    runId=context.run_id, generation=context_state.get("generation", 0),
+                    **dict(proposal.get("stats") or {}),
+                )
+                proposal["toolReplacements"] = _merge_tool_replacements(
+                    context_state.get("toolReplacements"),
+                    pending_replacements.values(),
+                )
+                checkpoint = dict(compact_result.continuation_checkpoint or {})
+                checkpoint["reactiveAttempted"] = True
+                checkpoint["compactCount"] = int(
+                    (continuation_checkpoint or {}).get("compactCount", 0)
+                ) + 1
+                if checkpoint["compactCount"] > 2:
+                    raise RuntimeError(
+                        "A public run cannot perform more than two full compactions"
+                    )
+                await agent_scope.__aexit__(None, None, None)
+                yield {
+                    "type": "context_compaction_required",
+                    "payload": {
+                        "proposal": proposal,
+                        "continuationCheckpoint": checkpoint,
+                    },
+                }
+                return
             # Agent 级异常（模型不可达、上下文构建失败等）不像工具失败那样可恢复。
             # 记入观测后继续上抛，由 agui 转成 RUN_ERROR。
             await agent_scope.__aexit__(type(exc), exc, exc.__traceback__)
             # 循环前失败时 trace 可能仍为空，不能盲取 trace[-1] 盖掉真正错误。
-            yield self._run_trace(
-                trace[-1] if trace else f"agent:failed:{type(exc).__name__}"
-            )
+            logger.exception("Agent run failed at %s", trace[-1] if trace else type(exc).__name__)
             raise
 
     async def _tool_excute_serially(
@@ -832,8 +1138,11 @@ class OpenAIAgent:
 
         kwargs: dict[str, Any] = {
             "model": request.model,
-            "messages": [dict(message) for message in request.messages],
+            "messages": sanitize_provider_messages(
+                [dict(message) for message in request.messages]
+            ),
             "stream": True,
+            "stream_options": {"include_usage": True},
             "max_tokens": max_output_tokens,
             "timeout": config.model_request_timeout_seconds,
         }
@@ -844,13 +1153,26 @@ class OpenAIAgent:
             kwargs["reasoning_effort"] = request.reasoning_effort
 
         started_at = time.perf_counter()
-        stream = await client.chat.completions.create(**kwargs)
+        try:
+            stream = await client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            # 部分 OpenAI-compatible Provider 尚未实现 stream_options。usage 是
+            # 优选计量信号而非可用性硬依赖，只对明确的不支持错误退回估算器。
+            if "stream_options" not in str(exc).lower() and "include_usage" not in str(exc).lower():
+                raise
+            kwargs.pop("stream_options", None)
+            stream = await client.chat.completions.create(**kwargs)
         content_buffer = ""
         tool_call_buffers: dict[int, dict[str, Any]] = {}
         response_id = ""
+        input_tokens: int | None = None
         async for chunk in self._iter_stream_with_idle_timeout(stream, config):
             if chunk.id:
                 response_id = chunk.id
+            usage = getattr(chunk, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+            if isinstance(prompt_tokens, int):
+                input_tokens = prompt_tokens
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta is None:
                 continue
@@ -890,6 +1212,7 @@ class OpenAIAgent:
                 elapsed_ms=(time.perf_counter() - started_at) * 1000,
                 tool_calls=tool_calls,
                 operation_id=request.operation_id,
+                input_tokens=input_tokens,
             )
         )
 
@@ -1524,30 +1847,6 @@ class OpenAIAgent:
         # 工具名自身可能含 `__`，所以只切前两段，剩下的原样拼回去。
         _, server_id, *name_parts = tool_name.split("__")
         return server_id, "__".join(name_parts)
-
-    @staticmethod
-    def _run_status(message: str) -> dict[str, Any]:
-        """顶栏胶囊 / 轨迹摘要的瞬时文案，不是会话 transcript。
-
-        agui 把它打成 CUSTOM ``status``；前端 ``setStatus``，不进消息流、
-        也不落工具卡片。和 ``tool_start`` / ``message_*`` 形状相近，所以
-        单独成函数，避免在 ReAct 循环里看起来像对话事件。
-        """
-
-        return {"type": "status", "payload": {"message": message}}
-
-    @staticmethod
-    def _run_trace(entry: str, *, output: str | None = None) -> dict[str, Any]:
-        """右侧「执行轨迹」的一行，不是会话 transcript。
-
-        agui 打成 CUSTOM ``trace``；前端只读 ``entry`` 追加到列表。
-        ``output`` 仅工具完成时附带，当前 UI 不用。
-        """
-
-        payload: dict[str, Any] = {"entry": entry}
-        if output is not None:
-            payload["output"] = output
-        return {"type": "trace", "payload": payload}
 
     def _final_state(
         self,

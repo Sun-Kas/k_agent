@@ -8,7 +8,7 @@ import { TERMINAL_DESIGN } from "../design.js";
 export function ActivityInspector({ item }: { item?: TimelineItem | undefined }): React.ReactElement {
   return (
     <Box flexDirection="column" width={TERMINAL_DESIGN.layout.inspectorColumns} paddingX={1}>
-      <Text bold>INSPECTOR</Text>
+      <Text color={TERMINAL_DESIGN.colors.muted}>inspect</Text>
       {!item ? <Text color={TERMINAL_DESIGN.colors.muted}>暂无运行活动</Text> : <InspectorItem item={item} />}
     </Box>
   );

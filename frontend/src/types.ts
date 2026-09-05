@@ -53,21 +53,14 @@ export interface SessionWorkspaceFileContent {
   size: number;
 }
 
-/** 打开会话时的服务端快照：messages 供模型上下文；events 供 UI 时间线重放。 */
+/** 打开会话时的服务端快照：UI 只重放完整 history 事件。 */
 export interface SessionState {
   sessionId: string;
-  messages: ChatMessage[];
-  trace: string[];
-  tasks: string[];
-  thinking: ThinkingActivity[];
-  events?: AgUiEvent[];
+  events: AgUiEvent[];
   openInterrupts?: Array<Omit<ApprovalActivity, "sequence"> & {
     requestHash?: string;
     toolCallId?: string;
   }>;
-  contextSummary?: string;
-  compactedMessageIds?: string[];
-  contextStats?: Record<string, unknown>;
   capabilities?: {
     mcpServerIds: string[];
     skillIds: string[];
@@ -110,11 +103,35 @@ export interface ModelProfile {
   contextWindow?: number;
   maxOutputTokens?: number;
   contextSafetyTokens?: number;
+  autoCompactEnabled?: boolean;
+  compactModelId?: string | null;
   enabled: boolean;
   isNew?: boolean;
 }
 
+export interface SessionContextStatus {
+  generation: number;
+  boundaryId?: string | null;
+  lastCompactedAt?: string | null;
+  trigger?: string | null;
+  beforeTokens?: number | null;
+  afterTokens?: number | null;
+  savedTokens?: number | null;
+  warning: boolean;
+  autoDisabled: boolean;
+  consecutiveAutoFailures: number;
+  lastFailureCode?: string | null;
+  pendingContinuation: boolean;
+}
+
 export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+
+export interface MarketplaceOrigin {
+  source: string;
+  sourceId: string;
+  version?: string | null;
+  installedAt?: string | null;
+}
 
 export interface McpServerConfig {
   id: string;
@@ -139,6 +156,7 @@ export interface McpServerConfig {
   resourceCount?: number;
   error?: string | null;
   isNew?: boolean;
+  marketplace?: MarketplaceOrigin | null;
 }
 
 export interface SkillConfig {
@@ -156,6 +174,7 @@ export interface SkillConfig {
   userInvocable?: boolean;
   editable?: boolean;
   isNew?: boolean;
+  marketplace?: MarketplaceOrigin | null;
 }
 
 export interface RuntimeOption {
@@ -173,6 +192,7 @@ export interface McpCapabilities {
 
 /** AG-UI / 扩展 SSE 事件联合类型；App.applyAgUiEvent 按 type 投影到 UI。 */
 export type AgUiEvent =
+  | { type: "input_message"; runId?: string; message: ChatMessage }
   | { type: "RUN_STARTED"; threadId: string; runId: string }
   | {
       type: "RUN_FINISHED";
@@ -192,11 +212,6 @@ export type AgUiEvent =
   | { type: "REASONING_MESSAGE_CONTENT"; messageId: string; delta: string; rawEvent?: unknown }
   | { type: "REASONING_MESSAGE_END"; messageId: string; rawEvent?: unknown }
   | { type: "REASONING_END"; messageId: string }
-  | { type: "THINKING_START"; title?: string }
-  | { type: "THINKING_TEXT_MESSAGE_START"; rawEvent?: unknown }
-  | { type: "THINKING_TEXT_MESSAGE_CONTENT"; delta: string; rawEvent?: unknown }
-  | { type: "THINKING_TEXT_MESSAGE_END"; rawEvent?: unknown }
-  | { type: "THINKING_END" }
   | { type: "TOOL_CALL_START"; toolCallId: string; toolCallName: string }
   | { type: "TOOL_CALL_ARGS"; toolCallId: string; delta: string }
   | { type: "TOOL_CALL_END"; toolCallId: string }

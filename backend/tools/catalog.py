@@ -18,7 +18,7 @@ class SkillCatalog:
     @classmethod
     def from_skills(cls, skills: Iterable[dict[str, Any]]) -> "SkillCatalog":
         # Copy dictionaries so later mutation of a decoded HTTP payload cannot
-        # change the tool description or execution allowlist mid-run.
+        # change the discovery reminder or execution allowlist mid-run.
         return cls(tuple(dict(item) for item in skills if _skill_enabled(item)))
 
     @property
@@ -28,28 +28,6 @@ class SkillCatalog:
             for item in self.items
             if item.get("name") or item.get("id")
         )
-
-    def tool_description(self) -> str:
-        """Describe only skills that the same request-scoped closure can load."""
-
-        if not self.items:
-            return (
-                "Load an MCP prompt by name when one is available. "
-                "No local K Agent skills are enabled for this run."
-            )
-        summaries = []
-        for item in self.items:
-            name = str(item.get("name") or item.get("id"))
-            description = str(item.get("description") or "").strip()
-            if not description:
-                description = str(item.get("instructions") or "").strip().splitlines()[0]
-            summaries.append(f"- {name}: {description}".rstrip())
-        return (
-            "Load and execute one of the K Agent skills enabled for this run. "
-            "Pass its exact name in `skill`; use `args` for task-specific input.\n\n"
-            "Available skills:\n" + "\n".join(summaries)
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class ToolCapability:

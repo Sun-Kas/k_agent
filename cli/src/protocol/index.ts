@@ -81,17 +81,11 @@ export interface ApprovalActivity {
 
 export interface SessionState {
   sessionId: string;
-  messages: ChatMessage[];
-  trace: string[];
-  tasks: string[];
-  thinking: Array<Record<string, unknown>>;
-  events?: AgUiEvent[];
+  events: AgUiEvent[];
   openInterrupts?: Array<Omit<ApprovalActivity, "sequence"> & {
     requestHash?: string;
     toolCallId?: string;
   }>;
-  contextSummary?: string;
-  contextStats?: Record<string, unknown>;
   capabilities?: {
     mcpServerIds: string[];
     skillIds: string[];
@@ -127,6 +121,52 @@ export interface RuntimeCatalog {
   sources: { mcp: string; skills: string };
 }
 
+export interface McpServerConfig {
+  id: string;
+  name?: string;
+  description?: string;
+  type?: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  envPassthrough?: string[];
+  cwd?: string;
+  url?: string;
+  bearerTokenEnv?: string;
+  headers?: Record<string, string>;
+  envHeaders?: Record<string, string>;
+  enabled: boolean;
+  connected?: boolean;
+  status?: string;
+  scope?: string;
+  transport?: string;
+  toolCount?: number;
+  resourceCount?: number;
+  error?: string | null;
+}
+
+export interface McpConfigPayload {
+  path?: string;
+  source?: string;
+  servers: McpServerConfig[];
+  warnings?: string[];
+}
+
+export interface McpToolInfo {
+  serverId: string;
+  name: string;
+  description: string;
+}
+
+export interface McpCapabilities {
+  tools: Array<{
+    server_id?: string;
+    serverId?: string;
+    name: string;
+    description?: string | null;
+  }>;
+}
+
 export interface DetectedAgent {
   kind: AgentKind;
   name: string;
@@ -157,6 +197,20 @@ export interface ModelProfile {
   enabled: boolean;
 }
 
+export interface SkillConfigItem {
+  id: string;
+  name: string;
+  description?: string;
+  instructions?: string;
+  enabled: boolean;
+}
+
+export interface SkillsConfigPayload {
+  path?: string;
+  skillDir?: string;
+  skills: SkillConfigItem[];
+}
+
 export interface AgUiInterrupt {
   id: string;
   reason: string;
@@ -171,6 +225,7 @@ export interface AgUiInterrupt {
  * 联合类型保持服务端原始生命周期，页面不得根据内容猜测 start/end。
  */
 export type AgUiEvent =
+  | { type: "input_message"; runId?: string; message: ChatMessage }
   | { type: "RUN_STARTED"; threadId: string; runId: string }
   | { type: "RUN_FINISHED"; threadId: string; runId: string; result?: unknown; outcome?: { type: "interrupt"; interrupts: AgUiInterrupt[] } }
   | { type: "RUN_ERROR"; message: string; code?: string }
@@ -184,11 +239,6 @@ export type AgUiEvent =
   | { type: "REASONING_MESSAGE_CONTENT"; messageId: string; delta: string; rawEvent?: unknown }
   | { type: "REASONING_MESSAGE_END"; messageId: string; rawEvent?: unknown }
   | { type: "REASONING_END"; messageId: string }
-  | { type: "THINKING_START"; title?: string }
-  | { type: "THINKING_TEXT_MESSAGE_START"; rawEvent?: unknown }
-  | { type: "THINKING_TEXT_MESSAGE_CONTENT"; delta: string; rawEvent?: unknown }
-  | { type: "THINKING_TEXT_MESSAGE_END"; rawEvent?: unknown }
-  | { type: "THINKING_END" }
   | { type: "TOOL_CALL_START"; toolCallId: string; toolCallName: string }
   | { type: "TOOL_CALL_ARGS"; toolCallId: string; delta: string }
   | { type: "TOOL_CALL_END"; toolCallId: string }

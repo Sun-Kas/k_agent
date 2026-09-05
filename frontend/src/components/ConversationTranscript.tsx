@@ -51,35 +51,36 @@ export function StaticConversationTranscript({
     answers?: UserQuestionAnswers
   ) => Promise<void>;
 }) {
-  const messages = useMemo(() => groupDisplayMessages(session.messages), [session.messages]);
-  const timeline = useMemo(() => timelineFromEvents(session.events ?? []), [session.events]);
-  const userMessages = messages.filter((message) => message.role === "user");
-  const assistantMessages = messages.filter((message) => message.role === "assistant");
-  const fallbackAnswer = assistantMessages.map((message) => message.content).filter(Boolean).join("\n\n");
+  const timeline = useMemo(() => timelineFromEvents(session.events), [session.events]);
   const approvals = useMemo(
-    () => approvalsFromEvents(session.events ?? [], session.openInterrupts ?? []),
+    () => approvalsFromEvents(session.events, session.openInterrupts ?? []),
     [session.events, session.openInterrupts]
   );
-  return <div className="scheduled-transcript">{userMessages.map((message) =>
-    <article className={`message-row ${message.role}`} key={message.id}>
-      <div className="avatar">你</div>
-      <div className="message-body">
-        <div className="bubble"><MarkdownContent content={message.content} /></div>
-      </div>
-    </article>)}
-    {(timeline.length > 0 || fallbackAnswer || approvals.length > 0) && <article className="message-row assistant">
-      <div className="avatar">K</div>
-      <div className="message-body">
-        {timeline.length > 0
-          ? timeline.map((activity) => activity.type === "thinking"
-            ? <StaticThinkingActivity activity={activity} key={activity.id} />
+  const approvalsById = useMemo(
+    () => new Map(approvals.map((approval) => [approval.id, approval])),
+    [approvals]
+  );
+  const timelineApprovalIds = useMemo(
+    () => new Set(timeline.filter((activity) => activity.type === "approval").map((activity) => activity.id)),
+    [timeline]
+  );
+  return <div className="scheduled-transcript">{timeline.map((activity) =>
+    activity.type === "user"
+      ? <article className="message-row user" key={activity.id}><div className="avatar">你</div><div className="message-body"><div className="bubble"><MarkdownContent content={activity.content} /></div></div></article>
+      : <article className="message-row assistant" key={`${activity.type}-${activity.id}`}><div className="avatar">K</div><div className="message-body">{
+          activity.type === "thinking"
+            ? <StaticThinkingActivity activity={activity} />
             : activity.type === "tool"
-              ? <InlineToolActivity tool={activity.tool} key={activity.id} />
-              : <div className="assistant-output" key={activity.id}><MarkdownContent content={activity.content} /></div>)
-          : <div className="assistant-output"><MarkdownContent content={fallbackAnswer} /></div>}
-        {approvals.map((approval) => <StaticApprovalCard approval={approval} key={approval.id} onDecision={onApprovalDecision} />)}
-      </div>
-    </article>}
+              ? <InlineToolActivity tool={activity.tool} />
+              : activity.type === "approval"
+                ? approvalsById.get(activity.id)
+                  ? <StaticApprovalCard approval={approvalsById.get(activity.id)!} onDecision={onApprovalDecision} />
+                  : null
+                : <div className={`assistant-output ${activity.type === "error" ? "error" : ""}`}><MarkdownContent content={activity.content} /></div>
+        }</div></article>)}
+    {approvals.some((approval) => !timelineApprovalIds.has(approval.id)) && <article className="message-row assistant"><div className="avatar">K</div><div className="message-body">
+      {approvals.filter((approval) => !timelineApprovalIds.has(approval.id)).map((approval) => <StaticApprovalCard approval={approval} key={approval.id} onDecision={onApprovalDecision} />)}
+    </div></article>}
   </div>;
 }
 

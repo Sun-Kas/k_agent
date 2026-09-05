@@ -5,8 +5,13 @@ import type {
   AgUiEvent,
   AgUiRunInput,
   HealthState,
+  McpCapabilities,
+  McpConfigPayload,
+  McpServerConfig,
   ModelProfile,
   RuntimeCatalog,
+  SkillConfigItem,
+  SkillsConfigPayload,
   ScheduledTaskSummary,
   ScheduledRunSummary,
   SessionState,
@@ -31,6 +36,22 @@ export class AccessLayerClient {
     return this.json<RuntimeCatalog>("/api/catalog", undefined, 5_000);
   }
 
+  async getMcpConfig(): Promise<McpConfigPayload> {
+    return this.json<McpConfigPayload>("/api/config/mcp", undefined, 10_000);
+  }
+
+  async saveMcpConfig(servers: McpServerConfig[]): Promise<McpConfigPayload> {
+    return this.json<McpConfigPayload>("/api/config/mcp", jsonPut({ servers }), 120_000);
+  }
+
+  async reloadMcp(): Promise<void> {
+    await this.json("/api/mcp/reload", { method: "POST" }, 120_000);
+  }
+
+  async mcpCapabilities(): Promise<McpCapabilities> {
+    return this.json<McpCapabilities>("/api/mcp/capabilities", undefined, 15_000);
+  }
+
   async agents(): Promise<AgentsCatalog> {
     return this.json<AgentsCatalog>("/api/agents", undefined, 5_000);
   }
@@ -38,6 +59,14 @@ export class AccessLayerClient {
   async models(): Promise<ModelProfile[]> {
     const payload = await this.json<{ models: ModelProfile[] }>("/api/config/models", undefined, 5_000);
     return payload.models;
+  }
+
+  async getSkillsConfig(): Promise<SkillsConfigPayload> {
+    return this.json<SkillsConfigPayload>("/api/config/skills", undefined, 10_000);
+  }
+
+  async saveSkillsConfig(skills: SkillConfigItem[]): Promise<SkillsConfigPayload> {
+    return this.json<SkillsConfigPayload>("/api/config/skills", jsonPut({ skills }), 120_000);
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -161,6 +190,14 @@ export class AccessLayerClient {
     if (!response.ok) throw await responseError(response, "Access Layer 请求失败");
     return response;
   }
+}
+
+function jsonPut(body: unknown): RequestInit {
+  return {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
 }
 
 function jsonPost(body: unknown): RequestInit {

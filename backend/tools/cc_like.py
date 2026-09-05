@@ -383,30 +383,35 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
         description="Read a UTF-8 text file from any local path. Read-only access does not require permission escalation.",
         parameters={"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"], "additionalProperties": False},
         execute=cc_read,
+        context_policy={"mode": "rerunnable", "maxResultChars": 30_000},
     ),
     ToolDefinition(
         name="Write",
         description="Write UTF-8 text. Paths outside the workspace require sandbox_permissions=require_escalated so the user can approve them.",
         parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["file_path", "content"], "additionalProperties": False},
         execute=cc_write,
+        context_policy={"mode": "receipt", "maxResultChars": 12_000},
     ),
     ToolDefinition(
         name="Edit",
         description="Replace text in a file. old_string must be unique unless replace_all is true. Outside-workspace paths require sandbox_permissions=require_escalated.",
         parameters={"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean", "default": False}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"]}}, "required": ["file_path", "old_string", "new_string"], "additionalProperties": False},
         execute=cc_edit,
+        context_policy={"mode": "receipt", "maxResultChars": 12_000},
     ),
     ToolDefinition(
         name="Glob",
         description="Find files under any local directory by glob pattern, sorted by recent modification time. Read-only access does not require permission escalation.",
         parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}}, "required": ["pattern"], "additionalProperties": False},
         execute=cc_glob,
+        context_policy={"mode": "rerunnable", "maxResultChars": 30_000},
     ),
     ToolDefinition(
         name="Grep",
         description="Search files under any local directory with a regular expression. Read-only access does not require permission escalation.",
         parameters={"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string", "default": "."}, "include": {"type": "string", "default": "**/*"}}, "required": ["pattern"], "additionalProperties": False},
         execute=cc_grep,
+        context_policy={"mode": "rerunnable", "maxResultChars": 30_000},
     ),
     ToolDefinition(
         name="Bash",
@@ -435,6 +440,8 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
         ),
         parameters={"type": "object", "properties": {"command": {"type": "string"}, "description": {"type": "string", "description": "Explain why the command or requested resource is required."}, "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 300, "description": "Bounded wall-clock timeout for an inherently long command. Increasing it does not grant additional permissions."}, "execution_mode": {"type": "string", "enum": ["auto", "foreground", "interactive"], "default": "auto", "description": "Auto-detect OAuth/device-code login commands; use interactive explicitly for other commands that print a URL and wait for the user."}, "sandbox_permissions": {"type": "string", "enum": ["require_escalated"], "description": "Request HITL only for a structured out-of-sandbox resource or a concrete hostname outside the domain allowlist."}, "escalation_scope": {"type": "string", "enum": ["outside_workspace_write", "host_resource", "network_destination"], "description": "Required with require_escalated: the exact class of access requested."}, "escalation_resource": {"type": "string", "description": "Required with require_escalated: concrete outside path, host resource, or exact network hostname without scheme/path/port."}}, "required": ["command"], "additionalProperties": False},
         execute=cc_bash,
+        # Bash schema 本身不能证明命令只读；在引入可靠命令分类器前保守 retain。
+        context_policy={"mode": "retain", "maxResultChars": 50_000},
     ),
     ToolDefinition(
         name="InstallSandbox",
@@ -461,5 +468,6 @@ CC_LIKE_TOOLS: list[ToolDefinition] = [
         description="Create or update the agent's visible todo list for the current task.",
         parameters={"type": "object", "properties": {"todos": {"type": "array", "items": {"oneOf": [{"type": "object"}, {"type": "string"}]}}}, "required": ["todos"], "additionalProperties": False},
         execute=cc_todo_write,
+        context_policy={"mode": "receipt", "maxResultChars": 12_000},
     ),
 ]

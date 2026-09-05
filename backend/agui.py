@@ -346,13 +346,25 @@ async def translate_agent_events(
                 # stdout delta. Keep this run-scoped extension small and keyed
                 # by toolCallId so clients can update the existing tool card.
                 yield CustomEvent(name="tool_output_delta", value=payload)
-            elif event_type == "status":
-                yield CustomEvent(name="status", value=payload)
-            elif event_type == "trace":
-                yield CustomEvent(name="trace", value=payload)
             elif event_type == "cli_session":
-                # 持久化 provider 原生 session id，便于用户选择 resume。
-                yield CustomEvent(name="cli_session", value=payload)
+                # 仅在 Backend→Access Layer 私有 NDJSON 中存在，网关消费后不转发浏览器。
+                yield CustomEvent(name="__private_cli_session", value=payload)
+            elif event_type == "context_state":
+                yield CustomEvent(
+                    name="__private_context_state",
+                    value={**payload, "sourceRunId": run_id},
+                )
+            elif event_type in {
+                "context_budget",
+                "context_patch",
+                "context_compaction_required",
+                "context_compact_failed",
+            }:
+                for reasoning_event in close_reasoning_events():
+                    yield reasoning_event
+                yield CustomEvent(name=f"__private_{event_type}", value=payload)
+            elif event_type == "context_warning":
+                yield CustomEvent(name="context_warning", value=payload)
             elif event_type == "approval_request":
                 # 审批卡是可更新的 UI activity。使用 AG-UI 标准 activity
                 # 快照后，请求与结果会按 messageId 原位更新，实时流与历史回放

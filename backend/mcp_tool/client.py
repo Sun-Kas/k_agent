@@ -68,6 +68,7 @@ class McpServerStatus:
     status: str
     tool_count: int = 0
     resource_count: int = 0
+    # Handshake usage hint copied from the live session, if the server sent one.
     instructions: str | None = None
     error: str | None = None
 
@@ -89,6 +90,7 @@ class McpSession:
         self._stop: asyncio.Event | None = None
         self._ready: asyncio.Future[None] | None = None
         self.session: ClientSession | None = None
+        # MCP InitializeResult.instructions — optional server-written usage hint.
         self.instructions: str | None = None
         self.server_info: Any = None
         # 桥接对象需与会话同寿命，否则 GC 后 MCP 会回落到进程 stderr。
@@ -117,6 +119,7 @@ class McpSession:
                 async with ClientSession(read, write) as session:
                     self.session = session
                     init = await session.initialize()
+                    # Spec field, not tools/list. Many servers leave this unset.
                     self.instructions = getattr(init, "instructions", None)
                     self.server_info = getattr(init, "serverInfo", None)
                     if self._ready is not None and not self._ready.done():
@@ -479,7 +482,7 @@ class McpClientManager:
         return statuses
 
     def connected_instructions(self) -> dict[str, str]:
-        """收集已连接 MCP server 的动态指令文本。"""
+        """已连接 server 在 initialize 时返回的 `instructions`（有才收录）。"""
         instructions = {}
         for server_id, session in self.sessions.items():
             value = getattr(session, "instructions", None)

@@ -1,7 +1,6 @@
 import type {
   AgUiEvent,
   ApprovalActivity,
-  ChatMessage,
   SessionState,
 } from "../protocol/index.js";
 
@@ -45,8 +44,17 @@ export function appendUserPrompt(state: TimelineState, id: string, content: stri
  * 原始 AG-UI 事件按到达顺序投影，不能按 Thinking、Tool、Text 类型重新分组。
  * 更新只修改原位置的活动；新生命周期才追加新项目，保证实时流和历史回放一致。
  */
-export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineState {
+export function projectEvent(
+  state: TimelineState,
+  event: AgUiEvent,
+  options: { history?: boolean } | number = {},
+): TimelineState {
+  const history = typeof options === "object" && options.history === true;
+  const applyDelta = (previous: string, delta: string) =>
+    history ? delta : previous + delta;
   switch (event.type) {
+    case "input_message":
+      return appendUserPrompt(state, event.message.id, event.message.content, event.runId);
     case "RUN_STARTED":
       return { ...state, runId: event.runId, runStatus: "running" };
     case "REASONING_START": {
@@ -64,30 +72,11 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
       return { ...state, activeThinkingStepId: event.messageId };
     case "REASONING_MESSAGE_CONTENT":
       return updateItem(state, state.activeReasoningId ?? event.messageId, (item) =>
-        item.kind === "thinking" ? { ...item, content: item.content + event.delta } : item,
+        item.kind === "thinking" ? { ...item, content: applyDelta(item.content, event.delta) } : item,
       );
     case "REASONING_MESSAGE_END":
       return { ...state, activeThinkingStepId: undefined };
     case "REASONING_END":
-      return closeThinking(state);
-    case "THINKING_START": {
-      const id = `legacy-thinking-${state.sequence + 1}`;
-      const next = appendItem(state, {
-        kind: "thinking",
-        id,
-        title: event.title || "思考过程",
-        content: "",
-        status: "active",
-        ...(state.runId ? { runId: state.runId } : {}),
-      });
-      return { ...next, activeReasoningId: id };
-    }
-    case "THINKING_TEXT_MESSAGE_CONTENT":
-      return state.activeReasoningId
-        ? updateItem(state, state.activeReasoningId, (item) =>
-          item.kind === "thinking" ? { ...item, content: item.content + event.delta } : item)
-        : state;
-    case "THINKING_END":
       return closeThinking(state);
     case "TOOL_CALL_START": {
       // 工具开始后前一个 Thinking 块不可继续追加；即使旧事件缺少 END 也必须封口。
@@ -103,7 +92,7 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
     }
     case "TOOL_CALL_ARGS":
       return updateItem(state, event.toolCallId, (item) =>
-        item.kind === "tool" ? { ...item, arguments: item.arguments + event.delta, status: "active" } : item,
+        item.kind === "tool" ? { ...item, arguments: applyDelta(item.arguments, event.delta), status: "active" } : item,
       );
     case "TOOL_CALL_END":
       return updateItem(state, event.toolCallId, (item) =>
@@ -139,7 +128,7 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
           ...(state.runId ? { runId: state.runId } : {}),
         });
       const next = updateItem(target, event.messageId, (item) =>
-        item.kind === "text" ? { ...item, content: item.content + event.delta } : item,
+        item.kind === "text" ? { ...item, content: applyDelta(item.content, event.delta) } : item,
       );
       return { ...next, activeTextId: event.messageId };
     }
@@ -186,58 +175,16 @@ export function projectEvent(state: TimelineState, event: AgUiEvent): TimelineSt
     }
     case "STATE_SNAPSHOT":
     case "MESSAGES_SNAPSHOT":
-    case "THINKING_TEXT_MESSAGE_START":
-    case "THINKING_TEXT_MESSAGE_END":
       return state;
   }
 }
 
 export function timelineFromSession(session: SessionState): TimelineState {
-  if (!(session.events?.length)) {
-    let messageState = emptyTimeline();
-    for (const message of session.messages) {
-      if (message.role === "user") {
-        messageState = appendUserPrompt(messageState, message.id, message.content, message.meta?.runId);
-      } else if (message.role === "assistant" && message.content) {
-        messageState = appendItem(messageState, {
-          kind: "text",
-          id: message.id,
-          content: message.content,
-          status: "complete",
-          ...(message.meta?.runId ? { runId: message.meta.runId } : {}),
-        });
-      }
-    }
-    for (const interrupt of session.openInterrupts ?? []) {
-      messageState = appendOpenInterrupt(messageState, interrupt);
-    }
-    return messageState;
-  }
   let state = emptyTimeline();
-  const userByRun = new Map<string, ChatMessage>();
-  const userWithoutRun: ChatMessage[] = [];
-  for (const message of session.messages) {
-    if (message.role !== "user") continue;
-    const runId = message.meta?.runId;
-    if (runId) userByRun.set(runId, message);
-    else userWithoutRun.push(message);
+  for (const event of session.events) {
+    // 落盘 events 已是累计块；history 模式整段赋值，实时流仍走 projectEvent 默认拼接。
+    state = projectEvent(state, event, { history: true });
   }
-
-  for (const message of userWithoutRun) {
-    state = appendUserPrompt(state, message.id, message.content);
-  }
-  const insertedRuns = new Set<string>();
-  for (const event of session.events ?? []) {
-    if (event.type === "RUN_STARTED") {
-      const user = userByRun.get(event.runId);
-      if (user && !insertedRuns.has(event.runId)) {
-        state = appendUserPrompt(state, user.id, user.content, event.runId);
-        insertedRuns.add(event.runId);
-      }
-    }
-    state = projectEvent(state, event);
-  }
-
   // openInterrupts 是 Access Layer 的当前 checkpoint 视图；即使旧事件窗口已裁剪，
   // CLI 仍必须把待处理输入恢复出来，并继续保持 fail-closed。
   for (const interrupt of session.openInterrupts ?? []) {
@@ -245,20 +192,6 @@ export function timelineFromSession(session: SessionState): TimelineState {
     state = appendOpenInterrupt(state, interrupt);
   }
 
-  // 旧会话可能没有完整 events；保留消息正文作为只读降级路径。
-  if (!state.items.some((item) => item.kind === "text")) {
-    for (const message of session.messages) {
-      if (message.role === "assistant" && message.content) {
-        state = appendItem(state, {
-          kind: "text",
-          id: message.id,
-          content: message.content,
-          status: "complete",
-          ...(message.meta?.runId ? { runId: message.meta.runId } : {}),
-        });
-      }
-    }
-  }
   return state;
 }
 

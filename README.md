@@ -11,9 +11,9 @@
   [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](requirements.txt)
   [![React](https://img.shields.io/badge/React-18-149ECA?logo=react&logoColor=white)](frontend/package.json)
   [![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688?logo=fastapi&logoColor=white)](requirements.txt)
-  [![AG--UI](https://img.shields.io/badge/Protocol-AG--UI-6C63FF)](docs/ag-ui-protocol.md)
+  [![AG--UI](https://img.shields.io/badge/Protocol-AG--UI-6C63FF)](docs/architecture/ag-ui-protocol.md)
 
-  [快速开始](#-快速开始) · [功能概览](#-功能概览) · [系统架构](#-系统架构) · [项目文档](#-项目文档)
+  [快速开始](#快速开始) · [功能概览](#功能概览) · [终端客户端](#终端客户端cli) · [系统架构](#系统架构) · [项目文档](#项目文档)
 </div>
 
 ---
@@ -25,6 +25,8 @@ K Agent 不只是一个聊天页面。它把 Agent 运行需要的会话状态�
 | 能力 | 说明 |
 | --- | --- |
 | 💬 **实时 Agent 对话** | 基于 AG-UI + SSE 展示文本、推理、工具调用、审批与运行状态 |
+| ⌨️ **终端工作台** | TypeScript / Ink CLI，支持交互对话、审批、配置管理和脚本调用 |
+| 🛍️ **能力广场** | 从魔搭 MCP 广场与 SkillHub 搜索、预览并安装能力 |
 | 🧰 **工具 / MCP / Skills** | 统一发现、配置和选择本地工具、MCP Server 与可复用 Skill 包 |
 | 🗂️ **持久化会话与工作空间** | 每个 Session 拥有独立历史、上下文、事件流和文件工作空间 |
 | ⏱️ **定时任务** | 按一次、每天或每周自动运行；结果在自动化页面独立查看，不污染普通会话列表 |
@@ -44,6 +46,14 @@ K Agent 不只是一个聊天页面。它把 Agent 运行需要的会话状态�
 - Session 级 MCP / Skill 选择与持久化
 - 独立 Workspace 文件浏览与内容预览
 - 多主题、字体调节和桌面宠物
+
+### 能力配置与广场
+
+- 配置中心管理已安装的 MCP、Skills、模型与 Agent
+- MCP 广场接入魔搭（ModelScope），Skill 广场接入 SkillHub
+- 外部条目经 Access Layer 查询、缓存与安装；安装后的运行时元数据由本地 Catalog 管理
+- Skill 的目录元数据参与能力选择，正文在授权后的调用阶段按需加载
+- 第三方服务凭据由 Access Layer 使用，可在 `.env` 中配置 `MODELSCOPE_API_TOKEN` 与 `SKILLHUB_API_KEY`
 
 ### Automations：可持久化的定时任务
 
@@ -67,6 +77,7 @@ K Agent 不只是一个聊天页面。它把 Agent 运行需要的会话状态�
 ```mermaid
 flowchart LR
     UI["React Workbench<br/>:5173 / :3001"]
+    CLI["Terminal CLI<br/>TypeScript / Ink"]
     AL["Access Layer<br/>FastAPI · :3001"]
     BE["Stateless Agent Backend<br/>FastAPI · :3002"]
     MODEL["OpenAI-compatible Model"]
@@ -75,6 +86,7 @@ flowchart LR
     STATE[("$K_AGENT_HOME<br/>Sessions · Teams · Automations")]
 
     UI -->|"HTTP + AG-UI/SSE"| AL
+    CLI -->|"HTTP + AG-UI/SSE"| AL
     AL -->|"Internal NDJSON"| BE
     AL <--> STATE
     BE --> MODEL
@@ -85,7 +97,7 @@ flowchart LR
 请求链路为：
 
 ```text
-Frontend → Access Layer (:3001) → Stateless Agent Backend (:3002)
+Web / CLI → Access Layer (:3001) → Stateless Agent Backend (:3002)
 ```
 
 - **Access Layer** 是公开接入边界，负责会话、并发、配置目录、Team、定时任务和持久化。
@@ -93,14 +105,14 @@ Frontend → Access Layer (:3001) → Stateless Agent Backend (:3002)
 - 两个服务通过内部 NDJSON 流式 HTTP 通信，不是进程内函数调用。
 - 默认仅允许本机访问。内部请求可能携带模型凭据，请勿直接暴露到公网或局域网。
 
-更多设计细节见[接口与架构变更记录](docs/interface-change-record.md)。
+更多设计细节见[接口与架构变更记录](docs/reference/interface-change-record.md)。
 
 ## 快速开始
 
 ### 环境要求
 
 - Python 3.11+
-- Node.js 18+
+- Node.js 18+（仅 Web）；使用 CLI 需要 Node.js 22.12+
 - npm 9+
 - 一个 OpenAI-compatible API Key
 
@@ -123,7 +135,7 @@ npm install
 cd ..
 ```
 
-> Windows PowerShell 请使用 `.venv\Scripts\Activate.ps1` 激活虚拟环境。
+> 上述命令适用于 macOS / Linux。Windows PowerShell 使用 `.venv\Scripts\Activate.ps1` 激活虚拟环境；前端的一键服务启动脚本使用 POSIX 路径，Windows 下可在两个终端分别执行 `python -m access_layer.run_server --reload`、`python -m backend.run_server --reload`，再执行 `npm --prefix frontend run dev:client`。
 
 ### 3. 配置环境变量
 
@@ -162,6 +174,30 @@ npm run dev
 
 打开 [http://localhost:5173](http://localhost:5173) 即可使用。
 
+## 终端客户端（CLI）
+
+完成 Python 依赖安装与 `.env` 配置后，在仓库根目录执行（Node.js 22.12+）：
+
+```bash
+npm --prefix cli install
+npm --prefix cli run dev:local
+```
+
+该命令启动 Access Layer、Agent Backend 和终端工作台，会复用已有的本地服务；退出时只关闭本次启动的服务。
+
+如果服务已经启动，可以直接运行客户端：
+
+```bash
+npm --prefix cli run dev -- doctor
+npm --prefix cli run dev -- chat
+npm --prefix cli run dev -- run "总结当前工作空间" --json
+npm --prefix cli run dev -- sessions list
+```
+
+CLI 默认连接 `http://127.0.0.1:3001`，可用 `--endpoint` 或 `K_AGENT_ENDPOINT` 指向其他 Access Layer。交互模式支持 MCP / Skill 管理、模型与 Agent 切换、审批及用户问题；单次运行支持 `--json`、`--jsonl` 和 `--quiet`，非交互模式遇到审批或用户问题返回退出码 `2`。
+
+完整命令与快捷键见 [CLI 使用说明](cli/README.md)。
+
 ## 本地部署
 
 构建前端并以非 reload 模式启动两个本地服务：
@@ -173,7 +209,7 @@ npm run deploy:local
 
 部署模式下 Access Layer 会在 `http://127.0.0.1:3001` 同源托管 `frontend/dist`，Agent Backend 继续运行在 `127.0.0.1:3002`。
 
-需要容器化部署时，请参阅 [Docker 部署指南](docs/docker-deployment.md)。镜像不会包含 `.env`、API Key 或 `.k_agent` 数据；凭据在运行时注入，状态保存在独立 Docker Volume 中。
+需要容器化部署时，请参阅 [Docker 部署指南](docs/guides/docker-deployment.md)。镜像不会包含 `.env`、API Key 或 `.k_agent` 数据；凭据在运行时注入，状态保存在独立 Docker Volume 中。
 
 ### Docker 运行流程
 
@@ -209,19 +245,27 @@ docker compose down
 $K_AGENT_HOME/
 ├── config/
 │   ├── mcp.json
+│   ├── user-mcp.json          # 可选的用户 MCP 覆盖
 │   ├── models.json
 │   ├── permissions.json
 │   └── catalog/
+├── cache/
+│   └── runtime/             # 会话与 Team 共用的 Node/npm 工具目录
 ├── content/
 │   ├── memory/
 │   └── skills/
 └── state/
     ├── sessions/
+    │   └── <session-id>/
+    │       ├── session.json  # 会话元数据
+    │       ├── history.jsonl # 追加式对话历史与持久化事件
+    │       ├── context/      # 模型上下文派生状态
+    │       └── workspace/    # 会话文件
     ├── teams/
     └── scheduled_tasks/
 ```
 
-每个会话目录包含持久化 JSON 与独立 `workspace/`。Agent Team 和定时任务由 Access Layer 使用 SQLite 保存调度状态。
+完整对话以追加式 `history.jsonl` 为事实源，上下文压缩状态单独保存在 `context/k_agent.json`，不覆盖完整历史。Agent Team 和定时任务由 Access Layer 使用 SQLite 保存调度状态。`K_AGENT_HOME` 的相对路径按仓库根目录解析。
 
 ## 常用配置
 
@@ -235,36 +279,48 @@ $K_AGENT_HOME/
 | `AGENT_BACKEND_HOST` / `AGENT_BACKEND_PORT` | Agent Backend 地址 | `127.0.0.1:3002` |
 | `MCP_CONNECT_TIMEOUT_SECONDS` | MCP 连接超时 | `60` |
 | `MAX_MODEL_ITERATIONS` | 单轮最大模型迭代次数 | `6` |
-| `LANGFUSE_ENABLED` | 是否启用 Langfuse | `true` |
+| `LANGFUSE_ENABLED` | Langfuse 开关；使用时还需配置公钥、密钥与服务地址 | `true` |
+| `SKILLHUB_API_KEY` | SkillHub 广场服务凭据 | 未设置 |
+| `MODELSCOPE_API_TOKEN` | 魔搭 MCP 广场服务凭据 | 未设置 |
+| `K_AGENT_ENDPOINT` | CLI 连接的 Access Layer 地址 | `http://127.0.0.1:3001` |
 | `TEAM_RUNTIME_ENABLED` | 是否启用 Agent Team 调度 | `true` |
 | `SCHEDULED_TASK_RUNTIME_ENABLED` | 是否启用定时任务调度 | `true` |
 
-完整模板见 [.env.example](.env.example)。
+常用环境变量模板见 [.env.example](.env.example)；服务配置定义见 [Access Layer 设置](access_layer/settings.py)与 [Backend 配置](backend/config/config.py)，CLI 配置见 [CLI 使用说明](cli/README.md)。
 
 ## 项目结构
 
 ```text
 k_agent/
 ├── frontend/                 # React / Vite 工作台
+├── cli/                      # TypeScript / Ink 终端客户端
 ├── access_layer/             # 公开 API、会话、Team、自动化与持久化
 ├── backend/                  # 无状态 Agent、模型、工具、MCP 与上下文管理
-├── docs/                     # 协议与技术方案
+├── docs/                     # 按架构、功能、指南、调研等主题分类的项目文档
+├── scripts/                  # 镜像构建等辅助脚本
+├── Dockerfile
+├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
 
 ## 项目文档
 
+完整分类见 [文档索引](docs/README.md)。技术方案与重构计划用于说明设计和实施边界，具体完成情况以当前代码及文档内的状态说明为准。
+
 | 文档 | 内容 |
 | --- | --- |
-| [AG-UI 协议约定](docs/ag-ui-protocol.md) | SSE 事件顺序、状态机与持久化规则 |
-| [工具系统](docs/tools.md) | 本地工具、MCP 与错误返回契约 |
-| [上下文管理](docs/context-management.md) | 指令、记忆、预算、裁剪与压缩 |
-| [Agent Hook 与 Middleware 技术方案](docs/agent-hooks-and-middleware-technical-solution.md) | 声明式 Hook、Observer/Middleware 分层、流式与安全执行管线 |
-| [权限模式与 HITL 技术方案](docs/permission-and-hitl-technical-solution.md) | 默认/完全权限、单次越权审批、沙箱与生命周期 |
-| [Agent Team 技术方案](docs/agent-team-technical-solution.md) | Supervisor、DAG、Mailbox 与 Artifact |
-| [定时任务技术方案](docs/scheduled-task-technical-solution.md) | 调度、租约、Session 隔离与运行记录 |
-| [接口变更记录](docs/interface-change-record.md) | Access Layer / Backend 服务边界 |
+| [AG-UI 协议约定](docs/architecture/ag-ui-protocol.md) | SSE 事件顺序、状态机与持久化规则 |
+| [上下文压缩、完整对话存储与 AG-UI 重构计划](docs/architecture/context-compaction-conversation-storage-refactor-plan.md) | 完整历史、compact boundary、删除 status/trace 与统一事件投影 |
+| [CLI 使用说明](cli/README.md) | 终端启动、命令、快捷键与中文输入 |
+| [Skill / MCP 广场技术方案](docs/features/marketplace-skill-mcp-technical-solution.md) | 外部发现、安装与本地 Catalog 边界 |
+| [工具系统](docs/guides/tools.md) | 本地工具、MCP 与错误返回契约 |
+| [上下文管理](docs/architecture/context-management.md) | 指令、记忆、预算、裁剪与压缩 |
+| [Agent Hook 与 Middleware 技术方案](docs/architecture/agent-hooks-and-middleware-technical-solution.md) | 声明式 Hook、Observer/Middleware 分层、流式与安全执行管线 |
+| [权限模式与 HITL 技术方案](docs/architecture/permission-and-hitl-technical-solution.md) | 默认/完全权限、单次越权审批、沙箱与生命周期 |
+| [Agent Team 技术方案](docs/features/agent-team-technical-solution.md) | Supervisor、DAG、Mailbox 与 Artifact |
+| [定时任务技术方案](docs/features/scheduled-task-technical-solution.md) | 调度、租约、Session 隔离与运行记录 |
+| [接口变更记录](docs/reference/interface-change-record.md) | Access Layer / Backend 服务边界 |
 
 ## 开发与验证
 
@@ -274,8 +330,15 @@ cd frontend
 npm run check
 npm run build:client
 
-# Python 测试
+# CLI 类型检查、构建与测试（回到仓库根目录）
 cd ..
+npm --prefix cli install
+npm --prefix cli run check
+npm --prefix cli run build
+npm --prefix cli test
+
+# Python 测试（pytest 不在运行时 requirements.txt 中）
+.venv/bin/python -m pip install pytest
 .venv/bin/python -m pytest backend/tests -q
 ```
 

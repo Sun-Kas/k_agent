@@ -81,12 +81,8 @@ class SessionCapabilities(BaseModel):
 
 
 class SessionState(BaseModel):
-    """描述单个会话详情和原始 AG-UI events。"""
+    """会话详情只暴露可重放事件；Provider messages 不是 UI 合同。"""
     session_id: str = Field(alias="sessionId")
-    messages: list[ChatMessage]
-    trace: list[str]
-    tasks: list[str]
-    thinking: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
     # 开放审批是服务端恢复真相源的只读投影，不包含可执行 checkpoint。
     open_interrupts: list[dict[str, Any]] = Field(

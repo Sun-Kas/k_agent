@@ -3,6 +3,28 @@ import { useApp } from "ink";
 import type { AccessLayerClient } from "../client/access-layer-client.js";
 import type { CliRuntimeConfig } from "../config/index.js";
 import { createResumeInput, createRunInput } from "./run-input.js";
+import {
+  applyMcpServersToRuntime,
+  parseMcpSlashArgs,
+  sanitizeMcpServersForSave,
+  setMcpEnabled,
+  toolsFromCapabilities,
+} from "./mcp-config.js";
+import {
+  applySkillsToRuntime,
+  parseSkillSlashArgs,
+  sanitizeSkillsForSave,
+  setSkillEnabled,
+} from "./skill-config.js";
+import {
+  applyRuntimeToSummary,
+  choicesFromAgents,
+  choicesFromModels,
+  selectAgent,
+  selectModel,
+  selectPermission,
+  parseMenuOrSetArgs,
+} from "./runtime-switch.js";
 import { appendUserPrompt, emptyTimeline, pendingApproval, projectEvent, timelineFromSession, type TimelineState } from "./event-projector.js";
 import { consumeRun } from "./run-lifecycle.js";
 import { emptyViewModel } from "./view-model.js";
@@ -22,6 +44,8 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
 }): React.ReactElement {
   const { exit } = useApp();
   const [config, setConfig] = useState(initialConfig);
+  const configRef = useRef(config);
+  configRef.current = config;
   const [model, setModel] = useState<TerminalPageViewModel>(() => ({ ...emptyViewModel(initialConfig), surface: startAt }));
   const activeSessionRef = useRef<string | undefined>(initialSessionId);
   const timelineCacheRef = useRef(new Map<string, TimelineState>());
@@ -49,6 +73,63 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
     }
   }, [client]);
 
+  const refreshMcp = useCallback(async (notice?: string): Promise<void> => {
+    try {
+      const snapshot = await refreshMcpSnapshot(client);
+      setModel((value) => ({
+        ...value,
+        mcpBusy: false,
+        ...(notice ? { notice } : {}),
+        runtime: applyMcpServersToRuntime(value.runtime, snapshot.servers, snapshot.tools),
+      }));
+    } catch (error) {
+      setModel((value) => ({ ...value, mcpBusy: false, error: errorMessage(error) }));
+    }
+  }, [client]);
+
+  const mutateSkills = useCallback(async (work: (access: AccessLayerClient) => Promise<string>): Promise<void> => {
+    setModel((value) => ({ ...value, mcpBusy: true, error: undefined }));
+    try {
+      const notice = await work(client);
+      const payload = await client.getSkillsConfig();
+      setModel((value) => ({
+        ...value,
+        mcpBusy: false,
+        notice,
+        runtime: applySkillsToRuntime(value.runtime, payload.skills),
+      }));
+    } catch (error) {
+      setModel((value) => ({ ...value, mcpBusy: false, error: errorMessage(error) }));
+    }
+  }, [client]);
+
+  const applyCliRuntime = useCallback((nextConfig: CliRuntimeConfig, notice: string): void => {
+    configRef.current = nextConfig;
+    setConfig(nextConfig);
+    setModel((value) => ({
+      ...value,
+      notice,
+      error: undefined,
+      runtime: applyRuntimeToSummary(value.runtime, nextConfig),
+    }));
+  }, []);
+
+  const mutateMcp = useCallback(async (work: (access: AccessLayerClient) => Promise<string>): Promise<void> => {
+    setModel((value) => ({ ...value, mcpBusy: true, error: undefined }));
+    try {
+      const notice = await work(client);
+      const snapshot = await refreshMcpSnapshot(client);
+      setModel((value) => ({
+        ...value,
+        mcpBusy: false,
+        notice,
+        runtime: applyMcpServersToRuntime(value.runtime, snapshot.servers, snapshot.tools),
+      }));
+    } catch (error) {
+      setModel((value) => ({ ...value, mcpBusy: false, error: errorMessage(error) }));
+    }
+  }, [client]);
+
   useEffect(() => {
     let active = true;
     void (async () => {
@@ -66,6 +147,8 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
         const selectedModel = config.modelId ?? models.find((item) => item.enabled)?.id;
         const nextConfig = selectedModel ? { ...config, modelId: selectedModel } : config;
         setConfig(nextConfig);
+        const modelChoices = choicesFromModels(models);
+        const agentChoices = choicesFromAgents(agents.agents);
         setModel((value) => ({
           ...value,
           connected: health.ok,
@@ -77,6 +160,20 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
           runtime: {
             ...value.runtime,
             modelId: selectedModel ?? "",
+            models: modelChoices,
+            agents: agentChoices,
+            mcpServers: catalog.mcpServers.map((item) => ({
+              id: item.id,
+              name: item.name,
+              enabled: item.enabled,
+            })),
+            skills: catalog.skills.map((item) => ({
+              id: item.id,
+              name: item.name,
+              enabled: item.enabled,
+            })),
+            selectedMcpIds: [...nextConfig.mcpServerIds],
+            selectedSkillIds: [...nextConfig.skillIds],
             mcpCount: nextConfig.mcpServerIds.length || catalog.mcpServers.filter((item) => item.enabled).length,
             skillCount: nextConfig.skillIds.length || catalog.skills.filter((item) => item.enabled).length,
           },
@@ -165,16 +262,16 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
       return;
     }
     if (action.type === "submit_prompt") {
-      if (!config.modelId && config.agentKind === "k_agent") {
+      if (!configRef.current.modelId && configRef.current.agentKind === "k_agent") {
         setModel((value) => ({ ...value, error: "没有可用模型，请先在 Web 配置中启用模型" }));
         return;
       }
-      const run = createRunInput(action.text, config, activeSessionRef.current);
+      const run = createRunInput(action.text, configRef.current, activeSessionRef.current);
       activeSessionRef.current = run.sessionId;
       const previous = timelineCacheRef.current.get(run.sessionId) ?? emptyTimeline();
       const timeline = appendUserPrompt(previous, run.userMessageId, action.text, run.runId);
-      timelineCacheRef.current.set(run.sessionId, timeline);
-      setModel((value) => ({ ...value, surface: "chat", activeSessionId: run.sessionId, activeSessionTitle: action.text.slice(0, 40), timeline, error: undefined }));
+      timelineCacheRef.current.set(run.sessionId, { ...timeline, runStatus: "running" });
+      setModel((value) => ({ ...value, surface: "chat", activeSessionId: run.sessionId, activeSessionTitle: action.text.slice(0, 40), timeline: { ...timeline, runStatus: "running" }, error: undefined }));
       await startRun(run.sessionId, run.input);
       return;
     }
@@ -227,11 +324,67 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
         : action.payload.action === "approve"
           ? { action: "approve" as const, scope: action.payload.scope }
           : { action: action.payload.action as "deny" | "cancel" };
-      await startRun(sessionId, createResumeInput(approval, config, decision));
+      await startRun(sessionId, createResumeInput(approval, configRef.current, decision));
+      return;
+    }
+    if (action.type === "refresh_mcp") {
+      await refreshMcp();
+      return;
+    }
+    if (action.type === "reload_mcp") {
+      await mutateMcp(async (access) => {
+        await access.reloadMcp();
+        return "MCP 已重新连接";
+      });
+      return;
+    }
+    if (action.type === "toggle_mcp") {
+      await mutateMcp(async (access) => {
+        const payload = await access.getMcpConfig();
+        const currentlyOn = payload.servers.find((item) => item.id === action.serverId)?.enabled !== false;
+        const next = setMcpEnabled(payload.servers, action.serverId, !currentlyOn);
+        if (next.missing) return `未找到 MCP “${action.serverId}”`;
+        if (next.changed.length === 0) return `MCP ${action.serverId} 状态未变化`;
+        await access.saveMcpConfig(sanitizeMcpServersForSave(next.servers));
+        return `MCP ${action.serverId} 已${currentlyOn ? "关闭" : "启用"}`;
+      });
+      return;
+    }
+    if (action.type === "refresh_skills") {
+      try {
+        const payload = await client.getSkillsConfig();
+        setModel((value) => ({ ...value, runtime: applySkillsToRuntime(value.runtime, payload.skills) }));
+      } catch (error) {
+        setModel((value) => ({ ...value, error: errorMessage(error) }));
+      }
+      return;
+    }
+    if (action.type === "toggle_skill") {
+      await mutateSkills(async (access) => {
+        const payload = await access.getSkillsConfig();
+        const currentlyOn = payload.skills.find((item) => item.id === action.skillId)?.enabled !== false;
+        const next = setSkillEnabled(payload.skills, action.skillId, !currentlyOn);
+        if (next.missing) return `未找到 Skill “${action.skillId}”`;
+        if (next.changed.length === 0) return `Skill ${action.skillId} 状态未变化`;
+        await access.saveSkillsConfig(sanitizeSkillsForSave(next.skills));
+        return `Skill ${action.skillId} 已${currentlyOn ? "关闭" : "启用"}`;
+      });
+      return;
+    }
+    if (action.type === "set_model") {
+      applyChoice(selectModel(configRef.current, model.runtime.models, action.modelId), applyCliRuntime, setModel);
+      return;
+    }
+    if (action.type === "set_agent") {
+      applyChoice(selectAgent(configRef.current, model.runtime.agents, action.agentKind), applyCliRuntime, setModel);
+      return;
+    }
+    if (action.type === "set_permission") {
+      applyChoice(selectPermission(configRef.current, action.permissionMode), applyCliRuntime, setModel);
       return;
     }
     if (action.type === "slash_command") await handleSlash(action.command, action.arguments);
-  }, [client, config, exit, loadSession, model.timeline, startRun]);
+  }, [applyCliRuntime, client, exit, loadSession, model.runtime.agents, model.runtime.models, model.timeline, mutateMcp, mutateSkills, refreshMcp, startRun]);
 
   const handleSlash = useCallback(async (command: string, args: string): Promise<void> => {
     if (command === "new") return void handleAction({ type: "new_session" });
@@ -244,12 +397,77 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
     if (command === "stop") return void handleAction({ type: "stop_run" });
     if (command === "cancel") return void handleAction({ type: "cancel_run" });
     if (command === "quit") return void handleAction({ type: "quit" });
-    if (["agent", "model", "mcp", "skill", "permissions", "trace", "help"].includes(command)) {
+    if (command === "mcp") {
+      const parsed = parseMcpSlashArgs(args);
+      if (parsed.kind === "reload") return void handleAction({ type: "reload_mcp" });
+      if (parsed.kind === "enable" || parsed.kind === "disable") {
+        await mutateMcp(async (clientRef) => {
+          const payload = await clientRef.getMcpConfig();
+          const next = setMcpEnabled(payload.servers, parsed.target, parsed.kind === "enable");
+          if (next.missing) return `未找到 MCP “${parsed.target}”`;
+          if (next.changed.length === 0) return `MCP 已是${parsed.kind === "enable" ? "启用" : "关闭"}状态`;
+          await clientRef.saveMcpConfig(sanitizeMcpServersForSave(next.servers));
+          return parsed.target === "all"
+            ? `已${parsed.kind === "enable" ? "启用" : "关闭"} ${next.changed.length} 个 MCP`
+            : `MCP ${parsed.target} 已${parsed.kind === "enable" ? "启用" : "关闭"}`;
+        });
+        return;
+      }
+      return void setModel((value) => ({
+        ...value,
+        notice: "用法：/mcp · /mcp enable [name|all] · /mcp disable [name|all] · /mcp reload",
+      }));
+    }
+    if (command === "model") {
+      const parsed = parseMenuOrSetArgs(args);
+      if (parsed.kind === "set") {
+        applyChoice(selectModel(configRef.current, model.runtime.models, parsed.target), applyCliRuntime, setModel);
+        return;
+      }
+      return void setModel((value) => ({ ...value, notice: "用法：/model · /model <id>" }));
+    }
+    if (command === "agent") {
+      const parsed = parseMenuOrSetArgs(args);
+      if (parsed.kind === "set") {
+        applyChoice(selectAgent(configRef.current, model.runtime.agents, parsed.target), applyCliRuntime, setModel);
+        return;
+      }
+      return void setModel((value) => ({ ...value, notice: "用法：/agent · /agent <kind>" }));
+    }
+    if (command === "permissions") {
+      const parsed = parseMenuOrSetArgs(args);
+      if (parsed.kind === "set") {
+        applyChoice(selectPermission(configRef.current, parsed.target), applyCliRuntime, setModel);
+        return;
+      }
+      return void setModel((value) => ({ ...value, notice: "用法：/permissions · /permissions default|full_access" }));
+    }
+    if (command === "skill") {
+      const parsed = parseSkillSlashArgs(args);
+      if (parsed.kind === "enable" || parsed.kind === "disable") {
+        await mutateSkills(async (clientRef) => {
+          const payload = await clientRef.getSkillsConfig();
+          const next = setSkillEnabled(payload.skills, parsed.target, parsed.kind === "enable");
+          if (next.missing) return `未找到 Skill “${parsed.target}”`;
+          if (next.changed.length === 0) return `Skill 已是${parsed.kind === "enable" ? "启用" : "关闭"}状态`;
+          await clientRef.saveSkillsConfig(sanitizeSkillsForSave(next.skills));
+          return parsed.target === "all"
+            ? `已${parsed.kind === "enable" ? "启用" : "关闭"} ${next.changed.length} 个 Skill`
+            : `Skill ${parsed.target} 已${parsed.kind === "enable" ? "启用" : "关闭"}`;
+        });
+        return;
+      }
+      return void setModel((value) => ({
+        ...value,
+        notice: "用法：/skill · /skill enable [name|all] · /skill disable [name|all]",
+      }));
+    }
+    if (["trace", "help"].includes(command)) {
       setModel((value) => ({ ...value, notice: slashSummary(command, value) }));
       return;
     }
     setModel((value) => ({ ...value, notice: `未知命令 /${command}；输入 /help 查看可用命令` }));
-  }, [handleAction]);
+  }, [applyCliRuntime, handleAction, model.runtime.agents, model.runtime.models, mutateMcp, mutateSkills]);
 
   return <TerminalPage model={model} onAction={(action) => { void handleAction(action); }} />;
 }
@@ -273,6 +491,28 @@ function slashSummary(command: string, model: TerminalPageViewModel): string {
   if (command === "permissions") return `Permission ${model.runtime.permissionMode}`;
   if (command === "trace") return `Timeline items ${model.timeline.items.length}`;
   return "/home /chat /team /auto /doctor /new /sessions /agent /model /mcp /skill /permissions /trace /workspace /stop /cancel /help /quit";
+}
+
+async function refreshMcpSnapshot(
+  client: AccessLayerClient,
+): Promise<{ servers: Awaited<ReturnType<AccessLayerClient["getMcpConfig"]>>["servers"]; tools: ReturnType<typeof toolsFromCapabilities> }> {
+  const [config, capabilities] = await Promise.all([
+    client.getMcpConfig(),
+    client.mcpCapabilities().catch(() => ({ tools: [] })),
+  ]);
+  return { servers: config.servers, tools: toolsFromCapabilities(capabilities) };
+}
+
+function applyChoice(
+  result: { config: CliRuntimeConfig; notice: string } | { error: string },
+  apply: (config: CliRuntimeConfig, notice: string) => void,
+  setView: React.Dispatch<React.SetStateAction<TerminalPageViewModel>>,
+): void {
+  if ("error" in result) {
+    setView((value) => ({ ...value, error: result.error }));
+    return;
+  }
+  apply(result.config, result.notice);
 }
 
 function errorMessage(error: unknown): string {
