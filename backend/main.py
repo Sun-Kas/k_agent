@@ -29,11 +29,10 @@ from backend.config import Settings, get_or_init_settings
 from backend.logging_config import configure_agent_backend_logging, log_event
 from backend.home import (
     ensure_home_layout,
-    ensure_shared_runtime,
-    link_shared_runtime,
     memory_dir,
     resolve_managed_path,
     sessions_dir,
+    shared_runtime_prefix,
     shared_runtime_tool_env,
     teams_dir,
 )
@@ -356,12 +355,11 @@ def create_app() -> FastAPI:
             permission_token = set_tool_permission_mode(
                 str(request_context.options.get("permissionMode") or "default")
             )
-            # 共享 runtime env，全项目一份 Node/npm 前缀，对话与 Team 共用。冲突键以
-            # agentOptions.toolEnv 为准。
-            shared_runtime = ensure_shared_runtime()
-            if request_context.workspace_dir is not None:
-                link_shared_runtime(request_context.workspace_dir, shared_runtime)
-            tool_env = shared_runtime_tool_env(shared_runtime)
+            # PATH/npm 走工作区 `.runtime`（指向共享 cache），不要把 cache 实路径
+            # 灌进子进程；无 workspace 时才用 cache。冲突键以 agentOptions.toolEnv 为准。
+            tool_env = shared_runtime_tool_env(
+                shared_runtime_prefix(request_context.workspace_dir)
+            )
             option_env = (
                 request_context.options.get("toolEnv")
                 if isinstance(request_context.options, dict)
@@ -411,6 +409,9 @@ def create_app() -> FastAPI:
                 )
                 raise
             finally:
+                # 下一 HTTP 请求一般是新 Task，不 reset 也不会串到别人。
+                # 本 Task 在 generator 返回后还会跑 ASGI 收尾/测试里同协程二次 run，
+                # reset 只是把 set 前的值还回去，避免这段窗口里 current_*() 仍看到本轮策略。
                 reset_tool_env_overrides(env_token)
                 reset_tool_permission_mode(permission_token)
                 reset_tool_network_access(network_token)

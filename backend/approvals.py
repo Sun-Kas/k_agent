@@ -93,11 +93,12 @@ class ApprovalInterrupt(BaseException):
 
 
 class ApprovalBroker:
-    """创建 run-scoped Interrupt，并把控制流转换为内部事件。
+    """把「工具要等人批准」变成**当前这次 HTTP 响应**里的 interrupt，然后结束本轮。
 
-    该类保留原名称以降低 Runner 注入面的改动，但不再维护 Future、队列或
-    ``requestId -> pending`` 内存表，因此 Backend 多 worker 不会导致 Resume
-    请求命中错误进程。
+    名字没改，是为了 Runner 仍注入 `approval_broker`。以前会在本进程用 Future /
+    `requestId → pending` 等用户点批准：多 worker 时 Resume 可能打到另一台，
+    内存表对不上。现在只在这一次 `stream()` 里用短队列把卡片送出；用户决定
+    由 Access Layer 落盘，批准发生在**另一次** HTTP Resume，不经过这张表。
     """
 
     def __init__(self) -> None:
@@ -105,7 +106,7 @@ class ApprovalBroker:
         self._active_runs: dict[
             tuple[str, str], asyncio.Queue[dict[str, Any]]
         ] = {}
-        # 同一 key 的关闭事件：stream() 结束时 set，好让 request() 从 wait 里醒来。
+        # 同一 key 的关闭开关：默认灭。stream() 结束时 set()，request() 的 wait() 才醒来。
         self._run_closed: dict[tuple[str, str], asyncio.Event] = {}
 
     async def stream(
@@ -123,7 +124,10 @@ class ApprovalBroker:
             raise RuntimeError(f"Approval stream already registered for run {run_id}")
         # maxsize=1：一个 run 同时只允许一张 pending 卡。
         interrupt_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
-        # 未 set 时，工具侧的 request() 会一直等，避免工具在中断发出前继续执行。
+        # asyncio.Event：进程内布尔闸门。新建时 clear（灭），wait() 挂起；
+        # set() 后所有 wait() 立刻返回。不是用户点击，只表示这条 HTTP stream 结束。
+        # 例：t0 request() 入队后 await wait() 睡着；t1 stream 发出 interrupt 并 set()；
+        # t2 wait() 醒来，request() 返回 cancel。闸门亮着再 wait() 也不会再睡。
         run_closed = asyncio.Event()
         # pump() 把 Runner 事件/错误/结束标进这条队列，主循环再和 interrupt 赛跑。
         event_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -171,7 +175,7 @@ class ApprovalBroker:
                     # 卡片已拿到：立刻停 Runner，不要再执行当前工具。
                     pump_task.cancel()
                     await asyncio.gather(pump_task, return_exceptions=True)
-                    # 先唤醒 request()，再 yield SSE；否则 bridge 会卡到客户端读完帧。
+                    # set() 只拨开、不自动灭。request() 的 wait() 在这里被叫醒。
                     run_closed.set()
                     # 给 Access Layer 落盘/展示的卡片事件。
                     yield {"type": "approval_request", "payload": payload}
@@ -193,7 +197,7 @@ class ApprovalBroker:
             pump_task.cancel()
             await asyncio.gather(pump_task, return_exceptions=True)
             self._active_runs.pop(key, None)
-            # 若 request() 仍在 wait（例如消费者取消了 SSE），这里也要把它放走。
+            # 幂等：已亮再 set() 无事发生。SSE 取消时 request() 若还在 wait() 也要放走。
             run_closed.set()
             self._run_closed.pop(key, None)
 
@@ -256,8 +260,7 @@ class ApprovalBroker:
             interrupt_queue.put_nowait(payload)
         except asyncio.QueueFull as exc:
             raise RuntimeError("Run already has a pending interrupt") from exc
-        # 停在工具执行前，直到 stream() set 了 run_closed。
-        # 不在这里存 Future，也不返回用户决定；批准发生在另一次 Resume。
+        # wait() 等到 stream() set()：只表示本轮 HTTP 结束，不是用户点了批准。
         await run_closed.wait()
         # 告诉还卡在 bridge 里的调用方：这次工具调用作废，不要继续 act。
         return {"action": "cancel", "scope": "once"}

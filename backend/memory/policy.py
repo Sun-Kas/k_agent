@@ -13,7 +13,7 @@ from backend.memory.constants import ALLOWED_INCLUDE_EXTENSIONS
 class MemoryPolicy:
     """Feature flags and trust boundary used during memory discovery."""
 
-    include_external: bool = False
+    include_external: bool = False  # True 时 @路径 可以指向规则文件目录之外
     allow_user_memory: bool = True
     allow_project_memory: bool = True
     allow_local_memory: bool = True

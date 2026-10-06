@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from backend.home import ensure_shared_runtime, link_shared_runtime, shared_runtime_tool_env
+from backend.home import shared_runtime_prefix, shared_runtime_tool_env
 from backend.runners.base import RunnerContext
 
 
@@ -21,13 +21,9 @@ def build_cli_child_env(
     their child shells normally inherit.
     """
 
-    runtime = ensure_shared_runtime()
     link_root = workspace if workspace is not None else ctx.workspace_dir
-    if link_root is not None:
-        link_shared_runtime(link_root, runtime)
-
     env = os.environ.copy()
-    env.update(shared_runtime_tool_env(runtime))
+    env.update(shared_runtime_tool_env(shared_runtime_prefix(link_root)))
     tool_env = ctx.options.get("toolEnv") if isinstance(ctx.options, dict) else None
     if isinstance(tool_env, dict):
         env.update(

@@ -429,7 +429,7 @@ class CodexRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured["network_access"])
         env = captured["env"]
         assert isinstance(env, dict)
-        self.assertIn("K_AGENT_SHARED_RUNTIME", env)
+        self.assertEqual(env["K_AGENT_SHARED_RUNTIME"], str(Path(tmp) / ".runtime"))
         self.assertIn("npm_config_prefix", env)
         self.assertTrue(str(env["PATH"]).startswith(str(Path(env["K_AGENT_SHARED_RUNTIME"]) / "node" / "bin")))
 
@@ -621,7 +621,7 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 from access_layer.home import reset_home_cache, ensure_home_layout
 
                 reset_home_cache()
-                ensure_home_layout(migrate=False)
+                ensure_home_layout()
                 settings_mod._config = None
                 settings = await get_or_init_settings()
                 storage = FileStorage(settings.storage_base_dir)
@@ -639,49 +639,7 @@ class SessionLayoutTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("messages", payload)
                 self.assertNotIn("events", payload)
 
-    async def test_migrates_flat_session_file(self) -> None:
-        from access_layer.storage import FileStorage
-        from access_layer.sessions.store import SessionStore
-        from access_layer.settings import get_or_init_settings
-        import access_layer.settings as settings_mod
-        import os
-
-        with TemporaryDirectory() as tmp:
-            with patch.dict(os.environ, {"K_AGENT_HOME": tmp}, clear=False):
-                from access_layer.home import reset_home_cache, ensure_home_layout
-
-                reset_home_cache()
-                ensure_home_layout(migrate=False)
-                settings_mod._config = None
-                settings = await get_or_init_settings()
-                root = Path(settings.storage_base_dir) / "sessions"
-                root.mkdir(parents=True, exist_ok=True)
-                flat = root / "legacy.json"
-                flat.write_text(
-                    json.dumps(
-                        {
-                            "id": "legacy",
-                            "title": "old",
-                            "messages": [],
-                            "trace": [],
-                            "tasks": [],
-                            "thinking": [],
-                            "events": [],
-                            "updatedAt": "2026-01-01T00:00:00+00:00",
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                store = SessionStore(FileStorage(settings.storage_base_dir))
-                session = await store.get("legacy")
-                assert session is not None
-                self.assertEqual(session.title, "old")
-                self.assertFalse(flat.exists())
-                self.assertTrue((root / "legacy" / "session.json").is_file())
-                self.assertTrue((root / "legacy" / "history.jsonl").is_file())
-                self.assertTrue((root / "legacy" / "legacy.json.bak").is_file())
-                self.assertTrue((root / "legacy" / "workspace").is_dir())
-
 
 if __name__ == "__main__":
     unittest.main()
+

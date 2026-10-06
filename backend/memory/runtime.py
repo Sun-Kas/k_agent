@@ -25,7 +25,11 @@ _PATH_TOKEN = re.compile(r"(?:^|[\s'\"`(])((?:/|\.\.?/)?[\w.@+-]+(?:/[\w.@+ -]+)
 
 
 def resolve_instruction_root(raw: str | Path) -> Path:
-    """Resolve the project rule root independently from session output state."""
+    """把 `LOCAL_TOOL_WORKSPACE_ROOT` 收成绝对项目根，用来发现 CLAUDE.md 等规则。
+
+    相对路径相对 **Backend 进程 cwd**（通常是仓库根），不是 session/Team 的
+    `workspaceDir`。`resolve()` 跟随符号链接，得到真实目录后再做 memory 扫描。
+    """
 
     path = Path(raw).expanduser()
     if not path.is_absolute():

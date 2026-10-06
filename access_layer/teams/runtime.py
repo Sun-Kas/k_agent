@@ -31,6 +31,7 @@ from access_layer.home import (
     link_shared_runtime,
     public_home_relative_path,
     resolve_managed_path,
+    shared_runtime_prefix,
     shared_runtime_tool_env,
     to_managed_path,
 )
@@ -236,7 +237,9 @@ class TeamRuntime:
                 mcp_servers=mcp_servers,
                 skills=skills,
                 workspace=task_dir,
-                tool_env=shared_runtime_tool_env(runtime),
+                tool_env=shared_runtime_tool_env(
+                    shared_runtime_prefix(task_dir, runtime)
+                ),
                 run_log=task_dir / "logs" / f"{run_id}.ndjson",
                 resume_record=resume_record,
             )
@@ -450,7 +453,9 @@ class TeamRuntime:
                     mcp_servers=mcp_servers,
                     skills=skills,
                     workspace=workspace,
-                    tool_env=shared_runtime_tool_env(runtime),
+                    tool_env=shared_runtime_tool_env(
+                        shared_runtime_prefix(workspace, runtime)
+                    ),
                     run_log=task_dir / "logs" / f"{run_id}.ndjson",
                 )
                 if not text.strip():

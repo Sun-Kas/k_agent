@@ -25,7 +25,7 @@ def get_memory_files(
     cwd: Path | None = None,
     *,
     additional_directories: list[Path] | None = None,
-    include_external: bool = False,
+    include_external: bool = False,  # 是否允许单独一行的 @相对路径 指到该文件目录之外
     use_cache: bool = True,
 ) -> list[MemoryFile]:
     """发现当前工作区可用的 memory 文件。"""
@@ -42,7 +42,7 @@ def load_memory_report(
     cwd: Path | None = None,
     *,
     additional_directories: list[Path] | None = None,
-    include_external: bool = False,
+    include_external: bool = False,  # 是否允许单独一行的 @相对路径 指到该文件目录之外
     use_cache: bool = True,
 ) -> MemoryLoadReport:
     """读取 memory 文件并返回加载报告。"""
@@ -208,6 +208,9 @@ def _append_memory(
     if depth > MAX_INCLUDE_DEPTH:
         report.warnings.append(f"include depth exceeded: {resolved}")
         return
+    # 上面已经把文件读进 raw。这里不是 OS 权限，只拦后缀；include 逃逸在下面。
+    # 未通过则丢掉 raw，不进 prompt、也不再展开 @路径。候选路径很多，先读再筛是为了
+    # 不存在的文件 read_text_sync 直接 None 返回。
     allowed, reason = can_read_memory_path(resolved)
     if not allowed:
         report.skipped.append(reason or str(resolved))
@@ -218,8 +221,10 @@ def _append_memory(
             report.skipped.append(reason or str(resolved))
             return
 
+    # 先入 processed 再 parse：后面递归 include 碰到自己会停，避免环。
     processed.add(resolved)
     parsed = parse_memory(raw, memory_type)
+    # 正文里单独一行的 @路径，相对本文件目录拼成绝对路径（见 resolve_include）。
     include_paths = tuple(resolve_include(item, resolved.parent).expanduser().resolve() for item in parsed.includes)
     report.files.append(
         MemoryFile(
