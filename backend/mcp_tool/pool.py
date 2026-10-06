@@ -1,7 +1,10 @@
 """跨无状态 Agent run 复用 MCP 连接，避免每轮冷启动 uvx/npx。
 
-Access Layer 每轮下发自包含 server 列表；朴素实现会每轮起停 stdio 子进程。
-池按连接设置指纹键控：相同设置复用，变更则新建；对话内容绝不跨 run 共享。
+Agent Backend 按设计无会话状态：Access Layer 每轮把自包含的 server 列表
+随请求送来。若每轮 `connect` + run 结束 `close`，stdio 型 MCP（uvx/npx
+拉起子进程、握手 initialize、list_tools）会变成延迟和 CPU 的主开销，
+HTTP 型也会反复鉴权握手。池把「连接」从请求生命周期里拆出来：相同指纹
+复用，配置变了才新建；对话内容仍不进池、不跨 run 共享。
 """
 
 from __future__ import annotations
@@ -50,16 +53,25 @@ class _PooledSession:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     leases: int = 0
     last_used: float = field(default_factory=time.monotonic)
+    # 墓碑：现有租约继续用这条连接，新 acquire 当它不存在、另开一条。
+    # 置位来源：传输不健康，或 close_all(force=False) 要换代但不能杀进行中的 run。
     retire: bool = False
 
 
 class McpSessionPool:
-    """把 MCP 会话租给请求级 manager，而不是每轮重连。"""
+    """本进程（uvicorn worker）内的 MCP 连接池，挂在 FastAPI `app.state`。
+
+    进程级、内存级：不按对话/thread/run 隔离，也不跨 Access Layer 或其它
+    worker 共享。键是连接设置指纹；相同配置的并发 run 共用一条会话，
+    用 `leases` 记账。请求级 `McpClientManager` 只租用/归还，不自己长连。
+    """
 
     def __init__(self, *, idle_ttl_seconds: float = DEFAULT_IDLE_TTL_SECONDS) -> None:
         """idle TTL 控制无租约会话何时被驱逐。"""
         self._idle_ttl_seconds = idle_ttl_seconds
         self._entries: dict[str, _PooledSession] = {}
+        # 必须用 asyncio.Lock：并发 run 是同一线程里的协程，在 await 处交错。
+        # threading.RLock 按线程认人，同线程二次 acquire 会直接放行，等于没锁。
         self._lock = asyncio.Lock()
 
     async def acquire(
@@ -71,20 +83,23 @@ class McpSessionPool:
         """返回该配置下已连接的会话；冷启动时用 per-entry 锁防重复拉起子进程。"""
 
         fingerprint = fingerprint_config(config)
+        # 池级锁只保护字典和租约记账，不包住 connect：慢握手不能堵住别的指纹。
+        # 并发 run 会在 await 处交错；无锁会出现双建条目、leases 对不上、
+        # 一边驱逐一边 acquire 把正在关的会话又租出去。
         async with self._lock:
             await self._evict_idle_locked()
             entry = self._entries.get(fingerprint)
             if entry is None or entry.retire:
+                # 退役条目不能再租；换新对象进字典，旧连接只留给还握着它的 run。
                 entry = _PooledSession(config=config, session=McpSession(config))
                 self._entries[fingerprint] = entry
             entry.leases += 1
         try:
-            # The per-entry lock keeps concurrent runs from spawning duplicate
-            # child processes for the same server during a cold start.
+            # 同一指纹的冷启动互斥：第二个等待者进来时连接往往已经好了。
             async with entry.lock:
+                # `McpSession.session` 才是 SDK ClientSession；None = 未连上或已死。
                 if entry.session.session is None:
-                    # A previous connect failed or the child process exited, so the
-                    # old session object cannot be reused for a second attempt.
+                    # 失败过的 wrapper 上可能残留 _runner/_ready，不能再 connect。
                     entry.session = McpSession(config)
                     async with asyncio.timeout(connect_timeout_seconds):
                         await entry.session.connect()
@@ -118,11 +133,13 @@ class McpSessionPool:
         async with self._lock:
             closing: list[_PooledSession] = []
             for fingerprint, entry in list(self._entries.items()):
+                # 有人还在用：只标退役，不关传输；最后一次 release() 才会 close。
                 if entry.leases > 0 and not force:
                     entry.retire = True
                     continue
                 self._entries.pop(fingerprint, None)
                 closing.append(entry)
+        # 锁外关连接，避免慢 close 堵住其它 acquire。
         for entry in closing:
             await self._close_entry(entry)
 

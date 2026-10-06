@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Static, Text, useInput, useStdout } from "ink";
-import { pendingApproval, type TimelineItem } from "../application/event-projector.js";
+import { awaitingApproval, type TimelineItem } from "../application/event-projector.js";
 import { terminalLayout, TERMINAL_DESIGN } from "./design.js";
 import { HOME_MODES, homePickItems, nextSurface, surfaceFromDigit } from "./home-catalog.js";
 import { pushPromptHistory, promptHistoryText } from "./prompt-history.js";
@@ -62,7 +62,8 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   const [sendQueue, setSendQueue] = useState<string[]>([]);
   const sendQueueRef = useRef<string[]>([]);
   const [localRunning, setLocalRunning] = useState(false);
-  const interrupt = pendingApproval(model.timeline);
+  // 只有还等着用户操作的审批才接管页面；提交后的 Resume 期间回到普通对话视图。
+  const interrupt = awaitingApproval(model.timeline);
   const interruptVisible = interrupt && interrupt.id !== dismissedInterruptId;
   const effectiveOverlay: OverlayState = interruptVisible
     ? { kind: isUserQuestion(interrupt.detail) ? "question" : "approval", approval: interrupt }
@@ -78,6 +79,12 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   useEffect(() => {
     if (interrupt && interrupt.id !== dismissedInterruptId) setFocus("overlay");
   }, [interrupt, dismissedInterruptId]);
+
+  // 审批自己消失（已提交、已被服务端收口）时没人来 closeOverlay，
+  // 焦点必须主动还给输入框，否则键盘会卡在已经不存在的浮层上。
+  useEffect(() => {
+    if (!interruptVisible && overlay.kind === "none" && focus === "overlay") setFocus("composer");
+  }, [interruptVisible, overlay.kind, focus]);
 
   useEffect(() => {
     const previouslyBusy = wasBusy.current;
@@ -390,9 +397,6 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
           )}
         </Box>
       ) : null}
-      {/* Home 内容可能高于视口，Ink 此时不会在帧尾追加换行。保留一个结构化空行，
-          让终端光标坐标仍以完整输出为原点；输入框内部的 Y 无需任何补偿。 */}
-      {model.surface === "home" && !overlayVisible ? <Text> </Text> : null}
     </Box>
   );
 }

@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from backend.tools.builtins.shell import _shell_subjects
+from backend.tests.tool_runtime_support import tool_json
 import os
+from backend.tools.contracts import ToolOutcome, ActivateToolAllowlist, ToolKey
+from backend.tests.tool_runtime_support import invoke_builtin
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,14 +14,15 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from backend.agent.contracts import AgentRunRequest
-from backend.agent.react_agent import OpenAIAgent
+from backend.tests.tool_runtime_support import ToolTestAgent as OpenAIAgent
 from backend.api.schemas import ChatMessage
 from backend.mcp_tool import McpClientManager
 from backend.permissions import check_permissions, default_behavior
 from backend.permissions import rules as permission_rules
-from backend.tools import ToolDefinition
-from backend.tools.cc_like import cc_glob, cc_grep, cc_read
-from backend.tools.cc_extra import _html_to_text, _is_public_address, cc_ls, cc_web_fetch
+from backend.tests.tool_runtime_support import make_test_tool
+from backend.tools.builtins.filesystem import cc_glob, cc_grep, cc_read
+from backend.tools.builtins.filesystem import cc_ls
+from backend.tools.builtins.web import _html_to_text, _is_public_address, cc_web_fetch
 from backend.tools.workspace import (
     reset_tool_network_access,
     reset_tool_workspace,
@@ -60,8 +65,7 @@ class PermissionRuleTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = self.write_rules(tmp, [{"tool": "Bash", "pattern": "rm *", "behavior": "deny"}])
             with patch.dict(os.environ, {"K_AGENT_PERMISSION_RULES": path}):
-                subjects = OpenAIAgent._permission_subjects(
-                    "Bash", {"command": "cd /tmp && rm -rf build"}
+                subjects = _shell_subjects( {"command": "cd /tmp && rm -rf build"}
                 )
                 decision = check_permissions("Bash", subjects)
         self.assertEqual(decision.behavior, "deny")
@@ -70,8 +74,7 @@ class PermissionRuleTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             path = self.write_rules(tmp, [{"tool": "Bash", "pattern": "rm *", "behavior": "deny"}])
             with patch.dict(os.environ, {"K_AGENT_PERMISSION_RULES": path}):
-                subjects = OpenAIAgent._permission_subjects(
-                    "Bash", {"command": "cd /tmp && ls -la"}
+                subjects = _shell_subjects( {"command": "cd /tmp && ls -la"}
                 )
                 decision = check_permissions("Bash", subjects)
         self.assertEqual(decision.behavior, "allow")
@@ -124,7 +127,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         async def execute(_: dict) -> str:
             return "ran"
 
-        tool = ToolDefinition(
+        tool = make_test_tool(
             name="Bash",
             description="",
             parameters={"type": "object", "properties": {}},
@@ -148,7 +151,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     tool_name="Bash",
                     arguments={"command": "ls"},
                 )
-        payload = json.loads(result)
+        payload = tool_json(result)
         self.assertFalse(payload["ok"])
         self.assertIn("requires manual approval", payload["error"])
 
@@ -166,7 +169,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Read", "", {"type": "object", "properties": {}}, execute)],
+            [make_test_tool("Read", "", {"type": "object", "properties": {}}, execute)],
             McpClientManager([]),
             approval_handler=approve,
         )
@@ -187,10 +190,10 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             report.write_text("permission-boundary-marker", encoding="utf-8")
             token = set_tool_workspace(Path(session_dir))
             try:
-                read_result = json.loads(await cc_read({"file_path": str(report)}))
-                ls_result = json.loads(await cc_ls({"path": str(project)}))
-                glob_result = json.loads(await cc_glob({"path": str(project), "pattern": "*.html"}))
-                grep_result = json.loads(await cc_grep({"path": str(project), "pattern": "boundary-marker"}))
+                read_result = tool_json(await invoke_builtin(cc_read, {"file_path": str(report)}))
+                ls_result = tool_json(await invoke_builtin(cc_ls, {"path": str(project)}))
+                glob_result = tool_json(await invoke_builtin(cc_glob, {"path": str(project), "pattern": "*.html"}))
+                grep_result = tool_json(await invoke_builtin(cc_grep, {"path": str(project), "pattern": "boundary-marker"}))
             finally:
                 reset_tool_workspace(token)
 
@@ -215,7 +218,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Write", "", {"type": "object", "properties": {}}, execute)],
+            [make_test_tool("Write", "", {"type": "object", "properties": {}}, execute)],
             McpClientManager([]),
             approval_handler=approve,
         )
@@ -244,7 +247,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
+            [make_test_tool("Bash", "", {"type": "object", "properties": {}}, execute)],
             McpClientManager([]),
             approval_handler=approve,
         )
@@ -259,7 +262,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        payload = json.loads(result)
+        payload = tool_json(result)
         self.assertFalse(payload["ok"])
         self.assertIn("requires escalation_scope", payload["error"])
         self.assertEqual(calls, [])
@@ -278,7 +281,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
+            [make_test_tool("Bash", "", {"type": "object", "properties": {}}, execute)],
             McpClientManager([]),
             approval_handler=approve,
         )
@@ -294,7 +297,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        payload = json.loads(result)
+        payload = tool_json(result)
         self.assertFalse(payload["ok"])
         self.assertIn("already allowed", payload["error"])
         self.assertEqual(calls, [])
@@ -324,7 +327,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Bash", "", parameters, execute)],
+            [make_test_tool("Bash", "", parameters, execute)],
             McpClientManager([]),
             approval_handler=approve,
         )
@@ -368,7 +371,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Bash", "", parameters, execute)],
+            [make_test_tool("Bash", "", parameters, execute)],
             McpClientManager([]),
             approval_handler=approve,
         )
@@ -394,7 +397,7 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
         runtime = await agent.create_runtime(
             _agent_request(),
-            [ToolDefinition("Bash", "", {"type": "object", "properties": {}}, execute)],
+            [make_test_tool("Bash", "", {"type": "object", "properties": {}}, execute)],
             McpClientManager([]),
         )
         runtime["pipeline"].context.metadata["permission_mode"] = "full_access"
@@ -413,12 +416,12 @@ class AskBehaviorTests(unittest.IsolatedAsyncioTestCase):
 class SkillAllowlistTests(unittest.IsolatedAsyncioTestCase):
     async def test_invoked_skill_restricts_later_tools_in_the_run(self) -> None:
         async def skill_execute(_: dict) -> str:
-            return json.dumps({
+            return ToolOutcome.succeeded(json.dumps({
                 "success": True,
                 "commandName": "reviewer",
                 "allowedTools": ["Read"],
                 "content": "review the diff",
-            })
+            }), effects=(ActivateToolAllowlist("reviewer", frozenset({ToolKey("local", "Read"), ToolKey("local", "Skill")})),))
 
         async def bash_execute(_: dict) -> str:
             return "ran"
@@ -427,8 +430,9 @@ class SkillAllowlistTests(unittest.IsolatedAsyncioTestCase):
         runtime = await agent.create_runtime(
             _agent_request(),
             [
-                ToolDefinition("Skill", "", {"type": "object", "properties": {}}, skill_execute),
-                ToolDefinition("Bash", "", {"type": "object", "properties": {}}, bash_execute),
+                make_test_tool("Read", "", {"type": "object", "properties": {}}, bash_execute),
+                make_test_tool("Skill", "", {"type": "object", "properties": {}}, skill_execute),
+                make_test_tool("Bash", "", {"type": "object", "properties": {}}, bash_execute),
             ],
             McpClientManager([]),
         )
@@ -440,10 +444,10 @@ class SkillAllowlistTests(unittest.IsolatedAsyncioTestCase):
             arguments={"skill": "reviewer"},
         )
         self.assertEqual(
-            runtime["pipeline"].context.skill_allowlist,
-            {"Read", "Skill"},
+            runtime["tool_effect_state"]["allowlist"],
+            frozenset({ToolKey("local", "Read"), ToolKey("local", "Skill")}),
         )
-        blocked = json.loads(
+        blocked = tool_json(
             await agent._run_tool(
                 runtime=runtime,
                 iteration=1,
@@ -460,8 +464,8 @@ class WebFetchGuardTests(unittest.TestCase):
     def test_run_network_policy_returns_a_recoverable_tool_error(self) -> None:
         token = set_tool_network_access(False)
         try:
-            payload = json.loads(
-                asyncio.run(cc_web_fetch({"url": "https://example.com"}))
+            payload = tool_json(
+                asyncio.run(invoke_builtin(cc_web_fetch, {"url": "https://example.com"}))
             )
         finally:
             reset_tool_network_access(token)

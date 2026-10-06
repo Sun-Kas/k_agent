@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from backend.mcp_tool import McpToolDescriptor
-from backend.tools.local import ToolDefinition
+from backend.tools.contracts import freeze
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +18,7 @@ class SkillCatalog:
     def from_skills(cls, skills: Iterable[dict[str, Any]]) -> "SkillCatalog":
         # Copy dictionaries so later mutation of a decoded HTTP payload cannot
         # change the discovery reminder or execution allowlist mid-run.
-        return cls(tuple(dict(item) for item in skills if _skill_enabled(item)))
+        return cls(tuple(freeze(item) for item in skills if _skill_enabled(item)))
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -28,6 +27,7 @@ class SkillCatalog:
             for item in self.items
             if item.get("name") or item.get("id")
         )
+
 
 @dataclass(frozen=True, slots=True)
 class ToolCapability:
@@ -39,7 +39,7 @@ class ToolCapability:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolCatalog:
+class ToolCapabilityView:
     """The final local + MCP capability set used to compile prompt guidance."""
 
     capabilities: tuple[ToolCapability, ...]
@@ -50,27 +50,6 @@ class ToolCatalog:
 
     def has(self, name: str) -> bool:
         return name in self.names
-
-
-def build_tool_catalog(
-    *,
-    local_tools: Iterable[ToolDefinition],
-    mcp_tools: Iterable[McpToolDescriptor],
-) -> ToolCatalog:
-    """Build the capability snapshot after all request filtering and binding."""
-
-    capabilities = [
-        ToolCapability(name=tool.name, source="local") for tool in local_tools
-    ]
-    capabilities.extend(
-        ToolCapability(
-            name=f"mcp__{tool.server_id}__{tool.name}",
-            source="mcp",
-            server_id=tool.server_id,
-        )
-        for tool in mcp_tools
-    )
-    return ToolCatalog(tuple(capabilities))
 
 
 def _skill_enabled(skill: dict[str, Any]) -> bool:

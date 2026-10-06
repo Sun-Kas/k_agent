@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from access_layer.catalog import CatalogError, RuntimeCatalog
+from access_layer.catalog import CatalogError, RuntimeCatalog, read_mcp_config
 from access_layer.main import _merge_mcp_runtime_status
 from access_layer.schemas import McpServerInput
 from pydantic import ValidationError
@@ -121,6 +121,24 @@ class AccessCatalogTests(unittest.TestCase):
 
             self.assertEqual(payload["mcpServers"][0]["description"], "管理日程")
             self.assertEqual(payload["skills"][0]["description"], "帮助写作")
+
+    def test_read_mcp_config_only_accepts_claude_mcp_servers_object(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = root / "claude.json"
+            legacy = root / "legacy.json"
+            claude.write_text(
+                json.dumps({"mcpServers": {"fs": {"command": "npx", "enabled": True}}}),
+                encoding="utf-8",
+            )
+            legacy.write_text(
+                json.dumps({"servers": [{"id": "old", "command": "node"}]}),
+                encoding="utf-8",
+            )
+            servers, fmt = read_mcp_config(claude)
+            self.assertEqual(fmt, "mcpServers")
+            self.assertEqual(servers[0]["id"], "fs")
+            self.assertEqual(read_mcp_config(legacy)[0], [])
 
     def test_bootstrap_persists_supported_frontmatter_in_skill_catalog(self) -> None:
         with TemporaryDirectory() as tmp:

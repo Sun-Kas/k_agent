@@ -54,56 +54,28 @@ def empty_context_state(session_id: str) -> dict[str, Any]:
 
 
 def normalize_context_state(session_id: str, raw: Any) -> dict[str, Any]:
-    """兼容升级旧的 seq/summary 简化格式，始终返回完整状态结构。"""
+    """补齐当前 v1 状态缺的嵌套字段；无法识别则视为尚未 compact。"""
 
     base = empty_context_state(session_id)
     if not isinstance(raw, dict):
         return base
-    if isinstance(raw.get("boundary"), dict) or "generation" in raw:
-        result = {**base, **copy.deepcopy(raw), "sessionId": session_id}
-        result["failureState"] = {
-            **base["failureState"],
-            **(result.get("failureState") if isinstance(result.get("failureState"), dict) else {}),
-        }
-        result["workingSet"] = {
-            **base["workingSet"],
-            **(result.get("workingSet") if isinstance(result.get("workingSet"), dict) else {}),
-        }
-        result["toolReplacements"] = (
-            result.get("toolReplacements")
-            if isinstance(result.get("toolReplacements"), list)
-            else []
-        )
-        return result
-
-    # 2026-09-03 的基础协议把 boundary 字段平铺在顶层；保留已有摘要并升为 generation 1。
-    covered_seq = raw.get("coveredThroughSeq")
-    covered_id = raw.get("coveredThroughMessageId")
-    digest = raw.get("coveredPrefixDigest")
-    summary_text = raw.get("summary")
-    if isinstance(covered_seq, int) and isinstance(covered_id, str) and isinstance(digest, str):
-        base.update({
-            "generation": 1,
-            "revision": 1,
-            "boundary": {
-                "id": str(raw.get("id") or "legacy-compact"),
-                "coveredThroughSeq": covered_seq,
-                "coveredThroughMessageId": covered_id,
-                "coveredPrefixDigest": digest,
-                "trigger": "migration",
-                "sourceRunId": raw.get("sourceRunId"),
-                "createdAt": raw.get("updatedAt"),
-            },
-            "summary": {
-                "formatVersion": 1,
-                "text": str(summary_text or ""),
-                "modelId": None,
-                "inputTokens": None,
-                "outputTokens": None,
-            },
-            "stats": copy.deepcopy(raw.get("stats") or {}),
-        })
-    return base
+    if not isinstance(raw.get("boundary"), dict) and "generation" not in raw:
+        return base
+    result = {**base, **copy.deepcopy(raw), "sessionId": session_id}
+    result["failureState"] = {
+        **base["failureState"],
+        **(result.get("failureState") if isinstance(result.get("failureState"), dict) else {}),
+    }
+    result["workingSet"] = {
+        **base["workingSet"],
+        **(result.get("workingSet") if isinstance(result.get("workingSet"), dict) else {}),
+    }
+    result["toolReplacements"] = (
+        result.get("toolReplacements")
+        if isinstance(result.get("toolReplacements"), list)
+        else []
+    )
+    return result
 
 
 class ContextStateStore:
@@ -122,20 +94,7 @@ class ContextStateStore:
             return copy.deepcopy(self._memory.get(session_id, empty_context_state(session_id)))
         key = await self._key(session_id)
         raw = await self._storage.read_json(key)
-        normalized = normalize_context_state(session_id, raw)
-        if isinstance(raw, dict) and "generation" not in raw:
-            # 旧平铺 state 没有 revision；首次读取就在存储锁内升级，后续
-            # proposal 才能以 generation/revision 做可靠 CAS。
-            upgraded = await self._storage.compare_and_swap_json(
-                key, expected_revision=0, payload=normalized
-            )
-            if not upgraded:
-                # 另一 worker/process 已先完成升级；返回它的版本，不能把本地旧
-                # 快照伪装成当前 revision。（部署仍限制单 worker，CAS 保留健壮性。）
-                normalized = normalize_context_state(
-                    session_id, await self._storage.read_json(key)
-                )
-        return normalized
+        return normalize_context_state(session_id, raw)
 
     async def delete(self, session_id: str) -> None:
         self._memory.pop(session_id, None)
@@ -166,14 +125,20 @@ class ContextStateStore:
     async def validated(
         self, session_id: str, history_records: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """校验前缀；失效时删除派生状态并退回完整历史。"""
+        """摘要只能信「boundary 之前的 history 没被改过」。
+
+        用当前 jsonl 重算 seq 处的消息前缀哈希，对不上就删掉 compact 文件，
+        调用方改走完整历史。history 仍在，只丢派生索引。
+        """
 
         state = await self.read(session_id)
         boundary = state.get("boundary")
+        # 还没 compact：没有锚点，状态本身就是空摘要。
         if not isinstance(boundary, dict):
             return state
         seq = boundary.get("coveredThroughSeq")
         digest = boundary.get("coveredPrefixDigest")
+        # 缺字段，或有人改/删了锚点之前的消息 → 旧摘要不能再用。
         if (
             not isinstance(seq, int)
             or not isinstance(digest, str)
@@ -192,11 +157,62 @@ class ContextStateStore:
     async def active_view(
         self, session_id: str, history_records: list[dict[str, Any]]
     ) -> tuple[list[ChatMessage], dict[str, Any]]:
-        """返回 boundary 后原始消息，并幂等应用已提交的工具正文 replacement。"""
+        """组装 Provider 活动窗口：boundary 之后的消息 + 完整 compact state。
+
+        history.jsonl 仍是全量事实源。本函数只投影「模型这轮该看到什么」。
+
+        未 compact（boundary 空）：消息 = 全部投影；state.summary 为 None。
+        已 compact 到 seq=4：消息只含 seq>4 的尾部；前 4 条在 state.summary.text。
+
+        返回 ``(provider_messages, context_state)``。tool 消息若有
+        toolReplacements 且 sourceDigest 仍对得上原文，用短 replacement 替换正文，
+        原文变了则不用旧压缩，避免把过期短文套到新工具输出上。
+
+
+        {
+            "schemaVersion": 1,
+            "sessionId": "thread-abc",
+            "generation": 1,          # compact 成功一次 +1
+            "revision": 1,
+            "boundary": {
+                "id": "compact-1",
+                "coveredThroughMessageId": "a1b",
+                "coveredThroughSeq": 4,
+                "coveredPrefixDigest": "sha256:9f3c...",
+                "trigger": "auto",
+                "sourceRunId": "run-1",
+                "createdAt": "2026-09-14T09:00:00+00:00",
+            },
+            "summary": {
+                "formatVersion": 1,
+                "text": "用户要改 gateway 注释；已 Read 并补了 run() 说明。",
+                "modelId": "claude-sonnet-4",
+                "inputTokens": 12000,
+                "outputTokens": 80,
+            },
+            "toolReplacements": [
+                {
+                "messageId": "t2",
+                "replacement": "[已压缩] Read 返回 200 行…",
+                "sourceDigest": "sha256:原文哈希",
+                }
+            ],
+            "workingSet": {
+                "recentFiles": ["access_layer/gateway.py"],
+                "invokedSkillIds": [],
+                "plan": None,
+            },
+            "failureState": {"consecutiveAutoFailures": 0, "autoDisabled": False, "lastFailureCode": None},
+            "pendingContinuation": None,   # 续跑未完成时这里会是 checkpoint
+            "lastProposalId": "proposal-1",
+            "stats": {},
+            }
+        """
 
         state = await self.validated(session_id, history_records)
         boundary = state.get("boundary")
         seq = boundary.get("coveredThroughSeq") if isinstance(boundary, dict) else None
+        # 无锚点 → 整份 history；有锚点 → 只保留 coveredThroughSeq 之后。
         records = (
             [record for record in history_records if int(record.get("seq") or 0) > seq]
             if isinstance(seq, int)
@@ -235,7 +251,12 @@ class ContextStateStore:
         proposal: dict[str, Any],
         continuation_checkpoint: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """校验提案并把 summary/boundary/checkpoint 一次 CAS 提交。"""
+        """把 compact 提案一次 CAS 写进 context state。
+
+        成功后 history 仍完整，但活动上下文改用 summary + boundary 之后的尾部。
+        同一次写入里带上 pendingContinuation：摘要已生效、本 public run 的
+        后续 Reason 还没跑完。续跑结束或启动恢复完成后会清掉该 checkpoint。
+        """
 
         current = await self.validated(session_id, history_records)
         expected_generation = proposal.get("expectedGeneration")

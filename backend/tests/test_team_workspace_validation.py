@@ -20,7 +20,7 @@ class TeamWorkspaceValidationTests(unittest.TestCase):
             home = Path(tmp) / "home"
             with patch.dict(os.environ, {"K_AGENT_HOME": str(home)}, clear=False):
                 reset_home_cache()
-                ensure_home_layout(migrate=False)
+                ensure_home_layout()
                 control = teams_dir() / "team_demo" / "supervisor" / "job_1"
                 control.mkdir(parents=True)
                 managed = to_managed_path(control)
@@ -38,7 +38,7 @@ class TeamWorkspaceValidationTests(unittest.TestCase):
             outside.mkdir(parents=True)
             with patch.dict(os.environ, {"K_AGENT_HOME": str(home)}, clear=False):
                 reset_home_cache()
-                ensure_home_layout(migrate=False)
+                ensure_home_layout()
                 with self.assertRaisesRegex(ValueError, "Team Runtime workspace root"):
                     _resolve_run_workspace(str(outside), is_team_run=True)
 

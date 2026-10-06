@@ -21,9 +21,14 @@ class MemoryCacheEntry:
 
 
 class MemoryCache:
-    """进程内 memory 加载结果缓存；任一关联路径 mtime 变化即判失效。"""
+    """进程内、同步的 memory 加载结果缓存；和协程 / asyncio.Lock 无关。
+
+    任一关联路径 mtime 变化即判失效。并发方是线程，所以用 threading.RLock。
+    """
     def __init__(self) -> None:
         """准备线程安全的条目表（RLock + dict）。"""
+        # 像一把卫生间门锁：同时只允许一个线程改 _entries 这本字典。
+        # R 表示同一线程可以进了再进（不会把自己锁在门外）。
         self._lock = RLock()
         self._entries: dict[str, MemoryCacheEntry] = {}
 
@@ -57,7 +62,7 @@ class MemoryCache:
         # 文件被删除时 _mtime 返回 None，与记录值不等，同样判为失效。
         return all(_mtime(Path(path)) == mtime for path, mtime in entry.mtimes)
 
-
+# 进程级单例，各 worker 共享
 MEMORY_CACHE = MemoryCache()
 
 

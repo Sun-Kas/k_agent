@@ -71,7 +71,7 @@ def make_record(
     mutation: dict[str, Any] | None = None,
     recorded_at: str | None = None,
 ) -> dict[str, Any]:
-    """构造统一 envelope；可选字段按 kind 严格分离。"""
+    """构造统一 envelope；可选字段按 kind 严格分离，一行只带一种载荷。"""
 
     record: dict[str, Any] = {
         "schemaVersion": 1,
@@ -81,10 +81,14 @@ def make_record(
         "kind": kind,
         "recordedAt": recorded_at or datetime.now(timezone.utc).isoformat(),
     }
+    # agui_event / agui_event_batch：已 coalesce 的 AG-UI 事件，供 UI 重放与 Provider 投影。
     if events is not None:
         record["events"] = copy.deepcopy(events)
+    # input_message：本轮用户提交，与模型输出分开放，取消 run 时可单独回滚。
     if message is not None:
         record["message"] = copy.deepcopy(message)
+    # history_mutation：append-only tombstone。线上目前只有 cancel_run 的 remove_run；
+    # delete_message / replace_message 只在读路径识别，尚无写入。
     if mutation is not None:
         record["mutation"] = copy.deepcopy(mutation)
     return record
@@ -114,19 +118,29 @@ def decode_records(lines: Iterable[str]) -> list[dict[str, Any]]:
 
 
 def visible_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """应用 append-only tombstone；历史原行不改写，派生视图隐藏被取消 run。"""
+    """从完整 JSONL 派生「对外可见」的记录，不改磁盘上的原行。
+
+    先扫 kind=history_mutation 的墓碑（线上主要是 cancel_run 写入的
+    remove_run），再过滤：墓碑行本身、被取消 run 的所有行都不出现在结果里。
+    delete_message / replace_message 读路径能识别，当前没有写入方。
+    messages_from_records / events_from_records 都走这里，避免 UI 和 Provider
+    看到已撤销的半截 run。
+    """
 
     removed_runs: set[str] = set()
     replaced_messages: dict[str, dict[str, Any]] = {}
     deleted_messages: set[str] = set()
+    # 第一遍只收墓碑，不改其它行。后面第二遍才按这些集合过滤/替换。
     for record in records:
         if record.get("kind") != "history_mutation":
             continue
         mutation = record.get("mutation")
         if not isinstance(mutation, dict):
             continue
+        # cancel_run：整轮 runId 从可见视图里拿掉。
         if mutation.get("type") == "remove_run" and isinstance(mutation.get("runId"), str):
             removed_runs.add(mutation["runId"])
+        # 下面两种读得懂，当前没有写入方。
         elif mutation.get("type") == "delete_message" and isinstance(mutation.get("messageId"), str):
             deleted_messages.add(mutation["messageId"])
         elif mutation.get("type") == "replace_message":
@@ -163,18 +177,28 @@ def events_from_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "message": copy.deepcopy(record["message"]),
             })
         elif kind in {"agui_event", "agui_event_batch"}:
-            events.extend(
-                copy.deepcopy(event)
-                for event in record.get("events", [])
-                if isinstance(event, dict)
-            )
+            # 展平副本带上 envelope 的落盘时间，历史重放才能显示原来的时刻。
+            # 不改 history.jsonl；事件自身已有 createdAt 时保留。
+            recorded_at = record.get("recordedAt")
+            for event in record.get("events", []):
+                if not isinstance(event, dict):
+                    continue
+                cloned = copy.deepcopy(event)
+                if isinstance(recorded_at, str) and not cloned.get("createdAt"):
+                    cloned["createdAt"] = recorded_at
+                events.append(cloned)
     return events
 
 
 def messages_from_records(
     records: list[dict[str, Any]], *, through_seq: int | None = None
 ) -> list[ChatMessage]:
-    """从对话事实流投影 Provider messages，不依赖 session.json 的旧 messages。"""
+    """从对话事实流投影 Provider messages，不依赖 session.json 的旧 messages。
+
+    through_seq：只投影 seq <= 该值的可见记录。None 表示整段历史。
+    compact 算 coveredPrefixDigest 时传入 boundary 的 seq，哈希只覆盖
+    压缩锚点之前的消息，后面新回合不改变前缀指纹。
+    """
 
     selected = [
         record for record in visible_records(records)
@@ -187,6 +211,7 @@ def messages_from_records(
 
     for record in selected:
         run_id = record.get("runId") if isinstance(record.get("runId"), str) else active_run_id
+        # 插入用户输入消息
         if record.get("kind") == "input_message" and isinstance(record.get("message"), dict):
             messages = _upsert_message(messages, ChatMessage.model_validate(record["message"]))
             continue
@@ -235,6 +260,9 @@ def messages_from_records(
                 if buffer is None or not isinstance(content, str):
                     continue
                 event_time = _event_time(event, record)
+                # Provider 要求成对：先 assistant(toolCalls)，再 role=tool 的结果。
+                # 不能合成一条，否则下一轮缺 tool_call_id 对或被当孤儿 tool 拒收。
+                # content 空的 assistant 仍靠 toolCalls 通过 carries_context。
                 messages = _upsert_message(messages, ChatMessage(
                     id=f"toolcall-{call_id}", role="assistant", content="",
                     createdAt=event_time,

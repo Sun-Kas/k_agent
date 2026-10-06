@@ -28,6 +28,7 @@ class RunnerRegistry:
         if not resolved:
             raise ValueError("Agent kind must not be empty")
         with self._lock:
+            # 与 get/kinds 共用一把锁：查重+写入必须原子，否则两个线程都能登记同一 kind。
             if resolved in self._loaders:
                 raise ValueError(f"Agent kind {resolved!r} is already registered")
             self._loaders[resolved] = loader

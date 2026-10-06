@@ -9,7 +9,6 @@ from ag_ui.core import RunAgentInput
 
 from access_layer.gateway import AgentAccessLayer
 from access_layer.sessions.store import (
-    OpenInterruptError,
     ResumeConflictError,
     SessionStore,
 )
@@ -93,8 +92,6 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
             public_event = await store.persist_interrupt(session.id, event)
             self.assertNotIn("_checkpoint", public_event["content"])
             self.assertEqual(session.open_interrupt_ids, ["interrupt-1"])
-            with self.assertRaises(OpenInterruptError):
-                await store.ensure_accepts_new_input(session.id)
 
             # A fresh store proves that the approval/checkpoint is not only held
             # by the process that produced the original run.
@@ -132,6 +129,50 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual((await reloaded.get(session.id)).open_interrupt_ids, [])
             self.assertEqual(await reloaded.list_open_interrupts(session.id), [])
+
+    async def test_new_input_cancels_pending_interrupt_without_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = FileStorage(Path(temp_dir))
+            store = SessionStore(storage)
+            session = await store.create_session(session_id="thread-new-input")
+            await store.persist_interrupt(session.id, {
+                "type": "ACTIVITY_SNAPSHOT",
+                "messageId": "interrupt-skip",
+                "activityType": "approval",
+                "replace": True,
+                "content": {
+                    "id": "interrupt-skip",
+                    "threadId": session.id,
+                    "runId": "run-1",
+                    "agentKind": "k_agent",
+                    "category": "local_tool",
+                    "title": "允许调用 Bash？",
+                    "message": "需要确认",
+                    "detail": {"toolName": "Bash"},
+                    "toolCallId": "call-1",
+                    "requestHash": "sha256:skip",
+                    "status": "pending",
+                    "_checkpoint": {"version": 1, "kind": "react_tool_boundary"},
+                },
+            })
+            snapshots = await store.ensure_accepts_new_input(session.id)
+            self.assertEqual(snapshots[0]["content"]["status"], "cancelled")
+            self.assertEqual((await store.get(session.id)).open_interrupt_ids, [])
+            self.assertEqual(await store.list_open_interrupts(session.id), [])
+            await store.save_run_start(
+                session.id,
+                [ChatMessage(
+                    id="user-2", role="user", content="换个话题",
+                    createdAt=datetime.now(timezone.utc),
+                )],
+                run_id="run-2", mcp_server_ids=[], skill_ids=[],
+            )
+            with self.assertRaises(ResumeConflictError):
+                await store.prepare_resume(
+                    session.id,
+                    [{"interruptId": "interrupt-skip", "status": "cancelled"}],
+                    resume_run_id="run-3",
+                )
 
     async def test_cli_provider_interrupts_survive_access_layer_restart(self) -> None:
         for agent_kind in ("claude_code", "codex"):

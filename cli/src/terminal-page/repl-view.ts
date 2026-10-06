@@ -1,5 +1,11 @@
 import type { TimelineItem, TimelineState } from "../application/event-projector.js";
 import stringWidth from "string-width";
+import {
+  CLI_DIFF_EXPANDED_LINES,
+  CLI_DIFF_PREVIEW_LINES,
+  estimateFileChangeLines,
+  parseFileChange,
+} from "../tools/file-change-preview.js";
 
 export function canFlushPromptQueue(runStatus: TimelineState["runStatus"]): boolean {
   return runStatus !== "running" && runStatus !== "waiting_input";
@@ -71,7 +77,12 @@ export function estimateTimelineItemLines(
     const hard = content.split("\n").reduce((sum, line) => sum + Math.max(1, Math.ceil(Math.max(1, stringWidth(line)) / width)), 0);
     return expanded ? Math.min(hard, 48) : Math.min(hard, Math.max(1, textMaxLines));
   }
-  if (item.kind === "thinking" || item.kind === "tool" || item.kind === "approval") return 1;
+  if (item.kind === "thinking" || item.kind === "approval") return 1;
+  if (item.kind === "tool") {
+    const change = parseFileChange(item.name, item.arguments, item.result);
+    if (!change) return 1;
+    return estimateFileChangeLines(change, expanded ? CLI_DIFF_EXPANDED_LINES : CLI_DIFF_PREVIEW_LINES);
+  }
   return Math.max(1, Math.ceil(Math.max(1, stringWidth(item.content)) / width));
 }
 

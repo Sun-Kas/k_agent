@@ -232,6 +232,20 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
     }
   }, [client, refreshSessions]);
 
+  const settleApproval = useCallback((
+    sessionId: string,
+    approvalId: string,
+    action: "approve" | "deny" | "cancel" | "answer",
+  ): void => {
+    const current = timelineCacheRef.current.get(sessionId);
+    const item = current?.items.find((entry) => entry.kind === "approval" && entry.id === approvalId);
+    // 流里已经带回更确定的结果（resume_failed 等）时不覆盖它。
+    if (!current || item?.kind !== "approval" || item.approval.status !== "submitting") return;
+    const settled = updateApprovalStatus(current, approvalId, RESUME_RESULT_STATUS[action]);
+    timelineCacheRef.current.set(sessionId, settled);
+    if (activeSessionRef.current === sessionId) setModel((value) => ({ ...value, timeline: settled }));
+  }, []);
+
   const handleAction = useCallback(async (action: TerminalPageAction): Promise<void> => {
     if (action.type === "quit") {
       exit();
@@ -325,6 +339,9 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
           ? { action: "approve" as const, scope: action.payload.scope }
           : { action: action.payload.action as "deny" | "cancel" };
       await startRun(sessionId, createResumeInput(approval, configRef.current, decision));
+      // Access Layer 在 Resume 结束后才把最终审批快照写进 history，本次 SSE 不会再推回来。
+      // 这里按提交的动作就地收口，否则卡片永远停在 submitting，下一次输入也会被它挡住。
+      settleApproval(sessionId, approval.id, decision.action);
       return;
     }
     if (action.type === "refresh_mcp") {
@@ -384,7 +401,7 @@ export function ChatController({ client, initialConfig, initialSessionId, startA
       return;
     }
     if (action.type === "slash_command") await handleSlash(action.command, action.arguments);
-  }, [applyCliRuntime, client, exit, loadSession, model.runtime.agents, model.runtime.models, model.timeline, mutateMcp, mutateSkills, refreshMcp, startRun]);
+  }, [applyCliRuntime, client, exit, loadSession, model.runtime.agents, model.runtime.models, model.timeline, mutateMcp, mutateSkills, refreshMcp, settleApproval, startRun]);
 
   const handleSlash = useCallback(async (command: string, args: string): Promise<void> => {
     if (command === "new") return void handleAction({ type: "new_session" });
@@ -518,6 +535,13 @@ function applyChoice(
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+const RESUME_RESULT_STATUS: Record<"approve" | "deny" | "cancel" | "answer", ApprovalActivity["status"]> = {
+  approve: "approved",
+  deny: "denied",
+  cancel: "cancelled",
+  answer: "answered",
+};
 
 function updateApprovalStatus(
   timeline: TimelineState,

@@ -34,6 +34,7 @@
 
 ## 调研
 
+- [Agent 逻辑回滚：调研与完整技术方案](agent-rollback/agent-logical-rollback-technical-proposal.md)
 - [Agent 递归自进化机制调研](research/agent-recursive-self-evolution-survey.md)
 
 ## 参考记录

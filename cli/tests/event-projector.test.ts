@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { timelineFromSession, type TimelineItem } from "../src/application/event-projector.js";
+import { awaitingApproval, pendingApproval, projectEvent, timelineFromSession, emptyTimeline, type TimelineItem } from "../src/application/event-projector.js";
 import type { AgUiEvent, ChatMessage, SessionState } from "../src/protocol/index.js";
 
 test("多轮回放严格保留 input_message 与 RUN_STARTED 的历史顺序", () => {
@@ -49,6 +49,27 @@ test("工具、错误与下一轮提问不按类型重排", () => {
   ]));
   assert.deepEqual(kinds(timeline.items), ["user", "tool", "error", "user"]);
   assert.deepEqual(contents(timeline.items), ["first", "", "failed", "second"]);
+});
+
+test("答案提交后审批不再算等待用户，但仍算未收口", () => {
+  let timeline = projectEvent(emptyTimeline(), { type: "RUN_STARTED", threadId: "s1", runId: "r1" });
+  timeline = projectEvent(timeline, {
+    type: "ACTIVITY_SNAPSHOT",
+    messageId: "i1",
+    activityType: "approval",
+    replace: true,
+    content: { id: "i1", threadId: "s1", runId: "r1", title: "需要你的确认", questions: [] },
+  });
+  assert.equal(awaitingApproval(timeline)?.id, "i1");
+
+  const submitting = {
+    ...timeline,
+    items: timeline.items.map((item) => item.kind === "approval"
+      ? { ...item, approval: { ...item.approval, status: "submitting" as const } }
+      : item),
+  };
+  assert.equal(awaitingApproval(submitting), undefined);
+  assert.equal(pendingApproval(submitting)?.id, "i1");
 });
 
 function input(id: string, content: string, runId: string): AgUiEvent {

@@ -102,6 +102,7 @@ class McpSession:
             return
         if self._runner is None:
             loop = asyncio.get_running_loop()
+            # 后台任务靠这盏灯活着：wait() 直到 close() 里 set()，传输的 async with 才退出。
             self._stop = asyncio.Event()
             self._ready = loop.create_future()
             self._runner = asyncio.create_task(self._run())
@@ -126,6 +127,7 @@ class McpSession:
                         self._ready.set_result(None)
                     # 停在这里不返回，让上面两层 async with 保持打开；
                     # 一旦返回，传输和会话就会被关掉。
+                    # 握手完成：停在 wait() 上保持连接，直到 close() set()。
                     if self._stop is not None:
                         await self._stop.wait()
         except asyncio.CancelledError:
@@ -197,6 +199,7 @@ class McpSession:
     async def close(self) -> None:
         """关闭当前会话和底层传输资源。"""
         if self._stop is not None:
+            # 点亮后 _run 从 wait() 返回，两层 async with 退出，子进程/HTTP 关掉。
             self._stop.set()
         if self._runner is not None:
             # 先给 3 秒让它走正常收尾（子进程优雅退出、HTTP 连接关闭）；
@@ -273,7 +276,13 @@ def _is_transient_result(result_json: str) -> bool:
 
 
 class McpClientManager:
-    """协调多个独立 MCP 会话，隔离单 server 失败。"""
+    """一组 MCP server 的请求/预热协调器，不是连接本体。
+
+    类本身没有进程单例：启动时 `app.state.mcp_manager` 一份（读盘预热、
+    health/capabilities/reload），每个 Agent run 再 `mcp_manager_from_runtime`
+    一份（只含本轮勾选）。真正跨 run 复用的是注入的 `McpSessionPool`。
+    两份 manager 对同一指纹只是 leases+1，不会再拉一个子进程。
+    """
 
     def __init__(
         self,
@@ -288,23 +297,34 @@ class McpClientManager:
         session_pool: "McpSessionPool | None" = None,
     ):
         """可注入进程级 `session_pool`：借共享连接，`close_all` 时归还而非杀进程。"""
+        # 本轮要管的 server 定义（启用/禁用都在列表里）。
         self.servers = servers
+        # 磁盘加载结果：warnings / blocked / suppressed，供日志；请求级装配可为空。
         self.load_result = load_result
+        # 打进 mcp.* 日志的 requestId/threadId/runId 等，缺省空 dict。
         self.log_context = dict(log_context or {})
         self.connect_timeout_seconds = connect_timeout_seconds
         self.call_timeout_seconds = call_timeout_seconds
         self.max_call_retries = max_call_retries
         self.retry_base_delay_seconds = retry_base_delay_seconds
-        # 有池时本 manager 借用共享连接，close_all 归还而非每轮杀掉子进程。
+        # 有池则借用共享连接；无池则本 manager 自建自毁 stdio/HTTP。
         self._session_pool = session_pool
+        # server.id → 池指纹；release 时凭这个归还，无池时为空。
         self._leases: dict[str, str] = {}
+        # server.id → 已连上的 McpSession，list/call 都走这里。
+        # 有池：acquire 借来的同一对象；无池：本 manager new 出来的，close_all 要自己关。
         self.sessions: dict[str, McpSession] = {}
+        # 本轮连接失败的 server.id → 错误文案；不阻止其它 server。
         self.failed: dict[str, str] = {}
+        # 配置里 enabled=false 的 id，connect_all 直接跳过。
         self.disabled: set[str] = {server.id for server in servers if not server.enabled}
 
     async def connect_all(self) -> None:
         """连接已启用 server；单个失败记入 `failed`，不阻塞其余。"""
 
+        # INFO 例：`15:03:12 INFO  sess=a1b2c3d4 run=9f3c1a2b │ 准备 MCP · 启用=2 禁用=0`
+        # 启动预热无 thread/run 时没有 sess=/run=。serverCount/suppressed/blocked/warning
+        # 只在 DEBUG 尾巴出现；requestId 会被 formatter 丢掉。
         log_event(
             "mcp.load.started",
             **self.log_context,
@@ -332,7 +352,7 @@ class McpClientManager:
                 transport=server.type,
                 scope=server.scope,
             )
-            session = self.sessions.get(server.id)
+            session = None
             try:
                 if self._session_pool is not None:
                     fingerprint, session = await self._session_pool.acquire(
@@ -341,10 +361,13 @@ class McpClientManager:
                     )
                     self._leases[server.id] = fingerprint
                 else:
+                    # 无池时同一 manager 再 connect_all 会复用已有包装对象。
+                    session = self.sessions.get(server.id)
                     if session is None:
                         session = McpSession(server)
                     async with asyncio.timeout(self.connect_timeout_seconds):
                         await session.connect()
+                # 有池/无池都在这里登记：list/call 只认 sessions，不认 leases。
                 self.sessions[server.id] = session
             except Exception as exc:
                 # Do not leave a timed-out uvx/npx child process downloading in
@@ -460,6 +483,7 @@ class McpClientManager:
         tools = await self.list_tools()
         resources = await self.list_resources()
         tool_counts: dict[str, int] = {}
+        # 按 server.id 数 list_tools 结果，写入各 server 的 tool_count。
         for tool in tools:
             tool_counts[tool.server_id] = tool_counts.get(tool.server_id, 0) + 1
         statuses = []
@@ -582,6 +606,7 @@ class McpClientManager:
                 # handed to the next run; retiring it forces a fresh connect.
                 healthy = session is not None and session.session is not None
                 await self._session_pool.release(fingerprint, healthy=healthy)
+            # 只丢掉本 manager 的引用，不 close：连接仍在池里给下一轮用。
             self._leases.clear()
             self.sessions.clear()
             return
@@ -605,7 +630,7 @@ async def load_mcp_servers() -> list[McpServerConfig]:
 async def load_mcp_manager(
     session_pool: "McpSessionPool | None" = None,
 ) -> McpClientManager:
-    """创建加载好配置的 MCP 客户端管理器。"""
+    """从磁盘配置建一份 manager，供进程预热 / reload；与 run 共用 `session_pool`。"""
     settings = await get_or_init_settings()
     result = load_scoped_mcp_servers(explicit_config_path=settings.mcp_config_path)
     return McpClientManager(

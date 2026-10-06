@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
-import { measureElement, useCursor, type DOMElement } from "ink";
+import { measureElement, useCursor, useWindowSize, type DOMElement } from "ink";
 import stringWidth from "string-width";
 
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -38,6 +38,7 @@ export function terminalCursorOffset(value: string, columns: number): { x: numbe
 export function imeCursorPosition(
   metrics: BoxMetrics,
   renderedValue: string,
+  rowOffset = 0,
 ): { x: number; y: number } | undefined {
   // 尚未完成布局时 yoga 全是 0。宽度为 0 的 caret 仍可能有合法的 x/y。
   if (metrics.width <= 0 && metrics.height <= 0 && metrics.x === 0 && metrics.y === 0) {
@@ -45,7 +46,24 @@ export function imeCursorPosition(
   }
   const columns = Math.max(1, metrics.width);
   const offset = terminalCursorOffset(renderedValue, columns);
-  return { x: metrics.x + offset.x, y: metrics.y + offset.y };
+  return { x: metrics.x + offset.x, y: metrics.y + offset.y + rowOffset };
+}
+
+/**
+ * Ink 帧高不到一屏时会在帧尾补一个换行，真实光标停在最后一行的下一行；
+ * 帧高占满或超过一屏时没有这个换行，光标停在最后一行本身。
+ * 但 Ink 计算光标后缀时一律按「多一行」上移，满屏帧因此整体偏高一行。
+ * 这里按同样条件补回 1，不能改成按 surface 判断——聊天页一样会占满屏。
+ */
+export function fullscreenRowOffset(frameHeight: number, rows: number): number {
+  return rows > 0 && frameHeight >= rows ? 1 : 0;
+}
+
+/** 输入框所在的这一帧有多高：沿布局树走到 ink-root，读它的 yoga 高度。 */
+export function liveFrameHeight(node: DOMElement): number {
+  let root = node;
+  while (root.parentNode) root = root.parentNode;
+  return root.yogaNode?.getComputedHeight() ?? 0;
 }
 
 function sameMetrics(left: BoxMetrics, right: BoxMetrics): boolean {
@@ -65,33 +83,40 @@ export function useImeCursor(
   active: boolean,
 ): void {
   const { setCursorPosition } = useCursor();
-  const metricsRef = useRef<BoxMetrics | undefined>(undefined);
+  const { rows } = useWindowSize();
+  const frameRef = useRef<{ metrics: BoxMetrics; rowOffset: number } | undefined>(undefined);
   const [, setLayoutTick] = useState(0);
 
-  function positionFrom(metrics: BoxMetrics): { x: number; y: number } | undefined {
-    return imeCursorPosition(metrics, renderedValue);
+  function positionFrom(frame: { metrics: BoxMetrics; rowOffset: number }): { x: number; y: number } | undefined {
+    return imeCursorPosition(frame.metrics, renderedValue, frame.rowOffset);
   }
 
   useLayoutEffect(() => {
     if (!active || !lineRef.current) {
-      metricsRef.current = undefined;
+      frameRef.current = undefined;
       setLayoutTick(0);
       setCursorPosition(undefined);
       return;
     }
-    const metrics = measureElement(lineRef.current);
-    const next = positionFrom(metrics);
+    const frame = {
+      metrics: measureElement(lineRef.current),
+      rowOffset: fullscreenRowOffset(liveFrameHeight(lineRef.current), rows),
+    };
+    const next = positionFrom(frame);
     if (!next) return;
-    const previous = metricsRef.current;
-    metricsRef.current = metrics;
+    const previous = frameRef.current;
+    frameRef.current = frame;
     setCursorPosition(next);
-    // 输入框挪了才再画一帧。上屏只改文本，原点不变，不能 setState，否则会先画出旧光标。
-    if (!previous || !sameMetrics(previous, metrics)) setLayoutTick((tick) => tick + 1);
+    // 输入框挪了（或帧跨过满屏边界）才再画一帧。上屏只改文本，原点不变，
+    // 不能 setState，否则会先画出旧光标。
+    if (!previous || !sameMetrics(previous.metrics, frame.metrics) || previous.rowOffset !== frame.rowOffset) {
+      setLayoutTick((tick) => tick + 1);
+    }
   });
 
   if (!active) setCursorPosition(undefined);
-  else if (metricsRef.current) {
-    const next = positionFrom(metricsRef.current);
+  else if (frameRef.current) {
+    const next = positionFrom(frameRef.current);
     if (next) setCursorPosition(next);
   }
 

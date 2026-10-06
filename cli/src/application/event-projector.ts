@@ -207,10 +207,32 @@ function appendOpenInterrupt(
   });
 }
 
+/** 尚未收口的审批，含已提交但 Resume 还没跑完的那一条。 */
 export function pendingApproval(state: TimelineState): ApprovalActivity | undefined {
+  return lastApproval(state, OPEN_APPROVAL_STATUSES);
+}
+
+/**
+ * 还在等用户动手的审批。
+ *
+ * `submitting` 不算：答案已经发给 Access Layer，Resume run 正在后台执行，
+ * 此时必须把页面交还给对话流，否则用户只能看着不会再变的 HITL 卡片。
+ */
+export function awaitingApproval(state: TimelineState): ApprovalActivity | undefined {
+  return lastApproval(state, OPEN_APPROVAL_STATUSES.filter((status) => status !== "submitting"));
+}
+
+const OPEN_APPROVAL_STATUSES: ApprovalActivity["status"][] = [
+  "pending",
+  "submitting",
+  "unknown_outcome",
+  "resume_failed",
+  "error",
+];
+
+function lastApproval(state: TimelineState, statuses: ApprovalActivity["status"][]): ApprovalActivity | undefined {
   return [...state.items].reverse().find((item): item is Extract<TimelineItem, { kind: "approval" }> =>
-    item.kind === "approval"
-      && ["pending", "submitting", "unknown_outcome", "resume_failed", "error"].includes(item.approval.status),
+    item.kind === "approval" && statuses.includes(item.approval.status),
   )?.approval;
 }
 

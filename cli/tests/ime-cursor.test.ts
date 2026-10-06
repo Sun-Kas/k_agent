@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { imeCursorPosition, terminalCursorOffset } from "../src/terminal-page/use-ime-cursor.js";
+import { fullscreenRowOffset, imeCursorPosition, terminalCursorOffset } from "../src/terminal-page/use-ime-cursor.js";
 
 test("中文按终端列宽计算光标偏移", () => {
   assert.deepEqual(terminalCursorOffset("❯ 你好", 80), { x: 6, y: 0 });
@@ -36,4 +36,17 @@ test("同一行原点下文本变长时立即算出新插入点，不沿用旧�
 test("输入框内容节点直接决定光标纵坐标，不再手工上下调整", () => {
   const contentLine = { x: 2, y: 21, width: 76, height: 1 };
   assert.deepEqual(imeCursorPosition(contentLine, "❯ 吃"), { x: 6, y: 21 });
+});
+
+test("帧没占满一屏时不补偿行号", () => {
+  assert.equal(fullscreenRowOffset(20, 40), 0);
+  // 终端行数未知时宁可不补，避免把光标推到输入框下面。
+  assert.equal(fullscreenRowOffset(40, 0), 0);
+});
+
+test("帧占满一屏时补一行，抵消 Ink 少掉的帧尾换行", () => {
+  assert.equal(fullscreenRowOffset(40, 40), 1);
+  assert.equal(fullscreenRowOffset(60, 40), 1);
+  const contentLine = { x: 2, y: 39, width: 76, height: 1 };
+  assert.deepEqual(imeCursorPosition(contentLine, "❯ 吃", 1), { x: 6, y: 40 });
 });

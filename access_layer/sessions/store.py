@@ -40,8 +40,9 @@ from access_layer.sessions.history import (
     message_seq_index,
     messages_from_records,
     projected_prefix_digest,
+    visible_records,
 )
-from access_layer.sessions.migrate_history import migrate_all_sessions, migrate_session_record
+from access_layer.sessions.migrate_history import migrate_session_record
 from access_layer.sessions.context_store import ContextStateStore, empty_context_state
 from access_layer.settings import get_or_init_settings
 from access_layer.schemas import ChatMessage, ChatMeta, SessionSummary, ToolCallRecord
@@ -56,8 +57,9 @@ class SessionBusyError(RuntimeError):
     """Raised when a destructive session operation races an active run."""
 
 
-class OpenInterruptError(RuntimeError):
-    """线程存在未解决 Interrupt，普通用户输入不能越过该恢复边界。"""
+class SessionForkAnchorError(LookupError):
+    """要分支的消息或 run 不在可见历史里。"""
+
 
 
 class ResumeConflictError(RuntimeError):
@@ -66,26 +68,40 @@ class ResumeConflictError(RuntimeError):
 
 @dataclass(slots=True)
 class SessionRecord:
-    """会话元数据及由 history 临时投影的 messages/events。"""
+    """一份会话的内存视图。磁盘上是 session.json（元数据）+ history.jsonl（事实源）。
 
+    messages/events 不单独落盘，每次从 history_records 投影；重启后重建。
+    """
+
+    # 目录名 sessions/{id}/，AG-UI threadId 就是它。例: "a1b2c3d4-..."
     id: str
+    # 侧栏标题；默认「新对话」，首条 user 消息截断替换。例: "帮我改 gateway 注释"
     title: str
+    # 给模型/UI 的聊天投影：user / assistant / tool。例: user「看看 MCP」+ assistant 回复
     messages: list[ChatMessage] = field(default_factory=list)
+    # 给前端时间线的 AG-UI 事件投影（已合并 delta）。例: RUN_STARTED、TEXT_MESSAGE_END
     events: list[dict] = field(default_factory=list)
+    # history.jsonl 每一行；seq 递增。例: {seq:1, kind:"input_message", message:{...}}
     history_records: list[dict[str, Any]] = field(default_factory=list)
+    # 下一条 history 的 seq。已有 seq=1,2 则为 3
     next_history_seq: int = 1
+    # 最近一轮勾选的 MCP id；None=还没跑过，[]=显式一个都没选。例: ["filesystem"]
     mcp_server_ids: list[str] | None = None
+    # 同上，Skill id。例: ["skill-creator"]
     skill_ids: list[str] | None = None
+    # 写工具是否要 HITL：default 要批，full_access 免批
     permission_mode: str = "default"
-    # 手动 compact 默认沿用该会话最近一次 K Agent 主模型，而不是全局默认模型。
+    # 最近一次 K Agent 主模型；手动 compact 沿用它，不用全局默认。例: "claude-sonnet-4"
     model_id: str | None = None
+    # 用哪个 runner。例: "k_agent" | "codex" | "claude_code"
     agent_kind: str = "k_agent"
-    # Provider-native CLI session ids (codex / claude_code) for optional resume.
+    # CLI runner 的原生会话 id，用来 resume。例: {"codex": "sess_abc"}
     cli_sessions: dict[str, str] = field(default_factory=dict)
-    # 主会话文件只保存开放 ID 索引；完整审批与 checkpoint 独立原子落盘。
+    # 未关闭的 Interrupt id；正文在独立审批文件。例: ["interrupt-write-hello"]
     open_interrupt_ids: list[str] = field(default_factory=list)
-    # 来源是持久化边界：自动任务仍有完整 session/workspace，但不进入普通会话目录。
+    # interactive=侧栏可见；scheduled=定时任务会话，不进普通列表
     source: str = "interactive"
+    # scheduled → 任务 run id；从别的会话 fork → 源 session id
     source_ref: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -104,6 +120,7 @@ class SessionStore:
         self._sessions: dict[str, SessionRecord] = {}
         # 无 StorageBackend 的单元测试也需要同一状态机；生产环境同时写独立文件。
         self._approval_records: dict[tuple[str, str], dict[str, Any]] = {}
+        # (session_id, intent_id) → 已认领的 resume 决定；与磁盘 resume-intents/*.json 对应。
         self._resume_intents: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_run_ids: dict[str, str] = {}
         self._run_input_message_ids: dict[tuple[str, str], set[str]] = {}
@@ -119,6 +136,9 @@ class SessionStore:
         # events 仅为内存投影；这个游标标记已追加到 history.jsonl 的位置。
         self._persisted_event_counts: dict[str, int] = {}
         self._loaded = False
+        # 整份 Store 一把锁，所有协程共用：进内存索引/落盘的 public 方法都要拿它。
+        # 按次短持有（get/append_event/…），不包住整段 agent SSE。
+        # 不是按 session 的 run 互斥（那是 RequestConcurrencyLimiter）。
         self._lock = asyncio.Lock()
 
     async def create_session(
@@ -640,6 +660,8 @@ class SessionStore:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(session_id)
+            # 客户端本请求交来的决定，按 interruptId 索引；expected 是服务端仍开放的集合。
+            # 两边必须正好相等：少交、多交、空 id 都算冲突。
             supplied = {
                 str(entry.get("interruptId") or ""): entry for entry in resume_entries
             }
@@ -649,14 +671,21 @@ class SessionStore:
                     "Resume must resolve every open interrupt for this thread"
                 )
 
+            # 把同一份决定收成稳定字节再哈希：键排序、无多余空格。
+            # 前端重试同一批准会得到同一个 intent 文件名；换 approved/换 interrupt 则哈希不同。
             canonical = json.dumps(
                 resume_entries,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
+            # SHA-256：任意长度字节 → 固定 64 个 hex 字符的指纹。不是加密，不能反推内容。
+            # 相同 canonical 必相同；改一个字段几乎必变。前缀标明算法，文件名再用前 32 个 hex。
             input_hash = "sha256:" + hashlib.sha256(canonical).hexdigest()
+            # "sha256:" + 64 hex → 去掉前缀再截前 32，当短 id / 文件名。
+            # 例: "sha256:9f3c1a2b..." → intent_id = "9f3c1a2b" 那一段（32 个字符）。
             intent_id = input_hash.removeprefix("sha256:")[:32]
+            # 本进程里这份决定是否已经认领过。没有再读磁盘；都没有才往下首次落盘。
             prior_intent = self._resume_intents.get((session_id, intent_id))
             if prior_intent is None and self._storage is not None:
                 settings = await get_or_init_settings()
@@ -669,8 +698,11 @@ class SessionStore:
                     raise ResumeConflictError(
                         "This resume decision was already claimed by another run"
                     )
+                # 非常规主路径：同一 run 对同一份决定再 POST（SSE 断线、按钮连点）。
+                # 首次点批准走下面，不进这个 return。
                 return copy.deepcopy(prior_intent.get("interrupts") or [])
 
+            # 内存和磁盘都没有这份 intent → 第一次认领：校验开放 Interrupt、写 intent、标 resuming。
             records: list[dict[str, Any]] = []
             now = datetime.now(timezone.utc).isoformat()
             for interrupt_id in session.open_interrupt_ids:
@@ -821,16 +853,50 @@ class SessionStore:
             await self._append_pending_events_locked(session)
             await self._persist(session)
 
-    async def ensure_accepts_new_input(self, session_id: str) -> None:
-        """阻止用户消息跨过一个仍需决定的工具边界。"""
+    async def ensure_accepts_new_input(self, session_id: str) -> list[dict[str, Any]]:
+        """允许新的 user 消息。未点的 HITL 就地标 cancelled，不 Resume、不跑工具。
+
+        未产生 RESULT 的 tool_calls 本来就不进 messages，下一轮 Provider 仍合法。
+        返回已写入 history 的审批快照，供本轮 SSE 先推给前端收起卡片。
+        """
 
         await self._ensure_loaded()
         async with self._lock:
             session = self._sessions.get(session_id)
-            if session is not None and session.open_interrupt_ids:
-                raise OpenInterruptError(
-                    "Resolve the pending approval before sending another message"
-                )
+            if session is None or not session.open_interrupt_ids:
+                return []
+            now = datetime.now(timezone.utc).isoformat()
+            snapshots: list[dict[str, Any]] = []
+            for interrupt_id in list(session.open_interrupt_ids):
+                record = await self._read_approval_locked(session_id, interrupt_id)
+                if record is None:
+                    continue
+                record.update({
+                    "status": "cancelled",
+                    "updatedAt": now,
+                    "decision": {"interruptId": interrupt_id, "status": "cancelled"},
+                })
+                await self._write_approval_locked(session_id, interrupt_id, record)
+                snapshot = {
+                    "type": "ACTIVITY_SNAPSHOT",
+                    "messageId": interrupt_id,
+                    "activityType": "approval",
+                    "replace": True,
+                    "content": {
+                        key: copy.deepcopy(value)
+                        for key, value in record.items()
+                        if key not in {"checkpoint", "decision"}
+                    },
+                }
+                session.events.append(snapshot)
+                snapshots.append(copy.deepcopy(snapshot))
+            session.open_interrupt_ids = []
+            session.updated_at = datetime.now(timezone.utc)
+            # events 刚 append 了 cancelled 快照：先写入 history.jsonl（事实源），
+            # 再写 session.json（清掉 openInterruptIds）。两文件职责不同，都要落盘。
+            await self._append_pending_events_locked(session)
+            await self._persist(session)
+            return snapshots
 
     async def apply_private_control(
         self, session_id: str, name: str, value: dict[str, Any]
@@ -865,7 +931,11 @@ class SessionStore:
     async def provider_context_state(
         self, session_id: str
     ) -> tuple[list[ChatMessage], dict[str, Any]]:
-        """返回 active tail 与完整私有 state，供 Backend 预算和 CAS 提案使用。"""
+        """组装本轮要交给 Backend 的模型上下文：boundary 之后的消息 + compact 状态。
+
+        例：history 有 seq 1..80，boundary.coveredThroughSeq=50 → 只投影 51..80；
+        seq 1..50 已收进 summary，不随 HTTP 发给 Backend。
+        """
 
         await self._ensure_loaded()
         async with self._lock:
@@ -925,7 +995,37 @@ class SessionStore:
             return self._context_store.public_status(state)
 
     async def pending_context_continuations(self) -> list[tuple[str, dict[str, Any]]]:
-        """列出重启后必须先恢复的 K Agent continuation 私有快照。"""
+        """启动扫描：找出卡在 full compact「已提交、续跑未完成」的会话。
+
+        一次用户 run 里，Backend 每次 Reason 前先做工具结果预算和 microcompact
+        （只打 context_patch，不换 run）。token 仍超限才 full compact：
+
+        1. Backend 停当前 Reason（形态像 HITL，但没有 Interrupt、不等用户），
+           单独打 compact 模型，经私有事件交出 proposal + continuationCheckpoint。
+        2. Access Layer 校验 generation/前缀哈希，一次 CAS 写入 summary、
+           boundary 和 pendingContinuation。history.jsonl 仍完整。
+           → 此时「compact 已提交」：活动上下文改用摘要 + boundary 之后的尾部。
+        3. 同一 public run 自动再调 Backend 续跑（resume 必须为空，避免误吃审批）。
+           跑完终端事件后清掉 pendingContinuation。
+           → 未到这一步或中途挂掉就是「续跑未完成」。
+
+        本函数只盘点第 2 步已落盘、第 3 步没结束的会话。lifespan 里
+        recover_pending_context_continuations 按返回列表在会话锁下续跑。
+        deepcopy 整份 state（含 generation），不只 checkpoint；
+        validated() 会丢掉与当前 history 对不上的脏快照。
+        """
+
+        await self._ensure_loaded()
+        pending: list[tuple[str, dict[str, Any]]] = []
+        async with self._lock:
+            for session_id, session in self._sessions.items():
+                state = await self._context_store.validated(
+                    session_id, session.history_records
+                )
+                checkpoint = state.get("pendingContinuation")
+                if isinstance(checkpoint, dict):
+                    pending.append((session_id, copy.deepcopy(state)))
+        return pending
 
         await self._ensure_loaded()
         pending: list[tuple[str, dict[str, Any]]] = []
@@ -1012,8 +1112,18 @@ class SessionStore:
             intent,
         )
 
-    async def fork_session(self, session_id: str) -> SessionRecord | None:
+    async def fork_session(
+        self,
+        session_id: str,
+        *,
+        through_message_id: str | None = None,
+        through_run_id: str | None = None,
+    ) -> SessionRecord | None:
         """Clone a stable conversation and workspace into an independent branch.
+
+        through_run_id 截到该 run 的最后一条可见记录，适合从一条助手回复分支：
+        同一气泡里后面的工具调用也会留下。through_message_id 只截到该消息结束，
+        适合从用户消息分支、不带上随后的回复。都不传则复制整段会话。
 
         Provider-native CLI resume ids are intentionally not copied: reusing them
         would let Codex/Claude continue the source provider thread even though the
@@ -1029,6 +1139,15 @@ class SessionStore:
                 return None
             if self._session_is_active(session_id):
                 raise SessionBusyError("Cannot branch a session while it is running")
+            records_to_copy = (
+                self._history_prefix(
+                    source.history_records,
+                    through_message_id=through_message_id,
+                    through_run_id=through_run_id,
+                )
+                if through_message_id or through_run_id
+                else source.history_records
+            )
 
             branch_id = str(uuid.uuid4())
             branch = SessionRecord(
@@ -1059,7 +1178,7 @@ class SessionStore:
             self._sessions[branch_id] = branch
             try:
                 # 分支复制同一事实流但重新分配 seq/sessionId，避免共享可变历史文件。
-                for record in source.history_records:
+                for record in records_to_copy:
                     cloned = copy.deepcopy(record)
                     cloned["sessionId"] = branch_id
                     for cloned_event in cloned.get("events", []):
@@ -1072,6 +1191,13 @@ class SessionStore:
                     (int(record.get("seq") or 0) for record in branch.history_records),
                     default=0,
                 ) + 1
+                # 截断后的 messages/events 必须从分支历史投影，不能沿用源会话全量。
+                branch.messages = messages_from_records(branch.history_records)
+                branch.events = self._events_for_branch(
+                    events_from_records(branch.history_records),
+                    session_id,
+                    branch_id,
+                )
                 await self._rewrite_history_locked(branch)
                 context_state = await self._read_context_state_locked(source.id)
                 if isinstance(context_state, dict):
@@ -1116,6 +1242,32 @@ class SessionStore:
                     await asyncio.to_thread(shutil.rmtree, branch_bundle, True)
                 raise
             return branch
+
+    @staticmethod
+    def _history_prefix(
+        records: list[dict[str, Any]],
+        *,
+        through_message_id: str | None,
+        through_run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """返回已经应用墓碑后的可见前缀，seq 保持原值以便摘要边界仍能对上。"""
+
+        visible = visible_records(records)
+        if through_run_id:
+            seqs = [
+                int(record.get("seq") or 0)
+                for record in visible
+                if record.get("runId") == through_run_id
+            ]
+            if not seqs:
+                raise SessionForkAnchorError("找不到要分支的这段对话")
+            cutoff = max(seqs)
+        else:
+            seq = message_seq_index(records).get(through_message_id or "")
+            if seq is None:
+                raise SessionForkAnchorError("找不到要分支的这段对话")
+            cutoff = seq
+        return [record for record in visible if int(record.get("seq") or 0) <= cutoff]
 
     def _next_branch_title(self, source_title: str) -> str:
         """Return a stable numeric sibling name such as title（2）, title（3）."""
@@ -1464,23 +1616,26 @@ class SessionStore:
         return self._upsert_message(updated, result_message)
 
     async def _ensure_loaded(self) -> None:
-        """首次访问时从存储目录加载会话缓存。"""
+        """首次访问时从 sessions/{id}/session.json + history.jsonl 加载索引。"""
         async with self._lock:
+            # 已扫过盘，或测试里没有 StorageBackend：当成空索引，避免重复/空读。
             if self._loaded or self._storage is None:
                 self._loaded = True
                 return
             settings = await get_or_init_settings()
             prefix = settings.session_storage_prefix
             root = self._storage.resolve(prefix)
-            await self._migrate_flat_sessions(prefix, root)
-            # 旧目录迁移失败只记日志；其余会话仍可正常进入索引。
-            await asyncio.to_thread(migrate_all_sessions, root)
             for path in await self._storage.list(prefix, "session.json"):
                 try:
+                    # 绝对路径扣掉 sessions 根，得到 id/session.json。
+                    # 例：root=.../state/sessions
+                    #     path=.../sessions/1e253ef8-…/session.json
+                    #     relative=1e253ef8-…/session.json  → parts[0] 即会话 id
+                    # 不在 root 下的路径 relative_to 会抛 ValueError，跳过。
                     relative = path.relative_to(root)
                 except ValueError:
                     continue
-                # 只接受 sessions/{id}/session.json，排除 approvals/context 等 JSON。
+                # 只接受 {id}/session.json，排除 approvals/context 等 JSON。
                 if len(relative.parts) != 2 or relative.name != "session.json":
                     continue
                 try:
@@ -1488,6 +1643,7 @@ class SessionStore:
                     if isinstance(payload, dict):
                         history_key = f"{prefix}/{relative.parts[0]}/history.jsonl"
                         history_lines = await self._storage.read_text_range(history_key)
+                        # history.jsonl 一行一条记录；空行跳过，json.loads 成 dict 列表。
                         history_records = [
                             json.loads(line) for line in history_lines if line.strip()
                         ]
@@ -1499,8 +1655,10 @@ class SessionStore:
                     # One unreadable session file must not take down the whole
                     # session index and, with it, every other conversation.
                     logger.error("Skipping unreadable session file %s", path, exc_info=True)
-            # 单 worker 重启意味着旧的 resuming 进程已经不存在；工具可能在崩溃前
-            # 执行过，不能自动重试。转成 unknown_outcome，等待用户显式二次确认。
+            # 单 worker 重启 = 上次认领后的 resume 协程已经没了。
+            # status=resuming 表示用户点过批准、工具可能已经跑过；不能当 pending
+            # 再自动续跑。改成 unknown_outcome，前端要求二次确认（reconfirm）。
+            # pending 的 Interrupt 保持不动，仍等用户审批。
             for session in self._sessions.values():
                 for interrupt_id in session.open_interrupt_ids:
                     record = await self._read_approval_locked(session.id, interrupt_id)
@@ -1512,30 +1670,6 @@ class SessionStore:
                     })
                     await self._write_approval_locked(session.id, interrupt_id, record)
             self._loaded = True
-
-    async def _migrate_flat_sessions(self, _prefix: str, root: Path) -> None:
-        """Move legacy sessions/{id}.json into sessions/{id}/{id}.json once."""
-
-        if self._storage is None or not root.exists():
-            return
-        await asyncio.to_thread(self._migrate_flat_sessions_sync, root)
-
-    @staticmethod
-    def _migrate_flat_sessions_sync(root: Path) -> None:
-        for path in sorted(root.glob("*.json")):
-            if not path.is_file():
-                continue
-            session_id = path.stem
-            destination = root / session_id / f"{session_id}.json"
-            if destination.exists():
-                continue
-            try:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(path), str(destination))
-                (destination.parent / "workspace").mkdir(exist_ok=True)
-                logger.info("Migrated flat session file to %s", destination)
-            except OSError:
-                logger.error("Failed to migrate session file %s", path, exc_info=True)
 
     async def _ensure_workspace(self, session_id: str) -> None:
         """Create the per-session workspace directory next to the JSON record."""
@@ -1660,10 +1794,13 @@ class SessionStore:
         payload: dict[str, Any], history_records: list[dict[str, Any]] | None = None
     ) -> SessionRecord:
         """从元数据与完整历史重建运行时投影。"""
+        # 现行写入只有 camelCase updatedAt；or 左边空/缺省时才看旧文件的 snake_case。
         updated_at = payload.get("updatedAt") or payload.get("updated_at")
         history_records = list(history_records or [])
         messages = messages_from_records(history_records)
+        #mcp skill
         capabilities = payload.get("capabilities")
+        # 同样：新文件 cliSessions，旧 payload 可能是 cli_sessions。
         raw_cli_sessions = payload.get("cliSessions") or payload.get("cli_sessions") or {}
         cli_sessions: dict[str, str] = {}
         if isinstance(raw_cli_sessions, dict):

@@ -1,4 +1,4 @@
-"""Local fail-open observer for Agent, model, context, and tool lifecycles."""
+"""把 Agent 生命周期钩子转成进程日志；失败不影响主流程。"""
 
 from __future__ import annotations
 
@@ -21,7 +21,12 @@ from backend.logging_config import log_event
 
 
 class AgentBackendLoggingObserver:
-    """Log lifecycle metadata while excluding prompts, arguments, and outputs."""
+    """每轮 run 一份：把钩子事件翻成 `log_event`，只打元数据。
+
+    记 request/thread/run、工具名、耗时、字数、token 估算等。不写 prompt、
+    工具参数值和模型原文——那些走 Langfuse。handle() 挂在 Runner 的 observer
+    列表上，Agent 循环每到一个阶段就回调一次。
+    """
 
     # Local logs intentionally contain only correlation IDs, counts, names,
     # lengths, and timings. Langfuse owns the separately-redacted content path.

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { AgUiEvent, ApprovalActivity, ChatMessage, SessionState, ToolActivity, UserQuestionAnswers } from "../types";
+import { parseFileChange } from "../tools/file-change-preview";
+import { FileChangePreview } from "./FileChangePreview";
 import { MarkdownContent } from "./MarkdownContent";
 import { timelineFromEvents, type StaticTimelineActivity } from "./transcript-timeline";
 import { UserQuestionForm } from "./UserQuestionForm";
@@ -232,7 +234,7 @@ function StaticThinkingActivity({ activity }: { activity: Extract<StaticTimeline
       {activity.status === "running" && <b>进行中</b>}
       <i aria-hidden="true">⌃</i>
     </button>
-    {open && <div className="inline-thinking-list"><article className={`inline-thinking-step ${activity.status}`}><span aria-hidden="true">{activity.status === "complete" ? "✓" : "✦"}</span><div><strong>{activity.title || "思考过程"}</strong>{activity.detail && <p>{activity.detail}</p>}</div></article></div>}
+    {open && activity.detail && <div className="inline-thinking-list"><p>{activity.detail}</p></div>}
   </section>;
 }
 
@@ -245,6 +247,10 @@ export function InlineToolActivity({
 }) {
   const [open, setOpen] = useState(tool.status !== "complete");
   const attemptedUrlRef = useRef("");
+  const fileChange = useMemo(
+    () => parseFileChange(tool.name, tool.arguments, tool.result),
+    [tool.name, tool.arguments, tool.result],
+  );
   const interactive = useMemo(() => {
     if (tool.executionMode === "interactive") return true;
     try { return JSON.parse(tool.arguments || "{}").execution_mode === "interactive"; }
@@ -255,7 +261,10 @@ export function InlineToolActivity({
     const match = (tool.liveOutput ?? "").match(/https:\/\/[^\s<>"']+/i);
     return match?.[0] ?? "";
   }, [interactive, tool.liveOutput]);
-  useEffect(() => { if (tool.status === "complete") setOpen(false); }, [tool.status]);
+  useEffect(() => {
+    // File diffs are the card body; keep them open after the write lands.
+    if (tool.status === "complete" && !fileChange) setOpen(false);
+  }, [fileChange, tool.status]);
   useEffect(() => {
     // Persisted OAuth output is replayed when a historical conversation opens.
     // Only a caller that owns the currently running tool may cause browser navigation.
@@ -268,16 +277,20 @@ export function InlineToolActivity({
   return <section className={`inline-tool ${tool.status} ${open ? "open" : ""}`}>
     <button type="button" className="inline-tool-summary" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
       <InlineToolIcon /><strong>调用工具</strong><code>{tool.name}</code>
+      {fileChange && <span className="inline-tool-file" title={fileChange.path}>{fileChange.path}</span>}
+      {fileChange && <span className="inline-tool-diff-stat"><b>+{fileChange.added}</b><b>−{fileChange.removed}</b></span>}
       <b>{tool.status === "complete" ? "已完成" : tool.status === "error" ? "失败" : tool.status === "stopped" ? "已停止" : "运行中"}</b><i aria-hidden="true">⌃</i>
     </button>
-    {open && (tool.arguments || tool.liveOutput || tool.result) && <div className="inline-tool-detail">
+    {open && (fileChange || tool.arguments || tool.liveOutput || tool.result) && <div className="inline-tool-detail">
       {externalUrl && <div className="external-action-card" aria-live="polite">
         <div><strong>需要完成外部授权</strong><span>{tool.status === "running" ? "正在等待你在浏览器中完成授权，成功后任务会自动继续。" : "授权流程已结束。"}</span></div>
         <a href={externalUrl} target="_blank" rel="noreferrer">打开授权页面</a>
       </div>}
-      {tool.arguments && <code>{tool.arguments}</code>}
+      {fileChange
+        ? <FileChangePreview change={fileChange} />
+        : tool.arguments && <code>{tool.arguments}</code>}
       {tool.liveOutput && <pre className="inline-tool-live-output">{tool.liveOutput}</pre>}
-      {tool.result && <p>{tool.result}</p>}
+      {tool.result && (!fileChange || tool.status === "error") && <p>{tool.result}</p>}
     </div>}
   </section>;
 }

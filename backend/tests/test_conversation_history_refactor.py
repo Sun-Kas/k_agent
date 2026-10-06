@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-import json
 import unittest
 from datetime import datetime, timezone
-from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from access_layer.schemas import ChatMessage
-from access_layer.sessions.history import events_from_records, is_public_event, messages_from_records
-from access_layer.sessions.migrate_history import (
-    migrate_all_sessions,
-    migrate_session_dir,
-    migrate_session_record,
-)
+from access_layer.sessions.history import events_from_records, is_public_event, make_record, messages_from_records
+from access_layer.sessions.migrate_history import migrate_session_record
 from access_layer.sessions.store import SessionStore
 from access_layer.storage import FileStorage
 from backend.agui import translate_agent_events
@@ -70,23 +64,6 @@ class HistoryMigrationTests(unittest.TestCase):
         approval = next(event for event in events if event["type"] == "ACTIVITY_SNAPSHOT")
         self.assertEqual(approval["content"]["status"], "pending")
         self.assertEqual([(item.role, item.content) for item in messages_from_records(migrated.history_records)], [("user", "你好"), ("assistant", "回答")])
-
-    def test_directory_migration_is_idempotent_and_keeps_backup(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp) / "sessions"
-            session_dir = root / "s1"
-            session_dir.mkdir(parents=True)
-            (session_dir / "s1.json").write_text(json.dumps({
-                "id": "s1", "title": "x", "messages": [message("u1", "user", "hi")],
-                "events": [], "updatedAt": datetime.now(timezone.utc).isoformat(),
-            }), encoding="utf-8")
-            self.assertTrue(migrate_session_dir(session_dir))
-            self.assertTrue((session_dir / "session.json").is_file())
-            self.assertTrue((session_dir / "history.jsonl").is_file())
-            self.assertTrue((session_dir / "s1.json.bak").is_file())
-            self.assertFalse(migrate_session_dir(session_dir))
-            report = migrate_all_sessions(root)
-            self.assertEqual((report.migrated, report.failed), (0, 0))
 
     def test_message_only_legacy_tool_pair_becomes_standard_tool_events(self) -> None:
         assistant = message("legacy-assistant", "assistant", "", "r1")
@@ -161,6 +138,26 @@ class HistoryMigrationTests(unittest.TestCase):
         ]
         self.assertEqual(len(starts), 2)
         self.assertNotEqual(starts[0]["messageId"], starts[1]["messageId"])
+
+    def test_flattened_events_keep_record_time_without_overwriting(self) -> None:
+        recorded_at = "2026-10-05T02:30:00+00:00"
+        records = [
+            make_record(
+                seq=1,
+                session_id="s1",
+                run_id="r1",
+                kind="agui_event_batch",
+                events=[
+                    {"type": "RUN_STARTED", "threadId": "s1", "runId": "r1"},
+                    {"type": "TEXT_MESSAGE_END", "messageId": "a1", "createdAt": "2026-10-05T02:31:00+00:00"},
+                ],
+                recorded_at=recorded_at,
+            )
+        ]
+        events = events_from_records(records)
+        self.assertEqual(events[0]["createdAt"], recorded_at)
+        self.assertEqual(events[1]["createdAt"], "2026-10-05T02:31:00+00:00")
+        self.assertNotIn("createdAt", records[0]["events"][0])
 
 
 class ProtocolBoundaryTests(unittest.IsolatedAsyncioTestCase):

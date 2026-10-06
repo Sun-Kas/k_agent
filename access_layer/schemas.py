@@ -54,14 +54,25 @@ class ChatMessage(BaseModel):
     attachments: list[MessageAttachment] = Field(default_factory=list)
 
     def carries_context(self) -> bool:
-        """Whether this message still contributes input for the next model call.
+        """这条消息要不要放进下一轮模型输入。
 
-        Assistant turns that only issue tool calls have empty content but must
-        survive history filtering, otherwise their paired tool results become
-        orphans that providers reject.
+        过滤的是「空壳」，不是 role。三种都算有上下文：
+        - 非空白 content（普通对话）
+        - tool_calls（assistant 只调工具、正文为空）
+        - attachments（用户只发了图）
+
+        只调工具的 assistant 若被丢掉，后面的 tool 结果会变成孤儿，Provider 会拒收。
         """
 
         return bool(self.content.strip()) or bool(self.tool_calls) or bool(self.attachments)
+
+
+class SessionForkInput(BaseModel):
+    """从整段会话或某一条消息处复制出独立分支。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+    through_message_id: str | None = Field(default=None, alias="throughMessageId")
+    through_run_id: str | None = Field(default=None, alias="throughRunId")
 
 
 class SessionSummary(BaseModel):

@@ -38,11 +38,7 @@ from access_layer.request_context import (
     update_request_context,
 )
 from access_layer.schemas import MessageAttachment
-from access_layer.sessions.store import (
-    OpenInterruptError,
-    ResumeConflictError,
-    SessionStore,
-)
+from access_layer.sessions.store import ResumeConflictError, SessionStore
 from access_layer.sessions.history import is_public_event
 
 
@@ -285,6 +281,8 @@ class AgentAccessLayer:
 }
 
 '''
+        # 两种跑法互斥：要么带一条新 user 消息，要么带 resume[] 续 HITL。
+        # resume 里是审批决定，不是聊天；再塞 messages 会变成「新回合 + 续跑」叠在一起。
         submitted = to_chat_messages(payload.messages)
         resume_entries = [
             entry.model_dump(by_alias=True, mode="json")
@@ -306,8 +304,9 @@ class AgentAccessLayer:
         payload.forwarded_props 包含：
         attachments — 附件
         agentKind / agentOptions — 用哪个 agent、权限模式等
-        mcpServerIds / skillIds — 启用的 MCP / Skill
+        mcpServerIds / skillIds — 前端勾选的 id 列表（不是完整 MCP 配置 / Skill 正文）
         modelId / reasoningEffort — 模型与推理强度
+        展开后的 mcpServers / skills 只出现在 Access Layer → Backend 的内部载荷里。
         '''
 
         '''
@@ -343,6 +342,7 @@ class AgentAccessLayer:
                 detail="agentOptions.permissionMode must be default or full_access",
             )
         agent_options["permissionMode"] = permission_mode
+        # 浏览器只交 id；连接参数与 Skill catalog 行在本层解析，避免把本机配置路径交给前端拼。
         mcp_ids = self._string_list(forwarded.get("mcpServerIds"), "mcpServerIds")
         skill_ids = self._string_list(forwarded.get("skillIds"), "skillIds")
         try:
@@ -363,6 +363,7 @@ class AgentAccessLayer:
 
         # HITL 审批模式下，需要先获取会话，再进行后续操作
         # 非 HITL 模式下，创建或获取会话
+        # AG-UI 的 thread_id 在本产品里就是 session id（sessions/{id}/）。
         if is_resume:
             session = await self._session_store.get(payload.thread_id)
             if session is None:
@@ -382,6 +383,9 @@ class AgentAccessLayer:
             stored = session.cli_sessions.get(agent_kind)
             if stored:
                 agent_options["resumeSessionId"] = stored
+        # 在中间件那份上补 session/run；request_id 不变。
+        # Token 用来结束本段时揭回外层。中间件写 x-request-id 并不依赖这次
+        # reset（request_id 还在），但揭回去之后 SSE 生成器必须用快照再 set。
         context_token = update_request_context(session_id=session.id, run_id=payload.run_id)
         try:
             # 锁：限流 + 同会话串行
@@ -403,7 +407,14 @@ class AgentAccessLayer:
 
             所以限流放在「确认这是一次合法、即将执行的 run」之后、save_run_start 之前：既避免无效请求浪费槽位，又保证真正执行时同会话串行、全局有上限。
             '''
+            # TODO：还是没理解这里的设计私思路
+            
+            # run() 的 finally 会先揭回中间件那层再返回 StreamingResponse，
+            # 生成器更晚才跑，所以这里先拍下带 session/run 的当前值。
             stream_request_context = get_request_context()
+            # 还没占锁：protect() 只返回异步上下文管理器。
+            # 不能 async with 包住整个 run()：函数返回 SSE 时 with 会结束并放锁，
+            # 流还没开始。改成 __aenter__ 拿到锁，在生成器 finally 里 __aexit__。
             stream_guard = self._request_limiter.protect(session.id)
             try:
                 await stream_guard.__aenter__()
@@ -542,6 +553,7 @@ class AgentAccessLayer:
             ]
             '''
             resume_records: list[dict[str, Any]] = []
+            dismissed_approval_events: list[dict[str, Any]] = []
             try:
                 if is_resume:
                     resume_records = await self._session_store.prepare_resume(
@@ -558,6 +570,8 @@ class AgentAccessLayer:
                         },
                     )
                 else:
+                    # 测试里的假 SessionStore 可能没有 compact 续跑 API；没有就跳过。
+                    # 生产路径有该方法：内部 compact 续跑未完成时，禁止再收新 user 消息。
                     pending_check = getattr(
                         self._session_store, "has_pending_context_continuation", None
                     )
@@ -565,7 +579,9 @@ class AgentAccessLayer:
                         raise ResumeConflictError(
                             "A compact continuation is still being recovered; retry shortly"
                         )
-                    await self._session_store.ensure_accepts_new_input(session.id)
+                    # 新消息等于放弃未点的审批：取消 HITL，不 Resume 上次工具。
+                    dismissed = await self._session_store.ensure_accepts_new_input(session.id)
+                    dismissed_approval_events = list(dismissed or [])
                     session = await self._session_store.save_run_start(
                         session.id,
                         messages,
@@ -580,7 +596,7 @@ class AgentAccessLayer:
                         ),
                         agent_kind=agent_kind,
                     )
-            except (OpenInterruptError, ResumeConflictError) as exc:
+            except ResumeConflictError as exc:
                 await stream_guard.__aexit__(None, None, None)
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except BaseException:
@@ -599,9 +615,12 @@ class AgentAccessLayer:
                     else update_request_context(session_id=session.id, run_id=payload.run_id)
                 )
                 started_at = time.perf_counter()
+                #因为前面可能update_request_context，所以这里需要重新get_request_context
                 request_context = get_request_context()
                 request_id = request_context.request_id if request_context else "-"
                 try:
+                    # k_agent：按 compact boundary 切出「摘要之后的活动尾部」+ 私有 context state。
+                    # 完整 history.jsonl 留在本层；Backend 只看到尾部消息和 summary 文本。
                     provider_context = getattr(self._session_store, "provider_context_state", None)
                     context_state: dict[str, Any] = {}
                     if agent_kind == "k_agent" and callable(provider_context):
@@ -666,6 +685,8 @@ class AgentAccessLayer:
                         }
                     # 落盘走后台队列，SSE 帧立刻 yield，避免磁盘 I/O 卡住流式体验。
                     # 单 worker 串行写盘以保持事件顺序。
+                    # 生产者：SSE 循环 put 事件后立刻 yield；消费者：这个 Task 串行 append_event。
+                    # 队列元素 None 表示流结束（哨兵），不是一条 AG-UI 事件。
                     persist_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
                     persist_failures: list[BaseException] = []
 
@@ -678,6 +699,7 @@ class AgentAccessLayer:
                             try:
                                 await self._session_store.append_event(session.id, event)
                             except Exception as exc:
+                                # 写盘失败不打断 SSE；join() 前会检查 persist_failures（compact 必须等历史落稳）。
                                 persist_failures.append(exc)
                                 logging.getLogger("k_agent.access.gateway").warning(
                                     "Failed to persist event for session %s",
@@ -691,14 +713,22 @@ class AgentAccessLayer:
                     resume_succeeded = False
                     resume_known_failure = False
                     try:
+                        # continue_run：本 public run 可能 compact 后立刻再调一次 Backend。
+                        # 先 True 进循环，每次进来先清成 False；compact 成功再置 True 并 break 内层 for。
+                        # seen_run_started：第二次 Backend 流还会发 RUN_STARTED，对浏览器只转发第一次。
                         continue_run = True
                         seen_run_started = False
+                        for snapshot in dismissed_approval_events:
+                            yield self._encode_sse(snapshot)
                         while continue_run:
                             continue_run = False
                             backend_events = self._agent_backend_client.stream(
                                 backend_payload, request_id
                             )
                             async for event in backend_events:
+                                # Backend→Access Layer 的内部控制帧：CUSTOM + name 以 __private_ 开头。
+                                # 剥前缀后得到短名（如 context_compaction_required），下面按短名处理。
+                                # 不是这类事件则为 ""，走后面的公开 SSE 白名单。
                                 private_name = (
                                     str(event.get("name") or "").removeprefix("__private_")
                                     if event.get("type") == "CUSTOM"
@@ -706,11 +736,14 @@ class AgentAccessLayer:
                                     else ""
                                 )
                                 if private_name == "context_compaction_required":
+                                    # 形态像 HITL：Backend 先停、Access Layer 落盘、再开同一 public run。
+                                    # 但没有 Interrupt、不等用户；续跑自动发起，且 resume 必须为空。
                                     value = event.get("value")
                                     if not isinstance(value, dict):
                                         raise RuntimeError("Backend returned an invalid compaction proposal")
                                     # proposal 可以引用本段刚完成的工具结果；提交前必须等
                                     # 公共事件全部落盘，Access Layer 才能计算真实 seq/digest。
+                                    # 等待队列里所有事件完成
                                     await persist_queue.join()
                                     if persist_failures:
                                         raise RuntimeError(
@@ -930,12 +963,10 @@ class AgentAccessLayer:
                 },
             )
         finally:
-            # 撕掉本函数 update 叠上的 session_id/run_id，露出中间件那一层。
-            # 不是防「下一请求复用协程」：ContextVar 按 Task 隔离，下个 HTTP
-            # 本来也看不见这份便签。reset 是同一次请求里的作用域收尾——
-            # run() 在流结束前就返回 StreamingResponse，中间件随后还要
-            # get_request_context() 写 x-request-id。生成器在这次 reset 之后
-            # 才开始跑，已用 stream_request_context 自行 set/reset。
+            # 揭回中间件那层（只有 request_id/path/method）。
+            # 不是因为 request_id 会被改掉，也不是防下一请求串号。
+            # 是本段作用域结束：外层 get() 不该继续看到 session/run。
+            # 生成器在 reset 之后才跑，所以必须用进生成器前拍的快照再 set。
             reset_request_context(context_token)
 
     @staticmethod
@@ -949,7 +980,12 @@ class AgentAccessLayer:
 
     @staticmethod
     def _attachments(value: Any) -> list[MessageAttachment]:
-        """Validate bounded image/video Data URLs before they enter session storage."""
+        """校验 forwarded_props.attachments：[{name, type, dataUrl}]。
+
+        例::
+            {"name": "cat.png", "type": "image/png",
+             "dataUrl": "data:image/png;base64,iVBOR..."}
+        """
         if not isinstance(value, list):
             raise HTTPException(status_code=400, detail="attachments must be a list")
         if len(value) > 4:

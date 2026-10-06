@@ -47,7 +47,8 @@ from backend.prompts import reset_prompt_caches
 from backend.runners import RunnerContext, get_default_registry
 from backend.runners.network_policy import network_access_enabled
 from backend.runners.detect import detect_agents_payload
-from backend.tools import load_local_tools
+from backend.tools.registry import build_request_tool_set
+from backend.tools.catalog import SkillCatalog
 from backend.runtime_config import select_compact_model, select_model
 from backend.context import generate_compaction, compose_api_messages
 from backend.tools.workspace import (
@@ -139,13 +140,14 @@ def create_app() -> FastAPI:
         )
         await get_or_init_settings()
         app.state.langfuse = LangfuseRuntime(settings)
-        ensure_home_layout(migrate=True)
+        ensure_home_layout()
         await app.state.langfuse.startup()
+        # 进程级连接池：本 worker 内跨 run 复用 MCP 子进程/HTTP 会话。
         app.state.mcp_pool = McpSessionPool(
             idle_ttl_seconds=settings.mcp_session_idle_ttl_seconds
         )
-        # 启动时的 manager 与 agent run 共用连接池，预热过的 server
-        # 在首个请求选中时往往已经连上。
+        # 进程级 manager 只是预热 + 运维查询用的租约持有者，不是第二套连接。
+        # 每轮 run 另建轻量 manager（几份 dict）；贵的 uvx/HTTP 仍在 mcp_pool 里。
         manager = await load_mcp_manager(app.state.mcp_pool)
         await manager.connect_all()
         app.state.mcp_manager = manager
@@ -229,11 +231,13 @@ def create_app() -> FastAPI:
     @app.get("/internal/runtime/status")
     async def runtime_status() -> dict[str, Any]:
         """本地工具数量 + 各 MCP server 连接态，供 Access Layer 展示运行时。"""
-        local_tools = await load_local_tools()
         mcp_tools = await app.state.mcp_manager.list_tools()
+        tool_set = build_request_tool_set(settings=await get_or_init_settings(),
+            mcp_tools=mcp_tools, mcp_manager=app.state.mcp_manager,
+            skill_catalog=SkillCatalog(), authorized_servers={t.server_id for t in mcp_tools})
         return {
             "ok": True,
-            "localToolCount": len(local_tools),
+            "localToolCount": sum(b.spec.key.source == "local" for b in tool_set.bindings),
             "mcpToolCount": len(mcp_tools),
             "mcpServers": [
                 asdict(status) for status in await app.state.mcp_manager.statuses()
@@ -297,6 +301,48 @@ def create_app() -> FastAPI:
     @app.post("/internal/agent/run")
     async def run_agent(payload: AgentBackendRunInput, request: Request) -> StreamingResponse:
         """核心入口：按 agentKind 选 Runner，经 ApprovalBroker 合流后输出 AG-UI NDJSON。"""
+
+        '''
+        payload:#accesslayer/gateway.py/AgentAccessLayer/run/event_generator
+        {
+                            "threadId": session.id,
+                            "runId": payload.run_id,
+                            # 只发送 compact boundary 后的活动尾部；完整 history 永不离开
+                            # Access Layer，也不会被压缩覆盖。
+                            "messages": [
+                                message.model_dump(by_alias=True, mode="json")
+                                for message in provider_messages
+                                if message.carries_context()
+                            ],
+                            "contextSummary": context_summary,
+                            "contextState": context_state,
+                            "continuationCheckpoint": None,
+                            "modelId": forwarded.get("modelId"),
+                            # Access Layer only forwards selected catalog metadata.
+                            # Backend lazily reads the body after an actual Skill call;
+                            # it never uses file frontmatter to rewrite this metadata.
+                            "mcpServers": mcp_servers,
+                            "skills": skills,
+                            "reasoningEffort": forwarded.get("reasoningEffort"),
+                            # Media is persisted on its owning user message. This
+                            # legacy run-level field stays empty to prevent the
+                            # latest turn from accidentally inheriting old media.
+                            "attachments": [],
+                            "agentKind": agent_kind,
+                            "agentOptions": agent_options,
+                            "resume": resume_entries,
+                            # checkpoint 只从 SessionStore 读取并走内部边界，前端提交
+                            # 的 resume payload 无法覆盖工具名、参数或 request hash。
+                            "resumeCheckpoints": resume_records,
+                            # Access Layer owns the session layout. Backend only
+                            # receives this run's explicit working directory and
+                            # must never derive a session/history path from threadId.
+                            "workspaceDir": to_managed_path(
+                                session_workspace_dir(session.id)
+                            ),
+                        }
+        '''
+        
         async def internal_events():
             # 每次 run 只消费 Access Layer 已解析的 MCP/Skill 元数据；Backend
             # 不读 catalog 或扫描目录，只有已授权的 Skill 工具调用会定点读取正文。
@@ -321,6 +367,7 @@ def create_app() -> FastAPI:
                 attachmentCount=len(payload.attachments),
             )
             request_context = RunnerContext(
+                # 三者独立：thread=会话，run=这次执行，request=这跳 HTTP（可多跳对同一 run）。
                 thread_id=payload.thread_id,
                 run_id=payload.run_id,
                 request_id=request_id,
@@ -429,14 +476,18 @@ def create_app() -> FastAPI:
                 )
 
         async def agui_stream():
-            # Agent 内部事件在这里统一转换为 AG-UI。HTTP 边界之后只允许
-            # 标准 start/content/end/result 事件，前端按到达顺序渲染即可。
-            """`translate_agent_events` → 逐行 JSON，媒体类型 application/x-ndjson。"""
+            """把内部事件编成 NDJSON 行，交给 StreamingResponse 一块块写出。
+
+            这里 yield 的必须是 str/bytes（一行 JSON + `\\n`），不能是 Event 对象。
+            `agui_stream()` 只创建生成器；真正跑是 Starlette `async for` 拉 chunk 的时候。
+            """
+            # 内部 dict → AG-UI 标准事件；HTTP 边界之后前端只认这些类型。
             async for event in translate_agent_events(
                 internal_events(),
                 thread_id=payload.thread_id,
                 run_id=payload.run_id,
             ):
+                # 一行一个事件；separators 去掉空格。末尾换行才构成 NDJSON。
                 yield json.dumps(
                     jsonable_encoder(
                         event.model_dump(
@@ -449,12 +500,17 @@ def create_app() -> FastAPI:
                     separators=(",", ":"),
                 ) + "\n"
 
+        # StreamingResponse 要的是「一块块 body」，不是 Python 对象。
+        # agui_stream 必须是 async 生成器：每 yield 一行 NDJSON 字符串，Starlette
+        # 就立刻 write 到 HTTP（more_body=True）。yield 事件对象本身不行。     
         return StreamingResponse(
             agui_stream(),
             media_type="application/x-ndjson",
             headers={
+                # 禁止中间缓存把流攒成一整份。
                 "Cache-Control": "no-cache",
                 "X-Request-Id": request.headers.get("x-request-id", ""),
+                # 告诉接入层/前端：body 是 AG-UI 事件，不是随意 JSON 数组。
                 "X-Event-Protocol": "AG-UI",
             },
         )

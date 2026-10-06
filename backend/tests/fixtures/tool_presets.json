@@ -1,0 +1,695 @@
+{
+  "legacy": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "Get the current local server time in ISO format.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "echo_text",
+        "description": "Echo user-provided text for testing the tool pipeline.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "Text to echo back"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_personal_memory",
+        "description": "Read K Agent's durable memory from $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "append_personal_memory",
+        "description": "Append a concise durable memory item to $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "One concise project-local memory item to remember."
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_personal_memory",
+        "description": "Search durable memory in $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search text."
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "compact_personal_memory",
+        "description": "Deduplicate and trim durable memory in $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "maxItems": {
+              "type": "integer",
+              "description": "Maximum memory items to keep.",
+              "default": 200
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Skill",
+        "description": "Load a K Agent skill or MCP prompt by exact name. Available K Agent skills are listed in the request context. Invoke a matching skill before continuing with the task; do not guess names.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill": {
+              "type": "string",
+              "description": "The skill or MCP prompt name, without a leading slash."
+            },
+            "args": {
+              "type": "string",
+              "description": "Optional arguments for the skill."
+            }
+          },
+          "required": [
+            "skill"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "coding": [
+    {
+      "type": "function",
+      "function": {
+        "name": "Read",
+        "description": "Read a UTF-8 text file from any local path. Read-only access does not require permission escalation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_path"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Write",
+        "description": "Write UTF-8 text. Paths outside the workspace require sandbox_permissions=require_escalated so the user can approve them.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "sandbox_permissions": {
+              "type": "string",
+              "enum": [
+                "require_escalated"
+              ]
+            }
+          },
+          "required": [
+            "file_path",
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Edit",
+        "description": "Replace text in a file. old_string must be unique unless replace_all is true. Outside-workspace paths require sandbox_permissions=require_escalated.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            },
+            "old_string": {
+              "type": "string"
+            },
+            "new_string": {
+              "type": "string"
+            },
+            "replace_all": {
+              "type": "boolean",
+              "default": false
+            },
+            "sandbox_permissions": {
+              "type": "string",
+              "enum": [
+                "require_escalated"
+              ]
+            }
+          },
+          "required": [
+            "file_path",
+            "old_string",
+            "new_string"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Glob",
+        "description": "Find files under any local directory by glob pattern, sorted by recent modification time. Read-only access does not require permission escalation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string",
+              "default": "."
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "LS",
+        "description": "List files and directories under any local directory. Read-only access does not require permission escalation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "default": "."
+            },
+            "max_entries": {
+              "type": "integer",
+              "default": 200
+            },
+            "show_hidden": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Grep",
+        "description": "Search files under any local directory with a regular expression. Read-only access does not require permission escalation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string",
+              "default": "."
+            },
+            "include": {
+              "type": "string",
+              "default": "**/*"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Bash",
+        "description": "Run a shell command in the workspace with timeout and output truncation. Commands prefer an OS sandbox (srt). If the sandbox is unavailable, the result includes userMessage/installGuidance — relay that full message to the user in Chinese (manual install vs confirm-then-InstallSandbox; Windows native unsupported / WSL2). Only call InstallSandbox after they explicitly confirm. Set sandbox_permissions=require_escalated ONLY when the user's task necessarily requires this command to (1) write, modify, or delete a path outside the session workspace; (2) access a host device, local socket, GUI, process, credential store, or system service blocked by the default sandbox; or (3) connect to a concrete hostname outside the configured sandbox domain allowlist. Also set escalation_scope and escalation_resource. A network escalation resource must be only the exact hostname, not a URL. Timeouts, DNS/HTTP errors, connection resets, truncated responses, and rate limits do not trigger escalation. For an inherently long but bounded command, set timeout_seconds instead of requesting escalation; this changes duration, not permissions. For OAuth, device-code login, or another command that waits for a user in an external web page, set execution_mode=interactive. Interactive mode streams stdout while the process is running and prevents the backend from opening a browser; do not pipe that command through head or tail. Full-access runs execute without the OS sandbox.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string",
+              "description": "Explain why the command or requested resource is required."
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 300,
+              "description": "Bounded wall-clock timeout for an inherently long command. Increasing it does not grant additional permissions."
+            },
+            "execution_mode": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "foreground",
+                "interactive"
+              ],
+              "default": "auto",
+              "description": "Auto-detect OAuth/device-code login commands; use interactive explicitly for other commands that print a URL and wait for the user."
+            },
+            "sandbox_permissions": {
+              "type": "string",
+              "enum": [
+                "require_escalated"
+              ],
+              "description": "Request HITL only for a structured out-of-sandbox resource or a concrete hostname outside the domain allowlist."
+            },
+            "escalation_scope": {
+              "type": "string",
+              "enum": [
+                "outside_workspace_write",
+                "host_resource",
+                "network_destination"
+              ],
+              "description": "Required with require_escalated: the exact class of access requested."
+            },
+            "escalation_resource": {
+              "type": "string",
+              "description": "Required with require_escalated: concrete outside path, host resource, or exact network hostname without scheme/path/port."
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "InstallSandbox",
+        "description": "Install Anthropic sandbox-runtime (srt) for Bash isolation. Call only after the user explicitly confirms installation in chat. Set confirmed=true; never install without confirmation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "confirmed": {
+              "type": "boolean",
+              "description": "Must be true only after the user explicitly agrees to install."
+            }
+          },
+          "required": [
+            "confirmed"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "WebFetch",
+        "description": "Fetch a web page over HTTP or HTTPS and return readable text.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "headers": {
+              "type": "object"
+            },
+            "max_chars": {
+              "type": "integer",
+              "default": 12000
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "WebSearch",
+        "description": "Search the web and return a small list of matching pages.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "max_results": {
+              "type": "integer",
+              "default": 5
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "NotebookEdit",
+        "description": "Insert, replace, or delete a cell in a Jupyter .ipynb notebook. Editing outside the workspace requires sandbox_permissions=require_escalated.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            },
+            "cell_index": {
+              "type": "integer"
+            },
+            "source": {
+              "type": "string"
+            },
+            "cell_type": {
+              "type": "string",
+              "default": "code"
+            },
+            "mode": {
+              "type": "string",
+              "default": "replace"
+            },
+            "sandbox_permissions": {
+              "type": "string",
+              "enum": [
+                "require_escalated"
+              ]
+            }
+          },
+          "required": [
+            "file_path",
+            "cell_index"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "TodoWrite",
+        "description": "Create or update the agent's visible todo list for the current task.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "todos": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          },
+          "required": [
+            "todos"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "AskUserQuestion",
+        "description": "Ask the user one to four clarification questions when their answer is required before continuing. Provide 2-4 useful preset options for each question. The UI also lets the user add free text, either instead of or in addition to selections.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "questions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "header": {
+                    "type": "string",
+                    "description": "Short label, at most 24 characters."
+                  },
+                  "question": {
+                    "type": "string"
+                  },
+                  "options": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "label": {
+                          "type": "string"
+                        },
+                        "description": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label",
+                        "description"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "multiSelect": {
+                    "type": "boolean",
+                    "description": "Whether multiple preset options may be selected.",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "header",
+                  "question",
+                  "options"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "questions"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ListMcpResourcesTool",
+        "description": "List resources exposed by connected MCP servers.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ReadMcpResourceTool",
+        "description": "Read a resource from a connected MCP server by server_id and uri.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "server_id": {
+              "type": "string"
+            },
+            "uri": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "server_id",
+            "uri"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "Get the current local server time in ISO format.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_personal_memory",
+        "description": "Read K Agent's durable memory from $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "append_personal_memory",
+        "description": "Append a concise durable memory item to $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string",
+              "description": "One concise project-local memory item to remember."
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_personal_memory",
+        "description": "Search durable memory in $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search text."
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "compact_personal_memory",
+        "description": "Deduplicate and trim durable memory in $K_AGENT_HOME/content/memory/MEMORY.md.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "maxItems": {
+              "type": "integer",
+              "description": "Maximum memory items to keep.",
+              "default": 200
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "Skill",
+        "description": "Load a K Agent skill or MCP prompt by exact name. Available K Agent skills are listed in the request context. Invoke a matching skill before continuing with the task; do not guess names.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill": {
+              "type": "string",
+              "description": "The skill or MCP prompt name, without a leading slash."
+            },
+            "args": {
+              "type": "string",
+              "description": "Optional arguments for the skill."
+            }
+          },
+          "required": [
+            "skill"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

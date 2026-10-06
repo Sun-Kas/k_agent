@@ -1,0 +1,17 @@
+"""显式工厂表；新增领域能力无需修改 Agent。"""
+
+from .filesystem import FILESYSTEM_TOOL_FACTORIES
+from .shell import SHELL_TOOL_FACTORIES
+from .web import WEB_TOOL_FACTORIES
+from .task import TASK_TOOL_FACTORIES
+from .misc import MISC_TOOL_FACTORIES
+from .memory import MEMORY_TOOL_FACTORIES
+
+LOCAL_TOOL_FACTORIES = (
+    *FILESYSTEM_TOOL_FACTORIES,
+    *SHELL_TOOL_FACTORIES,
+    *WEB_TOOL_FACTORIES,
+    *TASK_TOOL_FACTORIES,
+    *MISC_TOOL_FACTORIES,
+    *MEMORY_TOOL_FACTORIES,
+)

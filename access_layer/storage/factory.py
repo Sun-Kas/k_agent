@@ -8,6 +8,7 @@ from access_layer.storage.interface import StorageBackend
 
 
 def create_storage(settings: Settings) -> StorageBackend:
+    # 存储系统file，后续可换成mysql
     if settings.storage_backend == "file":
         return FileStorage(settings.storage_base_dir)
     raise ValueError(f"Unsupported storage backend: {settings.storage_backend}")

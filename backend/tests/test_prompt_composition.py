@@ -13,8 +13,10 @@ from backend.prompts import (
     compose_prompt,
 )
 from backend.prompts.skills import MAX_LISTING_DESC_CHARS
-from backend.tools import SkillCatalog, build_tool_catalog
-from backend.tools.local import ToolDefinition, build_skill_tool
+from backend.tools import SkillCatalog
+from backend.tests.tool_runtime_support import test_capability_view as make_capability_view
+from backend.tests.tool_runtime_support import make_test_tool
+from backend.tests.tool_runtime_support import build_test_skill_tool as build_skill_tool
 
 
 async def _noop(_: dict) -> str:
@@ -41,11 +43,11 @@ class PromptCompositionTests(unittest.TestCase):
                 type=MemoryType.AUTOMATED,
             )
             local_tools = [
-                ToolDefinition("AskUserQuestion", "ask", {}, _noop),
-                ToolDefinition("Skill", "skills", {}, _noop),
+                make_test_tool("AskUserQuestion", "ask", {}, _noop),
+                make_test_tool("Skill", "skills", {}, _noop),
             ]
             mcp_tools = [McpToolDescriptor("calendar", "create_event", "create", {})]
-            catalog = build_tool_catalog(local_tools=local_tools, mcp_tools=mcp_tools)
+            catalog = make_capability_view(local_tools=local_tools, mcp_tools=mcp_tools)
             skills = SkillCatalog.from_skills(
                 [
                     {
@@ -121,16 +123,16 @@ class PromptCompositionTests(unittest.TestCase):
         writer_tool = build_skill_tool(skill_catalog=writer_skills)
         reviewer_tool = build_skill_tool(skill_catalog=reviewer_skills)
 
-        self.assertEqual(writer_tool.description, reviewer_tool.description)
-        self.assertNotIn("writer", writer_tool.description)
-        self.assertNotIn("reviewer", reviewer_tool.description)
-        self.assertIn("request context", writer_tool.description)
-        self.assertNotIn("enum", writer_tool.parameters["properties"]["skill"])
+        self.assertEqual(writer_tool.spec.provider_description, reviewer_tool.spec.provider_description)
+        self.assertNotIn("writer", writer_tool.spec.provider_description)
+        self.assertNotIn("reviewer", reviewer_tool.spec.provider_description)
+        self.assertIn("request context", writer_tool.spec.provider_description)
+        self.assertNotIn("enum", writer_tool.spec.input_schema["properties"]["skill"])
 
     def test_skill_listing_applies_entry_and_total_budgets(self) -> None:
         root = Path("/tmp/project")
-        local_tools = [ToolDefinition("Skill", "stable", {}, _noop)]
-        tool_catalog = build_tool_catalog(local_tools=local_tools, mcp_tools=[])
+        local_tools = [make_test_tool("Skill", "stable", {}, _noop)]
+        tool_catalog = make_capability_view(local_tools=local_tools, mcp_tools=[])
         long_description = "界" * (MAX_LISTING_DESC_CHARS + 50)
         skill_catalog = SkillCatalog.from_skills(
             [
@@ -184,7 +186,7 @@ class PromptCompositionTests(unittest.TestCase):
         skill_catalog = SkillCatalog.from_skills(
             [{"id": "writer", "description": "Draft reports", "enabled": True}]
         )
-        tool_catalog = build_tool_catalog(local_tools=[], mcp_tools=[])
+        tool_catalog = make_capability_view(local_tools=[], mcp_tools=[])
 
         bundle = compose_prompt(
             PromptInputs(
@@ -203,8 +205,8 @@ class PromptCompositionTests(unittest.TestCase):
 
     def test_skill_listing_uses_when_to_use_not_instruction_body(self) -> None:
         root = Path("/tmp/project")
-        tool_catalog = build_tool_catalog(
-            local_tools=[ToolDefinition("Skill", "stable", {}, _noop)],
+        tool_catalog = make_capability_view(
+            local_tools=[make_test_tool("Skill", "stable", {}, _noop)],
             mcp_tools=[],
         )
         skill_catalog = SkillCatalog.from_skills(

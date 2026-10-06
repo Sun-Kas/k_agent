@@ -60,6 +60,32 @@ test("排队中的用户输入不算已完成", () => {
   assert.deepEqual(split.live.map((item) => item.id), ["queued-0"]);
 });
 
+test("文件改动工具按 hunk 行数占时间线高度", () => {
+  const item: TimelineItem = {
+    id: "edit-1",
+    sequence: 1,
+    kind: "tool",
+    name: "Edit",
+    arguments: "{}",
+    result: JSON.stringify({
+      path: "a.ts",
+      hunks: [{
+        oldStart: 1,
+        oldCount: 3,
+        newStart: 1,
+        newCount: 3,
+        lines: [
+          { kind: "ctx", text: "keep", oldLine: 1, newLine: 1 },
+          { kind: "del", text: "old", oldLine: 2 },
+          { kind: "add", text: "new", newLine: 2 },
+        ],
+      }],
+    }),
+    status: "complete",
+  };
+  assert.equal(estimateTimelineItemLines(item, 80, 8, false), 6);
+});
+
 test("运行提示优先展示当前工具名", () => {
   const items: TimelineItem[] = [
     { id: "t1", sequence: 1, kind: "tool", name: "bash", arguments: "", status: "active" },

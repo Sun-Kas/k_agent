@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from backend.tests.tool_runtime_support import tool_json
 import os
+from backend.tests.tool_runtime_support import invoke_builtin
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -19,7 +21,7 @@ from backend.sandbox import (
     reset_sandbox_detection,
     sandbox_runtime_status,
 )
-from backend.tools import cc_like
+from backend.tools.builtins import shell as cc_like
 from backend.tools.streaming import reset_tool_output_sink, set_tool_output_sink
 
 
@@ -154,7 +156,7 @@ class SandboxPlanningTests(unittest.TestCase):
             settings_path = Path(invocation.argv[2])
             self.assertTrue(settings_path.exists())
             self.assertEqual(invocation.argv[3:], ["/bin/bash", "-c", "ls -la"])
-            payload = json.loads(settings_path.read_text(encoding="utf-8"))
+            payload = tool_json(settings_path.read_text(encoding="utf-8"))
             self.assertIn(str(workspace), payload["filesystem"]["allowWrite"])
             self.assertIn(str(workspace / ".env"), payload["filesystem"]["denyRead"])
             self.assertIn(str(workspace / ".env"), payload["filesystem"]["denyWrite"])
@@ -162,12 +164,14 @@ class SandboxPlanningTests(unittest.TestCase):
 
 class SandboxSettingsTests(unittest.TestCase):
     def test_bash_contract_uses_positive_escalation_conditions(self) -> None:
-        bash_tool = next(tool for tool in cc_like.CC_LIKE_TOOLS if tool.name == "Bash")
+        bash_tool = next(tool for tool in cc_like.SHELL_TOOL_FACTORIES if tool.spec.provider_name == "Bash")
 
-        self.assertIn("ONLY when", bash_tool.description)
-        self.assertIn("outside the session workspace", bash_tool.description)
-        self.assertIn("outside the configured sandbox domain allowlist", bash_tool.description)
-        self.assertIn("escalation_resource", bash_tool.description)
+        from backend.prompts.tool_guidance.shell import BASH_GUIDANCE
+        self.assertLess(len(bash_tool.spec.provider_description), 200)
+        self.assertIn("ONLY when", BASH_GUIDANCE)
+        self.assertIn("outside the session workspace", BASH_GUIDANCE)
+        self.assertIn("outside the configured sandbox domain allowlist", BASH_GUIDANCE)
+        self.assertIn("escalation_resource", BASH_GUIDANCE)
 
     def test_domain_allowlist_matching_uses_srt_wildcard_semantics(self) -> None:
         from backend.sandbox import is_domain_allowed
@@ -329,13 +333,13 @@ class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
                     patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(5.0, 10_000))),
                 ):
-                    raw = await cc_like.cc_bash({
+                    raw = await invoke_builtin(cc_like.cc_bash, {
                         "command": "printf '%s\\n' \"$BROWSER|$CI\" # oauth login",
                     })
             finally:
                 reset_tool_output_sink(token)
 
-        payload = json.loads(raw)
+        payload = tool_json(raw)
         self.assertTrue(payload["ok"])
         self.assertIn("echo|1", payload["stdout"])
         self.assertTrue(output)
@@ -353,14 +357,14 @@ class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
                     patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(5.0, 10_000))),
                 ):
-                    raw = await cc_like.cc_bash({
+                    raw = await invoke_builtin(cc_like.cc_bash, {
                         "command": "printf '%s\\n' \"$BROWSER|$CI|$K_AGENT_INTERACTIVE\"",
                         "execution_mode": "interactive",
                     })
             finally:
                 reset_tool_output_sink(token)
 
-        payload = json.loads(raw)
+        payload = tool_json(raw)
         self.assertTrue(payload["ok"])
         self.assertIn("echo|1|1", payload["stdout"])
         self.assertEqual("".join(item["delta"] for item in output), payload["stdout"])
@@ -374,9 +378,9 @@ class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
                 patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(30.0, 10_000))),
             ):
-                raw = await cc_like.cc_bash({"command": "sleep 2", "timeout_seconds": 1})
+                raw = await invoke_builtin(cc_like.cc_bash, {"command": "sleep 2", "timeout_seconds": 1})
 
-        payload = json.loads(raw)
+        payload = tool_json(raw)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["timeoutSeconds"], 1.0)
 
@@ -394,8 +398,8 @@ class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     clear=False,
                 ),
             ):
-                raw = await cc_like.cc_bash({"command": "printenv OPENAI_API_KEY || true"})
-        payload = json.loads(raw)
+                raw = await invoke_builtin(cc_like.cc_bash, {"command": "printenv OPENAI_API_KEY || true"})
+        payload = tool_json(raw)
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["sandboxed"])
         self.assertEqual(payload["sandboxReason"], "sandbox disabled by configuration")
@@ -413,9 +417,9 @@ class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch("backend.sandbox.detect.shutil.which", return_value=None),
                 patch("backend.sandbox.detect.sys.platform", "darwin"),
             ):
-                raw = await cc_like.cc_bash({"command": "echo hi"})
+                raw = await invoke_builtin(cc_like.cc_bash, {"command": "echo hi"})
             reset_sandbox_detection()
-        payload = json.loads(raw)
+        payload = tool_json(raw)
         self.assertFalse(payload["ok"])
         self.assertIn("sandbox unavailable", payload["error"])
         self.assertFalse(payload["sandboxed"])
@@ -432,8 +436,8 @@ class BashToolIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)),
                 patch.object(cc_like, "_tool_limits", AsyncMock(return_value=(5.0, 10_000))),
             ):
-                raw = await cc_like.cc_bash({"command": "echo hi"})
-        payload = json.loads(raw)
+                raw = await invoke_builtin(cc_like.cc_bash, {"command": "echo hi"})
+        payload = tool_json(raw)
         self.assertNotIn("installGuidance", payload)
 
 
@@ -504,8 +508,8 @@ class InstallSandboxToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_cc_install_sandbox_requires_confirmed_true(self) -> None:
         settings = _settings()
         with patch.object(cc_like, "get_or_init_settings", AsyncMock(return_value=settings)):
-            raw = await cc_like.cc_install_sandbox({"confirmed": False})
-        payload = json.loads(raw)
+            raw = await invoke_builtin(cc_like.cc_install_sandbox, {"confirmed": False})
+        payload = tool_json(raw)
         self.assertFalse(payload["ok"])
         self.assertIn("confirmed=true", payload["error"])
 

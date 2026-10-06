@@ -8,12 +8,12 @@ from access_layer.sessions.store import ResumeConflictError, SessionStore
 from access_layer.scheduled_tasks.models import ScheduledApprovalResumeInput
 from access_layer.teams.runtime import TeamRuntime
 from backend.agent.contracts import AgentRunRequest
-from backend.agent.react_agent import OpenAIAgent
+from backend.tests.tool_runtime_support import ToolTestAgent as OpenAIAgent
 from backend.agui import translate_agent_events
 from backend.api.schemas import ChatMessage
 from backend.mcp_tool import McpClientManager
-from backend.tools.registry import get_all_base_tools
-from backend.tools.user_question import ASK_USER_QUESTION_TOOL
+from backend.tools.registry import TOOL_PRESETS
+from backend.tools.adapters.user_input import ASK_USER_QUESTION_TOOL
 from backend.user_questions import (
     normalize_user_question_answers,
     normalize_user_questions,
@@ -38,7 +38,7 @@ def question_arguments(*, multi_select: bool = False) -> dict:
 
 class UserQuestionContractTests(unittest.TestCase):
     def test_tool_is_registered_in_the_base_catalog(self) -> None:
-        self.assertIn("AskUserQuestion", {tool.name for tool in get_all_base_tools()})
+        self.assertIn("AskUserQuestion", set(TOOL_PRESETS["coding"]))
 
     def test_selection_custom_text_and_combination_are_all_valid(self) -> None:
         questions = normalize_user_questions(question_arguments())

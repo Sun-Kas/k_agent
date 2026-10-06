@@ -1,8 +1,10 @@
-"""Readable process logging for K Agent.
+"""进程日志：结构化事件名 + 中文一行叙事，不是 JSON 日志。
 
-Process events use INFO; real failures use ERROR. Correlation IDs are shortened
-and INFO lines stay as short Chinese summaries. Extra structured fields only
-appear at DEBUG. Third-party libraries stay quiet at WARNING+.
+调用 ``log_event("model.call.started", threadId=..., runId=..., model=...)``。
+INFO 用 ``_SUMMARIES`` 把字段收成短句；threadId/runId 截成 8 位挂在行首。
+DEBUG 才把剩余字段摊开。不要往这里打 prompt / 工具参数全文（那是 Langfuse）。
+
+Access Layer 有一份同名模块，各自进程各写 stdout；logger 名都是 ``k_agent``。
 """
 
 from __future__ import annotations
@@ -169,14 +171,22 @@ _SUMMARIES: dict[str, SummaryBuilder] = {
 
 
 class ProcessLogFormatter(logging.Formatter):
-    """One-line process narrative with short correlation ids."""
+    """把 LogRecord 收成一行。
+
+    例：log_event("model.call.started", threadId="a1b2c3d4-ffff", runId="9f3c1a2b-eeee",
+    model="claude-sonnet-4", iteration=0)
+    → ``15:03:12 INFO  sess=a1b2c3d4 run=9f3c1a2b │ 模型#1 开始 · claude-sonnet-4``
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         timestamp = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        # log_event 写入 extra 后：event_name="model.call.started"
+        # event_fields={"threadId":"a1b2c3d4-ffff","runId":"9f3c1a2b-eeee","model":"claude-sonnet-4","iteration":0}
         event = str(getattr(record, "event_name", "") or "")
         fields = getattr(record, "event_fields", None)
         fields = dict(fields) if isinstance(fields, dict) else {}
 
+        # threadId → sess=a1b2c3d4；runId → run=9f3c1a2b。pop 后 DEBUG 尾巴不再重复这两项。
         session_id = _short_id(_pop_first(fields, "threadId", "sessionId"))
         run_id = _short_id(_pop_first(fields, "runId", "agentRunId"))
         fields.pop("agentRunId", None)
@@ -184,6 +194,10 @@ class ProcessLogFormatter(logging.Formatter):
         fields.pop("requestId", None)
         fields.pop("traceId", None)
 
+        # 登记过：_SUMMARIES["model.call.started"] → "模型#1 开始 · claude-sonnet-4"
+        # 没登记：log_event("context_compact_started", threadId=..., trigger="auto")
+        #   INFO → 「│ context_compact_started」，kwargs 不进这一行
+        #   DEBUG → 后面再跟 · trigger=auto generation=0
         summary = fields.pop("summary", None)
         if not summary:
             builder = _SUMMARIES.get(event)
@@ -194,7 +208,7 @@ class ProcessLogFormatter(logging.Formatter):
             prefix += f" sess={session_id} run={run_id}"
         line = f"{prefix} │ {summary}"
 
-        # DEBUG keeps leftover structured fields for deep inspection.
+        # INFO 停在 │ 右侧。DEBUG 才会追加 · model=claude-sonnet-4 iteration=0
         if record.levelno <= logging.DEBUG:
             extras = [
                 f"{key}={_format_value(value)}"
@@ -226,12 +240,22 @@ def configure_agent_backend_logging(
     *,
     stream: TextIO | None = None,
 ) -> logging.Logger:
-    """Configure process logging for Access Layer and Agent Backend."""
+    """只配置本进程的 logger ``k_agent``（handler、级别、压制第三方）。
 
+    函数名带 agent_backend 是历史命名。Access Layer 有一份同名拷贝，各自
+    create_app 时调用自己模块里的这个函数；跨进程改不到对方的 stdout。
+    """
+
+    # getLogger(name) 走 logging 模块全局 Manager：同进程同名永远同一对象。
+    # 不是我们自己实现的单例；跨进程各有一份 Manager，所以 AL / Backend 互不影响。
+    # 这里只管「谁能出、打到哪、用哪套格式」：不决定中文短句（那是 Formatter+_SUMMARIES）。
+    # 漏过 logger.setLevel 的记录到不了 handler；到了 handler 才 format 成一行。
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(_coerce_level(level))
+    # 不向 root 冒泡，避免 uvicorn 再打一遍、格式被冲掉。
     logger.propagate = False
 
+    # 测试会多次 configure；只认带标记的 handler，避免每次再 add 一条重复输出。
     handlers = [
         handler
         for handler in logger.handlers
@@ -241,16 +265,12 @@ def configure_agent_backend_logging(
     handler = handlers[0] if handlers else logging.StreamHandler(target_stream)
     setattr(handler, _HANDLER_MARKER, True)
     handler.setFormatter(ProcessLogFormatter())
+    # NOTSET=不在 handler 再滤一层，级别只看 logger.setLevel。
     handler.setLevel(logging.NOTSET)
     if not handlers:
         logger.addHandler(handler)
     else:
         handler.setStream(target_stream)
-
-    # Compatibility alias used by older imports/tests.
-    logging.getLogger("k_agent.agent_backend").handlers = []
-    logging.getLogger("k_agent.agent_backend").propagate = True
-    logging.getLogger("k_agent.agent_backend").setLevel(logging.NOTSET)
 
     _quiet_third_party_loggers()
     _configure_uvicorn_access_filter()
@@ -258,11 +278,13 @@ def configure_agent_backend_logging(
 
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
-    """Emit a structured event. Prefer known event names so INFO stays narrative.
+    """打一条进程事件。event 是约定字符串，不是枚举：未登记在 _SUMMARIES 也能打，INFO 就显示这个名字。
 
     `*` 后只能关键字传参：`level=` 不会被位置参数误吃，其余 kwargs 全部进 fields。
     """
 
+    # logging=标准库模块；getLogger("k_agent")=进程里这份具名 Logger（单例）；
+    # .log=按级别吐一条 LogRecord，handler 的 ProcessLogFormatter 再画成中文行。
     logging.getLogger(LOGGER_NAME).log(
         level,
         event,

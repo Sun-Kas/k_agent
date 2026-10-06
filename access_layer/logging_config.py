@@ -226,7 +226,7 @@ def configure_agent_backend_logging(
     *,
     stream: TextIO | None = None,
 ) -> logging.Logger:
-    """Configure process logging for Access Layer and Agent Backend."""
+    """只配置本进程的 logger ``k_agent``。与 backend/logging_config 同名拷贝，互不调用。"""
 
     logger = logging.getLogger(LOGGER_NAME)
     logger.setLevel(_coerce_level(level))
@@ -246,11 +246,6 @@ def configure_agent_backend_logging(
         logger.addHandler(handler)
     else:
         handler.setStream(target_stream)
-
-    # Compatibility alias used by older imports/tests.
-    logging.getLogger("k_agent.agent_backend").handlers = []
-    logging.getLogger("k_agent.agent_backend").propagate = True
-    logging.getLogger("k_agent.agent_backend").setLevel(logging.NOTSET)
 
     _quiet_third_party_loggers()
     _configure_uvicorn_access_filter()
