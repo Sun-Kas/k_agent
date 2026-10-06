@@ -35,6 +35,7 @@ import { groupDisplayMessages, InlineToolActivity, toolResultFailed } from "./co
 import { ConfigCenter } from "./components/ConfigCenter";
 import { Marketplace } from "./components/Marketplace";
 import { ContentStage, type ContentStageItem } from "./components/ContentStage";
+import { ConversationTerminal } from "./components/ConversationTerminal";
 import { TeamWorkbench } from "./components/TeamWorkbench";
 import { ScheduledTasksView } from "./components/ScheduledTasksView";
 import { UserQuestionForm } from "./components/UserQuestionForm";
@@ -305,6 +306,13 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [terminalOpen, setTerminalOpen] = useState(() => localStorage.getItem("k-agent-terminal-open") === "true");
+  const [terminalHeight, setTerminalHeight] = useState(() => {
+    const saved = localStorage.getItem("k-agent-terminal-height");
+    const height = Number(saved);
+    return saved && Number.isFinite(height) ? Math.min(480, Math.max(120, height)) : 240;
+  });
+  const conversationRef = useRef<HTMLElement | null>(null);
   const [thinking, setThinking] = useState<ThinkingActivity[]>([]);
   const [thinkingBlocks, setThinkingBlocks] = useState<ThinkingBlock[]>([]);
   const [tools, setTools] = useState<ToolActivity[]>([]);
@@ -1348,6 +1356,29 @@ export function App() {
     ) return;
     setVoiceConversation((current) => ({ ...current, phase: "listening", message: "正在聆听" }));
     window.setTimeout(() => startVoiceRecognition(), 180);
+  }
+
+  function beginTerminalResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (window.innerWidth <= 860) return;
+    event.preventDefault();
+    const column = conversationRef.current;
+    if (!column) return;
+    const startY = event.clientY;
+    const startHeight = terminalHeight;
+    const maxHeight = Math.max(120, column.clientHeight / 2);
+    let latestHeight = startHeight;
+    const handleMove = (moveEvent: globalThis.PointerEvent) => {
+      const nextHeight = Math.min(maxHeight, Math.max(120, startHeight - (moveEvent.clientY - startY)));
+      latestHeight = nextHeight;
+      setTerminalHeight(nextHeight);
+    };
+    const handleEnd = () => {
+      localStorage.setItem("k-agent-terminal-height", String(latestHeight));
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleEnd);
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleEnd);
   }
 
   function beginResize(side: "sidebar" | "inspector", event: ReactPointerEvent<HTMLDivElement>) {
@@ -2847,7 +2878,7 @@ export function App() {
         onKeyDown={(event) => resizeWithKeyboard("sidebar", event)}
       />
 
-      <main className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""} ${view === "scheduled" ? "scheduled-conversation" : ""} ${view === "marketplace" ? "marketplace-conversation" : ""}`}>
+      <main ref={conversationRef} className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""} ${view === "scheduled" ? "scheduled-conversation" : ""} ${view === "marketplace" ? "marketplace-conversation" : ""}`}>
         {view === "scheduled" ? (
           <ScheduledTasksView
             models={models}
@@ -2960,6 +2991,21 @@ export function App() {
                 </div>
               )}
             </div>
+            <button
+              className={`topbar-icon-button ${terminalOpen ? "active" : ""}`}
+              type="button"
+              onClick={() => {
+                setTerminalOpen((value) => {
+                  const next = !value;
+                  localStorage.setItem("k-agent-terminal-open", String(next));
+                  return next;
+                });
+              }}
+              aria-label={terminalOpen ? "关闭底部终端" : "打开底部终端"}
+              aria-pressed={terminalOpen}
+            >
+              <BottomPanelIcon />
+            </button>
             <button className="topbar-icon-button" type="button" onClick={() => setInspectorOpen((value) => !value)} aria-label="切换右侧面板">
               <SidebarIcon side="right" />
             </button>
@@ -3248,6 +3294,25 @@ export function App() {
         </form>
         </div>
         <p className="disclaimer">Agent 可能会犯错，关键结果请核实。</p>
+        {terminalOpen && (
+          <div
+            className="terminal-resize-handle"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="调整终端高度"
+            onPointerDown={beginTerminalResize}
+          />
+        )}
+        <ConversationTerminal
+          key={sessionId ?? "none"}
+          sessionId={sessionId}
+          open={terminalOpen}
+          height={terminalHeight}
+          onClose={() => {
+            setTerminalOpen(false);
+            localStorage.setItem("k-agent-terminal-open", "false");
+          }}
+        />
         </>
         )}
       </main>
@@ -3804,6 +3869,15 @@ function SessionBranchIcon() {
 
 function SessionTrashIcon() {
   return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 5h9M6 2.75h4M5 5l.5 8h5l.5-8M6.75 7v4M9.25 7v4" /></svg>;
+}
+
+function BottomPanelIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="5" y="5" width="14" height="14" rx="2.5" />
+      <path d="M6 15h12" />
+    </svg>
+  );
 }
 
 function SidebarIcon({ side }: { side: "left" | "right" }) {

@@ -21,7 +21,7 @@ import shutil
 import uuid
 
 from ag_ui.core import RunAgentInput
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -36,6 +36,7 @@ from access_layer.request_context import (
     set_request_context,
 )
 from access_layer.sessions.store import SessionBusyError, SessionForkAnchorError, SessionStore
+from access_layer.sessions.terminal import TERMINAL_ID_RE, TerminalRegistry, encode_message
 from access_layer.sessions.workspace import (
     list_session_workspace,
     read_session_workspace_file,
@@ -301,6 +302,8 @@ def create_app() -> FastAPI:
         )
         # 本进程唯一 SessionStore：同一事件循环上所有请求协程共享；不跨 worker。
         app.state.session_store = SessionStore(app.state.storage)
+        # 交互终端只活在这个进程里：同一会话可以有多块 PTY，和 Agent Bash 不是同一条通道。
+        app.state.terminals = TerminalRegistry()
         app.state.agent_backend_client = AgentBackendClient(
             app.state.settings.agent_backend_url
         )
@@ -338,6 +341,7 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            await app.state.terminals.close_all()
             await app.state.team_runtime.stop()
             await app.state.scheduled_task_runtime.stop()
 
@@ -825,6 +829,34 @@ def create_app() -> FastAPI:
             "messageCount": len(session.messages),
             "status": "stopped",
         }
+
+    @app.websocket("/api/sessions/{session_id}/terminal/{terminal_id}")
+    async def session_terminal(websocket: WebSocket, session_id: str, terminal_id: str):
+        """把底栏里的一块标签接到该会话工作区里的登录 shell。
+
+        同一会话可以有多块，互不影响。某一块的连接断开后只关掉那一个 PTY。
+        """
+        await websocket.accept()
+        try:
+            if not TERMINAL_ID_RE.fullmatch(terminal_id):
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4400)
+                return
+            try:
+                cwd = resolve_session_workspace(session_id)
+            except ValueError:
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4400)
+                return
+            session = await app.state.session_store.get(session_id)
+            if session is None:
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4404)
+                return
+            cwd.mkdir(parents=True, exist_ok=True)
+            await app.state.terminals.attach(session_id, terminal_id, cwd, websocket)
+        except WebSocketDisconnect:
+            return
 
     @app.get("/api/sessions/{session_id}/workspace")
     async def get_session_workspace(session_id: str):

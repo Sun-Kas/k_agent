@@ -1426,7 +1426,7 @@ img.brand-symbol {
   .team-conversation-request dl { grid-template-columns: 1fr 1fr; }
 }
 
-.conversation { min-width: 0; height: 100vh; display: flex; flex-direction: column; background: var(--conversation-bg); }
+.conversation { position: relative; min-width: 0; height: 100vh; display: flex; flex-direction: column; background: var(--conversation-bg); }
 .topbar { height: 70px; flex: 0 0 70px; padding: 0 25px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 0; background: transparent; }
 @media (prefers-reduced-motion: reduce) {
   .brand-symbol, .welcome-mark { box-shadow: none; }
@@ -1606,6 +1606,7 @@ img.brand-symbol {
   stroke-linejoin: round;
 }
 .topbar-icon-button svg.mirrored { transform: scaleX(-1); }
+.topbar-icon-button.active { color: var(--ink); }
 .topbar-icon-button:hover { color: var(--ink); }
 .topbar-icon-button:active { transform: scale(.94); }
 .sidebar-toggle-button { flex: 0 0 auto; }
@@ -2164,6 +2165,105 @@ img.brand-symbol {
 .typing { display: flex; gap: 4px; padding: 5px 2px; }
 .typing i { width: 4px; height: 4px; border-radius: 50%; background: var(--lime); animation: bounce .8s infinite alternate; }
 .typing i:nth-child(2) { animation-delay: .15s; }.typing i:nth-child(3) { animation-delay: .3s; }
+
+.terminal-resize-handle {
+  flex: 0 0 6px;
+  margin: 0 18px;
+  border-radius: 999px;
+  cursor: ns-resize;
+  background: transparent;
+}
+.terminal-resize-handle:hover { background: color-mix(in srgb, var(--ink) 16%, transparent); }
+.conversation-terminal {
+  display: none;
+  flex: 0 0 var(--terminal-height);
+  height: var(--terminal-height);
+  min-height: 0;
+  margin: 0;
+  overflow: hidden;
+  border-top: 1px solid #2b2b2b;
+  background: #1a1a1a;
+  color: #cccccc;
+}
+.conversation-terminal.open { display: flex; flex-direction: column; }
+.conversation-terminal-tabs {
+  flex: 0 0 35px;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  background: #181818;
+}
+.conversation-terminal-tab {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 180px;
+  color: #bbbbbb;
+}
+.conversation-terminal-tab.active { background: #2d2d2d; color: #ffffff; }
+.conversation-terminal-tab-main,
+.conversation-terminal-tab-close,
+.conversation-terminal-add,
+.conversation-terminal-panel-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.conversation-terminal-tab-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 35px;
+  padding: 0 2px 0 10px;
+  font: 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.conversation-terminal-tab-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-terminal-tab-main svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.conversation-terminal-tab-close,
+.conversation-terminal-add,
+.conversation-terminal-panel-close {
+  width: 22px;
+  height: 22px;
+  margin: 0 4px;
+  border-radius: 4px;
+  font-size: 16px;
+  line-height: 22px;
+  color: #8a8a8a;
+}
+.conversation-terminal-add,
+.conversation-terminal-panel-close { align-self: center; flex: 0 0 auto; }
+.conversation-terminal-panel-close { margin-left: auto; margin-right: 8px; }
+.conversation-terminal-tab-close:hover,
+.conversation-terminal-add:hover,
+.conversation-terminal-panel-close:hover { background: rgba(255, 255, 255, .08); color: #ffffff; }
+.conversation-terminal-add:disabled { opacity: .35; cursor: default; }
+.conversation-terminal-body { position: relative; flex: 1; min-height: 0; background: #1a1a1a; }
+.conversation-terminal-empty {
+  margin: 0;
+  padding: 12px 14px;
+  color: #9d9d9d;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.conversation-terminal-screen { display: none; height: 100%; }
+.conversation-terminal-screen.active { display: block; }
+.conversation-terminal-screen .xterm { height: 100%; padding: 4px 0 0; }
+.conversation-terminal-screen .xterm-viewport { background: #1a1a1a; }
 
 .composer-dock {
   position: relative;
@@ -3540,7 +3640,17 @@ button:disabled, .attach-button.disabled {
 
 @media (max-width: 860px) {
   .shell, .shell.inspector-hidden, .shell.sidebar-collapsed, .shell.sidebar-collapsed.inspector-hidden { grid-template-columns: minmax(0, 1fr); }
-  .resize-handle { display: none; }
+  .resize-handle, .terminal-resize-handle { display: none; }
+  .conversation-terminal.open {
+    position: absolute;
+    z-index: 12;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: min(46vh, 320px);
+    margin: 0;
+    border-radius: 0;
+  }
   .sidebar { position: fixed; z-index: 20; left: 0; top: 0; width: 260px; transform: translateX(-100%); transition: transform .2s; }
   .sidebar,
   .sidebar-collapsed .sidebar { width: 260px; padding: 23px 15px 16px; border-right: 1px solid var(--line-soft); border-radius: 0; }
