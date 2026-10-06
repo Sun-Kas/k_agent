@@ -104,6 +104,8 @@ class CliModelsTests(unittest.TestCase):
         ids = {model["id"] for model in catalog["models"]}
         self.assertIn("sonnet", ids)
         self.assertIn("opus", ids)
+        self.assertIn("haiku", ids)
+        self.assertIn("fable", ids)
         self.assertEqual(catalog["defaultModelId"], "sonnet")
 
     def test_codex_models_non_empty(self) -> None:

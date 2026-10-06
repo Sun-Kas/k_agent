@@ -18,8 +18,11 @@ export interface ChatMessage {
 }
 
 export interface MediaAttachment {
+  /** 原始文件名，例如 cat.png */
   name: string;
+  /** FileReader.readAsDataURL：data:{type};base64, 后面是文件字节的 Base64，不是 URL 也不是像素数组。 */
   dataUrl: string;
+  /** MIME，仅 image/* 或 video/* */
   type: string;
 }
 
@@ -131,6 +134,7 @@ export interface MarketplaceOrigin {
   sourceId: string;
   version?: string | null;
   installedAt?: string | null;
+  iconUrl?: string | null;
 }
 
 export interface McpServerConfig {
@@ -182,6 +186,7 @@ export interface RuntimeOption {
   name: string;
   description: string;
   enabled: boolean;
+  marketplace?: MarketplaceOrigin | null;
 }
 
 export interface McpCapabilities {
@@ -262,9 +267,11 @@ export interface AgUiRunInput {
   }>;
   forwardedProps: {
     modelId?: string;
+    /** 本轮勾选的 MCP / Skill 的 id，不是连接配置或 SKILL.md。Access Layer 按 catalog 展开后再转给 Backend。 */
     mcpServerIds?: string[];
     skillIds?: string[];
     reasoningEffort?: ReasoningEffort;
+    /** 本轮图片/视频，走 Data URL；不进 messages。最多 4 个，每个 ≤20MB。 */
     attachments?: MediaAttachment[];
     agentKind?: AgentKind;
     agentOptions?: {

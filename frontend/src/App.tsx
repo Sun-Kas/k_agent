@@ -9,9 +9,11 @@ import {
   PointerEvent as ReactPointerEvent,
   type ReactNode,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState
 } from "react";
+import { createPortal } from "react-dom";
 import {
   compactSession,
   deleteSession,
@@ -21,7 +23,6 @@ import {
   getModelsConfig,
   getRuntimeCatalog,
   getSession,
-  getSessionContext,
   getSessionWorkspace,
   getSessionWorkspaceFile,
   listSessions,
@@ -29,6 +30,7 @@ import {
   streamAgentRun
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
+import { MessageActionIcon } from "./components/MessageActionIcon";
 import { groupDisplayMessages, InlineToolActivity, toolResultFailed } from "./components/ConversationTranscript";
 import { ConfigCenter } from "./components/ConfigCenter";
 import { Marketplace } from "./components/Marketplace";
@@ -59,7 +61,6 @@ import type {
   ReasoningEffort,
   RuntimeOption,
   SessionSummary,
-  SessionContextStatus,
   TextActivity,
   ThinkingActivity,
   ToolActivity,
@@ -312,7 +313,6 @@ export function App() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
   const [status, setStatus] = useState<string>(appConfig.status.idle);
-  const [contextStatus, setContextStatus] = useState<SessionContextStatus | null>(null);
   const [input, setInput] = useState("");
   // Voice recognition can outlive the render that started a model run. Keep
   // the current composer value outside that stale closure so a new transcript
@@ -441,6 +441,7 @@ export function App() {
     permissionMode?: PermissionMode;
   } | null>(null);
   const catalogLoadedRef = useRef(false);
+  const agentsRetryRef = useRef(0);
 
   function updateComposerInput(value: string) {
     composerInputRef.current = value;
@@ -731,6 +732,32 @@ export function App() {
     }
   }
 
+  async function forkFromMessage(message: ChatMessage) {
+    if (!sessionId || runningSessionIds.has(sessionId) || sessionActionBusyId) return;
+    const anchor = {
+      throughMessageId: message.id,
+      ...(message.role === "assistant" && message.meta?.runId
+        ? { throughRunId: message.meta.runId }
+        : {})
+    };
+    setSessionActionBusyId(sessionId);
+    setSessionActionError(null);
+    try {
+      const branch = await forkSession(sessionId, anchor);
+      setSessions((current) => [branch, ...current.filter((item) => item.id !== branch.id)]);
+      setView("chat");
+      await openSession(branch.id);
+      setStatus("已从这里创建分支");
+    } catch (error) {
+      setSessionActionError({
+        id: sessionId,
+        message: error instanceof Error ? error.message : "无法创建对话分支"
+      });
+    } finally {
+      setSessionActionBusyId(null);
+    }
+  }
+
   async function branchConversation(sourceId: string) {
     if (runningSessionIds.has(sourceId) || sessionActionBusyId) return;
     setSessionActionBusyId(sourceId);
@@ -787,18 +814,27 @@ export function App() {
       }
       const modelData = modelResult.value;
       const catalog = catalogResult.value;
-      const agentsCatalog = agentsResult.status === "fulfilled"
-        ? agentsResult.value
-        : { defaultKind: "k_agent" as const, agents: fallbackAgents };
+      // Agent 探测会在后端重启时超时。失败时先留着已有列表，避免 Codex / Claude Code 从选择器里消失。
+      const agentsCatalog = agentsResult.status === "fulfilled" ? agentsResult.value : null;
       const enabledModels = modelData.models.filter((model) => model.enabled);
       const enabledMcp = catalog.mcpServers.filter((server) => server.enabled);
       const enabledSkills = catalog.skills.filter((skill) => skill.enabled);
-      const availableAgents = agentsCatalog.agents.length ? agentsCatalog.agents : fallbackAgents;
+      const availableAgents = agentsCatalog?.agents.length ? agentsCatalog.agents : fallbackAgents;
       setModels(enabledModels);
-      setAgents(availableAgents);
+      if (agentsCatalog?.agents.length) {
+        agentsRetryRef.current = 0;
+        setAgents(agentsCatalog.agents);
+      } else if (agentsRetryRef.current < 4) {
+        agentsRetryRef.current += 1;
+        window.setTimeout(() => { void refreshOptions(); }, 700);
+        setAgents((current) => current.length ? current : fallbackAgents);
+      } else {
+        setAgents((current) => current.length ? current : availableAgents);
+      }
       setMcpServers(enabledMcp);
       setSkills(enabledSkills);
       catalogLoadedRef.current = true;
+      if (!agentsCatalog?.agents.length) return;
       const selectable = availableAgents.filter((agent) => agent.available);
       const nextKind = selectable.some((agent) => agent.kind === agentKind)
         ? agentKind
@@ -854,15 +890,21 @@ export function App() {
     resetRunViewState();
     setSessionLoading(true);
     setLoading(Boolean(bufferedRun));
-    setStatus(bufferedRun ? appConfig.status.processing : "正在加载会话");
+    if (bufferedRun) setStatus(appConfig.status.processing);
+    // 本地会话几乎瞬间返回；立刻写「正在加载」只会闪一下再跳到完成。
+    const loadingStatusTimer = bufferedRun
+      ? undefined
+      : window.setTimeout(() => {
+        if (sessionNavigationTokenRef.current === navigationToken) {
+          setStatus("正在加载会话");
+        }
+      }, 200);
     setSidebarOpen(false);
     try {
       const data = await getSession(nextId);
+      if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
       if (sessionNavigationTokenRef.current !== navigationToken) return;
       setSessionId(data.sessionId);
-      void getSessionContext(data.sessionId)
-        .then(setContextStatus)
-        .catch(() => setContextStatus(null));
       activeSessionIdRef.current = data.sessionId;
       localStorage.setItem(appConfig.storageKey, data.sessionId);
       const remembered = data.capabilities ?? null;
@@ -904,7 +946,9 @@ export function App() {
       setSessionLoading(false);
       setLoading(isRunning);
       if (isRunning) setStatus(appConfig.status.processing);
+      else if (!historicalEvents.length) setStatus(appConfig.status.idle);
     } catch {
+      if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
       if (sessionNavigationTokenRef.current !== navigationToken) return;
       const localRun = activeRunsRef.current.get(nextId);
       if (localRun) {
@@ -1370,23 +1414,22 @@ export function App() {
     }
     if (/^\/compact(?:\s|$)/i.test(prompt)) {
       const instructions = prompt.replace(/^\/compact\s*/i, "").trim();
-      void runManualCompact(instructions, false);
+      void runManualCompact(instructions);
       return;
     }
     void submitConversation(prompt);
   }
 
-  async function runManualCompact(instructions: string, reset: boolean) {
+  async function runManualCompact(instructions: string) {
     if (!sessionId || loading || sessionLoading) {
       setStatus(!sessionId ? "请先开始一个会话" : "当前会话仍在运行");
       return;
     }
-    setStatus(reset ? "正在重新建立上下文" : "正在压缩上下文");
+    setStatus("正在压缩上下文");
     try {
-      const next = await compactSession(sessionId, instructions, reset);
-      setContextStatus(next);
+      await compactSession(sessionId, instructions);
       updateComposerInput("");
-      setStatus(`上下文已压缩至第 ${next.generation} 代`);
+      setStatus("上下文已压缩");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "上下文压缩失败");
     }
@@ -1443,6 +1486,7 @@ export function App() {
       context: [],
       forwardedProps: {
         modelId,
+        // 只传勾选 id；MCP 连接与 Skill catalog 由 Access Layer 展开。
         mcpServerIds: selectedMcp,
         skillIds: selectedSkills,
         reasoningEffort: effectiveReasoningEffort,
@@ -1485,6 +1529,11 @@ export function App() {
       ]);
     streamPinnedRef.current = true;
     setMessages(nextMessages);
+    setApprovals((current) => current.map((approval) =>
+      (approval.status === "pending" || approval.status === "submitting")
+        ? { ...approval, status: "cancelled" }
+        : approval
+    ));
     pendingAssistantIdRef.current = pendingAssistantId;
     updateComposerInput("");
     setAttachments([]);
@@ -1620,6 +1669,9 @@ export function App() {
   }
 
   function applyAgUiEvent(event: AgUiEvent) {
+    // setState 回调会晚于本轮重放结束才执行，不能在回调里再读 replayingHistoryRef。
+    const replaying = replayingHistoryRef.current;
+    const recordedAt = replaying ? eventRecordedAt(event) : undefined;
     switch (event.type) {
       case "input_message": {
         const [message] = normalizeMessages([event.message]);
@@ -1635,7 +1687,7 @@ export function App() {
         setSessionId(event.threadId);
         localStorage.setItem(appConfig.storageKey, event.threadId);
         setStatus(appConfig.status.processing);
-        if (!replayingHistoryRef.current) {
+        if (!replaying) {
           const pendingAssistantId = pendingAssistantIdRef.current;
           if (pendingAssistantId) {
             setMessages((current) => current.map((message) =>
@@ -1647,7 +1699,7 @@ export function App() {
         } else {
           setMessages((current) => current.some((message) => message.meta?.runId === event.runId)
             ? current
-            : [...current, createStreamingMessage(`history-run-${event.runId}`, event.runId)]);
+            : [...current, createStreamingMessage(`history-run-${event.runId}`, event.runId, recordedAt)]);
         }
         break;
       case "TEXT_MESSAGE_START":
@@ -1683,6 +1735,7 @@ export function App() {
                 ? {
                   ...message,
                   id: event.messageId,
+                  createdAt: recordedAt ?? message.createdAt,
                   meta: { ...message.meta, runId: textTurnId }
                 }
                 : message
@@ -1690,7 +1743,7 @@ export function App() {
           }
           return current.some((message) => message.id === event.messageId)
             ? current
-            : [...current, createStreamingMessage(event.messageId, textTurnId)];
+            : [...current, createStreamingMessage(event.messageId, textTurnId, recordedAt)];
         });
         break;
       }
@@ -1718,7 +1771,7 @@ export function App() {
               text.id === event.messageId
                 ? {
                   ...text,
-                  content: replayingHistoryRef.current ? event.delta : text.content + event.delta
+                  content: replaying ? event.delta : text.content + event.delta
                 }
                 : text
             );
@@ -1742,7 +1795,7 @@ export function App() {
               message.id === event.messageId
                 ? {
                   ...message,
-                  content: replayingHistoryRef.current ? event.delta : message.content + event.delta
+                  content: replaying ? event.delta : message.content + event.delta
                 }
                 : message
             );
@@ -1760,6 +1813,7 @@ export function App() {
                   ...message,
                   id: event.messageId,
                   content: event.delta,
+                  createdAt: recordedAt ?? message.createdAt,
                   meta: { ...message.meta, runId: textTurnId }
                 }
                 : message
@@ -1767,7 +1821,7 @@ export function App() {
             : [
               ...current,
               {
-                ...createStreamingMessage(event.messageId, textTurnId),
+                ...createStreamingMessage(event.messageId, textTurnId, recordedAt),
                 content: event.delta
               }
             ];
@@ -1802,7 +1856,7 @@ export function App() {
         break;
       }
       case "REASONING_MESSAGE_CONTENT":
-        appendThinkingStepDetail(event.messageId, event.delta, replayingHistoryRef.current);
+        appendThinkingStepDetail(event.messageId, event.delta, replaying);
         break;
       case "REASONING_MESSAGE_END": {
         const rawStep = normalizeThinkingStep(event.rawEvent);
@@ -1846,7 +1900,7 @@ export function App() {
         setStatus("正在准备工具调用");
         updateTool(event.toolCallId, (tool) => ({
           ...tool,
-          arguments: replayingHistoryRef.current ? event.delta : tool.arguments + event.delta,
+          arguments: replaying ? event.delta : tool.arguments + event.delta,
           status: "running"
         }));
         break;
@@ -1891,22 +1945,8 @@ export function App() {
         }
         if (event.name === "context_warning") {
           setStatus("上下文接近上限，将在需要时自动压缩");
-          setContextStatus((current) => current ? { ...current, warning: true } : current);
         }
         if (event.name === "context_compacted") {
-          const generation = Number(event.value.generation ?? 0);
-          setContextStatus((current) => ({
-            ...current,
-            generation,
-            warning: false,
-            autoDisabled: false,
-            consecutiveAutoFailures: 0,
-            pendingContinuation: false,
-            trigger: String(event.value.trigger ?? "auto"),
-            beforeTokens: Number(event.value.beforeTokens ?? 0),
-            afterTokens: Number(event.value.afterTokens ?? 0),
-            savedTokens: Number(event.value.savedTokens ?? 0)
-          }));
           setStatus("上下文已压缩，正在继续当前任务");
         }
         break;
@@ -2699,6 +2739,7 @@ export function App() {
             aria-label="搜索会话"
           />
         </label>
+        <div className="session-scroll">
         <nav className="session-list" aria-label="会话列表">
           {filteredSessions.length === 0 && (
             <p className="empty-note">{query ? "没有匹配的会话" : "你的对话会显示在这里"}</p>
@@ -2783,10 +2824,17 @@ export function App() {
             );
           })}
         </nav>
-        <button className="settings-link sidebar-config" type="button" onClick={() => setView("config")}>
-          <span>⚙</span>
-          <strong>配置中心</strong>
-          <i>→</i>
+        </div>
+        <button
+          className={`settings-link sidebar-config ${view === "config" ? "active" : ""}`}
+          type="button"
+          aria-current={view === "config" ? "page" : undefined}
+          aria-label={health?.ok ? "设置，后端已连接" : health ? "设置，后端未连接" : "设置"}
+          onClick={() => setView("config")}
+        >
+          <SidebarSettingsIcon />
+          <strong>设置</strong>
+          <i className={`connection-dot ${health?.ok ? "online" : ""}`} aria-hidden="true" />
         </button>
       </aside>
       <div
@@ -2840,17 +2888,6 @@ export function App() {
             <span className={`status-pill ${loading ? "running" : ""}`}>
               <i />{status}
             </span>
-            {agentKind === "k_agent" && contextStatus && (
-              <button
-                className="status-pill"
-                type="button"
-                disabled={loading || sessionLoading || !sessionId}
-                onClick={() => { void runManualCompact("", true); }}
-                title="删除派生摘要并从完整历史重新建立上下文"
-              >
-                上下文 G{contextStatus.generation}{contextStatus.autoDisabled ? " · 自动压缩已停用" : ""}
-              </button>
-            )}
             <button
               className={`topbar-icon-button desktop-pet-toggle ${desktopPetEnabled ? "active" : ""}`}
               type="button"
@@ -3020,7 +3057,7 @@ export function App() {
                       )}
                     {!isActiveAssistant && (
                       <footer className="message-meta">
-                        <time>{formatTime(message.createdAt)}</time>
+                        {message.role === "user" && <time>{formatTime(message.createdAt)}</time>}
                         {message.content && (
                           <>
                           {message.role === "assistant" && (
@@ -3041,7 +3078,7 @@ export function App() {
                                 }
                               }}
                             >
-                              <span aria-hidden="true">{voicePlayback.messageId === message.id && voicePlayback.status === "speaking" ? "■" : "◉"}</span>
+                              <MessageActionIcon name={voicePlayback.messageId === message.id && voicePlayback.status === "speaking" ? "stop" : "speak"} />
                               {voicePlayback.messageId === message.id && voicePlayback.status === "speaking" && (
                                 <b role="status" aria-live="polite">朗读中</b>
                               )}
@@ -3058,15 +3095,27 @@ export function App() {
                               : "复制消息"}
                             onClick={() => void copyMessage(message.id, message.content)}
                           >
-                            <span aria-hidden="true">{copyFeedback?.messageId === message.id && copyFeedback.status === "success" ? "✓" : "⧉"}</span>
+                            <MessageActionIcon name={copyFeedback?.messageId === message.id && copyFeedback.status === "success" ? "copied" : "copy"} />
                             {copyFeedback?.messageId === message.id && (
                               <b role="status" aria-live="polite">
                                 {copyFeedback.status === "success" ? "已复制" : "复制失败"}
                               </b>
                             )}
                           </button>
+                          {message.role === "assistant" && (
+                            <button
+                              type="button"
+                              aria-label="从这里分支"
+                              title="从这里分支"
+                              disabled={!sessionId || runningSessionIds.has(sessionId) || sessionActionBusyId === sessionId}
+                              onClick={() => void forkFromMessage(message)}
+                            >
+                              <MessageActionIcon name="fork" />
+                            </button>
+                          )}
                           </>
                         )}
+                        {message.role === "assistant" && <time>{formatTime(message.createdAt)}</time>}
                       </footer>
                     )}
                   </div>
@@ -3148,10 +3197,10 @@ export function App() {
               <ComposerAddMenu
                 mediaModalities={agentKind === "k_agent" ? modelInputModalities(models.find((model) => model.id === modelId)) : new Set(["text"])}
                 onMedia={(files) => { void addMedia(files); }}
-                mcpItems={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description }))}
+                mcpItems={mcpServers.map((server) => ({ id: server.id, name: server.name || server.id, description: server.description, iconUrl: server.marketplace?.iconUrl || undefined }))}
                 selectedMcp={selectedMcp}
                 onMcpChange={changeSelectedMcp}
-                skillItems={skills.map((skill) => ({ id: skill.id, name: skill.name, description: skill.description }))}
+                skillItems={skills.map((skill) => ({ id: skill.id, name: skill.name, description: skill.description, iconUrl: skill.marketplace?.iconUrl || undefined }))}
                 selectedSkills={selectedSkills}
                 onSkillsChange={changeSelectedSkills}
               />
@@ -3325,12 +3374,17 @@ function formatWorkspacePreview(payload: {
   return payload.content;
 }
 
-function createStreamingMessage(id: string, runId?: string | null): ChatMessage {
+function eventRecordedAt(event: AgUiEvent): string | undefined {
+  const value = (event as { createdAt?: unknown }).createdAt;
+  return typeof value === "string" && !Number.isNaN(new Date(value).getTime()) ? value : undefined;
+}
+
+function createStreamingMessage(id: string, runId?: string | null, createdAt?: string): ChatMessage {
   return {
     id,
     role: "assistant",
     content: "",
-    createdAt: new Date().toISOString(),
+    createdAt: createdAt ?? new Date().toISOString(),
     meta: runId ? { runId } : undefined
   };
 }
@@ -3440,7 +3494,13 @@ function sanitizeSpeechText(text: string): string {
 function formatTime(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  const time = date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  const startOfDay = (item: Date) => new Date(item.getFullYear(), item.getMonth(), item.getDate()).getTime();
+  const today = new Date();
+  const dayDelta = Math.round((startOfDay(today) - startOfDay(date)) / 86_400_000);
+  if (dayDelta <= 0) return time;
+  if (dayDelta === 1) return `昨天 ${time}`;
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${time}`;
 }
 
 function formatRelativeTime(value: string) {
@@ -3452,12 +3512,6 @@ function formatRelativeTime(value: string) {
   if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}小时前`;
   if (delta < 7 * 86_400_000) return `${Math.floor(delta / 86_400_000)}天前`;
   return date.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
-}
-
-function thinkingIcon(phase: ThinkingActivity["phase"]) {
-  if (phase === "tool") return "⌁";
-  if (phase === "synthesis" || phase === "complete") return "✓";
-  return "✦";
 }
 
 function Typing() {
@@ -3489,15 +3543,7 @@ function InlineThinking({ block }: { block: ThinkingBlock }) {
       </button>
       {open && (
         <div className="inline-thinking-list">
-          {steps.map((step) => (
-            <article className={`inline-thinking-step ${step.status}`} key={step.id}>
-              <span>{thinkingIcon(step.phase)}</span>
-              <div>
-                <strong>{step.title}</strong>
-                {step.detail && <p>{step.detail}</p>}
-              </div>
-            </article>
-          ))}
+          {steps.map((step) => step.detail ? <p key={step.id}>{step.detail}</p> : null)}
         </div>
       )}
     </section>
@@ -3734,6 +3780,15 @@ function SidebarConnectorIcon() {
   );
 }
 
+function SidebarSettingsIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <circle cx="10" cy="10" r="2.15" />
+      <path d="M10 3.4v1.35M10 15.25v1.35M3.4 10h1.35M15.25 10h1.35M5.35 5.35l.95.95M13.7 13.7l.95.95M14.65 5.35l-.95.95M6.3 13.7l-.95.95" />
+    </svg>
+  );
+}
+
 function SidebarClockIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true">
@@ -3760,6 +3815,24 @@ function SidebarIcon({ side }: { side: "left" | "right" }) {
   );
 }
 
+function MenuMark({ iconUrl, kind }: { iconUrl?: string; kind: "MCP" | "Skill" }) {
+  const [broken, setBroken] = useState(false);
+  const safeUrl = iconUrl && /^https?:\/\//i.test(iconUrl) ? iconUrl : "";
+  useEffect(() => { setBroken(false); }, [iconUrl]);
+  // 广场条目用原图标；没有或加载失败时用种类线标，不放字母头像。
+  return (
+    <span className="composer-menu-mark" aria-hidden="true">
+      {safeUrl && !broken ? (
+        <img src={safeUrl} alt="" referrerPolicy="no-referrer" onError={() => setBroken(true)} />
+      ) : kind === "MCP" ? (
+        <svg viewBox="0 0 16 16"><path d="M5 3.5v2.2M11 3.5v2.2M3.8 6.2h8.4v2.6a4.2 4.2 0 0 1-8.4 0V6.2z" /></svg>
+      ) : (
+        <svg viewBox="0 0 16 16"><path d="M4.2 2.8h5.1L12.2 5.7v7.5H4.2zM9.2 2.8v3h3" /></svg>
+      )}
+    </span>
+  );
+}
+
 function ComposerAddMenu({
   mediaModalities,
   onMedia,
@@ -3772,24 +3845,70 @@ function ComposerAddMenu({
 }: {
   mediaModalities: Set<"text" | "image" | "video">;
   onMedia: (files: FileList | null) => void;
-  mcpItems: Array<{ id: string; name: string; description?: string }>;
+  mcpItems: Array<{ id: string; name: string; description?: string; iconUrl?: string }>;
   selectedMcp: string[];
   onMcpChange: (ids: string[]) => void;
-  skillItems: Array<{ id: string; name: string; description?: string }>;
+  skillItems: Array<{ id: string; name: string; description?: string; iconUrl?: string }>;
   selectedSkills: string[];
   onSkillsChange: (ids: string[]) => void;
 }) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [contextQuery, setContextQuery] = useState("");
-  const [contextTab, setContextTab] = useState<"attachments" | "mcp" | "skills">("attachments");
+  const [mcpOpen, setMcpOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const detailRef = useRef<HTMLElement>(null);
+  const [menuBox, setMenuBox] = useState<{ left: number; bottom: number; maxHeight: number } | null>(null);
+  const [preview, setPreview] = useState<{ id: string; name: string; description: string; kind: "MCP" | "Skill"; top: number; left: number } | null>(null);
   const acceptsImage = mediaModalities.has("image");
   const acceptsVideo = mediaModalities.has("video");
   const mediaEnabled = acceptsImage || acceptsVideo;
   const accept = [acceptsImage ? "image/*" : "", acceptsVideo ? "video/*" : ""].filter(Boolean).join(",");
   const normalizedQuery = contextQuery.trim().toLocaleLowerCase();
+  const showSearch = mcpItems.length + skillItems.length > 8;
   const visibleMcp = mcpItems.filter((item) => !normalizedQuery || `${item.name} ${item.description ?? ""}`.toLocaleLowerCase().includes(normalizedQuery));
   const visibleSkills = skillItems.filter((item) => !normalizedQuery || `${item.name} ${item.description ?? ""}`.toLocaleLowerCase().includes(normalizedQuery));
+  const previousQuery = useRef("");
+  // 开始搜索时先展开两组，之后仍由用户自己折叠。
+  useEffect(() => {
+    if (normalizedQuery && !previousQuery.current) {
+      setMcpOpen(true);
+      setSkillsOpen(true);
+    }
+    previousQuery.current = normalizedQuery;
+  }, [normalizedQuery]);
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const trigger = menuRef.current?.getBoundingClientRect();
+      if (!trigger) return;
+      // 贴着「添加」按钮上沿。按整个输入框上沿定位会把菜单抬到输入区外面。
+      const gap = 6;
+      setMenuBox({
+        left: Math.max(8, trigger.left),
+        bottom: Math.max(8, window.innerHeight - trigger.top + gap),
+        maxHeight: Math.max(160, trigger.top - gap - 12)
+      });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open, mcpOpen, skillsOpen, showSearch]);
+  useLayoutEffect(() => {
+    const card = detailRef.current;
+    if (!card || !preview) return;
+    const margin = 8;
+    const height = card.offsetHeight;
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    card.style.top = `${Math.min(Math.max(preview.top, margin), maxTop)}px`;
+  }, [preview]);
+  const mediaHint = mediaEnabled
+    ? `最多 4 个，单个 20 MB`
+    : "当前模型不支持多模态输入";
 
   const openMenu = () => {
     setContextQuery("");
@@ -3799,6 +3918,7 @@ function ComposerAddMenu({
   const closeMenu = () => {
     setOpen(false);
     setContextQuery("");
+    setPreview(null);
   };
 
   useEffect(() => {
@@ -3810,14 +3930,41 @@ function ComposerAddMenu({
   }, [open]);
 
   const renderSelection = (
-    item: { id: string; name: string; description?: string },
+    item: { id: string; name: string; description?: string; iconUrl?: string },
     selected: string[],
-    onChange: (ids: string[]) => void
+    onChange: (ids: string[]) => void,
+    kind: "MCP" | "Skill"
   ) => {
     const checked = selected.includes(item.id);
     return (
-      <label className={`composer-menu-option ${checked ? "selected" : ""}`} key={item.id}>
-        <b className="composer-context-avatar" aria-hidden="true">{item.name.slice(0, 1).toUpperCase()}</b>
+      <label
+        className={`composer-menu-option ${checked ? "selected" : ""}`}
+        key={item.id}
+        onMouseEnter={(event) => {
+          if (!item.description) {
+            setPreview(null);
+            return;
+          }
+          const popover = event.currentTarget.closest(".composer-add-popover");
+          if (!popover) return;
+          const row = event.currentTarget.getBoundingClientRect();
+          const frame = popover.getBoundingClientRect();
+          const margin = 8;
+          const width = 240;
+          let left = frame.right + margin;
+          if (left + width > window.innerWidth - margin) left = frame.left - margin - width;
+          left = Math.max(margin, Math.min(left, window.innerWidth - width - margin));
+          setPreview({
+            id: item.id,
+            name: item.name,
+            description: item.description,
+            kind,
+            top: row.top,
+            left
+          });
+        }}
+        onMouseLeave={() => setPreview((current) => current?.id === item.id ? null : current)}
+      >
         <input
           type="checkbox"
           checked={checked}
@@ -3825,8 +3972,9 @@ function ComposerAddMenu({
             ? [...selected, item.id]
             : selected.filter((id) => id !== item.id))}
         />
-        <span><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
-        <i>{checked ? "✓" : "+"}</i>
+        <MenuMark iconUrl={item.iconUrl} kind={kind} />
+        <span>{item.name}</span>
+        <span className="composer-menu-switch" aria-hidden="true"><i /></span>
       </label>
     );
   };
@@ -3840,55 +3988,78 @@ function ComposerAddMenu({
       }}
     >
       {open && (
-        <section className="composer-add-popover" aria-label="添加附件和能力">
-          <header className="composer-context-header">
-            <span className="composer-context-mark" aria-hidden="true">✦</span>
-            <span><strong>添加</strong><small>为当前对话添加附件、MCP 或 Skill</small></span>
-          </header>
-          {contextTab !== "attachments" && <label className="composer-context-search">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>
-            <input value={contextQuery} onChange={(event) => setContextQuery(event.target.value)} placeholder="搜索 Skill、MCP…" />
-            <kbd>⌘ K</kbd>
-          </label>}
-          <nav className="composer-context-tabs" aria-label="添加内容分类">
-            {([['attachments', '附件', null], ['mcp', 'MCP', mcpItems.length], ['skills', 'Skills', skillItems.length]] as const).map(([id, label, count]) => (
-              <button className={contextTab === id ? "active" : ""} type="button" key={id} onClick={() => setContextTab(id)}>{label}{count !== null && <small>{count}</small>}</button>
-            ))}
-          </nav>
-          <div className="composer-context-scroll">
-          {contextTab === "attachments" && <div className="composer-menu-section composer-menu-section-first">
-              <label className={`composer-menu-option composer-file-option ${mediaEnabled ? "" : "disabled"}`}>
-                <input
-                  type="file"
-                  accept={accept}
-                  multiple
-                  disabled={!mediaEnabled}
-                  onChange={(event) => {
-                    onMedia(event.target.files);
-                    event.target.value = "";
-                    setOpen(false);
-                  }}
-                />
-                <b>＋</b><span><strong>图片 / 视频</strong><small>{mediaEnabled ? `支持${acceptsImage ? "图片" : ""}${acceptsImage && acceptsVideo ? "、" : ""}${acceptsVideo ? "视频" : ""}，最多 4 个、单个 20 MB` : "当前模型不支持多模态输入"}</small></span>
-              </label>
-          </div>}
-          {contextTab === "mcp" && <div className="composer-menu-section composer-menu-section-first">
-              {visibleMcp.length === 0 && <p>没有匹配的 MCP</p>}
-              {visibleMcp.map((item) => renderSelection(item, selectedMcp, onMcpChange))}
-          </div>}
-          {contextTab === "skills" && <div className="composer-menu-section composer-menu-section-first">
-              {visibleSkills.length === 0 && <p>没有匹配的 Skill</p>}
-              {visibleSkills.map((item) => renderSelection(item, selectedSkills, onSkillsChange))}
-          </div>}
+        <>
+        <section
+          className="composer-add-popover"
+          aria-label="添加附件和能力"
+          style={menuBox ? { left: menuBox.left, bottom: menuBox.bottom } : undefined}
+        >
+          <div className="composer-add-body" style={menuBox ? { maxHeight: menuBox.maxHeight } : undefined} onScroll={() => setPreview(null)}>
+          {showSearch && (
+            <label className="composer-context-search">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" /><path d="m10.5 10.5 3 3" /></svg>
+              <input value={contextQuery} onChange={(event) => setContextQuery(event.target.value)} placeholder="搜索 MCP 或 Skill" aria-label="搜索 MCP 或 Skill" />
+            </label>
+          )}
+          <label className={`composer-menu-option composer-file-option ${mediaEnabled ? "" : "disabled"}`}>
+            <input
+              type="file"
+              accept={accept}
+              multiple
+              disabled={!mediaEnabled}
+              onChange={(event) => {
+                onMedia(event.target.files);
+                event.target.value = "";
+                setOpen(false);
+              }}
+            />
+            <span>附件</span>
+            <small>{mediaHint}</small>
+          </label>
+          <div className="composer-add-group">
+            <button type="button" className={mcpOpen ? "open" : ""} aria-expanded={mcpOpen} onClick={() => { setMcpOpen((current) => !current); setPreview(null); }}>
+              <span>MCP</span>
+              <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 3 7.5 6 4.5 9" /></svg>
+            </button>
+            {mcpOpen && (
+              <div>
+                {visibleMcp.length === 0 && <p>{normalizedQuery ? "没有匹配的 MCP" : "还没有 MCP"}</p>}
+                {visibleMcp.map((item) => renderSelection(item, selectedMcp, onMcpChange, "MCP"))}
+              </div>
+            )}
+          </div>
+          <div className="composer-add-group">
+            <button type="button" className={skillsOpen ? "open" : ""} aria-expanded={skillsOpen} onClick={() => { setSkillsOpen((current) => !current); setPreview(null); }}>
+              <span>Skills</span>
+              <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 3 7.5 6 4.5 9" /></svg>
+            </button>
+            {skillsOpen && (
+              <div>
+                {visibleSkills.length === 0 && <p>{normalizedQuery ? "没有匹配的 Skill" : "还没有 Skill"}</p>}
+                {visibleSkills.map((item) => renderSelection(item, selectedSkills, onSkillsChange, "Skill"))}
+              </div>
+            )}
+          </div>
           </div>
         </section>
+        {preview && createPortal(
+          <aside ref={detailRef} className="composer-add-detail" style={{ top: preview.top, left: preview.left }}>
+            <strong>{preview.name}</strong>
+            <em>{preview.kind}</em>
+            <p>{preview.description}</p>
+          </aside>,
+          document.body
+        )}
+        </>
       )}
       <button className="composer-add-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => open ? closeMenu() : openMenu()}>
         <svg className="composer-add-icon" viewBox="0 0 12 12" aria-hidden="true">
           <path d="M6 1.75v8.5M1.75 6h8.5" />
         </svg>
         <strong>添加</strong>
-        {(selectedMcp.length + selectedSkills.length) > 0 && <i>{selectedMcp.length + selectedSkills.length}</i>}
+        <i className={selectedMcp.length + selectedSkills.length > 0 ? "has-count" : ""} aria-hidden={selectedMcp.length + selectedSkills.length === 0}>
+          {selectedMcp.length + selectedSkills.length > 0 ? selectedMcp.length + selectedSkills.length : null}
+        </i>
       </button>
     </div>
   );
@@ -3986,7 +4157,8 @@ function RuntimeSettingsPicker({
 }) {
   const pickerRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  const [preview, setPreview] = useState<{ agentKind: AgentKind; modelId: string } | null>(null);
+  const [menuBox, setMenuBox] = useState<{ right: number; bottom: number; maxHeight: number } | null>(null);
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   const currentAgent = agents.find((agent) => agent.kind === agentKind) ?? agents[0];
   const currentModels = modelsForAgent(agentKind, kAgentModels, agents);
   const currentModel = currentModels.find((model) => model.id === modelId);
@@ -3994,11 +4166,8 @@ function RuntimeSettingsPicker({
   const normalizedReasoning = availableReasoningOptions.some((option) => option.id === reasoningEffort) ? reasoningEffort : "none";
   const currentReasoning = reasoningOptions.find((option) => option.id === normalizedReasoning);
   const supportsReasoning = Boolean(currentModel?.supportsReasoning);
-  const previewAgentKind = preview?.agentKind ?? agentKind;
-  const previewModelId = preview?.modelId ?? modelId;
-  const previewAgent = agents.find((agent) => agent.kind === previewAgentKind) ?? currentAgent;
-  const previewModel = modelsForAgent(previewAgentKind, kAgentModels, agents).find((model) => model.id === previewModelId) ?? currentModel;
-  const previewReasoningOptions = reasoningOptionsForModel(previewModel);
+  const availableAgents = agents.filter((agent) => agent.available);
+  const showAgentGroups = availableAgents.length > 1;
 
   useEffect(() => {
     if (normalizedReasoning !== reasoningEffort) onReasoningChange(normalizedReasoning);
@@ -4006,19 +4175,34 @@ function RuntimeSettingsPicker({
 
   useEffect(() => {
     const closeOnOutsidePointerDown = (event: globalThis.PointerEvent) => {
-      if (open && pickerRef.current && !pickerRef.current.contains(event.target as Node)) {
-        setOpen(false);
-        setPreview(null);
-      }
+      if (open && pickerRef.current && !pickerRef.current.contains(event.target as Node)) setOpen(false);
     };
     document.addEventListener("pointerdown", closeOnOutsidePointerDown);
     return () => document.removeEventListener("pointerdown", closeOnOutsidePointerDown);
   }, [open]);
 
-  const close = () => {
-    setOpen(false);
-    setPreview(null);
-  };
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const trigger = pickerRef.current?.getBoundingClientRect();
+      if (!trigger) return;
+      const gap = 6;
+      setMenuBox({
+        right: Math.max(8, window.innerWidth - trigger.right),
+        bottom: Math.max(8, window.innerHeight - trigger.top + gap),
+        maxHeight: Math.max(160, trigger.top - gap - 12)
+      });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
+
+  const close = () => setOpen(false);
 
   return (
     <div
@@ -4029,82 +4213,81 @@ function RuntimeSettingsPicker({
       }}
     >
       {open && (
-        <div className="runtime-settings-popovers">
-          <section className="runtime-detail-card">
-            <header><strong>{previewModel?.name ?? "选择模型"}</strong><small>{previewAgent?.name ?? "Agent"}</small></header>
-            {previewAgent?.version && <p>{previewAgent.version}</p>}
-            <div className="runtime-detail-row">
-              <span>思考强度</span>
-              <div>
-                {previewReasoningOptions.map((option) => (
-                  <button
-                    className={previewAgentKind === agentKind && previewModelId === modelId && option.id === reasoningEffort ? "selected" : ""}
-                    key={option.id}
-                    type="button"
-                    onClick={() => {
-                      if (previewAgentKind !== agentKind || previewModelId !== modelId) onRuntimeChange(previewAgentKind, previewModelId);
-                      onReasoningChange(option.id);
-                    }}
-                  >{option.name}</button>
-                ))}
-              </div>
-            </div>
-            {previewAgent?.supports_resume && (
-              <div className="runtime-detail-row">
-                <span>会话模式</span>
-                <div>
-                  {([['ephemeral', '新建'], ['resume', '继续']] as const).map(([id, name]) => (
-                    <button className={id === cliSessionMode ? "selected" : ""} key={id} type="button" onClick={() => onCliSessionModeChange(id)}>{name}</button>
-                  ))}
-                </div>
-              </div>
-            )}
-          </section>
-          <section className="runtime-settings-card">
-            {agents.filter((agent) => agent.available).map((agent) => {
+        <section
+          className="runtime-settings-card"
+          aria-label="选择模型"
+          style={menuBox ? { right: menuBox.right, bottom: menuBox.bottom, maxHeight: menuBox.maxHeight } : undefined}
+        >
+          <div className="runtime-settings-list">
+            {availableAgents.map((agent) => {
               const agentModels = modelsForAgent(agent.kind, kAgentModels, agents);
+              if (agentModels.length === 0) return null;
               return (
                 <div className="runtime-agent-group" key={agent.kind}>
-                  <header><strong>{agent.name}</strong>{agent.version && <small>{agent.version}</small>}</header>
-                  {agentModels.map((model) => {
+                  {showAgentGroups && (
+                    <button
+                      type="button"
+                      className={(openGroups[agent.kind] ?? agent.kind === agentKind) ? "open" : ""}
+                      aria-expanded={openGroups[agent.kind] ?? agent.kind === agentKind}
+                      onClick={() => setOpenGroups((current) => {
+                        const open = current[agent.kind] ?? agent.kind === agentKind;
+                        return { ...current, [agent.kind]: !open };
+                      })}
+                    >
+                      <span>{agent.name}</span>
+                      <i>{agentModels.length}</i>
+                      <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 3 7.5 6 4.5 9" /></svg>
+                    </button>
+                  )}
+                  {(!showAgentGroups || (openGroups[agent.kind] ?? agent.kind === agentKind)) && agentModels.map((model) => {
                     const selected = agent.kind === agentKind && model.id === modelId;
                     return (
                       <button
                         className={selected ? "selected" : ""}
                         key={`${agent.kind}:${model.id}`}
                         type="button"
-                        onPointerEnter={() => setPreview({ agentKind: agent.kind, modelId: model.id })}
-                        onFocus={() => setPreview({ agentKind: agent.kind, modelId: model.id })}
                         onClick={() => onRuntimeChange(agent.kind, model.id)}
                       >
-                        <span>
-                          <strong>{model.name}</strong>
-                          {selected && (model.supportsReasoning || agent.supports_resume) && (
-                            <small>
-                              {model.supportsReasoning ? `思考强度 ${currentReasoning?.name ?? "none"}` : ""}
-                              {model.supportsReasoning && agent.supports_resume ? " · " : ""}
-                              {agent.supports_resume ? (cliSessionMode === "resume" ? "继续上次会话" : "新建会话") : ""}
-                            </small>
-                          )}
-                        </span>
-                        <i>{selected ? "✓" : ""}</i>
+                        <span>{model.name}</span>
+                        {selected && (
+                          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.2 6.4 11l6.1-6.2" /></svg>
+                        )}
                       </button>
                     );
                   })}
                 </div>
               );
             })}
-          </section>
-        </div>
+          </div>
+          {supportsReasoning && (
+            <div className="runtime-settings-foot">
+              <span>思考强度</span>
+              <div>
+                {availableReasoningOptions.map((option) => (
+                  <button
+                    className={option.id === reasoningEffort ? "selected" : ""}
+                    key={option.id}
+                    type="button"
+                    onClick={() => onReasoningChange(option.id)}
+                  >{option.name}</button>
+                ))}
+              </div>
+            </div>
+          )}
+          {currentAgent?.supports_resume && (
+            <div className="runtime-settings-foot">
+              <span>会话模式</span>
+              <div>
+                {([["ephemeral", "新建"], ["resume", "继续"]] as const).map(([id, name]) => (
+                  <button className={id === cliSessionMode ? "selected" : ""} key={id} type="button" onClick={() => onCliSessionModeChange(id)}>{name}</button>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
       )}
-      <button className="runtime-settings-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => {
-        setOpen((value) => {
-          const next = !value;
-          setPreview(next ? { agentKind, modelId } : null);
-          return next;
-        });
-      }}>
-        <strong>{currentAgent?.name || "K Agent"}</strong><span>{currentModel?.name ?? "选择模型"}</span>
+      <button className="runtime-settings-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen((value) => !value)}>
+        <span>{currentModel?.name ?? "选择模型"}</span>
         {supportsReasoning && <em>{currentReasoning?.name}</em>}
         <svg className="trigger-chevron" viewBox="0 0 12 12" aria-hidden="true">
           <path d="m3 4.75 3 3 3-3" />

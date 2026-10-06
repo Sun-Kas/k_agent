@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 import { MarkdownContent } from "./MarkdownContent";
 
@@ -55,14 +56,11 @@ export function ContentStage({
   // Browse = full tree on open; preview only after an explicit file click.
   const [mode, setMode] = useState<"browse" | "preview">("browse");
   const [previewId, setPreviewId] = useState<string | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(() => new Set());
+  const [openTabs, setOpenTabs] = useState<string[]>([]);
+  const [query, setQuery] = useState("");
   const knownDirsRef = useRef<Set<string>>(new Set());
   const workspaceIdsRef = useRef("");
-  const stageRef = useRef<HTMLElement | null>(null);
-  const setStageRef = (node: HTMLElement | null) => {
-    stageRef.current = node;
-  };
   const treePathsKey = useMemo(
     () => items.map((item) => `${item.id}:${item.badge ?? ""}`).sort().join("\0"),
     [items]
@@ -72,6 +70,7 @@ export function ContentStage({
     [items]
   );
   const fileTree = useMemo(() => buildFileTree(items), [treePathsKey]);
+  const visibleTree = useMemo(() => filterFileTree(fileTree, query), [fileTree, query]);
   const activeId = mode === "preview"
     ? (previewId && items.some((item) => item.id === previewId) ? previewId : selectedId)
     : null;
@@ -116,14 +115,14 @@ export function ContentStage({
       workspaceIdsRef.current = "";
       setMode("browse");
       setPreviewId(null);
-      setMenuOpen(false);
+      setOpenTabs([]);
+      setQuery("");
       return;
     }
     const previous = workspaceIdsRef.current;
     if (!previous) {
       workspaceIdsRef.current = workspaceIdsKey;
       setMode("browse");
-      setMenuOpen(false);
       return;
     }
     if (previous === workspaceIdsKey) return;
@@ -135,7 +134,8 @@ export function ContentStage({
     if (!overlap) {
       setMode("browse");
       setPreviewId(null);
-      setMenuOpen(false);
+      setOpenTabs([]);
+      setQuery("");
     }
   }, [workspaceIdsKey, items.length]);
 
@@ -144,33 +144,13 @@ export function ContentStage({
     if (!selectedId) return;
     if (!items.some((item) => item.id === selectedId)) return;
     if (selectedId.startsWith("artifact:")) {
+      setOpenTabs((current) => (current.includes(selectedId) ? current : [...current, selectedId]));
       setPreviewId(selectedId);
       setMode("preview");
-      setMenuOpen(false);
     } else if (mode === "preview") {
       setPreviewId(selectedId);
     }
   }, [selectedId, items, mode]);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    function onPointerDown(event: MouseEvent) {
-      const root = stageRef.current;
-      if (!root) return;
-      if (event.target instanceof Node && !root.contains(event.target)) {
-        setMenuOpen(false);
-      }
-    }
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") setMenuOpen(false);
-    }
-    window.addEventListener("mousedown", onPointerDown);
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("mousedown", onPointerDown);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [menuOpen]);
 
   const previewKind = selected
     ? detectPreviewKind(selected.title, selected.content)
@@ -186,15 +166,29 @@ export function ContentStage({
   }
 
   function openFile(id: string) {
+    setOpenTabs((current) => (current.includes(id) ? current : [...current, id]));
     setPreviewId(id);
     setMode("preview");
-    setMenuOpen(false);
     onSelect(id);
+  }
+
+  function closeTab(id: string) {
+    setOpenTabs((current) => {
+      const next = current.filter((item) => item !== id);
+      if (previewId === id) {
+        const fallback = next[next.length - 1] ?? null;
+        setPreviewId(fallback);
+        setMode(fallback ? "preview" : "browse");
+      }
+      return next;
+    });
   }
 
   const tree = (
     <div className="content-stage-tree-scroll" role="tree" aria-label="文件结构">
-      {fileTree.map((node) => (
+      {visibleTree.length === 0 ? (
+        <p className="content-stage-tree-empty">没有匹配的文件</p>
+      ) : visibleTree.map((node) => (
         <TreeNodeView
           key={node.path}
           node={node}
@@ -202,12 +196,56 @@ export function ContentStage({
           selectedId={previewId}
           interactive
           expandedDirs={expandedDirs}
+          forceOpen={query.trim().length > 0}
           onToggleDir={toggleDir}
           onSelect={openFile}
         />
       ))}
     </div>
   );
+
+  const fileSearch = (
+    <label className="content-stage-file-search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.2" /><path d="M10.2 10.2 13.2 13.2" /></svg>
+      <input
+        value={query}
+        placeholder="按文件名搜索..."
+        aria-label="按文件名搜索"
+        onChange={(event) => setQuery(event.target.value)}
+      />
+    </label>
+  );
+
+  const tabs = items.length > 0 ? (
+    <div className="content-stage-tabs" role="tablist" aria-label="文件与预览">
+      <button
+        className={`content-stage-tab ${mode === "browse" ? "active" : ""}`}
+        type="button"
+        role="tab"
+        aria-selected={mode === "browse"}
+        onClick={() => setMode("browse")}
+      >
+        <FolderGlyph />
+        <span>文件</span>
+      </button>
+      {openTabs.map((id) => {
+        const item = items.find((entry) => entry.id === id);
+        if (!item) return null;
+        const active = mode === "preview" && selected?.id === id;
+        return (
+          <div className={`content-stage-tab ${active ? "active" : ""}`} key={id} role="tab" aria-selected={active}>
+            <button type="button" onClick={() => openFile(id)}>
+              <FileGlyph />
+              <span>{item.title}</span>
+            </button>
+            <button type="button" aria-label={`关闭 ${item.title}`} onClick={() => closeTab(id)}>
+              <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3.2 3.2 8.8 8.8M8.8 3.2 3.2 8.8" /></svg>
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  ) : null;
 
   const body = (
     <div className={`content-stage-body-shell mode-${mode}`}>
@@ -218,96 +256,64 @@ export function ContentStage({
           <p>{emptyHint}</p>
         </div>
       ) : mode === "browse" ? (
-        <div className="content-stage-browse">{tree}</div>
+        <div className="content-stage-browse">
+          {fileSearch}
+          {tree}
+        </div>
       ) : selected ? (
-        <>
-          <section
-            className={`content-stage-preview kind-${previewKind}`}
-            aria-label={selected.title}
-          >
-            {selected.footnote ? (
-              <p className="content-stage-footnote" title={selected.footnote}>
-                {selected.footnote}
-              </p>
-            ) : null}
-            <div className="content-stage-body">
-              <FilePreview
-                title={selected.title}
-                path={selected.subtitle ?? selected.id}
-                content={selected.content}
-                items={items}
-                resolveFile={resolveFile}
-              />
-            </div>
-          </section>
-          {menuOpen ? (
-            <button
-              className="content-stage-scrim"
-              type="button"
-              aria-label="收起文件列表"
-              onClick={() => setMenuOpen(false)}
-            />
+        <section
+          className={`content-stage-preview kind-${previewKind}`}
+          aria-label={selected.title}
+        >
+          {selected.footnote ? (
+            <p className="content-stage-footnote" title={selected.footnote}>
+              {selected.footnote}
+            </p>
           ) : null}
-        </>
+          <div className="content-stage-body">
+            <FilePreview
+              title={selected.title}
+              path={selected.subtitle ?? selected.id}
+              content={selected.content}
+              items={items}
+              resolveFile={resolveFile}
+            />
+          </div>
+        </section>
       ) : (
-        <div className="content-stage-browse">{tree}</div>
+        <div className="content-stage-browse">
+          {fileSearch}
+          {tree}
+        </div>
       )}
 
       {footer ? <footer className="content-stage-footer">{footer}</footer> : null}
     </div>
   );
 
-  // Parent inspector already owns the panel title when embedded — only keep
-  // chrome for file switching in preview so the header title doesn't jump.
-  const showEmbeddedChrome = embedded && mode === "preview" && selected;
-  const chrome = showEmbeddedChrome || !embedded ? (
-    <header className={`content-stage-chrome ${embedded ? "embedded-chrome" : ""}`}>
-      {!embedded ? (
-        <div className="content-stage-brand">
-          <p className="eyebrow">{eyebrow}</p>
-          <h2>{title}</h2>
-        </div>
-      ) : null}
-      {mode === "preview" && selected ? (
-        <div className={`content-stage-picker ${menuOpen ? "open" : ""}`}>
-          <button
-            className="content-stage-tree-toggle"
-            type="button"
-            aria-expanded={menuOpen}
-            aria-controls="content-stage-file-menu"
-            onClick={() => setMenuOpen((open) => !open)}
-            title="切换文件"
-          >
-            <span className={`content-stage-chevron ${menuOpen ? "open" : ""}`} aria-hidden>
-              ▾
-            </span>
-            <strong>{selected.title}</strong>
-          </button>
-          <div
-            className="content-stage-tree-panel"
-            id="content-stage-file-menu"
-            aria-hidden={!menuOpen}
-          >
-            {tree}
-          </div>
-        </div>
-      ) : null}
-      {!embedded ? <span className="content-stage-count">{items.length || ""}</span> : null}
+  const chrome = !embedded ? (
+    <header className="content-stage-chrome">
+      <div className="content-stage-brand">
+        <p className="eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+      </div>
+      <span className="content-stage-count">{items.length || ""}</span>
     </header>
   ) : null;
 
   if (embedded) {
     return (
-      <div className={`content-stage content-stage-embedded mode-${mode}`} ref={setStageRef}>
-        {chrome}
+      <div className={`content-stage content-stage-embedded mode-${mode}`}>
+        {tabs}
         {body}
       </div>
     );
   }
 
   return (
-    <aside className={`content-stage inspector mode-${mode}`} aria-label={title} ref={setStageRef}>
+    <aside className={`content-stage inspector mode-${mode}`} aria-label={title}>
       {chrome}
+      {tabs}
       {body}
     </aside>
   );
@@ -328,6 +334,7 @@ function TreeNodeView({
   selectedId,
   interactive,
   expandedDirs,
+  forceOpen,
   onToggleDir,
   onSelect
 }: {
@@ -336,11 +343,22 @@ function TreeNodeView({
   selectedId: string | null;
   interactive: boolean;
   expandedDirs: Set<string>;
+  forceOpen: boolean;
   onToggleDir: (path: string) => void;
   onSelect: (id: string) => void;
 }) {
+  const [tip, setTip] = useState<DOMRect | null>(null);
+  const showTip = (event: MouseEvent<HTMLButtonElement>) => {
+    const label = event.currentTarget.querySelector("strong");
+    if (!label || label.scrollWidth <= label.clientWidth + 1) {
+      setTip(null);
+      return;
+    }
+    setTip(label.getBoundingClientRect());
+  };
+
   if (node.kind === "dir") {
-    const open = expandedDirs.has(node.path);
+    const open = forceOpen || expandedDirs.has(node.path);
     return (
       <div className="content-stage-tree-dir" role="group" aria-label={node.name}>
         <button
@@ -349,15 +367,17 @@ function TreeNodeView({
           role="treeitem"
           aria-expanded={open}
           tabIndex={interactive ? 0 : -1}
-          style={{ paddingLeft: 10 + depth * 12 }}
+          style={{ paddingLeft: 8 + depth * 16 }}
           onClick={() => onToggleDir(node.path)}
+          onMouseEnter={showTip}
+          onMouseLeave={() => setTip(null)}
         >
-          <span className={`content-stage-glyph content-stage-dir-chevron ${open ? "open" : ""}`} aria-hidden>
-            ▸
+          <FolderGlyph open={open} />
+          <span className="content-stage-item-copy">
+            <strong>{node.name}</strong>
           </span>
-          <strong>{node.name}</strong>
-          <em>{node.children.length}</em>
         </button>
+        {tip ? <NameTip rect={tip} text={node.name} /> : null}
         {open ? (
           <div className="content-stage-tree-children">
             {node.children.map((child) => (
@@ -368,6 +388,7 @@ function TreeNodeView({
                 selectedId={selectedId}
                 interactive={interactive}
                 expandedDirs={expandedDirs}
+                forceOpen={forceOpen}
                 onToggleDir={onToggleDir}
                 onSelect={onSelect}
               />
@@ -386,23 +407,76 @@ function TreeNodeView({
       role="treeitem"
       aria-selected={active}
       tabIndex={interactive ? 0 : -1}
-      style={{ paddingLeft: 10 + depth * 12 }}
+      style={{ paddingLeft: 8 + depth * 16 }}
       onClick={() => {
         if (node.item) onSelect(node.item.id);
       }}
+      onMouseEnter={showTip}
+      onMouseLeave={() => setTip(null)}
     >
-      <span className="content-stage-glyph" aria-hidden>
-        <svg viewBox="0 0 16 16">
-          <path d="M4.25 1.75h4.6l2.9 2.9v9.6h-7.5z" />
-          <path d="M8.75 1.75v3h3" />
-        </svg>
-      </span>
+      <FileGlyph />
       <span className="content-stage-item-copy">
         <strong>{node.name}</strong>
       </span>
       {node.item?.badge ? <em>{node.item.badge}</em> : null}
+      {tip ? <NameTip rect={tip} text={node.name} /> : null}
     </button>
   );
+}
+
+function FolderGlyph({ open = false }: { open?: boolean }) {
+  return (
+    <span className="content-stage-glyph" aria-hidden>
+      {open ? (
+        <svg viewBox="0 0 16 16">
+          <path d="M1.6 6.5h12.8v6.2H1.6z" />
+          <path d="M1.6 6.5 3.3 4h3.3l1.1 1.3H14.4" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 16 16">
+          <path d="M1.8 4.2h4.1l1.2 1.4h7.1v7.2H1.8z" />
+        </svg>
+      )}
+    </span>
+  );
+}
+
+function FileGlyph() {
+  return (
+    <span className="content-stage-glyph" aria-hidden>
+      <svg viewBox="0 0 16 16">
+        <path d="M4.2 1.8h4.8L12.2 4.8v9.4H4.2z" />
+        <path d="M9 1.8v3.2h3.2" />
+      </svg>
+    </span>
+  );
+}
+
+function NameTip({ rect, text }: { rect: DOMRect; text: string }) {
+  return createPortal(
+    <div className="content-stage-name-tip" style={{ left: rect.right - 6, top: rect.top + rect.height / 2 }}>{text}</div>,
+    document.body
+  );
+}
+
+function filterFileTree(nodes: FileTreeNode[], query: string): FileTreeNode[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return nodes;
+  const walk = (entries: FileTreeNode[]): FileTreeNode[] => {
+    const next: FileTreeNode[] = [];
+    for (const node of entries) {
+      if (node.kind === "file") {
+        if (node.name.toLowerCase().includes(needle)) next.push(node);
+        continue;
+      }
+      const children = walk(node.children);
+      if (children.length || node.name.toLowerCase().includes(needle)) {
+        next.push({ ...node, children });
+      }
+    }
+    return next;
+  };
+  return walk(nodes);
 }
 
 function buildFileTree(items: ContentStageItem[]): FileTreeNode[] {

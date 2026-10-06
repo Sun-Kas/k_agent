@@ -226,23 +226,25 @@ class RuntimeCatalog:
             raise CatalogError(
                 f"Unknown or disabled {label}: " + ", ".join(missing)
             )
+        # dict.fromkeys 按首次出现顺序去重；set 会打乱请求里的勾选顺序。
         return [enabled[item_id] for item_id in dict.fromkeys(ids)]
 
 def read_mcp_config(path: Path) -> tuple[list[dict[str, Any]], str | None]:
-    """读取 Claude 风格 mcpServers 或旧版 servers 数组，返回 (列表, 格式名)。"""
+    """读取连接配置，只认 Claude 风格 mcpServers 对象。"""
     if not path.exists():
         return [], None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload.get("mcpServers"), dict):
-        return (
-            [
-                {"id": key, **value}
-                for key, value in payload["mcpServers"].items()
-                if isinstance(value, dict)
-            ],
-            "mcpServers",
-        )
-    return list(payload.get("servers", [])), "servers"
+    raw = payload.get("mcpServers")
+    if not isinstance(raw, dict):
+        return [], "mcpServers"
+    return (
+        [
+            {"id": key, **value}
+            for key, value in raw.items()
+            if isinstance(value, dict)
+        ],
+        "mcpServers",
+    )
 
 
 def catalog_fields_from_frontmatter(frontmatter: dict[str, Any]) -> dict[str, Any]:
@@ -292,6 +294,7 @@ def skill_catalog_row(item: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(item.get("enabled", True)),
         **catalog_fields_from_frontmatter(item),
     }
+    # Skill 包在 content/skills/<id>/；marketplace 同样只记广场 slug，不进 Backend。
     marketplace = _marketplace_block(item)
     if marketplace:
         row["marketplace"] = marketplace
@@ -299,6 +302,13 @@ def skill_catalog_row(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _mcp_summary(item: dict[str, Any]) -> dict[str, Any]:
+    """selector 行：id/name/description/enabled。
+
+    连接参数在 config/mcp.json；这里的 marketplace 只是广场溯源
+    （source / sourceId / version），不是把广场条目再存一份。
+    手工加的 MCP 没有该字段。不保留的话，配置中心保存会把未知键丢掉，
+    广场就无法再按 sourceId 判断「已安装」。
+    """
     item_id = str(item.get("id") or "").strip()
     row = {
         "id": item_id,
@@ -313,6 +323,7 @@ def _mcp_summary(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _marketplace_block(item: dict[str, Any]) -> dict[str, Any] | None:
+    """规范化 catalog 上的安装来源；缺 source/sourceId 视为非广场安装。"""
     raw = item.get("marketplace")
     if not isinstance(raw, dict):
         return None
@@ -323,10 +334,14 @@ def _marketplace_block(item: dict[str, Any]) -> dict[str, Any] | None:
     block = {"source": source, "sourceId": source_id}
     version = str(raw.get("version") or "").strip()
     installed_at = str(raw.get("installedAt") or "").strip()
+    # 只留 http(s) 图标地址。广场安装时写入；手工添加的 MCP/Skill 没有这个字段。
+    icon_url = str(raw.get("iconUrl") or "").strip()
     if version:
         block["version"] = version
     if installed_at:
         block["installedAt"] = installed_at
+    if icon_url.startswith(("https://", "http://")):
+        block["iconUrl"] = icon_url
     return block
 
 
