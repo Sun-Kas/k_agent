@@ -21,7 +21,7 @@ from ag_ui.core import (
 )
 
 from backend.agui import to_chat_messages, translate_agent_events
-from access_layer.sessions.store import SessionBusyError, SessionStore
+from access_layer.sessions.store import SessionBusyError, SessionForkAnchorError, SessionStore
 from backend.api.schemas import ChatMessage
 from backend.config import get_or_init_settings
 from backend.storage import FileStorage
@@ -434,6 +434,41 @@ class ActivityTimelineTests(unittest.IsolatedAsyncioTestCase):
             nested_branch = await store.fork_session(branch.id)
             assert nested_branch is not None
             self.assertEqual(nested_branch.title, "Source（4）")
+
+    async def test_fork_stops_at_a_message_or_the_end_of_its_run(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = SessionStore(FileStorage(tmp))
+            source = await store.create_session(session_id="thread-cut", title="Cut")
+
+            async def turn(user_id: str, user_text: str, run_id: str, assistant_id: str, assistant_text: str) -> None:
+                await store.save_run_start(
+                    source.id,
+                    [ChatMessage(id=user_id, role="user", content=user_text, createdAt=datetime.now(timezone.utc))],
+                    run_id=run_id,
+                    mcp_server_ids=[],
+                    skill_ids=[],
+                )
+                await store.append_event(source.id, {"type": "RUN_STARTED", "threadId": source.id, "runId": run_id})
+                await store.append_event(source.id, {"type": "TEXT_MESSAGE_START", "messageId": assistant_id, "role": "assistant"})
+                await store.append_event(source.id, {"type": "TEXT_MESSAGE_CONTENT", "messageId": assistant_id, "delta": assistant_text})
+                await store.append_event(source.id, {"type": "TEXT_MESSAGE_END", "messageId": assistant_id})
+                await store.append_event(source.id, {"type": "RUN_FINISHED", "threadId": source.id, "runId": run_id})
+
+            await turn("user-1", "first question", "run-1", "assistant-1", "first answer")
+            await turn("user-2", "second question", "run-2", "assistant-2", "second answer")
+
+            at_message = await store.fork_session(source.id, through_message_id="user-1")
+            assert at_message is not None
+            self.assertEqual([(item.role, item.content) for item in at_message.messages], [("user", "first question")])
+
+            at_run = await store.fork_session(source.id, through_run_id="run-1")
+            assert at_run is not None
+            self.assertEqual(
+                [(item.role, item.content) for item in at_run.messages],
+                [("user", "first question"), ("assistant", "first answer")],
+            )
+            with self.assertRaises(SessionForkAnchorError):
+                await store.fork_session(source.id, through_message_id="missing")
 
     async def test_delete_session_removes_bundle_and_active_runs_block_actions(self) -> None:
         with TemporaryDirectory() as tmp:

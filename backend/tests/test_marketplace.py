@@ -37,6 +37,7 @@ NPM_SERVER = {
     "title": "Brave Search",
     "description": "Search the web",
     "version": "1.0.2",
+    "logo_url": "https://example.com/brave.png",
     "packages": [
         {
             "registryType": "npm",
@@ -330,6 +331,7 @@ class MarketplaceServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result["localId"], "brave-search")
             self.assertEqual(catalog.mcp_summaries()[0]["marketplace"]["sourceId"], "io.github.user/brave-search")
+            self.assertEqual(catalog.mcp_summaries()[0]["marketplace"]["iconUrl"], "https://example.com/brave.png")
             mcp, _ = catalog.selected_runtime(["brave-search"], [])
             self.assertNotIn("marketplace", mcp[0])
             self.assertEqual(mcp[0]["env"]["BRAVE_API_KEY"], "secret")
@@ -401,13 +403,16 @@ class MarketplaceServiceTests(unittest.IsolatedAsyncioTestCase):
                         "name": "写作",
                         "description": "帮助写作",
                         "enabled": True,
-                        "marketplace": {"source": "skillhub", "sourceId": "writer-slug", "version": "1"},
+                        "marketplace": {"source": "skillhub", "sourceId": "writer-slug", "version": "1", "iconUrl": "https://cdn.example/icon.png", "iconUrlUnsafe": "javascript:alert(1)"},
                     }
                 ]
             )
             _, skills = catalog.selected_runtime([], ["writer"])
             self.assertEqual(skills[0]["id"], "writer")
             self.assertNotIn("marketplace", skills[0])
+            stored = catalog.skill_summaries()[0]["marketplace"]
+            self.assertEqual(stored["iconUrl"], "https://cdn.example/icon.png")
+            self.assertNotIn("iconUrlUnsafe", stored)
 
 
 class SkillZipHostTests(unittest.TestCase):

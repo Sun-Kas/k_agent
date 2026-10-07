@@ -23,6 +23,7 @@
 - [Agent Team 技术方案](features/agent-team-technical-solution.md)
 - [定时任务技术方案](features/scheduled-task-technical-solution.md)
 - [npm CLI / 终端工作台技术方案](features/npm-cli-terminal-technical-solution.md)
+- [对话区底部终端技术方案](features/conversation-bottom-terminal-technical-solution.md)
 - [前端页面设计评审与改造方案](features/frontend-design-review-and-improvement-plan.md)
 - [Skill / MCP 广场技术方案](features/marketplace-skill-mcp-technical-solution.md)
 - [流式审批卡片渲染待办](features/streaming-approval-card-todo.md)
@@ -34,6 +35,7 @@
 
 ## 调研
 
+- [Agent 逻辑回滚：调研与完整技术方案](agent-rollback/agent-logical-rollback-technical-proposal.md)
 - [Agent 递归自进化机制调研](research/agent-recursive-self-evolution-survey.md)
 
 ## 参考记录

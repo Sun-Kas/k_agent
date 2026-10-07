@@ -20,7 +20,12 @@ class WatchedPathState:
 
 
 class PollingChangeWatcher:
-    """对 prompt 相关文件做轻量轮询；相对原生 FS hook，依赖更少、行为更保守。"""
+    """对 prompt 相关文件做轻量 **mtime 轮询**，不用内核文件事件（inotify / FSEvents）。
+
+    原生 FS hook 要额外库（如 watchdog）、在 Docker/NFS/部分 macOS 上会丢事件。
+    这里只 `stat` 少量路径，不引那些依赖。行为保守：任意一处 mtime 变化就整表
+    失效 prompt/memory 缓存，不做「只清某一个文件」的精细失效。
+    """
 
     def __init__(self, roots: list[Path], on_change: Callable[[str], None], interval_seconds: float = 1.5):
         """绑定监听根路径、变更回调与轮询间隔，并准备空快照状态。"""
@@ -29,6 +34,8 @@ class PollingChangeWatcher:
         self.interval_seconds = interval_seconds
         self.state = WatchedPathState()
         self._task: asyncio.Task[None] | None = None
+        # 协程间的「红绿灯」：默认灭（未停止）。set() 点亮后，所有 wait() 立刻醒来，
+        # 且一直亮着；is_set() 只是看灯，不阻塞。
         self._stop = asyncio.Event()
 
     def start(self) -> None:
@@ -38,6 +45,7 @@ class PollingChangeWatcher:
 
     async def stop(self) -> None:
         """发出停止信号并等待轮询任务退出。"""
+        # 点亮开关：正在 wait() 的 _run 立刻醒来；is_set() 之后为真，循环结束。
         self._stop.set()
         if self._task is not None:
             await self._task
@@ -48,13 +56,14 @@ class PollingChangeWatcher:
         # 先取基线快照，避免把启动时的既有状态误判成一次变更。
         self.state.mtimes = self._snapshot()
         while not self._stop.is_set():
-            # 用「等待停止信号并超时」代替 sleep：停止时能立刻退出，
-            # 不必等完整的一个轮询周期。超时才说明该做一次检查。
+            # is_set()：只看灯，不阻塞。wait()：躺下等到 set()，或下面 timeout 到期。
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
+                # stop() 已 set：正常返回，不进 except，下一圈 while 条件为假就退出。
             except TimeoutError:
+                # 间隔到了、还没停：对比快照。reason 固定字符串，生命周期只当「有文件变了」。
                 current = self._snapshot()
-                # 整体比较字典，能同时覆盖新增、删除和修改三种情况。
+                # 整本 path→mtime 比较：新增、删除、内容改写都会让字典不等。
                 if current != self.state.mtimes:
                     self.state.mtimes = current
                     self.on_change("watched_files_changed")
@@ -85,6 +94,7 @@ def _interesting(path: Path) -> bool:
 def _mtime(path: Path) -> float | None:
     """读取单路径 mtime；不存在或不可读时返回 None。"""
     try:
+        # inode 元数据：内容最后修改时间（秒，浮点）。内容没变则两次 snapshot 相等。
         return path.stat().st_mtime
     except OSError:
         return None

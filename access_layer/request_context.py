@@ -27,8 +27,10 @@ class RequestContext:
     run_id: str | None = None
 
 
-# ContextVars 是协程本地的。请求若迁到有界线程池，调用方必须拷贝上下文
-# 并在该 worker 内运行。
+# 每个 Task 各自一份「当前值」，set 是替换这份当前值，不是压栈。
+# 旧 RequestContext 对象还在，但 get() 只能读到最新那份。
+# Token 记着「这次 set 之前的当前值」，reset 才能恢复。
+# 请求若迁到线程池或新建 Task，调用方必须自己拷贝后再 set。
 _request_context: ContextVar[RequestContext | None] = ContextVar("request_context", default=None)
 
 
@@ -43,7 +45,13 @@ def get_request_context() -> RequestContext | None:
 
 
 def set_request_context(context: RequestContext) -> Token[RequestContext | None]:
-    """设置当前协程请求上下文，并返回用于 finally 恢复的 token。"""
+    """写入当前协程的 RequestContext。
+
+    Token 不是这份 context 的拷贝，而是 set 之前那一格的书签。
+    中间件 set 得到 token_mw（底下是 None）；网关再 update 得到
+    token_gw（底下是中间件那层）。finally 必须用对应 token reset，
+    才能一层层揭回去，不能拿最新值当「清空」。
+    """
     return _request_context.set(context)
 
 
@@ -54,5 +62,5 @@ def update_request_context(**changes: str | None) -> Token[RequestContext | None
 
 
 def reset_request_context(token: Token[RequestContext | None]) -> None:
-    """用 token 恢复进入本请求段之前的上下文。"""
+    """按 token 把 ContextVar 恢复成那次 set/update 之前的值。"""
     _request_context.reset(token)

@@ -16,6 +16,7 @@ class PromptLifecycleState:
     reason: str | None = None
 
 
+# 进程级单例，各 worker 共享：
 STATE = PromptLifecycleState()
 
 

@@ -174,7 +174,7 @@ class AccessBoundaryTests(unittest.TestCase):
         self.assertIn("read_text(", body_loader)
         self.assertNotIn("parse_markdown_frontmatter", body_loader)
         self.assertNotIn("access_layer", body_loader)
-        local_tool = (backend_root / "tools" / "local.py").read_text(encoding="utf-8")
+        local_tool = (backend_root / "tools" / "adapters" / "skill.py").read_text(encoding="utf-8")
         self.assertNotIn("parse_markdown_frontmatter", local_tool)
         self.assertNotIn("read_text(", local_tool)
         self.assertIn("load_skill_body", local_tool)

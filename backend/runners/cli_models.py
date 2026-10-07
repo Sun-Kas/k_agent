@@ -88,14 +88,12 @@ def _codex_default_model() -> str | None:
 
 
 def _claude_models() -> dict[str, Any]:
-    # Claude Code accepts aliases (`sonnet`/`opus`/`haiku`) or full model names.
-    # All current Claude models support extended thinking via --thinking-budget-tokens.
+    # Claude Code 的 /model 用家族别名，别名会指向当前版本。
+    # 写死旧的完整 id（如 claude-sonnet-4-5）会停在过期版本上。
     models = [
-        {"id": "sonnet", "name": "Sonnet（默认别名）", "supportsReasoning": True},
+        {"id": "sonnet", "name": "Sonnet", "supportsReasoning": True},
         {"id": "opus", "name": "Opus", "supportsReasoning": True},
         {"id": "haiku", "name": "Haiku", "supportsReasoning": True},
-        {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "supportsReasoning": True},
-        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "supportsReasoning": True},
-        {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "supportsReasoning": True},
+        {"id": "fable", "name": "Fable", "supportsReasoning": True},
     ]
     return {"defaultModelId": "sonnet", "models": models}

@@ -20,34 +20,24 @@ $K_AGENT_HOME/
   content/
     memory/ / skills/
 ```
-
-首次启动可把遗留 `data/…`、`backend/config/runtime/…` 拷入空 home；原件不动。
 """
 
 from __future__ import annotations
 
-import logging
 import os
-import shutil
 from pathlib import Path
 
 
-logger = logging.getLogger(__name__)
-
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-LEGACY_DATA_DIR = PROJECT_DIR / "data"
-LEGACY_RUNTIME_DIR = PROJECT_DIR / "backend" / "config" / "runtime"
 
 _home_cache: Path | None = None
-_migrated = False
 
 
 def reset_home_cache() -> None:
-    """测试/重配：丢弃缓存的 home 解析与迁移标志。"""
+    """测试/重配：丢弃缓存的 home 解析。"""
 
-    global _home_cache, _migrated
+    global _home_cache
     _home_cache = None
-    _migrated = False
 
 
 def agent_home() -> Path:
@@ -56,6 +46,7 @@ def agent_home() -> Path:
     global _home_cache
     if _home_cache is not None:
         return _home_cache
+    # 从环境变量中获取K_AGENT_HOME，目前设置的是./.k_agent
     configured = (os.getenv("K_AGENT_HOME") or "").strip()
     if configured:
         path = Path(configured).expanduser()
@@ -110,37 +101,79 @@ def ensure_shared_runtime() -> Path:
 
 
 def link_shared_runtime(target_dir: Path, runtime: Path | None = None) -> Path:
-    """在工作区挂 `.runtime` → 共享 runtime；旧链接/目录先拆再建。"""
+    """在工作区挂 `.runtime` → 共享 runtime；过期链接先拆再建。"""
 
+    # 每个 workspace 只挂入口 `.runtime`；真实 Node/npm 仍在 $K_AGENT_HOME/cache/runtime。
     runtime = (runtime or ensure_shared_runtime()).resolve()
     link = target_dir / ".runtime"
+    # 断链时 exists() 为假，必须先认 symlink；正确链接则幂等返回，避免每次 run 拆链。
     if link.is_symlink():
         try:
             if link.resolve() == runtime:
                 return link
         except OSError:
+            # 断链/无权限：当过期链接处理，下面 unlink 后重建。
             pass
         link.unlink()
-    elif link.is_dir():
-        shutil.rmtree(link)
     elif link.exists():
+        # 普通文件残留不能 symlink_to 覆盖；真目录视为异常，让 symlink_to 失败。
         link.unlink()
     target_dir.mkdir(parents=True, exist_ok=True)
     link.symlink_to(runtime, target_is_directory=True)
     return link
 
 
+def shared_runtime_prefix(
+    target_dir: Path | None = None, runtime: Path | None = None
+) -> Path:
+    """子进程应使用的 runtime 前缀：有工作区则是 `.runtime` 链接，否则是 cache 实路径。"""
+
+    runtime = (runtime or ensure_shared_runtime()).resolve()
+    if target_dir is None:
+        return runtime
+    return link_shared_runtime(target_dir, runtime)
+
+
+def _env_runtime_root(runtime: Path) -> Path:
+    """把 runtime 做成绝对路径，但绝不跟随符号链接。
+
+    PATH/npm 需要绝对前缀；`Path.resolve()` 会穿过 workspace `.runtime`
+    回到 `$K_AGENT_HOME/cache/runtime`，等于白挂链接。
+    """
+
+    # cwd=/proj 时：
+    #   ~/.runtime          → /Users/me/.runtime（仍不跟随链接）
+    #   workspace/.runtime  → /proj/workspace/.runtime
+    #   /abs/ws/.runtime    → 原样返回（不会变成 cache/runtime）
+    runtime = runtime.expanduser()  # 只把开头的 ~ 换成当前用户 home，例如 ~/x → /Users/me/x
+    if not runtime.is_absolute():
+        runtime = Path.cwd() / runtime
+    return runtime
+
+
 def shared_runtime_tool_env(runtime: Path | None = None) -> dict[str, str]:
     """注入 Bash/CLI 子进程的 PATH/npm prefix，使安装复用同一项目前缀。"""
 
-    runtime = (runtime or ensure_shared_runtime()).resolve()
+    runtime = (
+        ensure_shared_runtime()
+        if runtime is None
+        else _env_runtime_root(Path(runtime))
+    )
     node_bin = str(runtime / "node" / "bin")
     parent_path = os.environ.get("PATH", "")
     return {
+        # 给 Agent/提示词用的 runtime 根：工作区里通常是 .runtime 链接。
         "K_AGENT_SHARED_RUNTIME": str(runtime),
+        # Team 任务约定交付目录名（相对 cwd），不是绝对路径。
         "K_AGENT_TASK_OUTPUT": "output",
+        # npm 下载缓存，避免每次 install 打到用户 ~/.npm。
         "NPM_CONFIG_CACHE": str(runtime / "npm-cache"),
+        # 全局包装到 runtime/node（bin 在 node/bin），而不是用户 ~/.npm-global。
         "npm_config_prefix": str(runtime / "node"),
+        # Unix PATH 用冒号拼接目录。例：
+        # node_bin=/proj/ws/.runtime/node/bin
+        # parent_path=/usr/bin:/bin
+        # → /proj/ws/.runtime/node/bin:/usr/bin:/bin（共享 bin 优先）
         "PATH": f"{node_bin}:{parent_path}" if parent_path else node_bin,
     }
 
@@ -159,15 +192,6 @@ def session_workspace_dir(session_id: str) -> Path:
     """对话绑定的 CLI/本地工具 cwd（非 Team 任务目录）。"""
 
     return session_bundle_dir(session_id) / "workspace"
-
-
-def team_workspace_dir(team_id: str, agent_id: str) -> Path:
-    """遗留的 Agent 级 Team 工作区路径。
-
-    新跑法用任务级目录；保留本解析器供旧快照与迁移前巡检。
-    """
-
-    return teams_dir() / team_id / "workspaces" / agent_id
 
 
 def team_task_dir(team_id: str, task_id: str) -> Path:
@@ -215,7 +239,12 @@ def skills_catalog_path() -> Path:
 
 
 def ensure_home_layout(*, migrate: bool = True) -> Path:
-    """创建 home 目录树；可选把遗留项目数据迁入空槽位。"""
+    """创建 `$K_AGENT_HOME` 下 config/state/content/cache 目录树。
+
+    `migrate` 只为旧调用保留；不再把遗留 data/ 拷进 home。
+    """
+
+    del migrate
 
     home = agent_home()
     for path in (
@@ -228,70 +257,7 @@ def ensure_home_layout(*, migrate: bool = True) -> Path:
     ):
         path.mkdir(parents=True, exist_ok=True)
     ensure_shared_runtime()
-    if migrate:
-        migrate_legacy_home()
     return home
-
-
-def migrate_legacy_home() -> list[str]:
-    """幂等：把已知遗留路径拷进尚未占用的 home 槽位。"""
-
-    global _migrated
-    if _migrated:
-        return []
-    _migrated = True
-    actions: list[str] = []
-
-    copies: list[tuple[Path, Path, bool]] = [
-        # (source, destination, is_directory)
-        (LEGACY_DATA_DIR / "sessions", sessions_dir(), True),
-        (LEGACY_DATA_DIR / "memory", memory_dir(), True),
-        (LEGACY_DATA_DIR / "skill", skills_dir(), True),
-        (LEGACY_DATA_DIR / "mcp.json", mcp_catalog_path(), False),
-        (LEGACY_DATA_DIR / "skill.json", skills_catalog_path(), False),
-        (LEGACY_RUNTIME_DIR / "mcp.config.json", mcp_config_path(), False),
-        (LEGACY_RUNTIME_DIR / "models.config.json", models_config_path(), False),
-        (Path.home() / ".k_agent" / "permissions.json", permissions_path(), False),
-        (Path.home() / ".k_agent" / "mcp.json", user_mcp_config_path(), False),
-    ]
-    for source, destination, is_dir in copies:
-        moved = _copy_if_needed(source, destination, is_directory=is_dir)
-        if moved:
-            actions.append(f"{source} -> {destination}")
-
-    if actions:
-        logger.info(
-            "Migrated legacy agent data into %s (%d items)",
-            agent_home(),
-            len(actions),
-        )
-    return actions
-
-
-def _copy_if_needed(source: Path, destination: Path, *, is_directory: bool) -> bool:
-    """仅当目标仍空/不存在时拷贝；同源同目标直接跳过。"""
-
-    try:
-        if not source.exists():
-            return False
-        # Never pull the live home onto itself when K_AGENT_HOME=~/.k_agent and
-        # the legacy file already sits at the new path.
-        if source.resolve() == destination.resolve():
-            return False
-        if is_directory:
-            if any(destination.iterdir()) if destination.is_dir() else destination.exists():
-                return False
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source, destination, dirs_exist_ok=True)
-            return True
-        if destination.exists():
-            return False
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        return True
-    except OSError as exc:
-        logger.info("Skipped legacy migrate %s -> %s: %s", source, destination, exc)
-        return False
 
 
 def display_home() -> str:

@@ -49,7 +49,11 @@ def _split_frontmatter(content: str) -> tuple[str, str]:
 
 
 def _frontmatter_globs(frontmatter: str) -> list[str]:
-    """解析 frontmatter 中的路径 glob。"""
+    """从 YAML frontmatter 抽出 paths/globs，供 .claude/rules 做「仅匹配这些路径时才注入」。
+
+    识别三种写法：``globs: *.ts``、``globs: [a, b]``、以及下面的 ``- 项`` 列表。
+    没有这些字段则返回空列表，规则会在 eager 加载里无条件生效。
+    """
     globs: list[str] = []
     capture = False
     for raw_line in frontmatter.splitlines():
@@ -75,11 +79,13 @@ def _extract_includes(content: str) -> list[str]:
     in_fenced_block = False
     for line in content.splitlines():
         stripped = line.strip()
+        # ``` / ~~~ 围栏内的 @ 当示例代码，不当 include。
         if stripped.startswith("```") or stripped.startswith("~~~"):
             in_fenced_block = not in_fenced_block
             continue
         if in_fenced_block:
             continue
+        # 整行只能是 @路径；行内 @foo、@include path 都不算。
         match = re.match(r"^@([^\s`]+)\s*$", stripped)
         if match:
             includes.append(match.group(1))

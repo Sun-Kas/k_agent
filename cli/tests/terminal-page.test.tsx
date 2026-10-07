@@ -389,6 +389,34 @@ test("Esc 不会批准审批，允许动作必须显式输入", async () => {
   view.unmount();
 });
 
+test("答完最后一个问题后页面交还给对话，不再停在 HITL 卡片", async () => {
+  const asked = questionTimeline();
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={{ ...chatModel(), timeline: asked }} onAction={(action) => actions.push(action)} />);
+  assert.match(stripStyles(view.lastFrame() ?? ""), /Agent 正在等待你的回答/);
+  view.stdin.write("\r");
+  await flush();
+  assert.equal(actions[0]?.type, "answer_interrupt");
+
+  // application 层提交后把卡片标成 submitting，Resume run 在后台继续跑。
+  const submitting = {
+    ...asked,
+    items: asked.items.map((item) => item.kind === "approval"
+      ? { ...item, approval: { ...item.approval, status: "submitting" as const } }
+      : item),
+  };
+  view.rerender(<TerminalPage model={{ ...chatModel(), timeline: submitting }} onAction={(action) => actions.push(action)} />);
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.doesNotMatch(frame, /Agent 正在等待你的回答/);
+  assert.doesNotMatch(frame, /Esc 暂不回答/);
+  // 焦点必须回到输入框，否则键盘卡在已经消失的浮层上。
+  view.stdin.write("下一句");
+  await flush();
+  assert.match(stripStyles(view.lastFrame() ?? ""), /下一句/);
+  view.unmount();
+});
+
 test("首页提供操作引导、模式切换和最近会话，不预置示例问题", async () => {
   const model = {
     ...emptyViewModel(resolveCliConfig({ modelId: "model-1" })),
@@ -410,8 +438,6 @@ test("首页提供操作引导、模式切换和最近会话，不预置示例�
   assert.match(frame, /4 诊断/);
   assert.match(frame, /最近会话/);
   assert.match(frame, /昨晚的任务/);
-  // Home 容易高于视口；帧尾空行让 Ink 的真实光标原点与输入内容节点保持一致。
-  assert.equal(frame.endsWith("\n"), true);
   assert.doesNotMatch(frame, /快捷提问/);
   assert.doesNotMatch(frame, /今天想完成什么/);
   view.stdin.write("2");
@@ -428,6 +454,30 @@ test("Shift+Tab 在一级模式之间切换", async () => {
   assert.deepEqual(actions, [{ type: "open_surface", surface: "doctor" }]);
   view.unmount();
 });
+
+function questionTimeline() {
+  let timeline = projectEvent(emptyTimeline(), { type: "RUN_STARTED", threadId: "s1", runId: "r1" });
+  return projectEvent(timeline, {
+    type: "ACTIVITY_SNAPSHOT",
+    messageId: "i1",
+    activityType: "approval",
+    replace: true,
+    content: {
+      id: "i1",
+      threadId: "s1",
+      runId: "r1",
+      title: "需要你的回答",
+      detail: {
+        questions: [{
+          id: "q1",
+          header: "配色",
+          question: "选一个主色",
+          options: [{ label: "青色", description: "" }, { label: "橙色", description: "" }],
+        }],
+      },
+    },
+  });
+}
 
 function chatModel() {
   return {

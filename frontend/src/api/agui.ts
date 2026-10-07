@@ -237,12 +237,6 @@ export async function getSession(sessionId: string): Promise<SessionState> {
   return response.json() as Promise<SessionState>;
 }
 
-export async function getSessionContext(sessionId: string): Promise<SessionContextStatus> {
-  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/context`));
-  if (!response.ok) throw new Error(await sessionActionError(response, "无法读取上下文状态"));
-  return response.json() as Promise<SessionContextStatus>;
-}
-
 export async function compactSession(
   sessionId: string,
   instructions = "",
@@ -257,9 +251,14 @@ export async function compactSession(
   return response.json() as Promise<SessionContextStatus>;
 }
 
-export async function forkSession(sessionId: string): Promise<SessionSummary> {
+export async function forkSession(
+  sessionId: string,
+  anchor?: { throughMessageId?: string; throughRunId?: string }
+): Promise<SessionSummary> {
   const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/fork`), {
-    method: "POST"
+    method: "POST",
+    headers: anchor ? { "Content-Type": "application/json" } : undefined,
+    body: anchor ? JSON.stringify(anchor) : undefined
   });
   if (!response.ok) {
     throw new Error(await sessionActionError(response, "无法创建对话分支"));

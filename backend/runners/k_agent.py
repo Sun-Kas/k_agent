@@ -7,6 +7,16 @@ pipeline：按请求连接 MCP → 拼 prompt → 绑定本轮工具 → 创建 
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
+from backend.tools.contracts import (
+    ToolOutcome,
+    UpdateWorkingSet,
+    RecordLoadedMemoryPaths,
+    ToolBindingDependencies,
+    ToolOutputLimits,
+    freeze,
+)
+from backend.tools.notices import _sandbox_user_notice
 import asyncio
 import hashlib
 import logging
@@ -34,14 +44,17 @@ from backend.prompts import (
 )
 from backend.prompts.memory import render_nested_reminder
 from backend.runners.base import RunnerContext
-from backend.runtime_config import normalize_reasoning_effort, select_compact_model, select_model
-from backend.context.projection import render_working_set
-from backend.tools import (
-    SkillCatalog,
-    bind_request_scoped_tools,
-    build_tool_catalog,
-    load_local_tools,
+from backend.runners.network_policy import network_access_enabled
+from backend.runtime_config import (
+    normalize_reasoning_effort,
+    select_compact_model,
+    select_model,
 )
+from backend.context.projection import render_working_set
+from backend.tools.catalog import SkillCatalog
+from backend.tools.registry import build_request_tool_set
+from backend.tools.dispatcher import ToolDispatcher
+from backend.tools.adapters.skill import SkillAliasNormalizer
 from backend.permissions import PermissionDecision
 
 
@@ -70,9 +83,7 @@ class KAgentRunner:
         self._agent = OpenAIAgent()
         self._pipeline_definition = build_k_agent_pipeline_definition()
 
-    async def create_runtime(
-        self, ctx: RunnerContext
-    ) -> dict[str, Any]:
+    async def create_runtime(self, ctx: RunnerContext) -> dict[str, Any]:
         """组装请求级 Runtime 信息；不执行模型循环。"""
         # 内置 Runner 依赖进程级配置、MCP 连接池和观测运行时；缺任一就不能安全开跑。
         if ctx.settings is None or ctx.mcp_pool is None or ctx.langfuse is None:
@@ -110,19 +121,14 @@ class KAgentRunner:
             # 优先读 inputModalities；旧配置只有 multimodal 布尔时，按图文或纯文本兜底。
             modalities = set(
                 model.get("inputModalities")
-                or (
-                    ["text", "image"]
-                    if model.get("multimodal", False)
-                    else ["text"]
-                )
+                or (["text", "image"] if model.get("multimodal", False) else ["text"])
             )
             # item.type 是 IANA MIME（浏览器 File.type / Data URL），如 video/mp4、image/png；
             # 模型目录用粗粒度 inputModalities: "image" | "video"。video/ 前缀来自 MIME 顶级类型，
             # 不是本仓库自创。Access Layer 只放行 image/ 与 video/，所以 else 一律当 image；
             # 纯文本在 messages.content，不会出现在 attachments 里。
             required = {
-                "video" if item.type.startswith("video/") else "image"
-                for item in media
+                "video" if item.type.startswith("video/") else "image" for item in media
             }
             # 集合差集：附件需要的模态 − 模型声明的 inputModalities。
             # 空集表示都能吃；非空（如 {"video"}）说明当前模型缺这类输入，立刻失败。
@@ -135,13 +141,13 @@ class KAgentRunner:
             skills = ctx.skills
             # Access Layer 下发的已选 MCP id；后面过滤 instructions，并写入 run_request。
             selected_mcp_ids = {
-                str(server.get("id"))
-                for server in ctx.mcp_servers
-                if server.get("id")
+                str(server.get("id")) for server in ctx.mcp_servers if server.get("id")
             }
             # 已连接 server 的工具快照。能力本身只通过 Provider tools 暴露；
             # Prompt 只读取最终 Catalog 生成少量条件指导。
             mcp_tools = await mcp_manager.list_tools()
+
+            # 把 `LOCAL_TOOL_WORKSPACE_ROOT` 收成绝对项目根，用来发现 CLAUDE.md 等规则。
             instruction_root = resolve_instruction_root(
                 settings.local_tool_workspace_root
             )
@@ -154,14 +160,25 @@ class KAgentRunner:
                 ctx.messages,
             )
             skill_catalog = SkillCatalog.from_skills(skills)
-            tools = bind_request_scoped_tools(
-                await load_local_tools(),
-                mcp_manager,
-                skill_catalog=skill_catalog,
-            )
-            tool_catalog = build_tool_catalog(
-                local_tools=tools,
+            tool_set = build_request_tool_set(
+                settings=settings,
                 mcp_tools=mcp_tools,
+                mcp_manager=mcp_manager,
+                skill_catalog=skill_catalog,
+                authorized_servers=selected_mcp_ids,
+            )
+            tool_catalog = tool_set.capability_view()
+            dispatcher = ToolDispatcher(
+                tool_set,
+                normalizer=SkillAliasNormalizer(skill_catalog),
+                dependencies=ToolBindingDependencies(
+                    ctx.workspace_dir or instruction_root,
+                    network_access_enabled(ctx),
+                    ToolOutputLimits(
+                        settings.local_tool_max_output_chars,
+                        settings.local_tool_bash_timeout_seconds,
+                    ),
+                ),
             )
             # InitializeResult.instructions for selected servers — not tool descriptions.
             instructions = tuple(
@@ -212,7 +229,9 @@ class KAgentRunner:
                     ctx.context_state,
                     allowed_roots=[instruction_root, ctx.workspace_dir],
                     authorized_skill_ids={
-                        str(skill.get("id") or "") for skill in skills if skill.get("id")
+                        str(skill.get("id") or "")
+                        for skill in skills
+                        if skill.get("id")
                     },
                     context_window=int(model.get("contextWindow") or 128_000),
                 ),
@@ -237,7 +256,8 @@ class KAgentRunner:
                 "model": model,
                 "compact_model": compact_model,
                 "skills": skills,
-                "tools": tools,
+                "tool_set": tool_set,
+                "dispatcher": dispatcher,
                 "run_request": run_request,
                 "instruction_root": instruction_root,
                 "output_workspace": ctx.workspace_dir,
@@ -271,9 +291,7 @@ class KAgentRunner:
             await mcp_manager.close_all()
             raise
 
-    async def run_stream(
-        self, ctx: RunnerContext
-    ) -> AsyncIterator[dict[str, Any]]:
+    async def run_stream(self, ctx: RunnerContext) -> AsyncIterator[dict[str, Any]]:
         """加载 Runtime 信息，在这里执行观察与模型工具循环。"""
         runtime = await self.create_runtime(ctx)
 
@@ -283,8 +301,8 @@ class KAgentRunner:
         async def enrich_observation(
             tool_name: str,
             arguments: dict[str, Any],
-            tool_result: str,
-        ) -> str:
+            tool_result: ToolOutcome,
+        ) -> ToolOutcome:
             """Load scoped rules from trusted local tool arguments only."""
 
             agent_runtime = agent_runtime_ref.get("value")
@@ -292,17 +310,11 @@ class KAgentRunner:
                 return tool_result
             working_set = agent_runtime.setdefault(
                 "working_set",
-                copy.deepcopy(ctx.context_state.get("workingSet") or {
-                    "recentFiles": [], "invokedSkillIds": [], "plan": None
-                }),
+                copy.deepcopy(
+                    ctx.context_state.get("workingSet")
+                    or {"recentFiles": [], "invokedSkillIds": [], "plan": None}
+                ),
             )
-            if tool_name == "Skill":
-                skill_id = str(arguments.get("skill") or "").strip().lstrip("/")
-                invoked = list(working_set.get("invokedSkillIds") or [])
-                if skill_id and skill_id not in invoked:
-                    working_set["invokedSkillIds"] = [*invoked, skill_id]
-            if tool_name == "TodoWrite" and isinstance(arguments.get("todos"), list):
-                working_set["plan"] = copy.deepcopy(arguments["todos"])
             paths = trusted_tool_paths(
                 tool_name,
                 arguments,
@@ -324,7 +336,10 @@ class KAgentRunner:
                     "path": str(path),
                     "observedDigest": digest,
                 }
-            working_set["recentFiles"] = list(by_path.values())[-5:]
+            effects = (
+                *tool_result.effects,
+                UpdateWorkingSet(freeze(list(by_path.values())[-5:])),
+            )
             loaded: set[str] = agent_runtime["loaded_memory_paths"]
             fresh = await asyncio.to_thread(
                 load_fresh_nested_memory,
@@ -333,13 +348,17 @@ class KAgentRunner:
                 loaded_paths=set(loaded),
             )
             reminder, loaded_paths = render_nested_reminder(fresh)
-            loaded.update(loaded_paths)
+            effects += (RecordLoadedMemoryPaths(tuple(loaded_paths)),)
             if reminder is None:
-                return tool_result
+                return replace(tool_result, effects=effects)
             agent_runtime["trace"].append(
                 f"memory:lazy_loaded:{len(loaded_paths)} files"
             )
-            return f"{tool_result}\n\n{reminder}"
+            return replace(
+                tool_result,
+                model_content=f"{tool_result.model_content}\n\n{reminder}",
+                effects=effects,
+            )
 
         async def request_approval(
             target: str,
@@ -366,6 +385,9 @@ class KAgentRunner:
             )
             # AG-UI MESSAGES_SNAPSHOT 用请求级消息；Resume Act 用 boundary 里的
             # modelMessages。两者不能混成一份列表。
+            boundary["toolScope"] = runtime["dispatcher"].checkpoint_state(
+                agent_runtime
+            )
             boundary["messages"] = [
                 message.model_dump(by_alias=True, mode="json")
                 for message in ctx.messages
@@ -377,7 +399,9 @@ class KAgentRunner:
                 category=(
                     "user_input"
                     if detail.get("source") == "user_input"
-                    else "mcp_tool" if detail.get("source") == "mcp" else "local_tool"
+                    else "mcp_tool"
+                    if detail.get("source") == "mcp"
+                    else "local_tool"
                 ),
                 title=(
                     "Agent 需要你的回答"
@@ -385,7 +409,10 @@ class KAgentRunner:
                     else f"允许调用 {target}？"
                 ),
                 message=(
-                    str((detail.get("questions") or [{}])[0].get("question") or decision.reason)
+                    str(
+                        (detail.get("questions") or [{}])[0].get("question")
+                        or decision.reason
+                    )
                     if detail.get("source") == "user_input"
                     else decision.reason or "该工具调用需要你的确认。"
                 ),
@@ -397,9 +424,7 @@ class KAgentRunner:
             with ctx.langfuse.observe_agent_run(
                 session_id=ctx.thread_id,
                 run_id=ctx.run_id,
-                model=str(
-                    runtime["model"].get("model") or ctx.model_id or "unknown"
-                ),
+                model=str(runtime["model"].get("model") or ctx.model_id or "unknown"),
                 messages=ctx.messages,
                 metadata=runtime["observability_metadata"],
             ) as observability_observers:
@@ -407,12 +432,14 @@ class KAgentRunner:
                     request_id=ctx.request_id,
                     thread_id=ctx.thread_id,
                     run_id=ctx.run_id,
-                    metadata={"permission_mode": runtime["run_request"].permission_mode},
+                    metadata={
+                        "permission_mode": runtime["run_request"].permission_mode
+                    },
                 )
                 agent_runtime = await self._agent.create_runtime(
                     runtime["run_request"],
-                    runtime["tools"],
-                    mcp_manager,
+                    runtime["tool_set"],
+                    runtime["dispatcher"],
                     observers=[
                         *runtime["observers"],
                         *observability_observers,
@@ -420,31 +447,36 @@ class KAgentRunner:
                     pipeline_definition=self._pipeline_definition,
                     run_context=run_context,
                     config=runtime["settings"],
-                    skills=runtime["skills"],
                     approval_handler=request_approval,
                 )
                 # The generic Agent core does not import Prompt/Memory modules;
                 # this request callback owns K Agent's lazy-rule semantics.
                 agent_runtime["observation_enricher"] = enrich_observation
+                agent_runtime["tool_notice"] = _sandbox_user_notice
                 agent_runtime["working_set"] = copy.deepcopy(
-                    ctx.context_state.get("workingSet") or {
-                        "recentFiles": [], "invokedSkillIds": [], "plan": None
-                    }
+                    ctx.context_state.get("workingSet")
+                    or {"recentFiles": [], "invokedSkillIds": [], "plan": None}
                 )
                 agent_runtime_ref["value"] = agent_runtime
                 if ctx.resume_checkpoints:
                     # Access Layer 已验证 resume 完整覆盖开放 Interrupt；K Agent
                     # 只接受一个 ReAct 工具边界，避免把多个决议错误合并成一次执行。
                     if len(ctx.resume_checkpoints) != 1:
-                        raise RuntimeError("K Agent resume requires exactly one checkpoint")
+                        raise RuntimeError(
+                            "K Agent resume requires exactly one checkpoint"
+                        )
                     resume_record = ctx.resume_checkpoints[0]
                     checkpoint = resume_record.get("checkpoint")
                     decision = resume_record.get("decision")
-                    if not isinstance(checkpoint, dict) or not isinstance(decision, dict):
+                    if not isinstance(checkpoint, dict) or not isinstance(
+                        decision, dict
+                    ):
                         raise RuntimeError("Invalid K Agent resume checkpoint")
                     agent_runtime["resume_checkpoint"] = copy.deepcopy(checkpoint)
                     agent_runtime["resume_decision"] = copy.deepcopy(decision)
-                    agent_runtime["resume_request_hash"] = resume_record.get("requestHash")
+                    agent_runtime["resume_request_hash"] = resume_record.get(
+                        "requestHash"
+                    )
                 if isinstance(ctx.continuation_checkpoint, dict):
                     agent_runtime["continuation_checkpoint"] = copy.deepcopy(
                         ctx.continuation_checkpoint

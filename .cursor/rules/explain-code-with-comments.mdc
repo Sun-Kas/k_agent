@@ -1,0 +1,13 @@
+---
+description: When explaining code, also write comments in the source
+alwaysApply: true
+---
+
+# Explain then annotate
+
+When the user asks what a function, parameter, or block of code means, do both in the same turn:
+
+1. Answer in chat.
+2. Write the corresponding comments in the file being discussed.
+
+Keep comments concise and in the same language the surrounding file already uses (this repo often uses Chinese). Explain non-obvious intent, ordering, or constraints — do not narrate obvious syntax. Do not wait for a follow-up "写注释".

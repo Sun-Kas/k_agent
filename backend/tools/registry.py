@@ -1,17 +1,12 @@
-"""组装并按请求绑定 Agent 可用的完整本地工具表。"""
+"""显式工厂装配；只构建一次本轮 ToolSet，不创建待替换的占位绑定。"""
 
-from __future__ import annotations
-
-from collections.abc import Iterable
-
-from backend.config import get_or_init_settings
-from backend.mcp_tool import McpClientManager
-from backend.tools.cc_extra import CC_EXTRA_TOOLS, build_mcp_resource_tools
-from backend.tools.cc_like import CC_LIKE_TOOLS
-from backend.tools.local import LEGACY_TOOLS, ToolDefinition, build_skill_tool
-from backend.tools.catalog import SkillCatalog
-from backend.tools.user_question import ASK_USER_QUESTION_TOOL
-
+from backend.tools.builtins import LOCAL_TOOL_FACTORIES
+from backend.tools.adapters.mcp import build_mcp_resource_tools
+from backend.tools.adapters.skill import build_skill_tool
+from backend.tools.adapters.user_input import ASK_USER_QUESTION_TOOL
+from backend.tools.adapters.mcp import bind_mcp_tool, mcp_outcome
+from backend.tools.adapters.user_input import bind_user_input
+from backend.tools.toolset import RequestToolSet
 
 TOOL_PRESETS: dict[str, tuple[str, ...]] = {
     "legacy": (
@@ -49,75 +44,41 @@ TOOL_PRESETS: dict[str, tuple[str, ...]] = {
 }
 
 
-def get_all_base_tools() -> list[ToolDefinition]:
-    """返回所有可能启用的本地工具；实际暴露前还会经过 preset/name 过滤。"""
-    return _uniq_by_name([*CC_LIKE_TOOLS, *CC_EXTRA_TOOLS, ASK_USER_QUESTION_TOOL, *build_mcp_resource_tools(), *LEGACY_TOOLS, build_skill_tool()])
+def build_request_tool_set(
+    *, settings, mcp_tools, mcp_manager, skill_catalog, authorized_servers
+):
+    async def call_prompt(server, name, arguments):
+        if server not in authorized_servers:
+            raise ValueError(f"Unauthorized MCP server: {server}")
+        return mcp_outcome(await mcp_manager.call_prompt(server, name, arguments))
 
+    async def list_resources():
+        resources = await mcp_manager.list_resources()
+        return {server: items for server, items in resources.items() if server in authorized_servers}
 
-async def load_local_tools() -> list[ToolDefinition]:
-    """按配置加载本地工具并附加 Skill 工具。"""
-    settings = await get_or_init_settings()
-    all_tools = {tool.name: tool for tool in get_all_base_tools()}
-    # 显式的名单配置优先级高于 preset，方便临时收窄工具面而不改预设。
-    names = _configured_names(settings.local_tool_names)
-    if names is None:
-        names = list(TOOL_PRESETS.get(settings.local_tool_preset, TOOL_PRESETS["coding"]))
-    # 白名单语义：只有出现在名单里的工具才会暴露给模型，配置里的未知名字静默忽略。
-    return [all_tools[name] for name in names if name in all_tools]
+    async def read_resource(server, uri):
+        if server not in authorized_servers:
+            raise ValueError(f"Unauthorized MCP server: {server}")
+        return mcp_outcome(await mcp_manager.read_resource(server, uri))
 
-
-def replace_skill_tool(tools: Iterable[ToolDefinition], skill_tool: ToolDefinition) -> list[ToolDefinition]:
-    """用新的 Skill 工具替换工具列表中的旧定义。"""
-    return [skill_tool if tool.name == "Skill" else tool for tool in tools]
-
-
-def bind_request_scoped_tools(
-    tools: Iterable[ToolDefinition],
-    mcp_manager: McpClientManager,
-    skills: list[dict] | None = None,
-    *,
-    skill_catalog: SkillCatalog | None = None,
-) -> list[ToolDefinition]:
-    """把依赖请求级 MCP manager 的工具换成闭包实例，避免跨请求复用连接状态。"""
-    # 模块级 TOOL_PRESETS 里的定义是进程共享的，直接给它们塞进本次请求的
-    # manager 会让下一个请求用到已关闭的连接。所以这里为每次 run 重建一份
-    # 绑定实例，Skill 工具同理只认本轮选中的 skills。
-    bound_mcp_tools = {
-        tool.name: tool
-        for tool in build_mcp_resource_tools(mcp_manager.list_resources, mcp_manager.read_resource)
-    }
-    result = []
-    for tool in tools:
-        if tool.name == "Skill":
-            result.append(
-                build_skill_tool(
-                    mcp_manager.call_prompt,
-                    skills,
-                    skill_catalog=skill_catalog,
-                )
-            )
-        elif tool.name in bound_mcp_tools:
-            result.append(bound_mcp_tools[tool.name])
-        else:
-            result.append(tool)
-    return result
-
-
-def _configured_names(raw_names: str | None) -> list[str] | None:
-    """解析启用工具名配置。"""
-    if raw_names is None:
-        return None
-    names = [item.strip() for item in raw_names.split(",") if item.strip()]
-    return names or None
-
-
-def _uniq_by_name(tools: Iterable[ToolDefinition]) -> list[ToolDefinition]:
-    """按工具名去重并保留首次出现项。"""
-    seen: set[str] = set()
-    result: list[ToolDefinition] = []
-    for tool in tools:
-        if tool.name in seen:
-            continue
-        seen.add(tool.name)
-        result.append(tool)
-    return result
+    factories = (
+        *LOCAL_TOOL_FACTORIES,
+        *build_mcp_resource_tools(list_resources, read_resource),
+        build_skill_tool(call_prompt, skill_catalog=skill_catalog),
+    )
+    bindings = [factory() for factory in factories]
+    bindings.append(bind_user_input(ASK_USER_QUESTION_TOOL))
+    # 全量冻结成目录：校验重名/schema，再按 preset 从这份目录挑，避免没选中的重复定义漏检。
+    available = RequestToolSet.create(bindings)
+    raw = settings.local_tool_names
+    names = [n.strip() for n in raw.split(",") if n.strip()] if raw else []
+    if not names:
+        if settings.local_tool_preset not in TOOL_PRESETS:
+            raise ValueError(f"Unknown tool preset: {settings.local_tool_preset}")
+        names = TOOL_PRESETS[settings.local_tool_preset]
+    selected = [available.resolve(name) for name in names]
+    for descriptor in mcp_tools:
+        if descriptor.server_id not in authorized_servers:
+            raise ValueError(f"Unauthorized MCP server: {descriptor.server_id}")
+        selected.append(bind_mcp_tool(descriptor, mcp_manager))
+    return RequestToolSet.create(selected)

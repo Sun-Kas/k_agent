@@ -56,6 +56,7 @@ class ScheduledTaskRuntime:
         self._semaphore = asyncio.Semaphore(
             _env_int("SCHEDULED_TASK_MAX_ACTIVE_RUNS", 2, 1, 16)
         )
+        # 可重复使用的叫醒铃：set() 唤醒 wait()，下一圈 clear() 灭灯才能再等。
         self._wake_event = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -78,6 +79,7 @@ class ScheduledTaskRuntime:
 
     async def stop(self) -> None:
         self._stopping = True
+        # 与 watcher 相同：set() 让 scheduler 的 wait() 立刻返回，不必睡满 delay。
         self._wake_event.set()
         if self._scheduler_task is not None:
             await asyncio.gather(self._scheduler_task, return_exceptions=True)
@@ -92,6 +94,7 @@ class ScheduledTaskRuntime:
     def wake(self) -> None:
         """CRUD calls invalidate the previously computed sleep deadline."""
 
+        # set() 叫醒正在 wait() 的 scheduler；灯会一直亮到 loop 里 clear()。
         self._wake_event.set()
 
     async def run_now(self, task_id: str) -> dict[str, Any] | None:
@@ -208,8 +211,8 @@ class ScheduledTaskRuntime:
 
         while not self._stopping:
             try:
-                # Clear before reading SQLite. A CRUD wake that arrives after this
-                # point remains set, so a newly earlier deadline cannot be lost.
+                # clear() 灭灯，否则上次 set() 会让后面的 wait() 立刻返回、空转。
+                # 灭完再读库：这之后到来的 wake 仍会 set，不会丢「更早的下次触发」。
                 self._wake_event.clear()
                 self.last_loop_at = datetime.now(UTC).isoformat()
                 claimed = await self.store.claim_due(
@@ -228,6 +231,7 @@ class ScheduledTaskRuntime:
                         max(0.0, (next_due - datetime.now(UTC)).total_seconds()),
                     )
                 try:
+                    # 与 PollingChangeWatcher 相同：wait() 等 set()，timeout 则到点自己醒。
                     await asyncio.wait_for(self._wake_event.wait(), timeout=delay)
                 except TimeoutError:
                     pass

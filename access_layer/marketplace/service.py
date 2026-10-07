@@ -140,7 +140,12 @@ class MarketplaceService:
                 "name": mapped.get("title") or target_id,
                 "description": mapped.get("description") or "",
                 "enabled": enabled,
-                "marketplace": _marketplace_meta(MCP_SOURCE, source_id, server.get("version")),
+                "marketplace": _marketplace_meta(
+                    MCP_SOURCE,
+                    source_id,
+                    server.get("version"),
+                    _icon_url(server.get("logo_url"), server.get("icons")),
+                ),
             }
         )
         self.catalog.write_mcp_summaries(summaries)
@@ -291,6 +296,7 @@ class MarketplaceService:
         frontmatter, _ = parse_markdown_frontmatter(
             (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
         )
+        detail_fields = normalize_skill_detail(detail) if isinstance(detail, dict) else {}
         summaries = self.catalog.skill_summaries()
         if any(str(item.get("id")) == skill_id for item in summaries):
             shutil.rmtree(skill_dir, ignore_errors=True)
@@ -304,7 +310,10 @@ class MarketplaceService:
                     "enabled": enabled and not parse_bool(frontmatter.get("disable-model-invocation"), False),
                     **catalog_fields_from_frontmatter(frontmatter),
                     "marketplace": _marketplace_meta(
-                        "skillhub", slug, detail.get("version") or frontmatter.get("version")
+                        "skillhub",
+                        slug,
+                        detail_fields.get("version") or frontmatter.get("version"),
+                        _icon_url(detail_fields.get("iconUrl")),
                     ),
                 }
             )
@@ -464,13 +473,16 @@ def _official_status(server: dict[str, Any]) -> str | None:
     return None
 
 
-def _marketplace_meta(source: str, source_id: str, version: Any) -> dict[str, Any]:
-    return {
+def _marketplace_meta(source: str, source_id: str, version: Any, icon_url: str | None = None) -> dict[str, Any]:
+    meta = {
         "source": source,
         "sourceId": source_id,
         "version": str(version or "").strip() or None,
         "installedAt": datetime.now(timezone.utc).isoformat(),
     }
+    if icon_url:
+        meta["iconUrl"] = icon_url
+    return meta
 
 
 def _as_list(payload: Any, key: str) -> list[Any]:

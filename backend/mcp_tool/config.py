@@ -60,21 +60,29 @@ def load_scoped_mcp_servers(
     cwd: Path | None = None,
     *,
     explicit_config_path: str | None = None,
+    # 预留：不落盘、请求内注入的 MCP。当前无调用方传入，工作台 MCP 只走配置文件。
     dynamic_servers: list[dict[str, Any]] | None = None,
 ) -> McpConfigLoadResult:
-    """按优先级加载并合并 scoped MCP server 配置。"""
+    """按优先级加载、策略过滤并去重 MCP server，供 run 时装配连接。"""
+    # 解析项目级 `.mcp.json` 用的工作目录；未传入则用本进程 cwd。
     cwd = (cwd or Path.cwd()).resolve()
+    # 配置损坏、缺字段等非致命问题，最后随结果返回。
     warnings: list[str] = []
+    # 被 enabled / allow-deny 策略丢掉的 server id。
     blocked: list[str] = []
+    # 各层解析出的原始 server（含 scope），尚未过滤、去重。
     scoped: list[ScopedMcpServerConfig] = []
 
+    # 1. 按 MANAGED → USER → PROJECT → LOCAL 读入各层配置（缺文件则跳过）。
     for path, scope in _config_sources(cwd, explicit_config_path):
         scoped.extend(_read_mcp_config_file(path, scope, warnings))
+    # 2. 预留的动态注入（scope=DYNAMIC），优先级最低；现无产品路径传参。
     for item in dynamic_servers or []:
         server = _normalize_server(item.get("id") or item.get("name"), item, McpScope.DYNAMIC, None, warnings)
         if server:
             scoped.append(server)
 
+    # 3. enabled / allow-deny 名单过滤；被拒的 id 记入 blocked，不进入结果。
     allowed = []
     for server in scoped:
         if not _allowed_by_policy(server):
@@ -82,6 +90,7 @@ def load_scoped_mcp_servers(
             continue
         allowed.append(server)
 
+    # 4. 同 id 或同连接签名只留先出现的；被挤掉的记入 suppressed。
     deduped, suppressed = _dedupe_servers(allowed)
     return McpConfigLoadResult(servers=deduped, suppressed=suppressed, blocked=blocked, warnings=warnings)
 
@@ -112,7 +121,7 @@ def _config_sources(cwd: Path, explicit_config_path: str | None) -> list[tuple[P
 
 
 def _read_mcp_config_file(path: Path, scope: McpScope, warnings: list[str]) -> list[ScopedMcpServerConfig]:
-    """读取并解析单个 MCP 配置文件。"""
+    """读取单个 MCP 连接配置。只认 Claude 风格 mcpServers 对象；不读旧版 servers 数组。"""
     if not path.exists():
         return []
     try:
@@ -122,7 +131,7 @@ def _read_mcp_config_file(path: Path, scope: McpScope, warnings: list[str]) -> l
         return []
     raw_servers = payload.get("mcpServers")
     if raw_servers is None:
-        raw_servers = {item.get("id"): item for item in payload.get("servers", []) if item.get("id")}
+        return []
     if not isinstance(raw_servers, dict):
         warnings.append(f"invalid MCP servers block in {path}")
         return []

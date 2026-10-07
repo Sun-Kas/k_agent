@@ -12,9 +12,7 @@ if TYPE_CHECKING:
 
 
 def __getattr__(name: str) -> Any:
-    """延迟导入网关，避免 `python -m access_layer.sessions.migrate_history`
-    在包初始化时又反向加载迁移模块。
-    """
+    """延迟导入网关，避免包初始化时拉起 gateway 依赖环。"""
 
     if name == "AgentAccessLayer":
         from access_layer.gateway import AgentAccessLayer

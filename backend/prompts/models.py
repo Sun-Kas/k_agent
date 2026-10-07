@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Literal, Mapping
 from backend.memory.models import MemoryFile
 
 if TYPE_CHECKING:
-    from backend.tools.catalog import SkillCatalog, ToolCatalog
+    from backend.tools.catalog import SkillCatalog, ToolCapabilityView
 
 
 # Channel：这段碎片走哪条 API 通道（发给谁）。
@@ -108,7 +108,7 @@ class PromptInputs:
     instruction_root: Path
     output_workspace: Path | None
     memory_files: tuple[MemoryFile, ...]
-    tool_catalog: "ToolCatalog"
+    tool_catalog: "ToolCapabilityView"
     # 同一份请求级快照同时驱动发现列表和 Skill 执行白名单，禁止各自重新筛选。
     skill_catalog: "SkillCatalog"
     # 仅用于限制发现列表体积；无效或缺失时由 skills 模块使用保守默认值。

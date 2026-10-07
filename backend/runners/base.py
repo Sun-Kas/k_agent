@@ -30,8 +30,12 @@ slots=True = 不能随便加新字段 + 更省内存
 class RunnerContext:
     """创建 Runtime 所需的只读请求输入与进程级依赖。"""
 
+    # 会话（AG-UI threadId）：同一聊天多轮共用。
     thread_id: str
+    # 这一次 Agent 执行（发送/Resume 各一个）。取消、停止、落盘事件按它切。
+    # 和 request_id 不是一对一：cancel/stop 是另一次 HTTP，仍带同一个 run_id。
     run_id: str
+    # 这一跳 HTTP（X-Request-Id）。只为日志对齐；一次 run 可以对应多次 request。
     request_id: str
     messages: list[ChatMessage]
     model_id: str | None

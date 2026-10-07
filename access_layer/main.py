@@ -21,7 +21,7 @@ import shutil
 import uuid
 
 from ag_ui.core import RunAgentInput
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -35,7 +35,8 @@ from access_layer.request_context import (
     reset_request_context,
     set_request_context,
 )
-from access_layer.sessions.store import SessionBusyError, SessionStore
+from access_layer.sessions.store import SessionBusyError, SessionForkAnchorError, SessionStore
+from access_layer.sessions.terminal import TERMINAL_ID_RE, TerminalRegistry, encode_message
 from access_layer.sessions.workspace import (
     list_session_workspace,
     read_session_workspace_file,
@@ -48,6 +49,7 @@ from access_layer.schemas import (
     HealthResponse,
     McpConfigUpdate,
     ModelsConfigUpdate,
+    SessionForkInput,
     SessionRunCancelInput,
     SessionCompactInput,
     SessionContextStatus,
@@ -239,14 +241,15 @@ def _merge_mcp_runtime_status(
 
 
 def _read_local_mcp_config(path: Path) -> tuple[list[dict], str | None]:
-    """Read either Claude-style mcpServers or the old local servers array."""
+    """读取本机托管 mcp.json，只认 Claude 风格 mcpServers 对象。"""
     if not path.exists():
         return [], None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload.get("mcpServers"), dict):
-        servers = [{"id": key, **value} for key, value in payload["mcpServers"].items()]
-        return servers, "mcpServers"
-    return payload.get("servers", []), "servers"
+    raw = payload.get("mcpServers")
+    if not isinstance(raw, dict):
+        return [], "mcpServers"
+    servers = [{"id": key, **value} for key, value in raw.items() if isinstance(value, dict)]
+    return servers, "mcpServers"
 
 
 def _write_local_mcp_config(path: Path, servers: list[dict]) -> None:
@@ -285,15 +288,22 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """启动时装配依赖并启动 Team 调度；关闭时仅停止本进程拥有的 TeamRuntime。"""
-        ensure_home_layout(migrate=True)
+        """启动时装配依赖并启动 Team 调度；关闭时仅停止本进程拥有的 TeamRuntime。
+
+        下面挂到 app.state 的都是本进程单例：同一事件循环上所有请求协程共用，
+        不按请求新建。SERVER_WORKERS 必须为 1，否则每个 worker 各有一份。
+        """
+        ensure_home_layout()
         app.state.settings = await get_or_init_settings()
         app.state.storage = create_storage(app.state.settings)
         app.state.request_limiter = RequestConcurrencyLimiter(
             app.state.settings.max_concurrent_agent_requests,
             app.state.settings.request_acquire_timeout_seconds,
         )
+        # 本进程唯一 SessionStore：同一事件循环上所有请求协程共享；不跨 worker。
         app.state.session_store = SessionStore(app.state.storage)
+        # 交互终端只活在这个进程里：同一会话可以有多块 PTY，和 Agent Bash 不是同一条通道。
+        app.state.terminals = TerminalRegistry()
         app.state.agent_backend_client = AgentBackendClient(
             app.state.settings.agent_backend_url
         )
@@ -331,6 +341,7 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            await app.state.terminals.close_all()
             await app.state.team_runtime.stop()
             await app.state.scheduled_task_runtime.stop()
 
@@ -655,13 +666,26 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/api/sessions/{session_id}/fork", response_model=SessionSummary)
-    async def fork_session(session_id: str) -> SessionSummary:
-        """复制稳定的对话历史和 workspace，创建后续运行互不影响的新分支。"""
+    async def fork_session(
+        session_id: str,
+        payload: SessionForkInput | None = None,
+    ) -> SessionSummary:
+        """复制稳定的对话历史和 workspace，创建后续运行互不影响的新分支。
 
+        请求体可带 throughRunId / throughMessageId，只保留到该段对话为止。
+        """
+
+        fork_at = payload or SessionForkInput()
         try:
-            branch = await app.state.session_store.fork_session(session_id)
+            branch = await app.state.session_store.fork_session(
+                session_id,
+                through_message_id=fork_at.through_message_id,
+                through_run_id=fork_at.through_run_id,
+            )
         except SessionBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except SessionForkAnchorError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         if branch is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return SessionSummary(
@@ -805,6 +829,34 @@ def create_app() -> FastAPI:
             "messageCount": len(session.messages),
             "status": "stopped",
         }
+
+    @app.websocket("/api/sessions/{session_id}/terminal/{terminal_id}")
+    async def session_terminal(websocket: WebSocket, session_id: str, terminal_id: str):
+        """把底栏里的一块标签接到该会话工作区里的登录 shell。
+
+        同一会话可以有多块，互不影响。某一块的连接断开后只关掉那一个 PTY。
+        """
+        await websocket.accept()
+        try:
+            if not TERMINAL_ID_RE.fullmatch(terminal_id):
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4400)
+                return
+            try:
+                cwd = resolve_session_workspace(session_id)
+            except ValueError:
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4400)
+                return
+            session = await app.state.session_store.get(session_id)
+            if session is None:
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4404)
+                return
+            cwd.mkdir(parents=True, exist_ok=True)
+            await app.state.terminals.attach(session_id, terminal_id, cwd, websocket)
+        except WebSocketDisconnect:
+            return
 
     @app.get("/api/sessions/{session_id}/workspace")
     async def get_session_workspace(session_id: str):

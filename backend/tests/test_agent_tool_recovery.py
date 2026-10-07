@@ -9,12 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from backend.agent.contracts import AgentRunRequest
-from backend.agent.react_agent import OpenAIAgent
+from backend.tests.tool_runtime_support import ToolTestAgent as OpenAIAgent
 from backend.agui import translate_agent_events
 from backend.api.schemas import ChatMessage
 from backend.config.config import Settings
 from backend.mcp_tool import McpClientManager
-from backend.tools import ToolDefinition
+from backend.tests.tool_runtime_support import make_test_tool
 
 
 class _ChunkStream:
@@ -176,7 +176,7 @@ class AgentToolRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def fail_read(_: dict) -> str:
             raise ValueError("path is outside workspace: /tmp/result.md")
 
-        tool = ToolDefinition(
+        tool = make_test_tool(
             name="Read",
             description="Read a file.",
             parameters={

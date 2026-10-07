@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from backend.tools.normalization import _decode_tool_arguments
+from backend.tests.tool_runtime_support import tool_json
+from backend.tests.tool_runtime_support import invoke_builtin
 import unittest
 import asyncio
 from datetime import datetime, timezone
@@ -10,13 +13,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from backend.agent.contracts import AgentRunRequest
-from backend.agent.react_agent import OpenAIAgent
+from backend.tests.tool_runtime_support import ToolTestAgent as OpenAIAgent
 from backend.api.schemas import ChatMessage
 from backend.mcp_tool.client import McpClientManager, McpServerConfig, McpSession
 from backend.mcp_tool.config import McpTransport, load_scoped_mcp_servers
 from backend.permissions import check_permission
-from backend.tools import ToolDefinition
-from backend.tools.local import build_skill_tool, invoke_skill
+from backend.tests.tool_runtime_support import make_test_tool
+from backend.tests.tool_runtime_support import build_test_skill_tool as build_skill_tool, invoke_test_skill as invoke_skill
 from backend.watchers import PollingChangeWatcher
 
 
@@ -63,6 +66,16 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             result = load_scoped_mcp_servers(cwd)
             self.assertEqual(result.servers[0].type, McpTransport.HTTP)
             self.assertEqual(result.servers[0].url, "https://example.test/mcp")
+
+    def test_legacy_servers_array_is_ignored(self) -> None:
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / ".mcp.json").write_text(
+                json.dumps({"servers": [{"id": "old", "command": "node"}]}),
+                encoding="utf-8",
+            )
+            result = load_scoped_mcp_servers(cwd)
+            self.assertNotIn("old", [server.id for server in result.servers])
 
     async def test_mcp_connect_timeout_closes_cold_start_process(self) -> None:
         async def wait_forever() -> None:
@@ -111,7 +124,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        result = json.loads(await mcp_session.call_tool("remote_tool", {}))
+        result = tool_json(await mcp_session.call_tool("remote_tool", {}))
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["tool"], "remote_tool")
@@ -128,7 +141,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
-                result = json.loads(
+                result = tool_json(
                     await invoke_skill(
                         {"skill": "remember", "args": "tea"},
                         [
@@ -156,7 +169,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
-                result = json.loads(
+                result = tool_json(
                     await invoke_skill(
                         {"skill": "remember", "args": "tea"},
                         [
@@ -174,11 +187,11 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("ignored-from-file", result["content"])
 
     async def test_skill_tool_does_not_read_body_before_authorization(self) -> None:
-        with patch("backend.tools.local.load_skill_body") as loader:
-            unknown = json.loads(
+        with patch("backend.tools.adapters.skill.load_skill_body") as loader:
+            unknown = tool_json(
                 await invoke_skill({"skill": "unknown", "args": ""}, [])
             )
-            disabled = json.loads(
+            disabled = tool_json(
                 await invoke_skill(
                     {"skill": "disabled", "args": ""},
                     [
@@ -197,7 +210,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(disabled["success"])
 
     async def test_skill_tool_rejects_unsafe_catalog_id(self) -> None:
-        result = json.loads(
+        result = tool_json(
             await invoke_skill(
                 {"skill": "escape", "args": ""},
                 [{"id": "../escape", "name": "escape", "enabled": True}],
@@ -219,7 +232,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
-                result = json.loads(
+                result = tool_json(
                     await invoke_skill(
                         {"skill": "steam-daily-deals", "args": "今天的Steam优惠"},
                         [
@@ -265,7 +278,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             token = set_tool_workspace(workspace)
             try:
                 with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
-                    result = json.loads(
+                    result = tool_json(
                         await invoke_skill(
                             {"skill": "steam-daily-deals", "args": ""},
                             [
@@ -300,7 +313,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
                 encoding="utf-8",
             )
             with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
-                result = json.loads(
+                result = tool_json(
                     await invoke_skill(
                         {"skill": "writer", "args": "report"},
                         [
@@ -328,7 +341,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             return json.dumps({"server": server_id, "prompt": prompt_name, "arguments": arguments})
 
         tool = build_skill_tool(call_prompt)
-        result = json.loads(await tool.execute({"skill": "mcp__calendar__create_event", "args": "tomorrow"}))
+        result = tool_json(await invoke_builtin(tool.executor, {"skill": "mcp__calendar__create_event", "args": "tomorrow"}))
         self.assertEqual(result["server"], "calendar")
         self.assertEqual(result["prompt"], "create_event")
 
@@ -354,7 +367,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             with patch("backend.skills.body.DATA_SKILLS_DIR", data_skills):
-                result = json.loads(
+                result = tool_json(
                     await agent._run_tool(
                         runtime=runtime,
                         iteration=0,
@@ -380,8 +393,8 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             skills=[],
         )
 
-        with patch("backend.tools.local.load_skill_body") as loader:
-            result = json.loads(
+        with patch("backend.tools.adapters.skill.load_skill_body") as loader:
+            result = tool_json(
                 await agent._run_tool(
                     runtime=runtime,
                     iteration=0,
@@ -408,7 +421,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         runtime = await agent.create_runtime(
             _agent_request(),
             [
-                ToolDefinition(
+                make_test_tool(
                     name="Read",
                     description="Read a file.",
                     parameters={
@@ -423,7 +436,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
             McpClientManager([]),
         )
 
-        result = json.loads(
+        result = tool_json(
             await agent._run_tool(
                 runtime=runtime,
                 iteration=0,
@@ -447,7 +460,7 @@ class McpSkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         agent = OpenAIAgent()
 
         with self.assertRaisesRegex(ValueError, "JSON object"):
-            agent._decode_tool_arguments("[1, 2]")
+            _decode_tool_arguments("[1, 2]")
 
     def test_permission_rules_deny(self) -> None:
         with TemporaryDirectory() as tmp, patch.dict("os.environ", {"K_AGENT_PERMISSION_RULES": str(Path(tmp) / "permissions.json")}, clear=False):

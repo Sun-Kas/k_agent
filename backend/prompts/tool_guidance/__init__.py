@@ -1,10 +1,13 @@
 """Short guidance conditional on the final provider-visible catalog."""
 
+from backend.prompts.tool_guidance.shell import BASH_GUIDANCE
 from backend.prompts.models import PromptInputs, PromptSection
 
 
 def build(inputs: PromptInputs) -> tuple[PromptSection, ...]:
     guidance: list[str] = []
+    if inputs.tool_catalog.has("Bash"):
+        guidance.append(BASH_GUIDANCE)
     if inputs.tool_catalog.has("AskUserQuestion"):
         guidance.append(
             "When asking for a decision, offer concise options and permit custom input; a response may contain both selected options and custom text."

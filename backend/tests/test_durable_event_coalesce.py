@@ -226,7 +226,7 @@ class DurableEventCoalesceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session.messages[-1].content, "partial")
 
-    async def test_loading_rewrites_legacy_token_deltas(self) -> None:
+    async def test_update_coalesces_token_deltas_for_reload(self) -> None:
         with TemporaryDirectory() as tmp:
             storage = FileStorage(tmp)
             writer = SessionStore(storage)
@@ -246,24 +246,7 @@ class DurableEventCoalesceTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {"type": "RUN_FINISHED", "threadId": "legacy", "runId": "run-1"},
             ]
-            await writer.update("legacy", [], [], [])
-            # update() coalesces on assign; write the raw token stream through storage.
-            await storage.write_json("sessions/legacy/legacy.json", {
-                **writer._record_to_payload(session),
-                "events": [
-                    {"type": "RUN_STARTED", "threadId": "legacy", "runId": "run-1"},
-                    {"type": "TEXT_MESSAGE_START", "messageId": "a1"},
-                    {"type": "TEXT_MESSAGE_CONTENT", "messageId": "a1", "delta": "你"},
-                    {"type": "TEXT_MESSAGE_CONTENT", "messageId": "a1", "delta": "好"},
-                    {"type": "TEXT_MESSAGE_END", "messageId": "a1"},
-                    {
-                        "type": "CUSTOM",
-                        "name": "tool_output_delta",
-                        "value": {"toolCallId": "c1", "delta": "out"},
-                    },
-                    {"type": "RUN_FINISHED", "threadId": "legacy", "runId": "run-1"},
-                ],
-            })
+            await writer.update("legacy", [], events=session.events)
 
             reloaded = SessionStore(storage)
             loaded = await reloaded.get("legacy")
@@ -290,7 +273,6 @@ class DurableEventCoalesceTests(unittest.IsolatedAsyncioTestCase):
                 "TEXT_MESSAGE_END",
                 "RUN_FINISHED",
             ])
-            self.assertTrue(storage.resolve("sessions/legacy/legacy.json.bak").is_file())
 
 
 class CoalesceFunctionTests(unittest.TestCase):

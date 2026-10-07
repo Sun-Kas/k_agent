@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from backend.tools.contracts import ToolOutcome
 import unittest
 
 from backend.agent.hooks import (
@@ -51,7 +52,7 @@ class ObserverDispatcherTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         async def execute(_request) -> str:
-            return "ok"
+            return ToolOutcome.succeeded("ok")
 
         await runtime.run_tool(
             ToolCallRequest(
@@ -87,7 +88,7 @@ class ObserverDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         async def execute(request) -> str:
             await asyncio.sleep(0)
-            return request.call_id
+            return ToolOutcome.succeeded(request.call_id)
 
         def request(call_id: str) -> ToolCallRequest:
             return ToolCallRequest(
@@ -128,7 +129,7 @@ class MiddlewarePipelineTests(unittest.IsolatedAsyncioTestCase):
 
         async def execute(request) -> str:
             received.append(dict(request.arguments))
-            return "ok"
+            return ToolOutcome.succeeded("ok")
 
         result = await runtime.run_tool(
             ToolCallRequest(
@@ -164,7 +165,7 @@ class MiddlewarePipelineTests(unittest.IsolatedAsyncioTestCase):
             received.append(dict(request.arguments))
 
         async def execute(_request) -> str:
-            return "ok"
+            return ToolOutcome.succeeded("ok")
 
         arguments = {
             "command": "pwd",
@@ -312,7 +313,7 @@ class MiddlewarePipelineTests(unittest.IsolatedAsyncioTestCase):
 
         async def execute(request) -> str:
             calls.append(f"execute:{request.arguments['path']}")
-            return "ok"
+            return ToolOutcome.succeeded("ok")
 
         result = await runtime.run_tool(
             ToolCallRequest(

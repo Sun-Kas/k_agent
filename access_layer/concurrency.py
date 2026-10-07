@@ -30,9 +30,42 @@ class RequestConcurrencyLimiter:
         self.max_concurrent_requests = max(1, max_concurrent_requests)
         self.acquire_timeout_seconds = max(0.0, acquire_timeout_seconds)
         self._request_slots = asyncio.BoundedSemaphore(self.max_concurrent_requests)
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}   #session会话锁 只有协程竞争的是“同一个 asyncio.Lock 实例”，这个锁才能起到互斥作用
         self._session_locks_guard = asyncio.Lock()
 
+    '''
+    把一个异步生成器函数变成可以用 async with 的异步上下文管理器。
+
+    最典型的例子：
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def connect():
+        print("1. 建立连接")
+
+        yield "connection"
+
+        print("3. 关闭连接")
+
+    async with connect() as conn:
+    print("2. 使用连接", conn)
+
+
+
+    1. 建立连接
+        ↓
+    yield
+        ↓
+    进入 async with
+        ↓
+    2. 使用连接
+        ↓
+    退出 async with
+        ↓
+    继续执行 yield 后面的代码
+        ↓
+    3. 关闭连接
+    '''
     @asynccontextmanager
     async def protect(self, session_id: str) -> AsyncIterator[None]:
         """为整次 agent run 预留一个全局槽位并独占目标会话。

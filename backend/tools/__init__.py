@@ -1,18 +1,7 @@
-"""Local tool definitions and argument validation."""
+"""工具契约与不可变元数据；请求装配请使用 registry.build_request_tool_set。"""
 
-from backend.tools.local import ToolDefinition
-from backend.tools.catalog import SkillCatalog, ToolCatalog, build_tool_catalog
-from backend.tools.registry import bind_request_scoped_tools, get_all_base_tools, load_local_tools, replace_skill_tool
+from backend.tools.contracts import ToolBinding, ToolSpec, ToolOutcome
+from backend.tools.catalog import SkillCatalog, ToolCapabilityView
 from backend.tools.validation import validate_tool_arguments
 
-__all__ = [
-    "ToolDefinition",
-    "SkillCatalog",
-    "ToolCatalog",
-    "build_tool_catalog",
-    "bind_request_scoped_tools",
-    "get_all_base_tools",
-    "load_local_tools",
-    "replace_skill_tool",
-    "validate_tool_arguments",
-]
+__all__ = ["ToolBinding", "ToolSpec", "ToolOutcome", "SkillCatalog", "ToolCapabilityView", "validate_tool_arguments"]
