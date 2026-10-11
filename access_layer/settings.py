@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     )
     # 相对 storage_base_dir 的会话对象前缀，实际路径为 `{prefix}/{session_id}/…`。
     session_storage_prefix: str = Field(default="sessions", alias="SESSION_STORAGE_PREFIX")
+    # 相对 storage_base_dir 的 Project 索引/归属会话前缀：`{prefix}/index.json`，
+    # `{prefix}/{projectId}/sessions/{sessionId}/…`。
+    projects_storage_prefix: str = Field(default="projects", alias="PROJECTS_STORAGE_PREFIX")
     # uvicorn worker 数。文件存储的会话 CAS 要求必须为 1；>1 会拒绝启动。
     server_workers: int = Field(default=1, alias="SERVER_WORKERS")
     # 本进程日志级别（复用 backend 的 logging 配置入口）。

@@ -321,7 +321,7 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_args): return None
 
         class Limiter:
-            def protect(self, _session_id): return Guard()
+            def protect(self, _session_id, _project_id=None): return Guard()
 
         class Catalog:
             def selected_runtime(self, _mcp_ids, _skill_ids): return [], []

@@ -42,6 +42,32 @@ class TeamWorkspaceValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Team Runtime workspace root"):
                     _resolve_run_workspace(str(outside), is_team_run=True)
 
+    def test_project_run_accepts_absolute_path_outside_home(self) -> None:
+        """Project 的 root_path 允许在 $K_AGENT_HOME 之外，和 session/Team 不同。"""
+
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            outside = Path(tmp) / "some-user-project"
+            with patch.dict(os.environ, {"K_AGENT_HOME": str(home)}, clear=False):
+                reset_home_cache()
+                ensure_home_layout()
+                resolved = _resolve_run_workspace(
+                    str(outside), is_team_run=False, is_project_run=True
+                )
+                self.assertEqual(resolved, outside.resolve())
+                self.assertTrue(resolved.is_dir())
+
+    def test_project_run_rejects_relative_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            with patch.dict(os.environ, {"K_AGENT_HOME": str(home)}, clear=False):
+                reset_home_cache()
+                ensure_home_layout()
+                with self.assertRaisesRegex(ValueError, "absolute path"):
+                    _resolve_run_workspace(
+                        "relative/dir", is_team_run=False, is_project_run=True
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

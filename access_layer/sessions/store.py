@@ -104,6 +104,9 @@ class SessionRecord:
     # scheduled → 任务 run id；从别的会话 fork → 源 session id
     source_ref: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # 归属的 Project id；None=未归属，走旧的 sessions/{id}/ 平铺布局。
+    # 归属的会话没有私有 workspace/：cwd 直接是 Project 的 root_path。
+    project_id: str | None = None
 
 
 class SessionStore:
@@ -113,11 +116,21 @@ class SessionStore:
     会话锁；按 session_id 的请求串行化在 RequestConcurrencyLimiter 中完成。
     """
 
-    def __init__(self, storage: StorageBackend | None = None) -> None:
-        """绑定存储后端，并初始化内存索引、缓冲与取消标记表。"""
+    def __init__(
+        self,
+        storage: StorageBackend | None = None,
+        project_store: Any | None = None,
+    ) -> None:
+        """绑定存储后端，并初始化内存索引、缓冲与取消标记表。
+
+        project_store 是可选的 ProjectStore 引用，仅用于维护 Project 列表里
+        session_count 这个展示字段；不传时 Project 功能里除计数展示外都正常工作。
+        """
         self._storage = storage
-        self._context_store = ContextStateStore(storage)
+        self._project_store = project_store
         self._sessions: dict[str, SessionRecord] = {}
+        # bound method 在调用时才读 self._sessions，这里提前传入不依赖初始化顺序。
+        self._context_store = ContextStateStore(storage, self._bundle_prefix)
         # 无 StorageBackend 的单元测试也需要同一状态机；生产环境同时写独立文件。
         self._approval_records: dict[tuple[str, str], dict[str, Any]] = {}
         # (session_id, intent_id) → 已认领的 resume 决定；与磁盘 resume-intents/*.json 对应。
@@ -141,19 +154,34 @@ class SessionStore:
         # 不是按 session 的 run 互斥（那是 RequestConcurrencyLimiter）。
         self._lock = asyncio.Lock()
 
+    def _bundle_prefix(self, session_id: str, settings: Any) -> str:
+        """该会话簿记落盘的存储前缀：归属 Project 则落在该 Project 的 sessions/ 下。
+
+        所有 session.json / history.jsonl / approvals / resume-intents /
+        context 路径都从这里派生，保证「归属 Project 的会话簿记不会落进
+        Project 的 root_path」——它们始终留在 state/projects/{id}/sessions/ 下。
+        """
+
+        session = self._sessions.get(session_id)
+        project_id = session.project_id if session is not None else None
+        if project_id:
+            return f"{settings.projects_storage_prefix}/{project_id}/sessions/{session_id}"
+        return f"{settings.session_storage_prefix}/{session_id}"
+
     async def create_session(
         self,
         title: str | None = None,
         session_id: str | None = None,
         source: str = "interactive",
         source_ref: str | None = None,
+        project_id: str | None = None,
     ) -> SessionRecord:
-        """创建新会话并写入存储后端。"""
+        """创建新会话并写入存储后端；project_id 非空时绑定到该 Project 根目录。"""
         settings = await get_or_init_settings()
         title = title or settings.default_session_title
         session = SessionRecord(
             id=session_id or str(uuid.uuid4()), title=title,
-            source=source, source_ref=source_ref,
+            source=source, source_ref=source_ref, project_id=project_id,
         )
         async with self._lock:
             self._sessions[session.id] = session
@@ -161,6 +189,8 @@ class SessionStore:
             await self._rewrite_history_locked(session)
             self._persisted_event_counts[session.id] = 0
             await self._persist(session)
+        if project_id and self._project_store is not None:
+            await self._project_store.adjust_session_count(project_id, 1)
         return session
 
     async def get_or_create(self, session_id: str | None) -> SessionRecord:
@@ -171,12 +201,17 @@ class SessionStore:
                 return self._sessions[session_id]
         return await self.create_session(session_id=session_id)
 
-    async def list_summaries(self) -> list[SessionSummary]:
-        """返回按更新时间排序的会话摘要。"""
+    async def list_summaries(self, project_id: str | None = None) -> list[SessionSummary]:
+        """返回按更新时间排序的会话摘要；project_id 非空时只返回该 Project 下的。"""
         await self._ensure_loaded()
         async with self._lock:
             sessions = sorted(
-                [session for session in self._sessions.values() if session.source == "interactive"],
+                [
+                    session
+                    for session in self._sessions.values()
+                    if session.source == "interactive"
+                    and (project_id is None or session.project_id == project_id)
+                ],
                 key=lambda session: session.updated_at,
                 reverse=True,
             )
@@ -186,6 +221,7 @@ class SessionStore:
                 title=session.title,
                 updatedAt=session.updated_at,
                 messageCount=len(session.messages),
+                projectId=session.project_id,
             )
             for session in sessions
         ]
@@ -690,7 +726,7 @@ class SessionStore:
             if prior_intent is None and self._storage is not None:
                 settings = await get_or_init_settings()
                 raw = await self._storage.read_json(
-                    f"{settings.session_storage_prefix}/{session_id}/resume-intents/{intent_id}.json"
+                    f"{self._bundle_prefix(session_id, settings)}/resume-intents/{intent_id}.json"
                 )
                 prior_intent = raw if isinstance(raw, dict) else None
             if prior_intent is not None:
@@ -1081,7 +1117,7 @@ class SessionStore:
             return None
         settings = await get_or_init_settings()
         raw = await self._storage.read_json(
-            f"{settings.session_storage_prefix}/{session_id}/approvals/{interrupt_id}.json"
+            f"{self._bundle_prefix(session_id, settings)}/approvals/{interrupt_id}.json"
         )
         if not isinstance(raw, dict):
             return None
@@ -1096,7 +1132,7 @@ class SessionStore:
             return
         settings = await get_or_init_settings()
         await self._storage.write_json(
-            f"{settings.session_storage_prefix}/{session_id}/approvals/{interrupt_id}.json",
+            f"{self._bundle_prefix(session_id, settings)}/approvals/{interrupt_id}.json",
             record,
         )
 
@@ -1108,7 +1144,7 @@ class SessionStore:
             return
         settings = await get_or_init_settings()
         await self._storage.write_json(
-            f"{settings.session_storage_prefix}/{session_id}/resume-intents/{intent_id}.json",
+            f"{self._bundle_prefix(session_id, settings)}/resume-intents/{intent_id}.json",
             intent,
         )
 
@@ -1163,19 +1199,24 @@ class SessionStore:
                 agent_kind=source.agent_kind,
                 source="interactive",
                 source_ref=session_id,
+                # 分支继承同一 Project 归属：既保持 cwd 一致，也避免分支凭空
+                # 获得一份本不存在的私有 workspace/。
+                project_id=source.project_id,
             )
+            self._sessions[branch_id] = branch
 
-            if self._storage is not None:
+            if self._storage is not None and source.project_id is None:
+                # 只有未归属 Project 的会话才有私有 workspace/ 需要复制；
+                # 归属 Project 的会话本来就没有，源和分支共享同一个 root_path。
                 source_workspace = self._storage.resolve(
-                    f"{settings.session_storage_prefix}/{session_id}/workspace"
+                    f"{self._bundle_prefix(session_id, settings)}/workspace"
                 )
                 branch_workspace = self._storage.resolve(
-                    f"{settings.session_storage_prefix}/{branch_id}/workspace"
+                    f"{self._bundle_prefix(branch_id, settings)}/workspace"
                 )
                 await asyncio.to_thread(
                     self._copy_workspace_tree, source_workspace, branch_workspace
                 )
-            self._sessions[branch_id] = branch
             try:
                 # 分支复制同一事实流但重新分配 seq/sessionId，避免共享可变历史文件。
                 for record in records_to_copy:
@@ -1228,17 +1269,19 @@ class SessionStore:
                             "lastProposalId": None,
                         }
                         await self._storage.write_json(
-                            f"{settings.session_storage_prefix}/{branch_id}/context/k_agent.json",
+                            f"{self._bundle_prefix(branch_id, settings)}/context/k_agent.json",
                             branch_state,
                         )
                 self._persisted_event_counts[branch_id] = len(branch.events)
                 await self._persist(branch)
             except Exception:
+                branch_bundle = (
+                    self._storage.resolve(self._bundle_prefix(branch_id, settings))
+                    if self._storage is not None
+                    else None
+                )
                 self._sessions.pop(branch_id, None)
-                if self._storage is not None:
-                    branch_bundle = self._storage.resolve(
-                        f"{settings.session_storage_prefix}/{branch_id}"
-                    )
+                if branch_bundle is not None:
                     await asyncio.to_thread(shutil.rmtree, branch_bundle, True)
                 raise
             return branch
@@ -1293,13 +1336,16 @@ class SessionStore:
                 return False
             if self._session_is_active(session_id):
                 raise SessionBusyError("Cannot delete a session while it is running")
+            project_id = self._sessions[session_id].project_id
             if self._storage is not None:
-                bundle = self._storage.resolve(
-                    f"{settings.session_storage_prefix}/{session_id}"
-                )
+                # 必须先算前缀再删索引：_bundle_prefix 要靠 self._sessions[session_id]
+                # 才知道这条会话落在平铺布局还是某个 Project 的 sessions/ 子树下。
+                bundle = self._storage.resolve(self._bundle_prefix(session_id, settings))
                 if await asyncio.to_thread(bundle.exists):
                     await asyncio.to_thread(shutil.rmtree, bundle)
             self._sessions.pop(session_id, None)
+            if project_id and self._project_store is not None:
+                await self._project_store.adjust_session_count(project_id, -1)
             self._drop_session_buffers(session_id)
             self._active_run_ids.pop(session_id, None)
             self._cancelled_active_run_ids.pop(session_id, None)
@@ -1327,6 +1373,59 @@ class SessionStore:
                 if key[0] != session_id
             }
             return True
+
+    async def bind_project(
+        self, session_id: str, project_id: str, project_root_path: str
+    ) -> SessionRecord | None:
+        """把一个未归属的会话迁入 Project：合并 workspace 内容、搬迁簿记目录。
+
+        调用方（main.py 路由）负责确认 project_id 对应的 Project 确实存在；
+        这里只做会话这一侧的迁移，不读写 ProjectStore 的索引记录本身。
+
+        迁移后该会话不再有私有 workspace/：原 workspace/ 下的文件被原样拷进
+        Project 的 root_path（同名文件直接覆盖，v1 不做冲突合并），随后整个
+        簿记目录从 sessions/{id}/ 搬到 projects/{projectId}/sessions/{id}/。
+        """
+
+        await self._ensure_loaded()
+        settings = await get_or_init_settings()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            if session.project_id:
+                raise ValueError("Session is already bound to a Project")
+            if self._session_is_active(session_id):
+                raise SessionBusyError("Cannot migrate a session while it is running")
+            if self._storage is not None:
+                old_bundle = self._storage.resolve(self._bundle_prefix(session_id, settings))
+                old_workspace = old_bundle / "workspace"
+                # 切换 project_id 之后 _bundle_prefix 会指向新位置，后面落盘/
+                # 读取都自动走新路径；这里先切再算 new_bundle 保证两者一致。
+                session.project_id = project_id
+                new_bundle = self._storage.resolve(self._bundle_prefix(session_id, settings))
+                project_root = Path(project_root_path)
+
+                def _migrate() -> None:
+                    new_bundle.parent.mkdir(parents=True, exist_ok=True)
+                    if old_workspace.is_dir():
+                        shutil.copytree(old_workspace, project_root, dirs_exist_ok=True)
+                    if old_bundle.exists():
+                        shutil.move(str(old_bundle), str(new_bundle))
+                    # 原 workspace/ 内容已经并入 Project 根目录，搬迁后的簿记
+                    # 目录里不应该再留一份——归属 Project 的会话没有私有 workspace/。
+                    leftover_workspace = new_bundle / "workspace"
+                    if leftover_workspace.is_dir():
+                        shutil.rmtree(leftover_workspace, ignore_errors=True)
+
+                await asyncio.to_thread(_migrate)
+            else:
+                session.project_id = project_id
+            session.updated_at = datetime.now(timezone.utc)
+            await self._persist(session)
+        if self._project_store is not None:
+            await self._project_store.adjust_session_count(project_id, 1)
+        return session
 
     def _session_is_active(self, session_id: str) -> bool:
         """Treat any active run or unfinished projection buffer as busy."""
@@ -1615,6 +1714,34 @@ class SessionStore:
         updated = self._upsert_message(messages, call_message)
         return self._upsert_message(updated, result_message)
 
+    async def _load_session_file_locked(
+        self, path: Path, history_key: str, *, project_id: str | None
+    ) -> None:
+        """读取一份 session.json + 对应 history.jsonl，并入内存索引。
+
+        调用方必须已持有 self._lock（扫描两棵子树的公共逻辑）。project_id 来自
+        扫描到的目录结构，用于在 session.json 自身字段缺失/不一致时兜底纠正——
+        防止簿记文件被手工挪动后，字段记的位置和它实际所在的位置对不上。
+        """
+
+        try:
+            payload = await self._storage.read_json(str(path))
+            if not isinstance(payload, dict):
+                return
+            history_lines = await self._storage.read_text_range(history_key)
+            # history.jsonl 一行一条记录；空行跳过，json.loads 成 dict 列表。
+            history_records = [json.loads(line) for line in history_lines if line.strip()]
+            session = self._record_from_payload(payload, history_records)
+            if project_id:
+                session.project_id = project_id
+            self._sessions[session.id] = session
+            self._persisted_event_counts[session.id] = len(session.events)
+            await self._ensure_workspace(session.id)
+        except Exception:
+            # One unreadable session file must not take down the whole
+            # session index and, with it, every other conversation.
+            logger.error("Skipping unreadable session file %s", path, exc_info=True)
+
     async def _ensure_loaded(self) -> None:
         """首次访问时从 sessions/{id}/session.json + history.jsonl 加载索引。"""
         async with self._lock:
@@ -1638,23 +1765,29 @@ class SessionStore:
                 # 只接受 {id}/session.json，排除 approvals/context 等 JSON。
                 if len(relative.parts) != 2 or relative.name != "session.json":
                     continue
+                session_id = relative.parts[0]
+                history_key = f"{prefix}/{session_id}/history.jsonl"
+                await self._load_session_file_locked(path, history_key, project_id=None)
+
+            # 归属 Project 的会话落在 projects/{projectId}/sessions/{sessionId}/
+            # 下，独立于上面那棵扁平 sessions/ 子树，这里额外扫一遍合并进同一份索引。
+            projects_prefix = settings.projects_storage_prefix
+            projects_root = self._storage.resolve(projects_prefix)
+            for path in await self._storage.list(projects_prefix, "session.json"):
                 try:
-                    payload = await self._storage.read_json(str(path))
-                    if isinstance(payload, dict):
-                        history_key = f"{prefix}/{relative.parts[0]}/history.jsonl"
-                        history_lines = await self._storage.read_text_range(history_key)
-                        # history.jsonl 一行一条记录；空行跳过，json.loads 成 dict 列表。
-                        history_records = [
-                            json.loads(line) for line in history_lines if line.strip()
-                        ]
-                        session = self._record_from_payload(payload, history_records)
-                        self._sessions[session.id] = session
-                        self._persisted_event_counts[session.id] = len(session.events)
-                        await self._ensure_workspace(session.id)
-                except Exception:
-                    # One unreadable session file must not take down the whole
-                    # session index and, with it, every other conversation.
-                    logger.error("Skipping unreadable session file %s", path, exc_info=True)
+                    relative = path.relative_to(projects_root)
+                except ValueError:
+                    continue
+                # 期望结构恰好是 {projectId}/sessions/{sessionId}/session.json。
+                if (
+                    len(relative.parts) != 4
+                    or relative.parts[1] != "sessions"
+                    or relative.name != "session.json"
+                ):
+                    continue
+                project_id, session_id = relative.parts[0], relative.parts[2]
+                history_key = f"{projects_prefix}/{project_id}/sessions/{session_id}/history.jsonl"
+                await self._load_session_file_locked(path, history_key, project_id=project_id)
             # 单 worker 重启 = 上次认领后的 resume 协程已经没了。
             # status=resuming 表示用户点过批准、工具可能已经跑过；不能当 pending
             # 再自动续跑。改成 unknown_outcome，前端要求二次确认（reconfirm）。
@@ -1672,13 +1805,20 @@ class SessionStore:
             self._loaded = True
 
     async def _ensure_workspace(self, session_id: str) -> None:
-        """Create the per-session workspace directory next to the JSON record."""
+        """Create the per-session workspace directory next to the JSON record.
+
+        归属 Project 的会话没有私有 workspace/——cwd 直接是 Project 的
+        root_path，这里直接跳过，避免在 Project 簿记目录下建一个永远不用的空壳。
+        """
 
         if self._storage is None:
             return
+        session = self._sessions.get(session_id)
+        if session is not None and session.project_id:
+            return
         settings = await get_or_init_settings()
         workspace = self._storage.resolve(
-            f"{settings.session_storage_prefix}/{session_id}/workspace"
+            f"{self._bundle_prefix(session_id, settings)}/workspace"
         )
         await asyncio.to_thread(workspace.mkdir, parents=True, exist_ok=True)
 
@@ -1689,7 +1829,7 @@ class SessionStore:
         settings = await get_or_init_settings()
         await self._ensure_workspace(session.id)
         await self._storage.write_json(
-            f"{settings.session_storage_prefix}/{session.id}/session.json",
+            f"{self._bundle_prefix(session.id, settings)}/session.json",
             self._record_to_payload(session),
         )
 
@@ -1716,7 +1856,7 @@ class SessionStore:
             settings = await get_or_init_settings()
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
             await self._storage.append_text(
-                f"{settings.session_storage_prefix}/{session.id}/history.jsonl",
+                f"{self._bundle_prefix(session.id, settings)}/history.jsonl",
                 line,
             )
         session.history_records.append(record)
@@ -1759,7 +1899,7 @@ class SessionStore:
             for record in session.history_records
         )
         await self._storage.write_text(
-            f"{settings.session_storage_prefix}/{session.id}/history.jsonl",
+            f"{self._bundle_prefix(session.id, settings)}/history.jsonl",
             content,
         )
 
@@ -1786,6 +1926,7 @@ class SessionStore:
             "openInterruptIds": list(session.open_interrupt_ids),
             "source": session.source,
             "sourceRef": session.source_ref,
+            "projectId": session.project_id,
             "updatedAt": session.updated_at.isoformat(),
         }
 
@@ -1842,6 +1983,7 @@ class SessionStore:
             ],
             source=str(payload.get("source") or "interactive"),
             source_ref=(str(payload["sourceRef"]) if payload.get("sourceRef") is not None else None),
+            project_id=(str(payload["projectId"]) if payload.get("projectId") else None),
             updated_at=datetime.fromisoformat(updated_at) if updated_at else datetime.now(timezone.utc),
         )
 

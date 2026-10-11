@@ -8,10 +8,12 @@ import type {
   AgUiEvent,
   AgUiRunInput,
   AgentsCatalog,
+  DirectoryListing,
   HealthState,
   McpCapabilities,
   McpServerConfig,
   ModelProfile,
+  ProjectSummary,
   RuntimeOption,
   SkillConfig,
   SessionState,
@@ -273,6 +275,100 @@ export async function deleteSession(sessionId: string): Promise<void> {
   if (!response.ok) {
     throw new Error(await sessionActionError(response, "无法删除对话"));
   }
+}
+
+export async function listProjects(): Promise<ProjectSummary[]> {
+  const response = await fetch(apiUrl("/api/projects"));
+  if (!response.ok) {
+    throw new Error(`Unable to load projects (${response.status})`);
+  }
+  return response.json() as Promise<ProjectSummary[]>;
+}
+
+/**
+ * 列出某个目录下的直接子目录，给"新建 Project"弹窗的目录浏览器用。
+ * 不传 path 时后端从用户主目录开始列（见 access_layer/fs_browse.py）。
+ */
+export async function browseDirectory(path?: string): Promise<DirectoryListing> {
+  const query = path ? `?${new URLSearchParams({ path })}` : "";
+  const response = await fetch(apiUrl(`/api/fs/browse${query}`));
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法浏览该目录"));
+  }
+  return response.json() as Promise<DirectoryListing>;
+}
+
+/** 在弹窗里新建一个子目录（给还没创建过文件夹的新 Project 用）。 */
+export async function makeDirectory(parentPath: string, name: string): Promise<DirectoryListing["entries"][number]> {
+  const response = await fetch(apiUrl("/api/fs/mkdir"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parentPath, name })
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法新建文件夹"));
+  }
+  return response.json() as Promise<DirectoryListing["entries"][number]>;
+}
+
+export async function createProject(rootPath: string, name?: string): Promise<ProjectSummary> {
+  const response = await fetch(apiUrl("/api/projects"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rootPath, name: name?.trim() || undefined })
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法创建 Project"));
+  }
+  return response.json() as Promise<ProjectSummary>;
+}
+
+export async function renameProject(projectId: string, name: string): Promise<ProjectSummary> {
+  const response = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}`), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法重命名 Project"));
+  }
+  return response.json() as Promise<ProjectSummary>;
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const response = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}`), {
+    method: "DELETE"
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法删除 Project"));
+  }
+}
+
+/** 在某个 Project 下新建一个归属会话；cwd 直接是该 Project 的 root_path。 */
+export async function createProjectSession(projectId: string): Promise<SessionSummary> {
+  const response = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}/sessions`), {
+    method: "POST"
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法在 Project 下新建对话"));
+  }
+  return response.json() as Promise<SessionSummary>;
+}
+
+/** 把一个已存在、未归属的会话迁入 Project（合并 workspace、搬迁簿记目录）。 */
+export async function bindSessionToProject(
+  sessionId: string,
+  projectId: string
+): Promise<SessionSummary> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/project`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId })
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法把对话移入 Project"));
+  }
+  return response.json() as Promise<SessionSummary>;
 }
 
 async function sessionActionError(response: Response, fallback: string): Promise<string> {

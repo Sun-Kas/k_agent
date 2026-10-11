@@ -77,10 +77,13 @@ class SessionForkInput(BaseModel):
 
 class SessionSummary(BaseModel):
     """描述会话列表中的轻量摘要。"""
+    model_config = ConfigDict(populate_by_name=True)
     id: str
     title: str
     updated_at: datetime = Field(alias="updatedAt")
     message_count: int = Field(alias="messageCount")
+    # 归属的 Project id；None 表示未归属任何 Project（旧的扁平会话）。
+    project_id: str | None = Field(default=None, alias="projectId")
 
 
 class SessionCapabilities(BaseModel):

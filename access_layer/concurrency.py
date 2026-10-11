@@ -32,6 +32,12 @@ class RequestConcurrencyLimiter:
         self._request_slots = asyncio.BoundedSemaphore(self.max_concurrent_requests)
         self._session_locks: dict[str, asyncio.Lock] = {}   #session会话锁 只有协程竞争的是“同一个 asyncio.Lock 实例”，这个锁才能起到互斥作用
         self._session_locks_guard = asyncio.Lock()
+        # Project 级串行锁：同一 Project 下的多个会话共享同一个 root_path，
+        # 必须在会话锁之外再叠一层，防止两个归属同一 Project 的不同会话同时
+        # 写同一批文件（例如都在改 CLAUDE.md）。按 session 维度的锁管不到这种
+        # "不同 session_id、同一目录" 的并发。
+        self._project_locks: dict[str, asyncio.Lock] = {}
+        self._project_locks_guard = asyncio.Lock()
 
     '''
     把一个异步生成器函数变成可以用 async with 的异步上下文管理器。
@@ -67,14 +73,17 @@ class RequestConcurrencyLimiter:
     3. 关闭连接
     '''
     @asynccontextmanager
-    async def protect(self, session_id: str) -> AsyncIterator[None]:
-        """为整次 agent run 预留一个全局槽位并独占目标会话。
+    async def protect(self, session_id: str, project_id: str | None = None) -> AsyncIterator[None]:
+        """为整次 agent run 预留一个全局槽位并独占目标会话（及其 Project）。
 
-        先拿全局槽再拿会话锁；任一步超时则转为 ConcurrencyLimitExceeded（对外 429）。
+        加锁顺序：全局槽 → 会话锁 → Project 锁（project_id 非空时）。任一步
+        超时则转为 ConcurrencyLimitExceeded（对外 429）。释放严格逆序。
         """
         acquired_slot = False
         acquired_session_lock = False
+        acquired_project_lock = False
         session_lock: asyncio.Lock | None = None
+        project_lock: asyncio.Lock | None = None
         try:
             await asyncio.wait_for(self._request_slots.acquire(), timeout=self.acquire_timeout_seconds)
             acquired_slot = True
@@ -83,10 +92,19 @@ class RequestConcurrencyLimiter:
             session_lock = await self._get_session_lock(session_id)
             await asyncio.wait_for(session_lock.acquire(), timeout=self.acquire_timeout_seconds)
             acquired_session_lock = True
+
+            if project_id:
+                # 同一 Project 下不同 session_id 仍可能并发跑，但它们共享同一个
+                # root_path；没有这把锁，两个会话各自的工具写入会互相踩文件。
+                project_lock = await self._get_project_lock(project_id)
+                await asyncio.wait_for(project_lock.acquire(), timeout=self.acquire_timeout_seconds)
+                acquired_project_lock = True
             yield
         except TimeoutError as exc:
             raise ConcurrencyLimitExceeded("Too many active requests, please retry later.") from exc
         finally:
+            if acquired_project_lock and project_lock is not None:
+                project_lock.release()
             if acquired_session_lock and session_lock is not None:
                 session_lock.release()
             if acquired_slot:
@@ -99,6 +117,15 @@ class RequestConcurrencyLimiter:
             if lock is None:
                 lock = asyncio.Lock()
                 self._session_locks[session_id] = lock
+            return lock
+
+    async def _get_project_lock(self, project_id: str) -> asyncio.Lock:
+        """惰性创建并缓存 per-project Lock；表本身用独立锁保护。"""
+        async with self._project_locks_guard:
+            lock = self._project_locks.get(project_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._project_locks[project_id] = lock
             return lock
 
     @asynccontextmanager

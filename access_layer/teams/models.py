@@ -58,10 +58,23 @@ class TeamCreateInput(BaseModel):
     goal: str = Field(min_length=1, max_length=20_000)
     mode: TeamMode = "manual"
     workspace_dir: str | None = Field(default=None, alias="workspaceDir", max_length=4096)
+    # 二选一：传 projectId 时，路由层会把它解析成该 Project 的 root_path 并
+    # 覆盖 workspace_dir——这样 Team 验收后发布的 artifacts 会落进 Project 的
+    # 共享目录，被同一 Project 下的其它 Session 直接看到。TeamStore 本身不
+    # 认识 Project，只看最终解析出来的 workspace_dir。
+    project_id: str | None = Field(default=None, alias="projectId")
     agents: list[TeamAgentInput] = Field(min_length=1, max_length=12)
     tasks: list[TeamTaskInput] = Field(default_factory=list, max_length=100)
     max_parallel: int = Field(default=4, alias="maxParallel", ge=1, le=12)
     permission_mode: PermissionMode = Field(default="default", alias="permissionMode")
+
+    @model_validator(mode="after")
+    def validate_project_exclusivity(self) -> "TeamCreateInput":
+        """projectId 和显式 workspaceDir 二选一，避免语义上互相打架。"""
+
+        if self.project_id and self.workspace_dir:
+            raise ValueError("projectId and workspaceDir are mutually exclusive")
+        return self
 
     @field_validator("agents")
     @classmethod

@@ -34,17 +34,24 @@ def is_ignored_workspace_name(name: str) -> bool:
     )
 
 
-def resolve_session_workspace(session_id: str) -> Path:
-    """解析会话工作区绝对路径；拒绝含路径分隔符或 `.`/`..` 的伪 id。"""
+def resolve_session_workspace(session_id: str, *, root: Path | str | None = None) -> Path:
+    """解析会话工作区绝对路径；拒绝含路径分隔符或 `.`/`..` 的伪 id。
+
+    root 由调用方（main.py 路由）显式传入：归属 Project 的会话传 Project 的
+    root_path，未归属会话不传、沿用旧的 sessions/{id}/workspace 布局。本模块
+    自己不查 SessionStore，只负责「给定一个根目录，怎么安全地预览它」。
+    """
     if not session_id or "/" in session_id or "\\" in session_id or session_id in {".", ".."}:
         raise ValueError("Invalid session id")
+    if root is not None:
+        return Path(root).resolve()
     return session_workspace_dir(session_id).resolve()
 
 
-def list_session_workspace(session_id: str) -> WorkspaceListing:
+def list_session_workspace(session_id: str, *, root: Path | str | None = None) -> WorkspaceListing:
     """列出可预览文件（过滤忽略项），root 对外显示为相对 $K_AGENT_HOME 的路径。"""
     listing = list_workspace_files(
-        resolve_session_workspace(session_id),
+        resolve_session_workspace(session_id, root=root),
         ignored_names=COMMON_IGNORED_NAMES,
         ignored_prefixes=COMMON_IGNORED_PREFIXES,
     )
@@ -54,10 +61,12 @@ def list_session_workspace(session_id: str) -> WorkspaceListing:
     )
 
 
-def read_session_workspace_file(session_id: str, relative_path: str) -> WorkspaceFileContent:
+def read_session_workspace_file(
+    session_id: str, relative_path: str, *, root: Path | str | None = None
+) -> WorkspaceFileContent:
     """读取单个工作区文件预览；路径逃逸时失败关闭（fail closed）。"""
     return read_workspace_file(
-        resolve_session_workspace(session_id),
+        resolve_session_workspace(session_id, root=root),
         relative_path,
         ignored_names=COMMON_IGNORED_NAMES,
         ignored_prefixes=COMMON_IGNORED_PREFIXES,

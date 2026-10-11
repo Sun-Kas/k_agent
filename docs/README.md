@@ -22,6 +22,7 @@
 
 - [Agent Team 技术方案](features/agent-team-technical-solution.md)
 - [项目制（Project Workspace）技术方案](features/project-workspace-technical-solution.md)
+- [参考 Codex 的 Project Git 工作区与 Session 右侧栏技术方案](features/project-git-tree-technical-solution.md)
 - [定时任务技术方案](features/scheduled-task-technical-solution.md)
 - [npm CLI / 终端工作台技术方案](features/npm-cli-terminal-technical-solution.md)
 - [对话区底部终端技术方案](features/conversation-bottom-terminal-technical-solution.md)

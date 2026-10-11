@@ -88,6 +88,9 @@ class AgentBackendRunInput(BaseModel):
     task_id: str | None = Field(default=None, alias="taskId")
     team_agent_id: str | None = Field(default=None, alias="teamAgentId")
     attempt_id: str | None = Field(default=None, alias="attemptId")
+    # 非空时表示该会话绑定了 Project：workspace_dir 就是 Project 的 root_path，
+    # 校验策略与普通 session/Team workspace 不同，见 _resolve_run_workspace。
+    project_id: str | None = Field(default=None, alias="projectId")
     workspace_dir: str = Field(alias="workspaceDir", min_length=1)
 
 
@@ -102,8 +105,23 @@ class AgentBackendCompactInput(BaseModel):
     model_id: str | None = Field(default=None, alias="modelId")
 
 
-def _resolve_run_workspace(raw_path: str, *, is_team_run: bool) -> Path:
+def _resolve_run_workspace(
+    raw_path: str, *, is_team_run: bool, is_project_run: bool = False
+) -> Path:
     """只接受 Access Layer 下发的工作区，不用 threadId 推导任何会话路径。"""
+
+    if is_project_run:
+        # Project 的 root_path 由用户指定，可能在 $K_AGENT_HOME 之外——这是它和
+        # session/Team workspace 的本质区别，所以不走下面的 $K_AGENT_HOME 边界
+        # 校验。Access Layer 已经在创建 Project 时做过路径白名单（拒绝系统根、
+        # 用户 home 根、$K_AGENT_HOME 本身等过宽路径），这里只再确认一次是
+        # 绝对路径、能用，不重复信任前端传来的相对值。
+        resolved = Path(raw_path).expanduser()
+        if not resolved.is_absolute():
+            raise ValueError("Project workspaceDir must be an absolute path")
+        resolved = resolved.resolve()
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
 
     # Access Layer sends `$K_AGENT_HOME`-relative paths via to_managed_path().
     # Resolve against the home, not process cwd, or LAN/deploy cwd mismatches
@@ -385,8 +403,10 @@ def create_app() -> FastAPI:
                 workspace_dir=_resolve_run_workspace(
                     payload.workspace_dir,
                     is_team_run=bool(payload.team_id),
+                    is_project_run=bool(payload.project_id),
                 ),
                 team_id=payload.team_id,
+                project_id=payload.project_id,
                 options=dict(payload.agent_options or {}),
                 settings=settings,
                 mcp_pool=app.state.mcp_pool,

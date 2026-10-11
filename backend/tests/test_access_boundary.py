@@ -109,6 +109,7 @@ class AccessBoundaryTests(unittest.TestCase):
                 "_request_limiter",
                 "_agent_backend_client",
                 "_runtime_catalog",
+                "_project_store",
             },
         )
 
@@ -273,7 +274,7 @@ class FullHistoryForwardingTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         class Limiter:
-            def protect(self, _session_id):
+            def protect(self, _session_id, _project_id=None):
                 return Guard()
 
         class Catalog:

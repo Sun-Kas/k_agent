@@ -45,6 +45,9 @@ from access_layer.sessions.workspace import (
 from access_layer.scheduled_tasks import ScheduledTaskRuntime, ScheduledTaskStore
 from access_layer.scheduled_tasks.router import build_scheduled_task_router
 from access_layer.teams import TeamRuntime, TeamStore, build_team_router
+from access_layer.projects import ProjectStore
+from access_layer.projects.router import build_project_router
+from access_layer.fs_browse import create_directory, list_directories
 from access_layer.schemas import (
     HealthResponse,
     McpConfigUpdate,
@@ -300,8 +303,12 @@ def create_app() -> FastAPI:
             app.state.settings.max_concurrent_agent_requests,
             app.state.settings.request_acquire_timeout_seconds,
         )
+        # Project 索引先于 SessionStore 构造：后者需要它来维护 session_count。
+        app.state.project_store = ProjectStore(app.state.storage)
         # 本进程唯一 SessionStore：同一事件循环上所有请求协程共享；不跨 worker。
-        app.state.session_store = SessionStore(app.state.storage)
+        app.state.session_store = SessionStore(
+            app.state.storage, project_store=app.state.project_store
+        )
         # 交互终端只活在这个进程里：同一会话可以有多块 PTY，和 Agent Bash 不是同一条通道。
         app.state.terminals = TerminalRegistry()
         app.state.agent_backend_client = AgentBackendClient(
@@ -315,6 +322,7 @@ def create_app() -> FastAPI:
             request_limiter=app.state.request_limiter,
             agent_backend_client=app.state.agent_backend_client,
             runtime_catalog=app.state.runtime_catalog,
+            project_store=app.state.project_store,
         )
         app.state.scheduled_task_store = ScheduledTaskStore(
             teams_dir().parent / "scheduled_tasks" / "scheduled_tasks.db"
@@ -375,9 +383,60 @@ def create_app() -> FastAPI:
         def store(self):
             return app.state.team_runtime.store
 
+    class _LazyAttrProxy:
+        """路由构造早于 lifespan；按属性名懒解析 app.state.*，构造期不触发 I/O。"""
+
+        def __init__(self, attr: str) -> None:
+            self._attr = attr
+
+        def __getattr__(self, name: str):
+            return getattr(getattr(app.state, self._attr), name)
+
     runtime_proxy = _RuntimeProxy()
     # 路由目前只需 store；调度器留在 app.state，避免构造应用时重复启动 runtime。
-    app.include_router(build_team_router(runtime_proxy))
+    # 额外传 project_store 代理，让 TeamCreateInput.projectId 能在路由层解析。
+    app.include_router(build_team_router(runtime_proxy, _LazyAttrProxy("project_store")))
+
+    app.include_router(
+        build_project_router(
+            _LazyAttrProxy("project_store"), _LazyAttrProxy("session_store")
+        )
+    )
+
+    # "新建 Project" 弹窗的目录选择器用：浏览器拿不到原生文件夹选择器返回的
+    # 磁盘绝对路径，所以用这两个只读/半只读接口在服务端（本机进程）代为浏览。
+    # 见 access_layer/fs_browse.py 顶部注释说明信任边界。
+    @app.get("/api/fs/browse")
+    async def browse_directory(path: str | None = None) -> dict:
+        try:
+            listing = list_directories(path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except NotADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        return {
+            "path": listing.path,
+            "parent": listing.parent,
+            "entries": [{"name": entry.name, "path": entry.path} for entry in listing.entries],
+        }
+
+    @app.post("/api/fs/mkdir")
+    async def make_directory(payload: dict) -> dict:
+        parent_path = payload.get("parentPath")
+        name = payload.get("name")
+        if not isinstance(parent_path, str) or not isinstance(name, str):
+            raise HTTPException(status_code=400, detail="parentPath 和 name 都必须是字符串")
+        try:
+            entry = create_directory(parent_path, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except NotADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"name": entry.name, "path": entry.path}
 
     class _ScheduledRuntimeProxy:
         """Resolve lifespan-owned runtime lazily so app construction performs no I/O."""
@@ -693,6 +752,39 @@ def create_app() -> FastAPI:
             title=branch.title,
             updatedAt=branch.updated_at,
             messageCount=len(branch.messages),
+            projectId=branch.project_id,
+        )
+
+    @app.post("/api/sessions/{session_id}/project")
+    async def bind_session_project(session_id: str, payload: dict) -> SessionSummary:
+        """把一个未归属的会话迁入 Project：合并 workspace、搬迁簿记目录。
+
+        body: {"projectId": "..."}。会话一旦归属就不能在这个接口里再改绑
+        到另一个 Project（技术方案未定义"换绑"语义，首版只支持绑一次）。
+        """
+
+        project_id = str(payload.get("projectId") or "").strip()
+        if not project_id:
+            raise HTTPException(status_code=400, detail="projectId is required")
+        project = await app.state.project_store.get(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        try:
+            session = await app.state.session_store.bind_project(
+                session_id, project_id, project.root_path
+            )
+        except SessionBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return SessionSummary(
+            id=session.id,
+            title=session.title,
+            updatedAt=session.updated_at,
+            messageCount=len(session.messages),
+            projectId=session.project_id,
         )
 
     @app.get(
@@ -830,6 +922,20 @@ def create_app() -> FastAPI:
             "status": "stopped",
         }
 
+    async def _resolve_session_workspace_root(session) -> Path:
+        """归属 Project 的会话 cwd 是 Project 的 root_path；否则沿用旧的私有 workspace/。
+
+        被终端 WebSocket 和 workspace 预览路由共用，保证两处对"这个会话的
+        cwd 到底是哪"的理解永远一致，不会因为各自单独实现而出现分歧。
+        """
+
+        if session.project_id:
+            project = await app.state.project_store.get(session.project_id)
+            if project is None:
+                raise ValueError("Project not found for this session")
+            return resolve_session_workspace(session.id, root=project.root_path)
+        return resolve_session_workspace(session.id)
+
     @app.websocket("/api/sessions/{session_id}/terminal/{terminal_id}")
     async def session_terminal(websocket: WebSocket, session_id: str, terminal_id: str):
         """把底栏里的一块标签接到该会话工作区里的登录 shell。
@@ -842,16 +948,16 @@ def create_app() -> FastAPI:
                 await websocket.send_text(encode_message("exit", code=None))
                 await websocket.close(code=4400)
                 return
-            try:
-                cwd = resolve_session_workspace(session_id)
-            except ValueError:
-                await websocket.send_text(encode_message("exit", code=None))
-                await websocket.close(code=4400)
-                return
             session = await app.state.session_store.get(session_id)
             if session is None:
                 await websocket.send_text(encode_message("exit", code=None))
                 await websocket.close(code=4404)
+                return
+            try:
+                cwd = await _resolve_session_workspace_root(session)
+            except ValueError:
+                await websocket.send_text(encode_message("exit", code=None))
+                await websocket.close(code=4400)
                 return
             cwd.mkdir(parents=True, exist_ok=True)
             await app.state.terminals.attach(session_id, terminal_id, cwd, websocket)
@@ -862,9 +968,12 @@ def create_app() -> FastAPI:
     async def get_session_workspace(session_id: str):
         """列出会话工作区中可对外预览的文件（过滤工具注入配置）。"""
 
+        session = await app.state.session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         try:
-            resolve_session_workspace(session_id)
-            listing = list_session_workspace(session_id)
+            root = await _resolve_session_workspace_root(session)
+            listing = list_session_workspace(session_id, root=root)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -885,9 +994,12 @@ def create_app() -> FastAPI:
     async def get_session_workspace_file(session_id: str, path: str):
         """读取会话工作区单个文件预览内容（路径逃逸失败关闭）。"""
 
+        session = await app.state.session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         try:
-            resolve_session_workspace(session_id)
-            payload = read_session_workspace_file(session_id, path)
+            root = await _resolve_session_workspace_root(session)
+            payload = read_session_workspace_file(session_id, path, root=root)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:

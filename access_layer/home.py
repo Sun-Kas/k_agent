@@ -15,10 +15,17 @@ $K_AGENT_HOME/
       mcp.json / skills.json # 前端选择器摘要
   cache/runtime/             # 全项目共享 Node/npm（会话与 Team 共用）
   state/
-    sessions/{id}/           # 会话 JSON + workspace/
+    sessions/{id}/           # 未归属 Project 的会话 JSON + workspace/
     teams/                   # Team 控制面与任务目录
+    projects/
+      index.json             # Project 索引表（纯簿记，不含用户内容）
+      {projectId}/sessions/{id}/  # 归属该 Project 的会话簿记（无 workspace/）
   content/
     memory/ / skills/
+
+Project 的真实工作目录（root_path）由用户指定，可在磁盘任意位置，不在上面
+这棵 `$K_AGENT_HOME` 树里；见 access_layer/projects/ 与
+docs/features/project-workspace-technical-solution.md。
 ```
 """
 
@@ -82,6 +89,27 @@ def teams_dir() -> Path:
     """Team Runtime 持久根：元数据、工件与隔离工作区。"""
 
     return state_dir() / "teams"
+
+
+def projects_dir() -> Path:
+    """Project 索引与归属会话簿记根：`state/projects/`。
+
+    注意：这里只放 index.json 和归属会话的 {sessionId}.json/history.jsonl 等
+    簿记文件；Project 真正的工作内容在用户指定的 root_path（可在磁盘任意位置），
+    绝不会落在这个目录下。
+    """
+
+    return state_dir() / "projects"
+
+
+def project_index_path() -> Path:
+    return projects_dir() / "index.json"
+
+
+def project_sessions_dir(project_id: str) -> Path:
+    """某个 Project 下所有归属会话的簿记目录：state/projects/{id}/sessions/。"""
+
+    return projects_dir() / project_id / "sessions"
 
 
 def shared_runtime_dir() -> Path:
@@ -178,20 +206,30 @@ def shared_runtime_tool_env(runtime: Path | None = None) -> dict[str, str]:
     }
 
 
-def session_bundle_dir(session_id: str) -> Path:
-    """单会话目录：会话 JSON + workspace。"""
+def session_bundle_dir(session_id: str, project_id: str | None = None) -> Path:
+    """单会话簿记目录：会话 JSON（+ 非 Project 会话还有 workspace/）。
 
+    归属 Project 的会话落在该 Project 的 sessions/ 子树下，不再平铺在
+    state/sessions/ 下；project_id 由调用方从 SessionStore 的记录里取得。
+    """
+
+    if project_id:
+        return project_sessions_dir(project_id) / session_id
     return sessions_dir() / session_id
 
 
-def session_json_path(session_id: str) -> Path:
-    return session_bundle_dir(session_id) / f"{session_id}.json"
+def session_json_path(session_id: str, project_id: str | None = None) -> Path:
+    return session_bundle_dir(session_id, project_id) / f"{session_id}.json"
 
 
-def session_workspace_dir(session_id: str) -> Path:
-    """对话绑定的 CLI/本地工具 cwd（非 Team 任务目录）。"""
+def session_workspace_dir(session_id: str, project_id: str | None = None) -> Path:
+    """对话绑定的 CLI/本地工具 cwd（非 Team 任务目录）。
 
-    return session_bundle_dir(session_id) / "workspace"
+    归属 Project 的会话没有私有 workspace/：cwd 直接就是 Project 的 root_path，
+    调用方应该优先用 Project 的 root_path，这里仅为未归属会话保留旧布局。
+    """
+
+    return session_bundle_dir(session_id, project_id) / "workspace"
 
 
 def team_task_dir(team_id: str, task_id: str) -> Path:
@@ -252,6 +290,7 @@ def ensure_home_layout(*, migrate: bool = True) -> Path:
         catalog_dir(),
         sessions_dir(),
         teams_dir(),
+        projects_dir(),
         memory_dir(),
         skills_dir(),
     ):

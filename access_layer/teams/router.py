@@ -26,8 +26,12 @@ from access_layer.teams.runtime import TeamRuntime
 from access_layer.teams.workspace import list_team_workspace, read_team_workspace_file
 
 
-def build_team_router(runtime: TeamRuntime) -> APIRouter:
-    """把 `/api/teams*` 处理器绑定到应用拥有的 TeamRuntime（实际多用其 store）。"""
+def build_team_router(runtime: TeamRuntime, project_store=None) -> APIRouter:
+    """把 `/api/teams*` 处理器绑定到应用拥有的 TeamRuntime（实际多用其 store）。
+
+    project_store 可选：用于把 TeamCreateInput.project_id 解析成该 Project 的
+    root_path。TeamStore 本身完全不认识 Project，这个翻译只发生在路由层。
+    """
 
     router = APIRouter(prefix="/api/teams", tags=["agent-teams"])
 
@@ -44,6 +48,15 @@ def build_team_router(runtime: TeamRuntime) -> APIRouter:
 
     @router.post("")
     async def create_team(payload: TeamCreateInput) -> dict:
+        if payload.project_id:
+            if project_store is None:
+                raise HTTPException(status_code=400, detail="Project binding is not available")
+            project = await project_store.get(payload.project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            # TeamStore 只认识 workspace_dir；这里把 projectId 换成它的 root_path
+            # 之后就是一次普通的"显式 workspaceDir"创建，Team 侧完全不用改。
+            payload = payload.model_copy(update={"workspace_dir": project.root_path, "project_id": None})
         try:
             return await runtime.store.create_team(
                 payload, runtime.store.database_path.parent

@@ -31,6 +31,31 @@ export interface SessionSummary {
   title: string;
   updatedAt: string;
   messageCount: number;
+  /** 归属的 Project id；undefined/null 表示未归属任何 Project。 */
+  projectId?: string | null;
+}
+
+/** Project：稳定文件夹 + 会话归属关系，不是新的运行时。 */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  rootPath: string;
+  sessionCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 目录浏览弹窗（新建 Project）里一个可进入的子目录条目。 */
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+/** `/api/fs/browse` 的返回：当前目录、父目录（到盘符根时为 null）和子目录列表。 */
+export interface DirectoryListing {
+  path: string;
+  parent: string | null;
+  entries: DirectoryEntry[];
 }
 
 export interface SessionWorkspaceFile {

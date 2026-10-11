@@ -29,6 +29,7 @@ from access_layer.agent_backend_client import AgentBackendClient
 from access_layer.catalog import CatalogError, RuntimeCatalog
 from access_layer.concurrency import ConcurrencyLimitExceeded, RequestConcurrencyLimiter
 from access_layer.home import session_workspace_dir, to_managed_path
+from access_layer.projects.store import ProjectStore
 from access_layer.logging_config import log_event
 from access_layer.messages import to_chat_messages
 from access_layer.request_context import (
@@ -52,12 +53,32 @@ class AgentAccessLayer:
         request_limiter: RequestConcurrencyLimiter,
         agent_backend_client: AgentBackendClient,
         runtime_catalog: RuntimeCatalog,
+        project_store: ProjectStore | None = None,
     ) -> None:
         """注入会话存储、并发守卫、后端客户端与运行时目录。"""
         self._session_store = session_store
         self._request_limiter = request_limiter
         self._agent_backend_client = agent_backend_client
         self._runtime_catalog = runtime_catalog
+        self._project_store = project_store
+
+    async def _resolve_run_workspace(self, session) -> tuple[str, str | None]:
+        """返回 (发给 Backend 的 workspaceDir, 实际使用的 project_id)。
+
+        未归属 Project 的会话沿用旧行为：workspaceDir 是私有的
+        sessions/{id}/workspace，走 $K_AGENT_HOME 边界校验。归属 Project 的
+        会话直接把 Project 的 root_path（可能在 $K_AGENT_HOME 之外）发给
+        Backend；Backend 对这两种 workspaceDir 的校验策略不同，见
+        backend/main.py::_resolve_run_workspace 的 is_project_run 分支。
+        Project 记录若已被外部删除/移动导致读取失败，安全退化为私有 workspace，
+        而不是让这轮运行失败。
+        """
+        project_id = session.project_id
+        if project_id and self._project_store is not None:
+            project = await self._project_store.get(project_id)
+            if project is not None:
+                return project.root_path, project_id
+        return to_managed_path(session_workspace_dir(session.id)), None
 
     async def recover_pending_context_continuations(self) -> None:
         """启动时续跑已原子提交的 compact checkpoint，再开放普通新输入。"""
@@ -110,6 +131,7 @@ class AgentAccessLayer:
         agent_options = dict(agent_options) if isinstance(agent_options, dict) else {}
         request_id = f"context-recovery-{uuid.uuid4()}"
 
+        workspace_dir, run_project_id = await self._resolve_run_workspace(session)
         while True:
             provider_messages, state = await self._session_store.provider_context_state(session_id)
             checkpoint = state.get("pendingContinuation")
@@ -137,7 +159,8 @@ class AgentAccessLayer:
                 "agentOptions": agent_options,
                 "resume": [],
                 "resumeCheckpoints": [],
-                "workspaceDir": to_managed_path(session_workspace_dir(session_id)),
+                "workspaceDir": workspace_dir,
+                "projectId": run_project_id,
             }
             nested_compact = False
             terminal = False
@@ -415,7 +438,7 @@ class AgentAccessLayer:
             # 还没占锁：protect() 只返回异步上下文管理器。
             # 不能 async with 包住整个 run()：函数返回 SSE 时 with 会结束并放锁，
             # 流还没开始。改成 __aenter__ 拿到锁，在生成器 finally 里 __aexit__。
-            stream_guard = self._request_limiter.protect(session.id)
+            stream_guard = self._request_limiter.protect(session.id, session.project_id)
             try:
                 await stream_guard.__aenter__()
             except ConcurrencyLimitExceeded as exc:
@@ -615,6 +638,7 @@ class AgentAccessLayer:
                     else update_request_context(session_id=session.id, run_id=payload.run_id)
                 )
                 started_at = time.perf_counter()
+                workspace_dir, run_project_id = await self._resolve_run_workspace(session)
                 #因为前面可能update_request_context，所以这里需要重新get_request_context
                 request_context = get_request_context()
                 request_id = request_context.request_id if request_context else "-"
@@ -679,9 +703,10 @@ class AgentAccessLayer:
                             # Access Layer owns the session layout. Backend only
                             # receives this run's explicit working directory and
                             # must never derive a session/history path from threadId.
-                            "workspaceDir": to_managed_path(
-                                session_workspace_dir(session.id)
-                            ),
+                            # 归属 Project 的会话这里直接是 Project 的 root_path
+                            # （可能在 $K_AGENT_HOME 之外）；见 _resolve_run_workspace。
+                            "workspaceDir": workspace_dir,
+                            "projectId": run_project_id,
                         }
                     # 落盘走后台队列，SSE 帧立刻 yield，避免磁盘 I/O 卡住流式体验。
                     # 单 worker 串行写盘以保持事件顺序。

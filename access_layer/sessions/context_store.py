@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import hashlib
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from access_layer.schemas import ChatMessage
 from access_layer.sessions.history import (
@@ -81,13 +81,26 @@ def normalize_context_state(session_id: str, raw: Any) -> dict[str, Any]:
 class ContextStateStore:
     """在 Access Layer 内拥有每会话 compact state 的唯一读写入口。"""
 
-    def __init__(self, storage: StorageBackend | None) -> None:
+    def __init__(
+        self,
+        storage: StorageBackend | None,
+        prefix_resolver: Callable[[str, Any], str] | None = None,
+    ) -> None:
         self._storage = storage
         self._memory: dict[str, dict[str, Any]] = {}
+        # SessionStore 注入的 (session_id, settings) -> 存储前缀；归属 Project 的
+        # 会话需要把 compact state 和 session.json/history.jsonl 落在同一个
+        # 簿记目录下，否则重启后两者会散落在不同地方。
+        self._prefix_resolver = prefix_resolver
 
     async def _key(self, session_id: str) -> str:
         settings = await get_or_init_settings()
-        return f"{settings.session_storage_prefix}/{session_id}/context/k_agent.json"
+        prefix = (
+            self._prefix_resolver(session_id, settings)
+            if self._prefix_resolver is not None
+            else f"{settings.session_storage_prefix}/{session_id}"
+        )
+        return f"{prefix}/context/k_agent.json"
 
     async def read(self, session_id: str) -> dict[str, Any]:
         if self._storage is None:

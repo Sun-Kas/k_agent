@@ -298,18 +298,23 @@ img.brand-symbol {
   font-size: var(--type-small);
   font-weight: 500;
 }
+.history-head-actions { display: flex; align-items: center; gap: 2px; }
 .history-head button {
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   padding: 0;
   border: 0;
-  border-radius: 7px;
+  border-radius: 6px;
   color: var(--muted);
   background: transparent;
-  font-size: 16px;
+  font-size: 13px;
   line-height: 1;
 }
 .history-head button:hover { color: var(--ink); background: var(--control-hover); }
+.history-head button svg {
+  width: 15px; height: 15px; overflow: visible; fill: none; stroke: currentColor;
+  stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round;
+}
 .new-session { height: 40px; margin: 0 0 11px; padding: 0 10px; border: 1px solid var(--control-border); border-radius: 10px; display: flex; align-items: center; gap: 8px; background: var(--control-bg); font-size: var(--type-ui); font-weight: 600; color: var(--ink); }
 .new-session:hover { border-color: var(--line); background: var(--control-hover); }
 .new-session span { flex: 0 0 20px; width: 20px; display: inline-flex; align-items: center; justify-content: center; color: var(--ink); font-size: var(--type-title); font-weight: 400; line-height: 1; }
@@ -562,6 +567,107 @@ img.brand-symbol {
   background: linear-gradient(to bottom, transparent, var(--sidebar));
 }
 .session-list { min-height: 0; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+.project-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
+.project-group-header {
+  min-height: 34px; display: flex; align-items: center; gap: 7px; padding: 5px 6px;
+  border-radius: 6px; color: var(--ink); font-size: var(--type-ui); font-weight: 400;
+  cursor: pointer;
+}
+.project-group-header:hover { background: var(--surface-hover); }
+.project-group-toggle {
+  display: grid; place-items: center; flex: 0 0 18px; width: 18px; height: 18px;
+  color: inherit;
+}
+.project-folder-icon { position: relative; display: block; width: 16px; height: 16px; color: var(--ink); }
+.project-folder-icon svg {
+  position: absolute; inset: 0; width: 16px; height: 16px;
+  fill: none; stroke: currentColor; stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round;
+  transition: opacity 140ms ease, transform 160ms ease;
+}
+.project-folder-icon .closed { opacity: 1; transform: scale(1); }
+.project-folder-icon .opened { opacity: 0; transform: translateY(1px) scale(0.92); }
+.project-folder-icon.open .closed { opacity: 0; transform: translateY(-1px) scale(0.92); }
+.project-folder-icon.open .opened { opacity: 1; transform: translateY(0) scale(1); }
+.project-group-name {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; color: var(--ink);
+  font-size: var(--type-ui); font-weight: 400; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+}
+.project-group-count { opacity: 0.6; font-weight: 400; }
+.project-group-action {
+  display: grid; place-items: center; flex: 0 0 23px; width: 23px; height: 23px; padding: 0;
+  border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer;
+  opacity: 0; transition: opacity 120ms ease, color 120ms ease, background-color 120ms ease, transform 120ms cubic-bezier(.23,1,.32,1);
+}
+.project-group-action svg {
+  width: 16px; height: 16px; overflow: visible; fill: none; stroke: currentColor;
+  stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round;
+}
+.project-info-action svg { fill: currentColor; stroke: none; }
+.project-group-header:hover .project-group-action,
+.project-group-header:focus-within .project-group-action,
+.project-group-action[aria-expanded="true"],
+.chat-group .project-group-action { opacity: 1; }
+.project-group-action:hover,
+.project-group-action[aria-expanded="true"] { color: var(--ink); background: var(--control-hover); }
+.project-group-action:active { transform: scale(0.94); }
+.project-group > .session-row { margin-left: 10px; }
+.project-info-card {
+  position: fixed; z-index: 90; width: min(320px, calc(100vw - 20px)); overflow: hidden;
+  border: 1px solid var(--line); border-radius: 13px; color: var(--ink); background: var(--panel);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .24); transform-origin: top left;
+}
+.project-info-card > header {
+  min-height: 48px; padding: 12px 14px; display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.project-info-card > header .project-folder-icon { flex: 0 0 18px; width: 18px; height: 18px; }
+.project-info-card > header .project-folder-icon svg { width: 18px; height: 18px; }
+.project-info-card > header strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+.project-info-card-row {
+  min-height: 42px; padding: 9px 14px; display: flex; align-items: center; gap: 10px;
+  border-bottom: 1px solid var(--line-soft); color: var(--muted); font-size: 13px;
+}
+.project-info-card-row svg,
+.project-info-edit-button svg {
+  flex: 0 0 18px; width: 18px; height: 18px; fill: none; stroke: currentColor;
+  stroke-width: 1.35; stroke-linecap: round; stroke-linejoin: round;
+}
+.project-info-card-row.path span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-info-edit-button {
+  width: calc(100% - 12px); min-height: 36px; margin: 6px; padding: 0 8px;
+  border: 0; border-radius: 8px; display: flex; align-items: center; gap: 10px;
+  color: var(--ink); background: transparent; text-align: left; font-size: 13px;
+  transition: background-color 120ms ease, transform 120ms cubic-bezier(.23,1,.32,1);
+}
+.project-info-edit-button:hover { background: var(--control-hover); }
+.project-info-edit-button:active { transform: scale(0.98); }
+.project-info-edit-form { padding: 12px; display: grid; gap: 11px; }
+.project-info-edit-form label,
+.project-info-readonly-path { display: grid; gap: 5px; }
+.project-info-edit-form label > span,
+.project-info-readonly-path > span { color: var(--dim); font-size: 11px; font-weight: 600; }
+.project-info-edit-form input {
+  width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--control-border); border-radius: 8px;
+  outline: none; color: var(--ink); background: var(--control-bg); font-size: 13px;
+}
+.project-info-edit-form input:focus { border-color: var(--ink); }
+.project-info-readonly-path code {
+  min-width: 0; padding: 8px 9px; overflow: hidden; border: 1px solid var(--line-soft); border-radius: 8px;
+  color: var(--muted); background: var(--control-bg); font: 11px/1.35 var(--mono-font), monospace;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.project-info-error { margin: 0; color: #b95852; font-size: 11px; }
+.project-info-edit-form footer { display: flex; justify-content: flex-end; gap: 7px; }
+.project-info-edit-form footer button {
+  min-width: 58px; height: 30px; padding: 0 10px; border: 1px solid var(--control-border); border-radius: 7px;
+  color: var(--muted); background: var(--surface); font-size: 12px;
+  transition: transform 120ms cubic-bezier(.23,1,.32,1), background-color 120ms ease;
+}
+.project-info-edit-form footer button:hover:not(:disabled) { color: var(--ink); background: var(--control-hover); }
+.project-info-edit-form footer button:active:not(:disabled) { transform: scale(0.97); }
+.project-info-edit-form footer button.primary { border-color: var(--ink); color: var(--surface); background: var(--ink); }
+.session-move-to-project { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; }
+.session-move-to-project select { font-size: 12px; padding: 3px 4px; }
 .session-row { position: relative; flex: 0 0 auto; display: flex; align-items: center; min-width: 0; border-radius: 8px; }
 .session-row.menu-open { z-index: 8; }
 .session-row:hover,
@@ -4175,6 +4281,55 @@ button:disabled, .attach-button.disabled {
   font-size: var(--type-ui);
 }
 .marketplace-dialog .config-field input:focus { border-color: var(--ink); }
+/* 新建 Project 弹窗（服务端目录浏览器），复用能力广场弹窗的壳，内容区自定义。 */
+.project-create-dialog .pcd-current-path {
+  display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 12px; margin: 0 0 10px;
+  border: 1px solid var(--control-border); border-radius: 10px; background: var(--control-bg);
+  color: var(--ink); font: var(--type-small) var(--mono-font), monospace;
+}
+.project-create-dialog .pcd-current-path .icon { flex: 0 0 auto; color: var(--dim); font-size: 13px; }
+.project-create-dialog .pcd-path-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-create-dialog .pcd-browser { border: 1px solid var(--line-soft); border-radius: 10px; overflow: hidden; margin: 0 0 12px; }
+.project-create-dialog .pcd-browser-toolbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 8px; background: color-mix(in srgb, var(--ink) 2.5%, var(--surface));
+  border-bottom: 1px solid var(--line-soft);
+}
+.project-create-dialog .pcd-toolbar-btn {
+  height: 26px; padding: 0 9px; border: 1px solid var(--control-border); border-radius: 7px;
+  background: var(--surface); color: var(--muted); font-size: 12px;
+}
+.project-create-dialog .pcd-toolbar-btn:hover:not(:disabled) { color: var(--ink); background: var(--control-hover); }
+.project-create-dialog .pcd-toolbar-btn:disabled { opacity: 0.45; }
+/* 固定高度而不是 max-height：条目数量少的目录（甚至 0 个）也占满这块区域，
+   这样切换目录只在这块区域内部滚动/变化内容，弹窗外层尺寸永远不跳动。 */
+.project-create-dialog .pcd-entry-list { height: 260px; overflow-y: auto; transition: opacity 120ms ease; }
+/* 切换目录时旧列表原地变暗，而不是被卸载再重新挂载——避免卡片内容整体闪一下。 */
+.project-create-dialog .pcd-entry-list-stale { opacity: 0.45; }
+.project-create-dialog .pcd-entry-row:disabled { cursor: default; }
+.project-create-dialog .pcd-entry-row {
+  display: flex; align-items: center; gap: 10px; width: 100%; height: 38px; padding: 0 12px;
+  border: 0; border-top: 1px solid var(--line-soft); background: transparent; color: var(--ink);
+  font-size: 13px; text-align: left;
+}
+.project-create-dialog .pcd-entry-row:first-child { border-top: 0; }
+.project-create-dialog .pcd-entry-row:hover { background: var(--surface-hover); }
+.project-create-dialog .pcd-entry-row .icon { flex: 0 0 auto; color: var(--muted); font-size: 13px; }
+.project-create-dialog .pcd-entry-row .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-create-dialog .pcd-entry-row .chevron { flex: 0 0 auto; color: var(--dim); }
+.project-create-dialog .pcd-new-folder-row { background: var(--surface-hover); }
+.project-create-dialog .pcd-new-folder-row:hover { background: var(--surface-hover); }
+.project-create-dialog .pcd-new-folder-row input {
+  flex: 1 1 auto; min-width: 0; height: 26px; padding: 0 7px;
+  border: 1px solid var(--ink); border-radius: 6px; outline: none;
+  background: var(--control-bg); color: var(--ink); font: inherit;
+}
+.project-create-dialog .pcd-new-folder-row input:disabled { opacity: 0.65; }
+.project-create-dialog .pcd-new-folder-hint {
+  flex: 0 0 auto; color: var(--dim); font-size: 11px; white-space: nowrap;
+}
+/* 文字提示（读取中/空目录）在固定高度的列表区域里垂直居中，而不是贴在顶上。 */
+.project-create-dialog .pcd-state-note { display: flex; align-items: center; justify-content: center; height: 100%; margin: 0; padding: 14px 12px; color: var(--dim); font-size: 12.5px; text-align: center; }
 @keyframes marketplace-fade-in {
   from { opacity: 0; }
   to { opacity: 1; }

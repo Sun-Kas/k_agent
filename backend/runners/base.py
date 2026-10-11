@@ -53,6 +53,9 @@ class RunnerContext:
     # Access Layer 必须显式下发；Runner 不得通过 thread_id 推导会话存储路径。
     workspace_dir: Path | None = None
     team_id: str | None = None
+    # 非空时 workspace_dir 就是某个 Project 的 root_path（可能在 $K_AGENT_HOME
+    # 之外）；目前仅作遥测/日志用途，不影响执行路径的选择。
+    project_id: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     settings: Settings | None = None
     mcp_pool: McpSessionPool | None = None
