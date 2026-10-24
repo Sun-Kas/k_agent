@@ -5,6 +5,7 @@ import { terminalLayout, TERMINAL_DESIGN } from "./design.js";
 import { HOME_MODES, homePickItems, nextSurface, surfaceFromDigit } from "./home-catalog.js";
 import { pushPromptHistory, promptHistoryText } from "./prompt-history.js";
 import { canFlushPromptQueue, splitSettledTimeline } from "./repl-view.js";
+import { rewriteFrameAfterTranscriptWipe, shouldResetTranscriptScrollback, staticTranscriptKey, transcriptOwner } from "./transcript-scrollback.js";
 import { filterSlashCommands, slashCommandAvailability, slashQuery, slashStatusPanel, type SlashStatusPanel } from "./slash-catalog.js";
 import { TimelineEntry } from "./panels/ConversationTimeline.js";
 import type { OverlayState, RuntimeChoice, TerminalFocus, TerminalPageAction, TerminalPageProps, TerminalPageViewModel } from "./types.js";
@@ -29,6 +30,11 @@ import { SkillMenu } from "./panels/SkillMenu.js";
 import { ErrorBlock } from "./renderers/ErrorBlock.js";
 import { PERMISSION_CHOICES } from "../application/runtime-switch.js";
 
+import { SessionRail } from "./panels/SessionRail.js";
+import { WorkbenchScreen } from "./screens/WorkbenchScreen.js";
+import { ProjectHomeScreen } from "./screens/ProjectHomeScreen.js";
+import { MarketplaceScreen } from "./screens/MarketplaceScreen.js";
+
 type ComposerMenu = "mcp" | "model" | "agent" | "permissions" | "skill";
 
 /**
@@ -46,6 +52,7 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   const [focus, setFocus] = useState<TerminalFocus>("composer");
   const [overlay, setOverlay] = useState<OverlayState>({ kind: "none" });
   const [showInspector, setShowInspector] = useState(false);
+  useEffect(() => { setShowInspector(model.preferences?.inspector ?? false); }, [model.preferences?.inspector]);
   const [dismissedInterruptId, setDismissedInterruptId] = useState<string>();
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
@@ -56,11 +63,36 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   const staticItemsRef = useRef<TimelineItem[]>([]);
   const seenStaticKeysRef = useRef(new Set<string>());
   const [staticItems, setStaticItems] = useState<TimelineItem[]>([]);
+  const [staticEpoch, setStaticEpoch] = useState(0);
+  const transcriptOwnerRef = useRef<string | undefined>(undefined);
+  const wipeArmedRef = useRef(false);
+  // 挂上一次即可。离开对话时的清屏要赶在下一次绘制之前，不能等那次 effect。
+  useEffect(() => {
+    const original = stdout.write.bind(stdout) as (...args: unknown[]) => boolean;
+    stdout.write = ((chunk: unknown, encoding?: unknown, callback?: unknown) => {
+      let next = chunk;
+      if (wipeArmedRef.current && typeof chunk === "string") {
+        const rewritten = rewriteFrameAfterTranscriptWipe(chunk);
+        if (rewritten?.consumed) {
+          wipeArmedRef.current = false;
+          next = rewritten.chunk;
+        }
+      }
+      if (typeof callback === "function") return original(next, encoding, callback);
+      if (encoding !== undefined) return original(next, encoding);
+      return original(next);
+    }) as NodeJS.WriteStream["write"];
+    return () => {
+      stdout.write = original as NodeJS.WriteStream["write"];
+    };
+  }, [stdout]);
   const promptHistoryRef = useRef<string[]>([]);
   const historyCursorRef = useRef(-1);
   const historyStashRef = useRef("");
   const [sendQueue, setSendQueue] = useState<string[]>([]);
   const sendQueueRef = useRef<string[]>([]);
+  const queueSessionRef = useRef(model.activeSessionId ?? "pending");
+  const sessionQueuesRef = useRef(new Map<string, string[]>());
   const [localRunning, setLocalRunning] = useState(false);
   // 只有还等着用户操作的审批才接管页面；提交后的 Resume 期间回到普通对话视图。
   const interrupt = awaitingApproval(model.timeline);
@@ -70,6 +102,26 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     : overlay;
   const busy = localRunning || !canFlushPromptQueue(model.timeline.runStatus);
   const wasBusy = useRef(busy);
+
+  // 排队输入归属创建它的 Session；切换页面既不能误发到新会话，也不能继承旧会话 busy。
+  useEffect(() => {
+    const target = model.activeSessionId ?? "pending";
+    const previous = queueSessionRef.current;
+    if (target !== previous) {
+      sessionQueuesRef.current.set(previous, sendQueueRef.current);
+      sendQueueRef.current = previous === "pending" && model.timeline.runStatus === "running" ? sendQueueRef.current : sessionQueuesRef.current.get(target) ?? [];
+      queueSessionRef.current = target;
+      setSendQueue(sendQueueRef.current);
+      setLocalRunning(false);
+      wasBusy.current = !canFlushPromptQueue(model.timeline.runStatus);
+    }
+    if (!model.loading && canFlushPromptQueue(model.timeline.runStatus) && sendQueueRef.current.length) {
+      const next = sendQueueRef.current[0]!;
+      sendQueueRef.current = sendQueueRef.current.slice(1);
+      setSendQueue(sendQueueRef.current); setLocalRunning(true);
+      onAction({ type: "submit_prompt", text: next });
+    }
+  }, [model.activeSessionId, model.loading]);
 
   useEffect(() => {
     const status = model.timeline.runStatus;
@@ -87,6 +139,7 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   }, [interruptVisible, overlay.kind, focus]);
 
   useEffect(() => {
+    if (model.loading) return;
     const previouslyBusy = wasBusy.current;
     wasBusy.current = busy;
     if (!previouslyBusy || busy) return;
@@ -95,7 +148,7 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     sendQueueRef.current = sendQueueRef.current.slice(1);
     setSendQueue(sendQueueRef.current);
     onAction({ type: "submit_prompt", text: next });
-  }, [busy, onAction]);
+  }, [busy, model.loading, onAction]);
 
   const picks = homePickItems(model);
   const selectedPick = picks[Math.min(homePick, Math.max(0, picks.length - 1))];
@@ -124,6 +177,8 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
   }, [slashOpen]);
 
   useInput((input, key) => {
+    if (model.workbenchOpen) return;
+    if (key.ctrl && input === "g") return onAction({ type: "open_workbench" });
     if (effectiveOverlay.kind !== "none") return;
     if (key.ctrl && input === "k") return openOverlay({ kind: "commands" });
     if (key.ctrl && input === "p") return openOverlay({ kind: "sessions" });
@@ -131,6 +186,10 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     if (key.ctrl && input === "c") {
       if (model.timeline.runStatus === "running") onAction({ type: "stop_run" });
       else onAction({ type: "quit" });
+      return;
+    }
+    if (model.surface === "projects") {
+      if (input === "?" && !key.ctrl && !key.meta) return openOverlay({ kind: "help" });
       return;
     }
     if (slashOpen) {
@@ -155,6 +214,11 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
       if (composerMenu === "mcp" && mcpDetailId) return;
       const items = menuItems(composerMenu, model);
       if (composerMenu === "mcp" && input === "r") return onAction({ type: "reload_mcp" });
+      if ((composerMenu === "mcp" || composerMenu === "skill") && ["s", "a", "n"].includes(input)) {
+        const item = items[Math.min(menuIndex, items.length - 1)];
+        onAction({ type: "toggle_capability", kind: composerMenu, id: item?.id ?? "", ...(input === "a" ? { selection: "all" as const } : input === "n" ? { selection: "none" as const } : {}) });
+        return;
+      }
       if (!items.length) return;
       if (key.upArrow) return setMenuIndex((value) => (value + items.length - 1) % items.length);
       if (key.downArrow) return setMenuIndex((value) => (value + 1) % items.length);
@@ -176,6 +240,11 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
         if (composerMenu === "permissions") onAction({ type: "set_permission", permissionMode: current.id });
         setComposerMenu(undefined);
       }
+      return;
+    }
+    if (key.return && !draft && model.attachments?.length && !busy) {
+      setLocalRunning(true);
+      onAction({ type: "submit_prompt", text: "" });
       return;
     }
     if (statusPanel && key.escape) return setStatusPanel(undefined);
@@ -226,6 +295,11 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
     const mode = HOME_MODES.find((item) => item.id === id);
     if (mode) {
       onAction({ type: "open_surface", surface: mode.surface });
+      return;
+    }
+    const project = model.projects.find((item) => id === `project-${item.id}`);
+    if (project) {
+      onAction({ type: "enter_project", projectId: project.id });
       return;
     }
     const sessionId = id.startsWith("session-") ? id.slice("session-".length) : undefined;
@@ -312,6 +386,8 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
 
   const main = useMemo(() => {
     if (model.surface === "home") return <HomeScreen model={model} selectedId={selectedPick?.id ?? HOME_MODES[0]!.id} />;
+    if (model.surface === "projects") return <ProjectHomeScreen model={model} onAction={onAction} />;
+    if (model.surface === "skills" || model.surface === "connectors") return <MarketplaceScreen model={model} />;
     if (model.surface === "team") return <TeamScreen teams={model.teams} />;
     if (model.surface === "automation") return <AutomationScreen automations={model.automations} />;
     if (model.surface === "doctor") return <DoctorScreen lines={model.doctorLines} />;
@@ -324,30 +400,52 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
         pendingPrompts={sendQueue}
       />
     );
-  }, [focus, layout, model, selectedPick?.id, showInspector, sendQueue]);
+  }, [focus, layout, model, onAction, selectedPick?.id, showInspector, sendQueue]);
 
   const overlayVisible = effectiveOverlay.kind !== "none";
+  const owner = transcriptOwner(model.surface, model.activeSessionId);
+  // 属性变了就在这次渲染里换掉滚动区，避免先画一帧旧对话再清。
+  if (transcriptOwnerRef.current !== owner) {
+    const previous = transcriptOwnerRef.current;
+    transcriptOwnerRef.current = owner;
+    if (shouldResetTranscriptScrollback(previous, owner)) {
+      wipeArmedRef.current = true;
+      const seeded = owner === "away" ? [] : splitSettledTimeline(model.timeline.items).settled;
+      seenStaticKeysRef.current = new Set(seeded.map((item) => staticTranscriptKey(owner, item)));
+      staticItemsRef.current = seeded;
+      setStaticEpoch((epoch) => epoch + 1);
+      setStaticItems(seeded);
+    } else if (previous === "draft") {
+      seenStaticKeysRef.current = new Set([...seenStaticKeysRef.current].map((key) => (
+        key.startsWith("draft:") ? `${owner}:${key.slice("draft:".length)}` : key
+      )));
+    }
+  }
   const settledSignature = model.timeline.items.map((item) => `${item.id}:${item.sequence}`).join("|");
   useEffect(() => {
+    if (owner === "away") return;
     const extra: TimelineItem[] = [];
-    const sessionKey = model.activeSessionId ?? "pending";
     for (const item of splitSettledTimeline(model.timeline.items).settled) {
-      const key = `${sessionKey}:${item.id}:${item.sequence}`;
+      const key = staticTranscriptKey(owner, item);
       if (seenStaticKeysRef.current.has(key)) continue;
+      if (staticItemsRef.current.some((existing) => existing.id === item.id && existing.sequence === item.sequence)) {
+        seenStaticKeysRef.current.add(key);
+        continue;
+      }
       seenStaticKeysRef.current.add(key);
       extra.push(item);
     }
     if (extra.length === 0) return;
     staticItemsRef.current = [...staticItemsRef.current, ...extra];
     setStaticItems(staticItemsRef.current);
-  }, [model.activeSessionId, model.timeline.items, settledSignature]);
+  }, [owner, model.timeline.items, settledSignature]);
 
   return (
     <Box
       flexDirection="column"
       minWidth={Math.min(columns, TERMINAL_DESIGN.layout.minimumColumns)}
     >
-      <Static items={staticItems}>
+      <Static key={staticEpoch} items={staticItems}>
         {(item) => (
           <Box key={`${item.id}-${item.sequence}`} flexDirection="column" paddingX={1} width="100%">
             <TimelineEntry item={item} expanded={false} />
@@ -355,6 +453,7 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
         )}
       </Static>
       <GlobalBar model={model} />
+      {model.preferences?.sidebar ? <SessionRail focused={false} sessions={model.sessions} activeSessionId={model.activeSessionId} /> : null}
       {model.error ? <ErrorBlock content={model.error} /> : null}
       {interrupt && dismissedInterruptId === interrupt.id ? <Text color={TERMINAL_DESIGN.colors.warning}>{TERMINAL_DESIGN.symbols.approval} 待处理输入仍存在 · {TERMINAL_DESIGN.copy.reviewPendingInput}</Text> : null}
       {overlayVisible ? (
@@ -363,14 +462,14 @@ export function TerminalPage({ model, onAction }: TerminalPageProps): React.Reac
         </Box>
       ) : (
         <Box flexDirection="column">
-          {main}
+          {model.workbenchOpen ? <WorkbenchScreen model={model} onAction={onAction} /> : main}
         </Box>
       )}
-      {!overlayVisible ? (
+      {!overlayVisible && !model.workbenchOpen && model.surface !== "projects" ? (
         <Box flexDirection="column">
           <Composer
             value={draft}
-            disabled={!model.connected}
+            disabled={!model.connected || model.loading}
             focused={focus === "composer" && effectiveOverlay.kind === "none"}
             captureDigits={modeKeysIdle}
             suppressKeys={slashOpen || composerMenuOpen}
@@ -409,7 +508,7 @@ function OverlayHost({ overlay, model, onAction, onRunCommand, onClose }: {
   onClose: () => void;
 }): React.ReactElement | null {
   if (overlay.kind === "commands") return <CommandPalette model={model} onRun={onRunCommand} onClose={onClose} />;
-  if (overlay.kind === "sessions") return <SessionSwitcher sessions={model.sessions} activeSessionId={model.activeSessionId} onSelect={(sessionId) => onAction({ type: "select_session", sessionId })} onClose={onClose} />;
+  if (overlay.kind === "sessions") return <SessionSwitcher sessions={model.sessions} projects={model.projects} activeSessionId={model.activeSessionId} activeProjectId={model.activeProjectId} running={model.timeline.runStatus === "running"} onAction={onAction} onClose={onClose} />;
   if (overlay.kind === "help") return <HelpOverlay onClose={onClose} />;
   if (overlay.kind === "approval" && overlay.approval) return <ApprovalDialog approval={overlay.approval} onAnswer={(payload) => onAction({ type: "answer_interrupt", interruptId: overlay.approval!.id, payload })} onClose={onClose} />;
   if (overlay.kind === "question" && overlay.approval) return <UserQuestionDialog approval={overlay.approval} onSubmit={(answers) => onAction({ type: "answer_interrupt", interruptId: overlay.approval!.id, payload: { action: "answer", answers } })} onClose={onClose} />;

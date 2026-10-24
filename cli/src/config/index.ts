@@ -10,6 +10,9 @@ export interface CliRuntimeConfig {
   mcpServerIds: string[];
   skillIds: string[];
   plain: boolean;
+  networkAccess?: boolean;
+  resumeSessionId?: string;
+  claudeAutoApproveTools?: string[];
 }
 
 export interface CliConfigOverrides extends Partial<CliRuntimeConfig> {

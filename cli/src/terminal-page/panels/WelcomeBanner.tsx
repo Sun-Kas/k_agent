@@ -11,7 +11,7 @@ export function WelcomeBanner({ model }: { model: TerminalPageViewModel }): Reac
   const { stdout } = useStdout();
   const compact = (stdout.columns ?? 80) < TERMINAL_DESIGN.layout.compactMinColumns;
   const glyph = compact ? TERMINAL_DESIGN.copy.logoFallback : TERMINAL_DESIGN.copy.logo;
-  const workspace = workspaceContext();
+  const workspace = model.environment ? { cwd: model.environment.cwd, folder: model.environment.cwd, ...(model.environment.branchRef ? { branch: model.environment.branchRef } : {}) } : model.activeSessionId ? { cwd: "", folder: "会话执行目录：Ctrl+G 查询工作区" } : workspaceContext();
 
   return (
     <Box flexDirection="column" marginBottom={1}>

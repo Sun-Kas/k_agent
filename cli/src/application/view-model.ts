@@ -25,6 +25,8 @@ export function emptyViewModel(config: CliRuntimeConfig): TerminalPageViewModel 
       agents: [],
     },
     sessions: [],
+    projects: [],
+    pinnedProjectIds: [],
     activeSessionId: undefined,
     activeSessionTitle: undefined,
     timeline: emptyTimeline(),

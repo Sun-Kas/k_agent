@@ -17,7 +17,7 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/index.ts",
     "dev:local": "node scripts/dev-local.mjs",
-    "test": "tsx --test tests/*.test.ts tests/*.test.tsx",
+    "test": "node --import tsx --test tests/*.test.ts tests/*.test.tsx",
     "prepublishOnly": "npm run check && npm test && npm run build"
   },
   "engines": {

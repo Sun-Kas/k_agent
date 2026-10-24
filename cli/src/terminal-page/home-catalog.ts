@@ -17,18 +17,34 @@ export interface HomeSessionItem {
   subtitle: string;
 }
 
-export type HomePickItem = HomeModeItem | HomeSessionItem;
+export interface HomeProjectItem {
+  kind: "project";
+  id: string;
+  projectId: string;
+  title: string;
+  subtitle: string;
+}
 
+export type HomePickItem = HomeModeItem | HomeSessionItem | HomeProjectItem;
+
+/** 与网页侧栏功能入口一致：项目、技能、连接器、定时任务。 */
 export const HOME_MODES: HomeModeItem[] = [
-  { kind: "mode", id: "mode-home", key: "1", title: "工作", hint: "对话、工具与审批", surface: "home" },
-  { kind: "mode", id: "mode-team", key: "2", title: "团队", hint: "Agent Team 与任务", surface: "team" },
-  { kind: "mode", id: "mode-auto", key: "3", title: "自动", hint: "定时任务与执行记录", surface: "automation" },
-  { kind: "mode", id: "mode-doctor", key: "4", title: "诊断", hint: "连接、模型与工具检查", surface: "doctor" },
+  { kind: "mode", id: "mode-projects", key: "1", title: "项目", hint: "项目目录与其中的会话", surface: "projects" },
+  { kind: "mode", id: "mode-skills", key: "2", title: "技能", hint: "技能广场", surface: "skills" },
+  { kind: "mode", id: "mode-connectors", key: "3", title: "连接器", hint: "MCP 广场", surface: "connectors" },
+  { kind: "mode", id: "mode-auto", key: "4", title: "定时任务", hint: "计划与执行记录", surface: "automation" },
 ];
 
 export const HOME_RECENT_SESSION_LIMIT = 5;
 
 export function homePickItems(model: TerminalPageViewModel): HomePickItem[] {
+  const projects: HomeProjectItem[] = model.projects.slice(0, 3).map((project) => ({
+    kind: "project",
+    id: `project-${project.id}`,
+    projectId: project.id,
+    title: project.name,
+    subtitle: `${project.sessionCount} 个会话 · ${project.rootPath}`,
+  }));
   const sessions: HomeSessionItem[] = model.sessions.slice(0, HOME_RECENT_SESSION_LIMIT).map((session) => ({
     kind: "session",
     id: `session-${session.id}`,
@@ -36,23 +52,22 @@ export function homePickItems(model: TerminalPageViewModel): HomePickItem[] {
     sessionId: session.id,
     subtitle: `${session.messageCount} 条 · ${relativeTime(session.updatedAt)}`,
   }));
-  return [...HOME_MODES, ...sessions];
+  return [...HOME_MODES, ...projects, ...sessions];
 }
 
 export function surfaceFromDigit(input: string): TerminalSurface | undefined {
   return HOME_MODES.find((item) => item.key === input)?.surface;
 }
 
-/** Shift+Tab 在一级模式之间循环；chat 属于“工作”模式，不算独立一级入口。 */
+/** Shift+Tab 在侧栏四个入口之间循环。对话页不属于这四项。 */
 export function nextSurface(current: TerminalSurface, direction: 1 | -1): TerminalSurface {
   const index = HOME_MODES.findIndex((item) => isActiveSurface(current, item.surface));
   const base = index < 0 ? 0 : index;
   const next = HOME_MODES[(base + direction + HOME_MODES.length) % HOME_MODES.length];
-  return next ? next.surface : "home";
+  return next ? next.surface : "projects";
 }
 
 export function isActiveSurface(current: TerminalSurface, mode: TerminalSurface): boolean {
-  if (mode === "home") return current === "home" || current === "chat";
   return current === mode;
 }
 

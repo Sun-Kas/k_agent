@@ -46,6 +46,8 @@ export function choicesFromAgents(agents: DetectedAgent[]): RuntimeChoice[] {
       name: item.name || item.kind,
       enabled: item.available,
     };
+    choice.models = (item.models ?? []).map((model) => ({ id: model.id, name: model.name, enabled: true }));
+    if (item.defaultModelId) choice.defaultModelId = item.defaultModelId;
     if (!item.available) choice.note = item.detail?.trim() || "当前不可用";
     else if (item.version) choice.note = item.version;
     return choice;
@@ -62,6 +64,10 @@ export function applyRuntimeToSummary(runtime: RuntimeSummary, config: CliRuntim
   return {
     ...runtime,
     agentKind: config.agentKind,
+    reasoningEffort: config.reasoningEffort,
+    mcpCount: config.mcpServerIds.length,
+    skillCount: config.skillIds.length,
+    models: config.agentKind === "k_agent" ? runtime.modelCatalog ?? runtime.models : runtime.agents.find((agent) => agent.id === config.agentKind)?.models ?? [],
     modelId: config.modelId ?? "",
     permissionMode: config.permissionMode,
     selectedMcpIds: [...config.mcpServerIds],
@@ -92,7 +98,7 @@ export function selectAgent(
   if (!match) return { error: `未找到 Agent “${target}”` };
   if (!match.enabled) return { error: `Agent “${match.id}” 当前不可用` };
   return {
-    config: { ...config, agentKind: match.id },
+    config: { ...config, agentKind: match.id, ...(match.models?.length ? { modelId: match.models.some((item) => item.id === match.defaultModelId) ? match.defaultModelId! : match.models[0]!.id } : {}) },
     notice: `已切换 Agent ${match.name === match.id ? match.id : `${match.name} (${match.id})`}，下一轮生效`,
   };
 }

@@ -4221,7 +4221,9 @@ function splitSpeakableChunks(text: string, force: boolean): { ready: string[]; 
 }
 
 function splitTextForManualSpeech(content: string): string[] {
-  const chunks = splitSpeakableChunks(content, true).ready
+  // 先清理整段 Markdown，避免切片把链接截成几段后无法去掉 URL。
+  const cleaned = sanitizeSpeechText(content);
+  const chunks = splitSpeakableChunks(cleaned, true).ready
     .map((chunk) => sanitizeSpeechText(chunk))
     .filter((chunk) => chunk.length > 0);
   return chunks.length ? chunks : sanitizeSpeechText(content) ? [sanitizeSpeechText(content)] : [];

@@ -28,7 +28,7 @@ export function McpMenu({ model, selected, detailId }: {
           : servers.map((server, itemIndex) => (
             <Text key={server.id} inverse={itemIndex === selected}>
               {itemIndex === selected ? `${TERMINAL_DESIGN.symbols.pointer} ` : "  "}
-              {statusMark(server)} {server.enabled ? "on " : "off"} {server.name}
+              {model.runtime.selectedMcpIds.includes(server.id) ? "[✓]" : "[ ]"} {statusMark(server)} {server.enabled ? "on " : "off"} {server.name}
               {server.name === server.id ? "" : ` (${server.id})`}
               {typeof server.toolCount === "number" ? ` · ${server.toolCount} tools` : ""}
               {server.status ? ` · ${server.status}` : ""}
@@ -39,7 +39,7 @@ export function McpMenu({ model, selected, detailId }: {
           ? "正在写入 Access Layer…"
           : detailId
             ? "Esc 返回列表"
-            : "↑↓ 选择   Space 开关   Enter 工具   r 重载   Esc 关闭"}
+            : "↑↓ 选择   s 本轮勾选   a 全选 / n 全不选   Space 开关全局配置   Enter 工具   r 重载   Esc 关闭"}
       </Text>
     </Box>
   );

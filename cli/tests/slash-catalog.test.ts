@@ -32,7 +32,7 @@ test("选择栏只声明 application 层已实现的命令", () => {
   const supported = new Set([
     "new", "sessions", "chat", "home", "team", "auto", "automation", "doctor",
     "workspace", "stop", "cancel", "trace", "model", "agent", "mcp", "skill",
-    "permissions", "help", "quit",
+    "permissions", "help", "quit", "workbench", "projects", "fork", "compact", "handoff",
   ]);
   for (const command of SLASH_COMMANDS) {
     assert.ok(supported.has(command.name), `未实现的命令 /${command.name}`);

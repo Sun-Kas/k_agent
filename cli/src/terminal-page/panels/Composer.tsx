@@ -30,7 +30,7 @@ import {
  * 输入法预编辑画在真实光标上，不进草稿。确认后的汉字必须按行编辑光标插入。
  * 父层改写草稿时不能把光标甩到行尾，否则会出现「拼音显示在中间、上屏却接到末尾」。
  */
-export function Composer({ value, disabled, focused, captureDigits, suppressKeys, lockInput = false, historyEnabled = false, onHistory, onChange, onSubmit }: {
+export function Composer({ value, disabled, focused, captureDigits, suppressKeys, lockInput = false, mask = false, historyEnabled = false, onHistory, onChange, onSubmit }: {
   value: string;
   disabled: boolean;
   focused: boolean;
@@ -40,6 +40,7 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
   suppressKeys: boolean;
   /** MCP 管理栏打开时，全部按键归管理栏，草稿不能被 Space / r 污染。 */
   lockInput?: boolean;
+  mask?: boolean;
   /** 首页空输入时 ↑↓ 选功能，不召回历史。 */
   historyEnabled?: boolean;
   onHistory?: (delta: 1 | -1, liveDraft: string) => string | undefined;
@@ -63,8 +64,8 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
     setEditor(next);
   }, [value]);
 
-  const before = textBeforeCursor(editor);
-  const after = `${graphemeAtCursor(editor)}${textAfterCursor(editor)}`;
+  const before = mask ? "•".repeat(Array.from(textBeforeCursor(editor)).length) : textBeforeCursor(editor);
+  const after = mask ? "•".repeat(Array.from(`${graphemeAtCursor(editor)}${textAfterCursor(editor)}`).length) : `${graphemeAtCursor(editor)}${textAfterCursor(editor)}`;
   const prompt = `${TERMINAL_DESIGN.symbols.prompt} `;
   // ref 属于输入框内容行，真实光标直接继承该子节点的 Y；边框不能参与纵向坐标换算。
   useImeCursor(inputLineRef, `${prompt}${before}`, active);
@@ -89,7 +90,7 @@ export function Composer({ value, disabled, focused, captureDigits, suppressKeys
   useInput((input, key) => {
     if (!focused || disabled) return;
     if (lockInput) return;
-    if (suppressKeys && (key.return || key.tab || key.escape || key.upArrow || key.downArrow)) return;
+    if (suppressKeys && ((key.return && !key.meta) || key.tab || key.escape || key.upArrow || key.downArrow)) return;
     if (captureDigits && !editorRef.current.value && !key.ctrl && !key.meta && /^[1-4]$/.test(input)) return;
     if (!editorRef.current.value && !key.ctrl && !key.meta && input === "?") return;
     if ((key.upArrow || key.downArrow) && historyEnabled && onHistory) {

@@ -8,6 +8,7 @@ export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
+  attachments?: MediaAttachment[];
   createdAt: string;
   meta?: {
     toolName?: string;
@@ -17,10 +18,73 @@ export interface ChatMessage {
 }
 
 export interface SessionSummary {
+  projectId?: string | null;
+  environment?: SessionEnvironment | null;
   id: string;
   title: string;
   updatedAt: string;
   messageCount: number;
+}
+
+export interface SessionEnvironment {
+  kind: "local" | "worktree";
+  cwd: string;
+  projectId: string;
+  repositoryRoot?: string | null;
+  gitCommonDir?: string | null;
+  baseOid?: string | null;
+  branchRef?: string | null;
+  detached: boolean;
+  worktreeId?: string | null;
+}
+
+/** Project：稳定文件夹 + 会话归属关系，不是新的运行时。 */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  rootPath: string;
+  isGitRepository?: boolean;
+  repositoryRoot?: string | null;
+  gitCommonDir?: string | null;
+  targetBranch?: string | null;
+  sessionCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 目录浏览弹窗（新建 Project）里一个可进入的子目录条目。 */
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface ProjectRepository {
+  isGitRepository: boolean;
+  branchRef?: string | null;
+  targetBranch?: string | null;
+  branches: string[];
+}
+
+export interface IntegrationState {
+  status: "idle" | "merging" | "conflicts" | "ready" | "publishing" | "completed" | "aborted" | "failed";
+  targetBranch?: string | null;
+  conflicts: string[];
+  message?: string;
+  resultOid?: string;
+}
+
+export interface IntegrationFile {
+  path: string;
+  content: string;
+  binary: boolean;
+  hash: string;
+}
+
+/** `/api/fs/browse` 的返回：当前目录、父目录（到盘符根时为 null）和子目录列表。 */
+export interface DirectoryListing {
+  path: string;
+  parent: string | null;
+  entries: DirectoryEntry[];
 }
 
 export interface SessionWorkspaceFile {
@@ -80,6 +144,7 @@ export interface ApprovalActivity {
 }
 
 export interface SessionState {
+  environment?: SessionEnvironment | null;
   sessionId: string;
   events: AgUiEvent[];
   openInterrupts?: Array<Omit<ApprovalActivity, "sequence"> & {
@@ -193,6 +258,15 @@ export interface ModelProfile {
   model: string;
   baseUrl: string;
   apiKeyConfigured: boolean;
+  apiKey?: string;
+  apiKeyEnv?: string;
+  multimodal?: boolean;
+  inputModalities?: Array<"text" | "image" | "video">;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  contextSafetyTokens?: number;
+  autoCompactEnabled?: boolean;
+  compactModelId?: string | null;
   supportsReasoning: boolean;
   enabled: boolean;
 }
@@ -260,6 +334,7 @@ export interface AgUiRunInput {
       | { answers: UserQuestionAnswers; reconfirm?: boolean };
   }>;
   forwardedProps: {
+    attachments?: MediaAttachment[];
     modelId?: string;
     mcpServerIds?: string[];
     skillIds?: string[];
@@ -269,6 +344,8 @@ export interface AgUiRunInput {
       cliSessionMode?: CliSessionMode;
       permissionMode?: PermissionMode;
       networkAccess?: boolean;
+      resumeSessionId?: string;
+      claudeAutoApproveTools?: string[];
     };
   };
 }
@@ -292,4 +369,51 @@ export interface ScheduledRunSummary extends Record<string, unknown> {
   status: string;
   scheduledFor: string;
   sessionId?: string | null;
+}
+
+export interface MediaAttachment { name: string; dataUrl: string; type: string }
+
+export interface SessionGitChange {
+  path: string;
+  status: string;
+  originalPath?: string | null;
+}
+
+export interface SessionChanges {
+  sessionId: string;
+  baseOid?: string | null;
+  files: SessionGitChange[];
+}
+
+
+export interface SessionContextStatus {
+  generation: number;
+  boundaryId?: string | null;
+  lastCompactedAt?: string | null;
+  trigger?: string | null;
+  beforeTokens?: number | null;
+  afterTokens?: number | null;
+  savedTokens?: number | null;
+  warning: boolean;
+  autoDisabled: boolean;
+  consecutiveAutoFailures: number;
+  lastFailureCode?: string | null;
+  pendingContinuation: boolean;
+}
+
+
+export interface ScheduledTaskInput {
+  name: string;
+  prompt: string;
+  scheduleKind: "once" | "daily" | "weekly";
+  localDate?: string | null;
+  weekdays: number[];
+  localTime: string;
+  timezone: string;
+  agentKind: AgentKind;
+  modelId: string;
+  reasoningEffort: ReasoningEffort;
+  mcpServerIds: string[];
+  skillIds: string[];
+  permissionMode: PermissionMode;
 }

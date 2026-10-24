@@ -2,12 +2,13 @@ import type {
   AgUiEvent,
   ApprovalActivity,
   SessionState,
+  MediaAttachment,
 } from "../protocol/index.js";
 
 export type ActivityStatus = "active" | "waiting" | "complete" | "error" | "stopped";
 
 export type TimelineItem =
-  | { kind: "user"; id: string; runId?: string; content: string; sequence: number }
+  | { kind: "user"; attachments?: MediaAttachment[]; id: string; runId?: string; content: string; sequence: number }
   | { kind: "text"; id: string; runId?: string; content: string; status: ActivityStatus; sequence: number }
   | { kind: "thinking"; id: string; runId?: string; title: string; content: string; status: ActivityStatus; sequence: number }
   | { kind: "tool"; id: string; runId?: string; name: string; arguments: string; result?: string; liveOutput?: string; status: ActivityStatus; sequence: number }
@@ -22,6 +23,7 @@ export interface TimelineState {
   activeReasoningId: string | undefined;
   activeThinkingStepId: string | undefined;
   activeTextId: string | undefined;
+  contextNotice?: string;
 }
 
 export function emptyTimeline(): TimelineState {
@@ -36,8 +38,8 @@ export function emptyTimeline(): TimelineState {
   };
 }
 
-export function appendUserPrompt(state: TimelineState, id: string, content: string, runId?: string): TimelineState {
-  return appendItem(state, { kind: "user", id, content, ...(runId ? { runId } : {}) });
+export function appendUserPrompt(state: TimelineState, id: string, content: string, runId?: string, attachments?: MediaAttachment[]): TimelineState {
+  return appendItem(state, { kind: "user", id, content, ...(attachments?.length ? { attachments } : {}), ...(runId ? { runId } : {}) });
 }
 
 /**
@@ -54,7 +56,7 @@ export function projectEvent(
     history ? delta : previous + delta;
   switch (event.type) {
     case "input_message":
-      return appendUserPrompt(state, event.message.id, event.message.content, event.runId);
+      return appendUserPrompt(state, event.message.id, event.message.content, event.runId, event.message.attachments);
     case "RUN_STARTED":
       return { ...state, runId: event.runId, runStatus: "running" };
     case "REASONING_START": {
@@ -145,11 +147,13 @@ export function projectEvent(
     case "CUSTOM":
       if (event.name === "approval_request") return projectApproval(state, event.value);
       if (event.name === "approval_resolved") return projectApproval(state, event.value);
+      if (event.name === "context_warning") return { ...state, contextNotice: "上下文接近上限，将在需要时自动压缩" };
+      if (event.name === "context_compacted") return { ...state, contextNotice: "上下文已压缩，正在继续当前任务" };
       if (event.name === "tool_output_delta") {
         const toolCallId = String(event.value.toolCallId ?? "");
         const delta = String(event.value.delta ?? "");
         return updateItem(state, toolCallId, (item) =>
-          item.kind === "tool" ? { ...item, liveOutput: `${item.liveOutput ?? ""}${delta}` } : item,
+          item.kind === "tool" ? { ...item, liveOutput: `${item.liveOutput ?? ""}${delta}`, status: "active" } : item,
         );
       }
       return state;

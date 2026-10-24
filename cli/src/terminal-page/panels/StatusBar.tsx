@@ -29,6 +29,7 @@ export function StatusBar({ model, queuedCount = 0 }: { model: TerminalPageViewM
         {TERMINAL_DESIGN.copy.composerKeys}
         {queuedCount > 0 ? `   排队 ${queuedCount}` : ""}
         {model.notice ? `   ${model.notice}` : ""}
+        {model.timeline.contextNotice ? `   ${model.timeline.contextNotice}` : ""}
       </Text>
       <Text wrap="truncate-end">
         <Text color={TERMINAL_DESIGN.colors.muted}>

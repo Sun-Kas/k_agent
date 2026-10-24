@@ -35,6 +35,11 @@ export const SLASH_COMMANDS: readonly SlashCommandItem[] = [
   { name: "skill", group: "运行时", hint: "管理 Skill（开关写入 Access Layer）", readOnly: true },
   { name: "permissions", group: "运行时", hint: "切换权限模式（下一轮生效）", readOnly: true },
   { name: "help", group: "其他", hint: "列出全部快捷键", readOnly: true },
+  { name: "projects", group: "导航", hint: "进入项目：选择文件夹、开工和分支会话", readOnly: true },
+  { name: "fork", group: "会话", hint: "从当前会话分支；参数 worktree 使用隔离目录，here 从最后一条回复" },
+  { name: "compact", group: "会话", hint: "压缩当前会话上下文；参数 reset 重置自动压缩" },
+  { name: "handoff", group: "会话", hint: "在 Local 与 Worktree 之间切换；可跟 local 或 worktree" },
+  { name: "workbench", group: "导航", hint: "全部功能：Git、配置、广场、团队和定时任务（Ctrl+G）", readOnly: true },
   { name: "quit", group: "其他", hint: "退出终端工作台", readOnly: true },
 ];
 
@@ -83,7 +88,8 @@ export function slashCommandAvailability(
     if (!model.activeSessionId) return { enabled: false, reason: "尚未打开 Session" };
     return { enabled: true };
   }
-  if (item.name === "new") {
+  if (item.name === "new" || item.name === "fork" || item.name === "compact" || item.name === "handoff") {
+    if (!model.activeSessionId && item.name !== "new") return { enabled: false, reason: "尚未打开 Session" };
     return running ? { enabled: false, reason: "当前 Run 未结束" } : { enabled: true };
   }
   return { enabled: true };
@@ -97,6 +103,7 @@ export function slashCommandValue(item: SlashCommandItem, model: TerminalPageVie
   if (item.name === "skill") return String(model.runtime.skillCount);
   if (item.name === "permissions") return model.runtime.permissionMode;
   if (item.name === "sessions") return String(model.sessions.length);
+  if (item.name === "projects") return model.projects.find((project) => project.id === model.activeProjectId)?.name || String(model.projects.length);
   if (item.name === "team") return String(model.teams.length);
   if (item.name === "auto") return String(model.automations.length);
   return "";

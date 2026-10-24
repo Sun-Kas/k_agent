@@ -73,6 +73,9 @@ function forwardedProps(config: CliRuntimeConfig): AgUiRunInput["forwardedProps"
     agentKind: config.agentKind,
     agentOptions: {
       permissionMode: config.permissionMode,
+      ...(config.networkAccess === undefined ? {} : { networkAccess: config.networkAccess }),
+      ...(config.resumeSessionId ? { resumeSessionId: config.resumeSessionId } : {}),
+      ...(config.claudeAutoApproveTools ? { claudeAutoApproveTools: config.claudeAutoApproveTools } : {}),
       ...(config.agentKind === "k_agent" ? {} : { cliSessionMode: config.cliSessionMode }),
     },
   };

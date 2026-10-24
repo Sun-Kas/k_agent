@@ -1,6 +1,8 @@
 import React from "react";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { render as renderInk } from "ink";
 import { render } from "ink-testing-library";
 import { resolveCliConfig } from "../src/config/index.js";
 import { emptyViewModel } from "../src/application/view-model.js";
@@ -347,6 +349,112 @@ test("需要参数的命令只补全草稿，不提交缺参数动作", async ()
   view.unmount();
 });
 
+test("离开对话或切换会话后，上一份记录不再留在新页面上", async () => {
+  const chatting = {
+    ...chatModel(),
+    activeSessionId: "s1",
+    timeline: {
+      ...chatModel().timeline,
+      items: [
+        { kind: "user" as const, id: "u1", content: "你好", sequence: 1 },
+        { kind: "text" as const, id: "a1", content: "我是 K Agent", status: "complete" as const, sequence: 2 },
+      ],
+    },
+  };
+  const view = render(<TerminalPage model={chatting} onAction={() => {}} />);
+  await flush();
+  assert.match(stripStyles(view.lastFrame() ?? ""), /你好/);
+
+  view.rerender(<TerminalPage model={{ ...chatting, surface: "home" }} onAction={() => {}} />);
+  await flush();
+  assert.doesNotMatch(stripStyles(view.lastFrame() ?? ""), /你好/);
+
+  view.rerender(<TerminalPage model={{
+    ...chatting,
+    surface: "projects",
+    activeProjectId: "p1",
+    projects: [{ id: "p1", name: "project_test", rootPath: "/tmp/project_test", sessionCount: 0, createdAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" }],
+  }} onAction={() => {}} />);
+  await flush();
+  const projectFrame = stripStyles(view.lastFrame() ?? "");
+  assert.doesNotMatch(projectFrame, /你好/);
+  assert.match(projectFrame, /project_test/);
+
+  view.rerender(<TerminalPage model={{
+    ...chatting,
+    activeSessionId: "s2",
+    timeline: {
+      ...chatting.timeline,
+      items: [
+        { kind: "user" as const, id: "u2", content: "只看这一段", sequence: 1 },
+        { kind: "text" as const, id: "a2", content: "新会话", status: "complete" as const, sequence: 2 },
+      ],
+    },
+  }} onAction={() => {}} />);
+  await flush();
+  const switched = stripStyles(view.lastFrame() ?? "");
+  assert.doesNotMatch(switched, /你好/);
+  assert.match(switched, /只看这一段/);
+  view.unmount();
+});
+
+test("真实终端离开对话时用整屏清除抹掉滚动区里的上一份记录", async () => {
+  const stdout = new TranscriptStdout();
+  const chatting = {
+    ...chatModel(),
+    activeSessionId: "s1",
+    timeline: {
+      ...chatModel().timeline,
+      items: [
+        { kind: "user" as const, id: "u1", content: "你好", sequence: 1 },
+        { kind: "text" as const, id: "a1", content: "我是 K Agent", status: "complete" as const, sequence: 2 },
+      ],
+    },
+  };
+  const app = renderInk(<TerminalPage model={chatting} onAction={() => {}} />, {
+    stdout: stdout as unknown as NodeJS.WriteStream,
+    stdin: transcriptStdin(),
+    patchConsole: false,
+    exitOnCtrlC: false,
+    interactive: true,
+  });
+  await flush();
+  assert.match(stdout.chunks.join(""), /你好/);
+  app.rerender(<TerminalPage model={{
+    ...chatting,
+    surface: "projects",
+    activeProjectId: "p1",
+    projects: [{ id: "p1", name: "project_test", rootPath: "/tmp/project_test", sessionCount: 0, createdAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z" }],
+  }} onAction={() => {}} />);
+  await flush();
+  await flush();
+  const tail = stdout.chunks.join("").split("\u001b[2J").at(-1) ?? "";
+  assert.doesNotMatch(tail, /你好/);
+  assert.match(tail, /project_test/);
+  app.unmount();
+});
+
+test("草稿会话拿到真实 id 时保留刚写上的内容", async () => {
+  const draft = {
+    ...chatModel(),
+    timeline: {
+      ...chatModel().timeline,
+      items: [
+        { kind: "user" as const, id: "u1", content: "第一句", sequence: 1 },
+        { kind: "text" as const, id: "a1", content: "已经回复", status: "complete" as const, sequence: 2 },
+      ],
+    },
+  };
+  const view = render(<TerminalPage model={draft} onAction={() => {}} />);
+  await flush();
+  view.rerender(<TerminalPage model={{ ...draft, activeSessionId: "s-new" }} onAction={() => {}} />);
+  await flush();
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /第一句/);
+  assert.match(frame, /已经回复/);
+  view.unmount();
+});
+
 test("已完成的多轮对话不靠 PgUp 裁切历史", () => {
   const model = {
     ...chatModel(),
@@ -431,18 +539,18 @@ test("首页提供操作引导、模式切换和最近会话，不预置示例�
   assert.match(frame, /欢迎使用 K Agent/);
   assert.match(frame, /开始/);
   assert.match(frame, /\/ 命令/);
-  assert.match(frame, /切换模式/);
-  assert.match(frame, /1 工作/);
-  assert.match(frame, /2 团队/);
-  assert.match(frame, /3 自动/);
-  assert.match(frame, /4 诊断/);
+  assert.match(frame, /Shift\+Tab/);
+  assert.match(frame, /1 项目/);
+  assert.match(frame, /2 技能/);
+  assert.match(frame, /3 连接器/);
+  assert.match(frame, /4 定时任务/);
   assert.match(frame, /最近会话/);
   assert.match(frame, /昨晚的任务/);
   assert.doesNotMatch(frame, /快捷提问/);
   assert.doesNotMatch(frame, /今天想完成什么/);
   view.stdin.write("2");
   await flush();
-  assert.deepEqual(actions, [{ type: "open_surface", surface: "team" }]);
+  assert.deepEqual(actions, [{ type: "open_surface", surface: "skills" }]);
   view.unmount();
 });
 
@@ -451,7 +559,29 @@ test("Shift+Tab 在一级模式之间切换", async () => {
   const view = render(<TerminalPage model={chatModel()} onAction={(action) => actions.push(action)} />);
   view.stdin.write("\u001b[Z");
   await flush();
-  assert.deepEqual(actions, [{ type: "open_surface", surface: "doctor" }]);
+  assert.deepEqual(actions, [{ type: "open_surface", surface: "automation" }]);
+  view.unmount();
+});
+
+test("项目首页进入所选项目，而不是打开通用表单", async () => {
+  const model = {
+    ...chatModel(),
+    surface: "projects" as const,
+    projects: [
+      { id: "p1", name: "仓库", rootPath: "/repo", sessionCount: 1, createdAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-02T00:00:00.000Z", isGitRepository: true, targetBranch: "main" },
+      { id: "p2", name: "笔记", rootPath: "/notes", sessionCount: 0, createdAt: "2026-10-01T00:00:00.000Z", updatedAt: "2026-10-01T00:00:00.000Z" },
+    ],
+  };
+  const actions: TerminalPageAction[] = [];
+  const view = render(<TerminalPage model={model} onAction={(action) => actions.push(action)} />);
+  const frame = stripStyles(view.lastFrame() ?? "");
+  assert.match(frame, /仓库/);
+  assert.match(frame, /Enter 进入/);
+  view.stdin.write("\u001b[B");
+  await flush();
+  view.stdin.write("\r");
+  await flush();
+  assert.deepEqual(actions.at(-1), { type: "enter_project", projectId: "p2" });
   view.unmount();
 });
 
@@ -491,6 +621,33 @@ function chatModel() {
 /** Ink 会在选中项上叠加反显序列，断言前先剥离样式，避免匹配到控制字符。 */
 function stripStyles(frame: string): string {
   return frame.replace(/\u001B\[[0-9;]*m/g, "");
+}
+
+function transcriptStdin(): NodeJS.ReadStream {
+  const stdin = new EventEmitter() as NodeJS.ReadStream & { isTTY: boolean };
+  stdin.isTTY = true;
+  Object.assign(stdin, {
+    setRawMode: () => stdin,
+    setEncoding: () => stdin,
+    read: () => null,
+    resume: () => stdin,
+    pause: () => stdin,
+    ref: () => stdin,
+    unref: () => stdin,
+  });
+  return stdin;
+}
+
+class TranscriptStdout extends EventEmitter {
+  isTTY = true;
+  columns = 100;
+  rows = 40;
+  chunks: string[] = [];
+
+  write(chunk: string): boolean {
+    this.chunks.push(String(chunk));
+    return true;
+  }
 }
 
 async function flush(): Promise<void> {

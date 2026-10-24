@@ -23,6 +23,7 @@ export function isSettledTimelineItem(item: TimelineItem): boolean {
 /**
  * 已完成的前缀写入终端原生滚动区；第一个未完成条目及其之后留在动态区。
  * 这样提示符始终在底部，上文用鼠标/触控板/终端滚动查看，而不是 PgUp 翻页。
+ * 离开当前对话或换到另一个会话时，页面会清掉这段滚动区。
  */
 export function splitSettledTimeline(items: readonly TimelineItem[]): {
   settled: TimelineItem[];

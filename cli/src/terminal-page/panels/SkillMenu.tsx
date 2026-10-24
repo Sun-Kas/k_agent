@@ -20,14 +20,14 @@ export function SkillMenu({ model, selected }: {
         : skills.map((skill, itemIndex) => (
           <Text key={skill.id} inverse={itemIndex === safeSelected}>
             {itemIndex === safeSelected ? `${TERMINAL_DESIGN.symbols.pointer} ` : "  "}
-            {skill.enabled ? "● on " : "○ off"} {skill.name}
+            {model.runtime.selectedSkillIds.includes(skill.id) ? "[✓] " : "[ ] "}{skill.enabled ? "● on " : "○ off"} {skill.name}
             {skill.name === skill.id ? "" : ` (${skill.id})`}
           </Text>
         ))}
       <Text color={TERMINAL_DESIGN.colors.muted}>
         {model.mcpBusy
           ? "正在写入 Access Layer…"
-          : "↑↓ 选择   Space / Enter 开关   Esc 关闭"}
+          : "↑↓ 选择   s 本轮勾选   a 全选 / n 全不选   Space / Enter 开关全局配置   Esc 关闭"}
       </Text>
     </Box>
   );

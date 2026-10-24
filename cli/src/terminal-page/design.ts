@@ -100,14 +100,15 @@ export const TERMINAL_DESIGN = {
     newActivity: "有新的运行活动",
     reviewPendingInput: "按 ! 返回待处理输入",
     /** 提示符下方的 REPL 脚注，风格对齐 Claude Code：短、灰、可发现。 */
-    composerKeys: "? 帮助   / 命令   ↑ 历史   Ctrl+P 会话",
+    composerKeys: "? 帮助   / 命令   Ctrl+G 全部功能   Ctrl+P 会话",
     slashKeys: "↑↓ 选择   Tab 补全   Enter 执行   Esc 收起",
     paletteKeys: "输入以过滤   ↑↓ 选择   Enter 执行   Esc 关闭",
     startGuideTitle: "开始",
     startGuide: [
-      "输入目标后回车即可开始",
+      "Ctrl+G 完整功能：项目、Git、配置、广场、团队和定时任务",
+      "输入目标后回车即可开始；/projects 先进入项目",
       "运行中仍可输入，回车后排队发送",
-      "终端滚动查看上文 · / 命令 · ↑ 历史 · Ctrl+P 会话 · Shift+Tab 切换模式",
+      "终端滚动查看上文 · / 命令 · ↑ 历史 · Ctrl+P 会话 · Shift+Tab 切换项目 / 技能 / 连接器 / 定时任务",
     ],
   },
   keys: {
@@ -128,4 +129,14 @@ export function terminalLayout(columns: number): TerminalLayout {
   if (columns >= TERMINAL_DESIGN.layout.standardMinColumns) return "standard";
   if (columns >= TERMINAL_DESIGN.layout.compactMinColumns) return "compact";
   return "minimum";
+}
+
+/** 单个终端应用共享调色板，修改后由偏好状态触发 React 重绘。 */
+export function applyTerminalPreferences(theme: string, fontSizeDelta: number): void {
+  const palettes: Record<string, { accent: string; muted: string }> = {
+    snow: { accent: "#111111", muted: "#666666" }, ink: { accent: "#f5f5f5", muted: "#aaaaaa" }, blueprint: { accent: "#2b59ff", muted: "#8090a8" }, forest: { accent: "#5b8cff", muted: "#94a3b8" }, ocean: { accent: "#3ec4e0", muted: "#80a5b5" }, sand: { accent: "#e08a3c", muted: "#ab9383" }, dusk: { accent: "#ff6b3d", muted: "#b09485" },
+  };
+  Object.assign(TERMINAL_DESIGN.colors, palettes[theme] ?? palettes.blueprint);
+  // 终端宿主掌管实际字体像素；CLI 阅读缩放通过行距适配，不伪造宿主字体已改变。
+  Object.assign(TERMINAL_DESIGN.density, { timelineGapRows: fontSizeDelta > 2 ? 2 : fontSizeDelta < 0 ? 0 : 1 });
 }

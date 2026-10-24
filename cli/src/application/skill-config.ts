@@ -22,11 +22,10 @@ export function catalogItemsFromSkills(skills: SkillConfigItem[]): RuntimeCatalo
 
 export function applySkillsToRuntime(runtime: RuntimeSummary, skills: SkillConfigItem[]): RuntimeSummary {
   const items = catalogItemsFromSkills(skills);
-  const enabledCount = items.filter((item) => item.enabled).length;
   return {
     ...runtime,
     skills: items,
-    skillCount: runtime.selectedSkillIds.length || enabledCount,
+    skillCount: runtime.selectedSkillIds.length,
   };
 }
 

@@ -12,6 +12,7 @@ import { splitSettledTimeline } from "../repl-view.js";
 /**
  * 对话是一段贴在提示符上方的 REPL 日志。
  * 已完成轮次由父层写入终端滚动区；这里只画仍在变化的条目。
+ * 离开对话或换会话后，那段滚动区会被清掉，不再留在下一屏上面。
  */
 export function ChatScreen({ model, layout: _layout, focus: _focus, showInspector, pendingPrompts = [] }: {
   model: TerminalPageViewModel;

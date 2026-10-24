@@ -22,12 +22,11 @@ export function applyMcpServersToRuntime(
   tools?: McpToolInfo[],
 ): RuntimeSummary {
   const mcpServers = catalogItemsFromMcpServers(servers);
-  const enabledCount = mcpServers.filter((item) => item.enabled).length;
   return {
     ...runtime,
     mcpServers,
     mcpTools: tools ?? runtime.mcpTools,
-    mcpCount: runtime.selectedMcpIds.length || enabledCount,
+    mcpCount: runtime.selectedMcpIds.length,
   };
 }
 

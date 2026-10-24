@@ -10,9 +10,11 @@ export function HelpOverlay({ onClose }: { onClose: () => void }): React.ReactEl
   return (
     <Overlay title="快捷键">
       <Text>/         展开命令选择栏（Tab 补全 · Enter 执行）</Text>
+      <Text>Ctrl+G    全部功能：Git、配置、广场、团队和定时任务</Text>
+      <Text>/projects 进入项目：开工、同目录分支、隔离 Worktree</Text>
       <Text>Ctrl+K    同一命令目录的浮层入口（运行中或断线时可用）</Text>
-      <Text>Shift+Tab  切换 工作 / 团队 / 自动 / 诊断</Text>
-      <Text>1–4       直接跳到对应模式（输入框为空时）</Text>
+      <Text>Shift+Tab  切换 项目 / 技能 / 连接器 / 定时任务</Text>
+      <Text>1–4       同上，对应网页侧栏（输入框为空时）</Text>
       <Text>↑↓        提示符历史（首页空输入时选功能）</Text>
       <Text>终端滚动 查看更早的对话，提示符保持在底部</Text>
       <Text>?         打开本页</Text>

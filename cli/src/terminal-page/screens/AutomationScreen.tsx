@@ -6,7 +6,7 @@ import { ScreenFrame } from "../panels/ScreenFrame.js";
 
 export function AutomationScreen({ automations }: { automations: ScheduledTaskSummary[] }): React.ReactElement {
   return (
-    <ScreenFrame title="AUTOMATIONS" count={`${automations.length} 个任务`}>
+    <ScreenFrame title="定时任务" count={`${automations.length} 个任务`}>
       <Box justifyContent="space-between">
         <Text color={TERMINAL_DESIGN.colors.muted}>任务</Text>
         <Text color={TERMINAL_DESIGN.colors.muted}>状态 · 下次执行</Text>

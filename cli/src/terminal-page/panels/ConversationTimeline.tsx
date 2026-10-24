@@ -35,6 +35,7 @@ export function TimelineEntry({ item, expanded }: {
         <Text color={queued ? TERMINAL_DESIGN.colors.muted : TERMINAL_DESIGN.colors.accent}>{TERMINAL_DESIGN.symbols.prompt} </Text>
         <Box flexDirection="column">
           <MarkdownBlock content={item.content} />
+          {item.attachments?.map((file, index) => <Text key={index} dimColor>附件 {file.name} · {file.type}</Text>)}
           {queued ? <Text color={TERMINAL_DESIGN.colors.muted}>排队发送</Text> : null}
         </Box>
       </Box>
