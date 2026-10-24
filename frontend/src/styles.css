@@ -2580,7 +2580,8 @@ img.brand-symbol {
 .runtime-settings-trigger > em { color: var(--dim); font-style: normal; white-space: nowrap; }
 .trigger-chevron { width: 12px; height: 12px; flex: 0 0 12px; overflow: visible; fill: none; stroke: var(--dim); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; transform: rotate(180deg); transform-origin: center; transition: transform var(--duration-popover) ease; }
 .runtime-settings.open .trigger-chevron,
-.composer-permission.open .trigger-chevron { transform: rotate(0deg); }
+.composer-permission.open .trigger-chevron,
+.composer-project-trigger[aria-expanded="true"] > .trigger-chevron { transform: rotate(0deg); }
 
 /* Both composite menus are physically anchored to their footer triggers so
    the control and the surface read as one reversible interaction. */
