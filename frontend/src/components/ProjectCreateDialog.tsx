@@ -199,7 +199,7 @@ export function ProjectCreateDialog({
 
           {error && <p className="marketplace-dialog-alert">{error}</p>}
           <p className="marketplace-dialog-hint">
-            选中当前目录后点击"选择此文件夹"即可创建 Project；Project 名称默认取文件夹名，创建后可在侧栏双击重命名。
+            选中当前目录后点击"选择此文件夹"即可创建项目；项目名称默认取文件夹名，创建后可在项目信息中编辑。
           </p>
         </div>
         <footer>

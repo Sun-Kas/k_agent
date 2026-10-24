@@ -21,6 +21,8 @@ import {
   createProjectSession,
   deleteSession,
   forkSession,
+  getSessionChanges,
+  getSessionDiff,
   getAgentsCatalog,
   getHealth,
   getModelsConfig,
@@ -28,6 +30,8 @@ import {
   getSession,
   getSessionWorkspace,
   getSessionWorkspaceFile,
+  getProjectRepository,
+  handoffSessionEnvironment,
   listProjects,
   listSessions,
   renameProject,
@@ -36,7 +40,16 @@ import {
 } from "./api/agui";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { MessageActionIcon } from "./components/MessageActionIcon";
+import { ProjectBranchSelect } from "./components/ProjectBranchSelect";
+import { ComposerProjectPicker } from "./components/ComposerProjectPicker";
+import { resolveComposerSession } from "./composer-session";
+import { PinnedProjects } from "./components/PinnedProjects";
+import { parseProjectPins, toggleProjectPin } from "./project-pins";
+import { ProjectsView } from "./components/ProjectsView";
+import { SidebarModeSwitcher } from "./components/SidebarModeSwitcher";
+import { selectSidebarSessions } from "./sidebar-sessions";
 import { ProjectCreateDialog } from "./components/ProjectCreateDialog";
+import { ProjectIntegrationPanel } from "./components/ProjectIntegrationPanel";
 import { groupDisplayMessages, InlineToolActivity, toolResultFailed } from "./components/ConversationTranscript";
 import { ConfigCenter } from "./components/ConfigCenter";
 import { Marketplace } from "./components/Marketplace";
@@ -233,13 +246,20 @@ function normalizeSessionSummaries(sessions: unknown): SessionSummary[] {
     const updatedAt = typeof rawUpdatedAt === "string" && !Number.isNaN(new Date(rawUpdatedAt).getTime())
       ? rawUpdatedAt
       : new Date().toISOString();
+    const rawEnvironment = record.environment;
+    const environment = rawEnvironment && typeof rawEnvironment === "object"
+      && "kind" in rawEnvironment && ["local", "worktree"].includes(String(rawEnvironment.kind))
+      && "cwd" in rawEnvironment && typeof rawEnvironment.cwd === "string"
+      && "projectId" in rawEnvironment && typeof rawEnvironment.projectId === "string"
+        ? rawEnvironment as SessionSummary["environment"] : null;
 
     return [{
       id: record.id,
       title: typeof record.title === "string" && record.title ? record.title : "新会话",
       updatedAt,
       messageCount: typeof record.messageCount === "number" ? record.messageCount : 0,
-      projectId: typeof record.projectId === "string" && record.projectId ? record.projectId : null
+      projectId: typeof record.projectId === "string" && record.projectId ? record.projectId : null,
+      environment
     }];
   });
 }
@@ -314,11 +334,21 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  // 折叠态按 Project id 存；默认展开，不在 localStorage 里也不影响渲染正确性。
-  const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(() => new Set());
-  // "Chat" 分组（未归属任何 Project 的会话）自己的折叠状态，与 Project 分组的折叠状态分开存
-  // 存储，因为它不对应任何 projectId。
-  const [chatGroupCollapsed, setChatGroupCollapsed] = useState(false);
+  const [pinnedProjectIds, setPinnedProjectIds] = useState<string[]>(() => {
+    try { return parseProjectPins(localStorage.getItem("k-agent-pinned-projects")); } catch { return []; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("k-agent-pinned-projects", JSON.stringify(pinnedProjectIds)); } catch { /* 本地存储不可用时仍保留本次会话的置顶操作。 */ }
+  }, [pinnedProjectIds]);
+  const pinnedProjects = pinnedProjectIds.flatMap((id) => {
+    const project = projects.find((item) => item.id === id);
+    return project ? [project] : [];
+  });
+  function togglePinnedProject(projectId: string) {
+    setPinnedProjectIds((current) => toggleProjectPin(current, projectId));
+  }
+  // null 表示全部最近会话；选中项目只筛选列表，不改变会话的归属或执行目录。
+  const [sidebarProjectId, setSidebarProjectId] = useState<string | null>(null);
   const [projectCreateDialogOpen, setProjectCreateDialogOpen] = useState(false);
   const [projectActionBusyId, setProjectActionBusyId] = useState<string | null>(null);
   const [projectActionError, setProjectActionError] = useState<{ id: string; message: string } | null>(null);
@@ -329,6 +359,9 @@ export function App() {
     top: number;
   } | null>(null);
   const [renameProjectDraft, setRenameProjectDraft] = useState("");
+  const [targetBranchDraft, setTargetBranchDraft] = useState("");
+  const [projectBranches, setProjectBranches] = useState<string[]>([]);
+  const projectEditorIdRef = useRef<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [terminalOpen, setTerminalOpen] = useState(() => localStorage.getItem("k-agent-terminal-open") === "true");
   const [terminalHeight, setTerminalHeight] = useState(() => {
@@ -351,6 +384,8 @@ export function App() {
   // never reuses the previous turn after submit cleared the textarea.
   const composerInputRef = useRef("");
   const [query, setQuery] = useState("");
+  const [composerProjectId, setComposerProjectId] = useState<string | null>(null);
+  const creatingComposerSessionRef = useRef(false);
   const [loading, setLoading] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
@@ -368,9 +403,9 @@ export function App() {
   const [teamStageOpen, setTeamStageOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => Number(localStorage.getItem("k-agent-sidebar-width")) || 252);
   const [inspectorWidth, setInspectorWidth] = useState(() => Number(localStorage.getItem("k-agent-inspector-width")) || 360);
-  const [rightPanelMode, setRightPanelMode] = useState<"trace" | "workspace">(() => {
+  const [rightPanelMode, setRightPanelMode] = useState<"trace" | "changes" | "files">(() => {
     const saved = localStorage.getItem("k-agent-right-panel-mode");
-    return saved === "workspace" ? "workspace" : "trace";
+    return saved === "workspace" || saved === "files" ? "files" : saved === "changes" ? "changes" : "trace";
   });
   const [workspaceItems, setWorkspaceItems] = useState<ContentStageItem[]>([]);
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
@@ -378,9 +413,19 @@ export function App() {
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const workspaceCacheRef = useRef<Map<string, string>>(new Map());
   const selectedWorkspacePathRef = useRef<string | null>(null);
-  const [view, setView] = useState<"chat" | "config" | "marketplace" | "team" | "scheduled">(() => (
+  const [changeItems, setChangeItems] = useState<ContentStageItem[]>([]);
+  const [selectedChangePath, setSelectedChangePath] = useState<string | null>(null);
+  const [changesLoading, setChangesLoading] = useState(false);
+  const [changesError, setChangesError] = useState<string | null>(null);
+  const changeCacheRef = useRef<Map<string, string>>(new Map());
+  const selectedChangePathRef = useRef<string | null>(null);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
+  const workspaceEpochRef = useRef(0);
+  const [view, setView] = useState<"chat" | "config" | "marketplace" | "team" | "scheduled" | "projects">(() => (
     localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY) === "scheduled" ? "scheduled" : "chat"
   ));
+  const currentViewRef = useRef(view);
+  currentViewRef.current = view;
   const [marketplaceTab, setMarketplaceTab] = useState<"skill" | "mcp">("skill");
   const [models, setModels] = useState<ModelProfile[]>([]);
   const [agents, setAgents] = useState<DetectedAgent[]>([]);
@@ -635,15 +680,21 @@ export function App() {
   }, [rightPanelMode]);
 
   useEffect(() => {
+    workspaceEpochRef.current += 1;
     workspaceCacheRef.current.clear();
     selectedWorkspacePathRef.current = null;
     setWorkspaceItems([]);
     setSelectedWorkspacePath(null);
     setWorkspaceError(null);
-  }, [sessionId]);
+    changeCacheRef.current.clear();
+    selectedChangePathRef.current = null;
+    setChangeItems([]);
+    setSelectedChangePath(null);
+    setChangesError(null);
+  }, [sessionId, workspaceRevision]);
 
   useEffect(() => {
-    if (rightPanelMode !== "workspace" || !sessionId) {
+    if (rightPanelMode !== "files" || !sessionId) {
       return;
     }
 
@@ -711,7 +762,53 @@ export function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [rightPanelMode, sessionId, loading]);
+  }, [rightPanelMode, sessionId, loading, workspaceRevision]);
+
+  useEffect(() => {
+    if (rightPanelMode !== "changes" || !sessionId) return;
+    let cancelled = false;
+
+    async function refreshChanges() {
+      const activeId = sessionId;
+      if (!activeId) return;
+      setChangesLoading(true);
+      setChangesError(null);
+      try {
+        const payload = await getSessionChanges(activeId);
+        if (cancelled) return;
+        // 每次刷新都失效 diff，避免 Agent 连续改同一文件后仍显示第一次结果。
+        changeCacheRef.current.clear();
+        let nextSelected = selectedChangePathRef.current;
+        if (!nextSelected || !payload.files.some((file) => file.path === nextSelected)) {
+          nextSelected = payload.files[0]?.path ?? null;
+        }
+        selectedChangePathRef.current = nextSelected;
+        setSelectedChangePath(nextSelected);
+        setChangeItems(payload.files.map((file) => ({
+          id: file.path,
+          title: file.path.split("/").pop() || file.path,
+          subtitle: file.originalPath ? `${file.originalPath} → ${file.path}` : file.path,
+          badge: file.status.trim() || file.status,
+          content: changeCacheRef.current.get(`${activeId}:${file.path}`) ?? "选择后加载差异…"
+        })));
+        if (nextSelected) void resolveChangeAsset(nextSelected);
+      } catch (reason) {
+        if (!cancelled) {
+          setChangeItems([]);
+          setChangesError(reason instanceof Error ? reason.message : "Git 变更加载失败");
+        }
+      } finally {
+        if (!cancelled) setChangesLoading(false);
+      }
+    }
+
+    void refreshChanges();
+    const timer = window.setInterval(() => { void refreshChanges(); }, loading ? 2500 : 8000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [rightPanelMode, sessionId, loading, workspaceRevision]);
 
   async function openWorkspaceFile(path: string) {
     if (!sessionId) return;
@@ -722,6 +819,7 @@ export function App() {
 
   async function resolveWorkspaceAsset(path: string): Promise<string | null> {
     if (!sessionId) return null;
+    const epoch = workspaceEpochRef.current;
     const cacheKey = `${sessionId}:${path}`;
     const cached = workspaceCacheRef.current.get(cacheKey);
     if (cached && cached !== "选择后加载预览…" && cached !== "读取失败") {
@@ -729,6 +827,7 @@ export function App() {
     }
     try {
       const payload = await getSessionWorkspaceFile(sessionId, path);
+      if (epoch !== workspaceEpochRef.current) return null;
       const content = formatWorkspacePreview(payload);
       workspaceCacheRef.current.set(cacheKey, content);
       setWorkspaceItems((current) => {
@@ -737,6 +836,7 @@ export function App() {
       });
       return content;
     } catch {
+      if (epoch !== workspaceEpochRef.current) return null;
       workspaceCacheRef.current.set(cacheKey, "读取失败");
       setWorkspaceItems((current) => current.map((item) => (
         item.id === path ? { ...item, content: "读取失败" } : item
@@ -745,22 +845,59 @@ export function App() {
     }
   }
 
-  const filteredSessions = sessions.filter((session) =>
-    session.title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
-  );
-  const knownProjectIds = new Set(projects.map((project) => project.id));
-  const ungroupedSessions = filteredSessions.filter(
-    (session) => !session.projectId || !knownProjectIds.has(session.projectId)
-  );
-  const sessionsByProjectId = new Map<string, SessionSummary[]>();
-  for (const session of filteredSessions) {
-    if (!session.projectId || !knownProjectIds.has(session.projectId)) continue;
-    const bucket = sessionsByProjectId.get(session.projectId);
-    if (bucket) bucket.push(session);
-    else sessionsByProjectId.set(session.projectId, [session]);
+  async function resolveChangeAsset(path: string): Promise<string | null> {
+    if (!sessionId) return null;
+    const epoch = workspaceEpochRef.current;
+    const cacheKey = `${sessionId}:${path}`;
+    const cached = changeCacheRef.current.get(cacheKey);
+    if (cached) return cached;
+    try {
+      const diff = await getSessionDiff(sessionId, path);
+      if (epoch !== workspaceEpochRef.current) return null;
+      const content = diff ? `\`\`\`diff\n${diff}\n\`\`\`` : "这个文件当前没有可显示的文本差异。";
+      changeCacheRef.current.set(cacheKey, content);
+      setChangeItems((current) => current.map((item) => (
+        item.id === path ? { ...item, content } : item
+      )));
+      return content;
+    } catch (reason) {
+      if (epoch !== workspaceEpochRef.current) return null;
+      const message = reason instanceof Error ? reason.message : "差异读取失败";
+      setChangesError(message);
+      return null;
+    }
   }
 
-  /** 单条会话行：Project 分组和"未分组"区共用同一份渲染/交互逻辑。 */
+  async function openChangeFile(path: string) {
+    selectedChangePathRef.current = path;
+    setSelectedChangePath(path);
+    await resolveChangeAsset(path);
+  }
+
+  async function handoffActiveSession(target: "local" | "worktree") {
+    if (!sessionId) return;
+    setSessionActionBusyId(sessionId);
+    setSessionActionError(null);
+    try {
+      const updated = await handoffSessionEnvironment(sessionId, target);
+      setSessions((current) => current.map((item) => item.id === updated.id ? updated : item));
+      workspaceCacheRef.current.clear();
+      changeCacheRef.current.clear();
+      setWorkspaceRevision((current) => current + 1);
+    } catch (reason) {
+      setSessionActionError({
+        id: sessionId,
+        message: reason instanceof Error ? reason.message : "无法切换会话工作区"
+      });
+    } finally {
+      setSessionActionBusyId(null);
+    }
+  }
+
+  const sidebarProject = projects.find((project) => project.id === sidebarProjectId) ?? null;
+  const filteredSessions = selectSidebarSessions(sessions, query, sidebarProject?.id ?? null);
+
+  /** 通用和项目会话复用同一行，不在最近列表追加项目名。 */
   function renderSessionRow(session: SessionSummary): ReactNode {
     const running = runningSessionIds.has(session.id);
     const menuOpen = sessionMenuId === session.id;
@@ -817,7 +954,7 @@ export function App() {
               ? (
                 <div className="session-delete-confirm" role="alert">
                   <strong>删除这个对话？</strong>
-                  <small>历史记录和工作区文件将永久删除。</small>
+                  <small>{session.projectId ? "历史记录将删除，项目和 Worktree 文件会保留。" : "历史记录和工作区文件将永久删除。"}</small>
                   <div>
                     <button type="button" disabled={actionBusy} onClick={() => setSessionDeleteConfirmId(null)}>取消</button>
                     <button className="danger" type="button" disabled={actionBusy} onClick={() => void removeConversation(session.id)}>
@@ -829,8 +966,13 @@ export function App() {
               : (
                 <>
                   <button role="menuitem" type="button" disabled={running || actionBusy} onClick={() => void branchConversation(session.id)}>
-                    <SessionBranchIcon /><span><strong>创建分支</strong><small>复制历史、能力和工作区</small></span>
+                    <SessionBranchIcon /><span><strong>创建分支</strong><small>{session.projectId ? "复制历史，继续共享当前目录" : "复制历史、能力和工作区"}</small></span>
                   </button>
+                  {session.environment?.repositoryRoot && (
+                    <button role="menuitem" type="button" disabled={running || actionBusy} onClick={() => void branchConversation(session.id, "worktree")}>
+                      <SessionBranchIcon /><span><strong>在新 Worktree 中分支</strong><small>复制历史，使用隔离目录</small></span>
+                    </button>
+                  )}
                   {movableTargets.length > 0 && (
                     <label className="session-move-to-project" role="menuitem">
                       <span><strong>移入 Project</strong><small>合并工作区文件，搬迁对话簿记</small></span>
@@ -861,11 +1003,12 @@ export function App() {
     );
   }
   const activeSession = sessions.find((session) => session.id === sessionId);
+  const activeProject = projects.find((project) => project.id === activeSession?.projectId);
   const projectInfoCardProject = projectInfoCard
     ? projects.find((project) => project.id === projectInfoCard.projectId) ?? null
     : null;
   const projectInfoSessionCount = projectInfoCardProject
-    ? sessionsByProjectId.get(projectInfoCardProject.id)?.length ?? projectInfoCardProject.sessionCount
+    ? sessions.filter((session) => session.projectId === projectInfoCardProject.id).length
     : 0;
   const groupedMessages = groupDisplayMessages(messages);
   const activityTurnIds = new Set([
@@ -925,16 +1068,23 @@ export function App() {
   async function submitNewProject(rootPath: string) {
     const project = await createProject(rootPath);
     setProjects((current) => [project, ...current.filter((item) => item.id !== project.id)]);
+    setSidebarProjectId(project.id);
+    if (!sessionId) setComposerProjectId(project.id);
+    setQuery("");
     setStatus(`已创建 Project「${project.name}」`);
     setProjectCreateDialogOpen(false);
   }
 
-  async function startSessionInProject(projectId: string) {
+  async function startSessionInProject(
+    projectId: string, environment: "auto" | "local" | "worktree" = "auto", startingState: "default" | "working-tree" = "default"
+  ) {
     setProjectActionBusyId(projectId);
     setProjectActionError(null);
     try {
-      const session = await createProjectSession(projectId);
+      const session = await createProjectSession(projectId, environment, startingState);
       setSessions((current) => [session, ...current.filter((item) => item.id !== session.id)]);
+      setSidebarProjectId(projectId);
+      setQuery("");
       setView("chat");
       await openSession(session.id);
     } catch (error) {
@@ -1002,6 +1152,18 @@ export function App() {
       ? projectInfoPosition(element.closest<HTMLElement>(".project-group-header") ?? element)
       : { left: projectInfoCard?.left ?? 0, top: projectInfoCard?.top ?? 0 };
     setRenameProjectDraft(project.name);
+    setTargetBranchDraft(project.targetBranch || "");
+    setProjectBranches([]);
+    projectEditorIdRef.current = project.id;
+    void getProjectRepository(project.id).then((repository) => {
+      if (projectEditorIdRef.current !== project.id) return;
+      setProjectBranches(repository.branches);
+      setTargetBranchDraft(repository.targetBranch || "");
+    }).catch((reason) => {
+      if (projectEditorIdRef.current === project.id) {
+        setProjectActionError({ id: project.id, message: reason instanceof Error ? reason.message : "读取分支失败" });
+      }
+    });
     setProjectActionError(null);
     setProjectInfoCard({ projectId: project.id, mode: "edit", ...position });
   }
@@ -1011,7 +1173,7 @@ export function App() {
     if (!name) return;
     setProjectActionBusyId(projectId);
     try {
-      const updated = await renameProject(projectId, name);
+      const updated = await renameProject(projectId, name, targetBranchDraft || null);
       setProjects((current) => current.map((item) => (item.id === projectId ? updated : item)));
       setProjectInfoCard(null);
     } catch (error) {
@@ -1042,13 +1204,13 @@ export function App() {
     }
   }
 
-  function toggleProjectCollapsed(projectId: string) {
-    setCollapsedProjectIds((current) => {
-      const next = new Set(current);
-      if (next.has(projectId)) next.delete(projectId);
-      else next.add(projectId);
-      return next;
-    });
+  function selectSidebarProject(projectId: string | null) {
+    clearProjectInfoTimers();
+    setProjectInfoCard(null);
+    setSidebarProjectId(projectId);
+    setQuery("");
+    setSessionMenuId(null);
+    setView("chat");
   }
 
   async function forkFromMessage(message: ChatMessage) {
@@ -1077,12 +1239,12 @@ export function App() {
     }
   }
 
-  async function branchConversation(sourceId: string) {
+  async function branchConversation(sourceId: string, environment: "same-directory" | "worktree" = "same-directory") {
     if (runningSessionIds.has(sourceId) || sessionActionBusyId) return;
     setSessionActionBusyId(sourceId);
     setSessionActionError(null);
     try {
-      const branch = await forkSession(sourceId);
+      const branch = await forkSession(sourceId, { environment });
       setSessions((current) => [branch, ...current.filter((item) => item.id !== branch.id)]);
       setSessionMenuId(null);
       setSessionDeleteConfirmId(null);
@@ -1224,6 +1386,11 @@ export function App() {
       if (loadingStatusTimer) window.clearTimeout(loadingStatusTimer);
       if (sessionNavigationTokenRef.current !== navigationToken) return;
       setSessionId(data.sessionId);
+      if (data.environment !== undefined) {
+        setSessions((current) => current.map((item) => item.id === data.sessionId
+          ? { ...item, environment: data.environment, projectId: data.environment?.projectId ?? item.projectId }
+          : item));
+      }
       activeSessionIdRef.current = data.sessionId;
       localStorage.setItem(appConfig.storageKey, data.sessionId);
       const remembered = data.capabilities ?? null;
@@ -1293,6 +1460,9 @@ export function App() {
 
   /** 清空当前线程指针与视图；不中止其他会话上仍在跑的 activeRuns。 */
   function startNewSession() {
+    setComposerProjectId(null);
+    setSidebarProjectId(null);
+    setQuery("");
     stopVoiceConversation("新会话已准备，语音会话已结束");
     sessionNavigationTokenRef.current += 1;
     activeSessionIdRef.current = null;
@@ -1782,7 +1952,7 @@ export function App() {
    * 仅当前可见会话会把流事件应用到 UI；切走时仍写入 activeRun.events 供回来时重放。
    */
   async function submitConversation(prompt: string) {
-    if ((!prompt && !attachments.length) || loading || sessionLoading || !modelId) {
+    if ((!prompt && !attachments.length) || loading || sessionLoading || creatingComposerSessionRef.current || !modelId) {
       if (voiceConversationActiveRef.current) {
         voiceRunFinishedRef.current = !loading;
         setVoiceConversation((current) => ({
@@ -1810,7 +1980,36 @@ export function App() {
     const submittedAttachments = attachments;
     const userMessage = createMessage("user", prompt, submittedAttachments);
     const nextMessages = [...messages, userMessage, createStreamingMessage(pendingAssistantId)];
-    const targetSessionId = sessionId ?? createClientId();
+    let targetSessionId: string;
+    // 项目选择只属于当前草稿；请求失败保留输入，导航离开后不把旧草稿发送到新页面。
+    const navigationToken = sessionNavigationTokenRef.current;
+    const creatingProject = !sessionId && Boolean(composerProjectId);
+    creatingComposerSessionRef.current = true;
+    if (creatingProject) {
+      setSessionLoading(true);
+      setStatus("正在创建项目会话…");
+    }
+    try {
+      const resolved = await resolveComposerSession(sessionId, composerProjectId, createProjectSession, createClientId);
+      targetSessionId = resolved.id;
+      if (resolved.created) {
+        const created = resolved.created;
+        setSessions((current) => [{ ...created, title: prompt || submittedAttachments[0]?.name || created.title }, ...current.filter((item) => item.id !== created.id)]);
+        void refreshProjects();
+      }
+      if (navigationToken !== sessionNavigationTokenRef.current || (creatingProject && currentViewRef.current !== "chat")) return;
+    } catch (error) {
+      if (navigationToken !== sessionNavigationTokenRef.current || (creatingProject && currentViewRef.current !== "chat")) return;
+      const message = error instanceof Error ? error.message : "创建项目会话失败";
+      setStatus(message);
+      if (voiceConversationActiveRef.current) setVoiceConversation((current) => ({ ...current, phase: "error", message }));
+      return;
+    } finally {
+      creatingComposerSessionRef.current = false;
+      if (creatingProject) {
+        if (navigationToken === sessionNavigationTokenRef.current) setSessionLoading(false);
+      }
+    }
     // Access Layer 只收本轮 user 消息；完整历史由服务端按 threadId 拼接。
     // 模型/MCP/skills/agent 选项走 forwardedProps，不进入 messages 正文。
     const runInput: AgUiRunInput = {
@@ -2980,7 +3179,16 @@ export function App() {
     return (
       <>
         <TeamWorkbench
+          pinnedProjects={pinnedProjects}
+          pinnedSessions={sessions}
+          onOpenPinnedSession={(id) => { setView("chat"); setSidebarCollapsed(false); void openSession(id); }}
+          onUnpinProject={togglePinnedProject}
           onBack={() => setView("chat")}
+          onNavigate={(page) => {
+            setSidebarOpen(false);
+            if (page === "skill" || page === "mcp") { setMarketplaceTab(page); setView("marketplace"); }
+            else { setView(page); if (page === "projects") void refreshProjects(); }
+          }}
           onOpenConfig={() => setView("config")}
           health={health}
           onRefreshHealth={() => void refreshHealth()}
@@ -3029,20 +3237,20 @@ export function App() {
         onClick={() => setSidebarOpen(false)}
       />
 
-      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+      <aside className={`sidebar sidebar-recent ${sidebarOpen ? "open" : ""}`}>
         <div className="brand">
-          <img className="brand-symbol" src="/brand-k.png" alt="" width={32} height={32} />
-          <div><strong>K Agent</strong><small>本地执行台</small></div>
+          <img className="brand-symbol" src="/brand-k.png" alt="" width={24} height={24} />
+          <strong>K Agent</strong>
+          <button type="button" className="sidebar-collapse" aria-label="收起会话侧栏" onClick={() => { setSidebarCollapsed(true); setSidebarOpen(false); }}><SidebarIcon side="left" /></button>
         </div>
-        <nav className="workspace-switch" aria-label="工作模式">
-          <button className={view === "chat" ? "active" : ""} type="button" aria-current={view === "chat" ? "page" : undefined} onClick={() => setView("chat")}>
-            <span>◉</span><strong>Work</strong>
-          </button>
-          <button type="button" onClick={() => setView("team")}>
-            <span>⌘</span><strong>Agent Team</strong>
-          </button>
-        </nav>
+        <SidebarModeSwitcher onChange={setView} />
         <nav className="sidebar-nav" aria-label="功能入口">
+          <button className="sidebar-nav-item" type="button" onClick={() => { setView("chat"); startNewSession(); }}>
+            <NewConversationIcon /><strong>新建对话</strong><kbd>⌘ N</kbd>
+          </button>
+          <button className={`sidebar-nav-item ${view === "projects" ? "active" : ""}`} type="button" onClick={() => { setView("projects"); setSidebarOpen(false); void refreshProjects(); }}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 6V4.5h5L9 6h8.5v10h-15V6Zm0 2h15" /></svg><strong>项目</strong>
+          </button>
           <button
             className={`sidebar-nav-item ${view === "marketplace" && marketplaceTab === "skill" ? "active" : ""}`}
             type="button"
@@ -3068,137 +3276,51 @@ export function App() {
             <strong>定时任务</strong>
           </button>
         </nav>
-        <div className="history-head">
-          <span>会话 ({sessions.length})</span>
-          <div className="history-head-actions">
-            <button type="button" aria-label="新建会话" title="新建会话 ⌘N" onClick={() => { setView("chat"); startNewSession(); }}>
-              <NewConversationIcon />
-            </button>
-            <button type="button" aria-label="新建 Project" title="新建 Project" onClick={() => void createNewProject()}>📁</button>
-          </div>
+        <PinnedProjects projects={pinnedProjects} onBrowse={() => { setView("projects"); void refreshProjects(); }}
+          sessions={sessions} selectedSessionId={sessionId} onOpenSession={(id) => { setView("chat"); void openSession(id); }}
+          onUnpin={togglePinnedProject} renderProject={(project, expanded, onToggle) => {
+                const selected = expanded;
+                const busy = projectActionBusyId === project.id;
+                return <div className="project-group" key={project.id}>
+                  <div className={`project-group-header ${selected ? "selected" : ""}`}
+                    onMouseEnter={(event) => showProjectInfoPreview(project.id, event.currentTarget)} onMouseLeave={scheduleProjectInfoHide}>
+                    <button type="button" className="sidebar-project-select" aria-expanded={expanded} aria-label={`${expanded ? "收起" : "展开"} ${project.name} 的会话`}
+                      onClick={onToggle}>
+                      <ProjectFolderIcon open={selected} /><span className="project-group-name">{project.name}</span>
+                    </button>
+                    <button type="button" className="project-group-action project-info-action" aria-label={`查看和编辑 ${project.name} 的信息`}
+                      aria-expanded={projectInfoCard?.projectId === project.id && projectInfoCard.mode === "edit"} title="项目信息"
+                      onClick={(event) => openProjectEditor(project, event.currentTarget)}><ProjectMoreIcon /></button>
+                    <button type="button" className="project-group-action project-new-chat-action" aria-label={`在 ${project.name} 下新建对话`} title="新建对话" disabled={busy}
+                      onClick={() => void startSessionInProject(project.id)}><NewConversationIcon /></button>
+                  </div>
+                  {projectActionError?.id === project.id && <p className="session-action-error">{projectActionError.message}</p>}
+                </div>;
+          }} />
+        <div className="history-head recent-history-head">
+          <button type="button" className={sidebarProject ? "" : "selected"} aria-label="显示全部最近会话" onClick={() => selectSidebarProject(null)}>最近会话</button>
+          {sidebarProject && <button type="button" className="recent-project-filter" aria-label={`清除 ${sidebarProject.name} 的会话筛选`} title="显示全部最近会话" onClick={() => selectSidebarProject(null)}><span>{sidebarProject.name}</span><span aria-hidden="true">×</span></button>}
         </div>
         <label className="session-search">
-          <span>⌕</span>
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索会话"
-            aria-label="搜索会话"
-          />
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4" /></svg>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={sidebarProject ? "搜索项目会话" : "搜索会话"} aria-label="搜索会话" />
         </label>
         <div className="session-scroll">
-        <nav className="session-list" aria-label="会话列表">
-          {filteredSessions.length === 0 && (
-            <p className="empty-note">{query ? "没有匹配的会话" : "你的对话会显示在这里"}</p>
-          )}
-          {(ungroupedSessions.length > 0 || projects.length > 0) && (
-            // "Chat" 分组：未归属任何 Project 的会话。和 Project 分组同级、同样可折叠，
-            // 但没有图标/重命名/删除——它不是一个真实实体，只是未分组会话的容器。
-            <div className="project-group chat-group">
-              <div
-                className="project-group-header"
-                role="button"
-                tabIndex={0}
-                aria-expanded={!chatGroupCollapsed}
-                aria-label={chatGroupCollapsed ? "展开 Chat" : "折叠 Chat"}
-                onClick={() => setChatGroupCollapsed((current) => !current)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    setChatGroupCollapsed((current) => !current);
-                  }
-                }}
-              >
-                <span className="project-group-name">Chat</span>
-                <span className="project-group-count">{ungroupedSessions.length}</span>
-                <button
-                  type="button"
-                  className="project-group-action"
-                  aria-label="新建对话"
-                  title="新建对话"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    setView("chat");
-                    startNewSession();
-                  }}
-                >
-                  <NewConversationIcon />
-                </button>
-              </div>
-              {!chatGroupCollapsed && ungroupedSessions.map((session) => renderSessionRow(session))}
-            </div>
-          )}
-          {projects.map((project) => {
-            const collapsed = collapsedProjectIds.has(project.id);
-            const projectSessions = sessionsByProjectId.get(project.id) ?? [];
-            const busy = projectActionBusyId === project.id;
-            return (
-              <div className="project-group" key={project.id}>
-                <div
-                  className="project-group-header"
-                  role="button"
-                  tabIndex={0}
-                  aria-expanded={!collapsed}
-                  aria-label={collapsed ? `展开 ${project.name}` : `折叠 ${project.name}`}
-                  onMouseEnter={(event) => showProjectInfoPreview(project.id, event.currentTarget)}
-                  onMouseLeave={scheduleProjectInfoHide}
-                  onClick={(event) => {
-                    // 行内按钮有各自的动作；其余整行区域都负责折叠。
-                    if ((event.target as HTMLElement).closest("button")) return;
-                    toggleProjectCollapsed(project.id);
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.target !== event.currentTarget) return;
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      toggleProjectCollapsed(project.id);
-                    }
-                  }}
-                >
-                  <span className="project-group-toggle" aria-hidden="true">
-                    <ProjectFolderIcon open={!collapsed} />
-                  </span>
-                  <span className="project-group-name">{project.name}</span>
-                  <button
-                    type="button"
-                    className="project-group-action project-info-action"
-                    aria-label={`查看和编辑 ${project.name} 的信息`}
-                    aria-expanded={projectInfoCard?.projectId === project.id && projectInfoCard.mode === "edit"}
-                    title="项目信息"
-                    onClick={(event) => openProjectEditor(project, event.currentTarget)}
-                  >
-                    <ProjectMoreIcon />
-                  </button>
-                  <button
-                    type="button"
-                    className="project-group-action project-new-chat-action"
-                    aria-label={`在 ${project.name} 下新建对话`}
-                    title="新建对话"
-                    disabled={busy}
-                    onClick={() => void startSessionInProject(project.id)}
-                  >
-                    <NewConversationIcon />
-                  </button>
-                </div>
-                {projectActionError?.id === project.id && (
-                  <p className="session-action-error">{projectActionError.message}</p>
-                )}
-                {!collapsed && projectSessions.map((session) => renderSessionRow(session))}
-              </div>
-            );
-          })}
-        </nav>
+          <nav className="session-list" aria-label={sidebarProject ? `${sidebarProject.name} 的会话` : "最近会话列表"}>
+            {filteredSessions.length === 0 && <p className="empty-note">{query ? "没有匹配的会话" : sidebarProject ? "这个项目还没有会话" : "你的对话会显示在这里"}</p>}
+            {filteredSessions.map((session) => renderSessionRow(session))}
+          </nav>
+
         </div>
         <button
-          className={`settings-link sidebar-config ${view === "config" ? "active" : ""}`}
+          className="settings-link sidebar-config"
           type="button"
-          aria-current={view === "config" ? "page" : undefined}
           aria-label={health?.ok ? "设置，后端已连接" : health ? "设置，后端未连接" : "设置"}
           onClick={() => setView("config")}
         >
           <SidebarSettingsIcon />
           <strong>设置</strong>
-          <i className={`connection-dot ${health?.ok ? "online" : ""}`} aria-hidden="true" />
+
         </button>
       </aside>
       <div
@@ -3212,7 +3334,15 @@ export function App() {
       />
 
       <main ref={conversationRef} className={`conversation ${voiceConversation.active ? "voice-conversation-mode" : ""} ${view === "scheduled" ? "scheduled-conversation" : ""} ${view === "marketplace" ? "marketplace-conversation" : ""}`}>
-        {view === "scheduled" ? (
+        {view === "projects" ? (
+          <ProjectsView projects={projects} pinnedIds={pinnedProjectIds} onTogglePin={togglePinnedProject} busyId={projectActionBusyId} error={projectActionError}
+            onCreate={createNewProject} onEdit={openProjectEditor} onOpen={(projectId) => { selectSidebarProject(projectId); setSidebarCollapsed(false); if (window.matchMedia("(max-width: 860px)").matches) setSidebarOpen(true); }}
+            onNewSession={(projectId) => void startSessionInProject(projectId)}
+            onToggleSidebar={() => {
+              if (window.matchMedia("(max-width: 860px)").matches) { setSidebarCollapsed(false); setSidebarOpen(true); }
+              else setSidebarCollapsed((current) => !current);
+            }} />
+        ) : view === "scheduled" ? (
           <ScheduledTasksView
             models={models}
             agents={agents}
@@ -3584,6 +3714,8 @@ export function App() {
                 onSkillsChange={changeSelectedSkills}
               />
               <ComposerPermissionPicker value={permissionMode} onChange={changePermissionMode} />
+              <ComposerProjectPicker projects={projects} value={sessionId ? activeSession?.projectId ?? null : composerProjectId}
+                disabled={Boolean(sessionId) || sessionLoading || loading} onChange={setComposerProjectId} onCreate={createNewProject} />
             </div>
             <div className="composer-toolbar composer-toolbar-right">
               <RuntimeSettingsPicker
@@ -3637,7 +3769,7 @@ export function App() {
           />
         )}
         <ConversationTerminal
-          key={sessionId ?? "none"}
+          key={`${sessionId ?? "none"}:${workspaceRevision}`}
           sessionId={sessionId}
           open={terminalOpen}
           height={terminalHeight}
@@ -3659,11 +3791,11 @@ export function App() {
         onPointerDown={(event) => beginResize("inspector", event)}
         onKeyDown={(event) => resizeWithKeyboard("inspector", event)}
       />
-      <aside className="inspector" aria-label={rightPanelMode === "trace" ? "运行轨迹" : "工作区"}>
+      <aside className="inspector" aria-label={rightPanelMode === "trace" ? "运行轨迹" : rightPanelMode === "changes" ? "Git 变更" : "文件"}>
         <header className="inspector-header inspector-header-switch">
           <div className="inspector-header-title">
-            <p className="eyebrow">{rightPanelMode === "trace" ? "RUN DETAILS" : "WORKSPACE"}</p>
-            <h2>{rightPanelMode === "trace" ? "运行轨迹" : "工作区"}</h2>
+            <p className="eyebrow">{rightPanelMode === "trace" ? "RUN DETAILS" : rightPanelMode === "changes" ? "GIT CHANGES" : "FILES"}</p>
+            <h2>{rightPanelMode === "trace" ? "运行轨迹" : rightPanelMode === "changes" ? "变更" : "文件"}</h2>
           </div>
           <div className="inspector-mode-switch" role="tablist" aria-label="右侧面板模式">
             <button
@@ -3676,16 +3808,59 @@ export function App() {
               轨迹
             </button>
             <button
-              className={rightPanelMode === "workspace" ? "active" : ""}
+              className={rightPanelMode === "changes" ? "active" : ""}
               type="button"
               role="tab"
-              aria-selected={rightPanelMode === "workspace"}
-              onClick={() => setRightPanelMode("workspace")}
+              aria-selected={rightPanelMode === "changes"}
+              onClick={() => setRightPanelMode("changes")}
             >
-              工作区
+              变更
+            </button>
+            <button
+              className={rightPanelMode === "files" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={rightPanelMode === "files"}
+              onClick={() => setRightPanelMode("files")}
+            >
+              文件
             </button>
           </div>
         </header>
+
+        {activeSession?.projectId && activeSession.environment && (
+          <div className="session-environment-bar">
+            <div>
+              <strong title={activeSession.environment.kind === "local" || sessions.some((item) => item.id !== activeSession.id && item.environment?.cwd === activeSession.environment?.cwd) ? "此目录由会话共享，变更可能来自其他会话" : "独立工作目录"}>
+                {activeSession.environment.kind === "worktree" ? "Worktree" : "Local · 共享"}
+              </strong>
+              <span title={activeSession.environment.cwd}>{activeSession.environment.cwd}</span>
+            </div>
+            {activeSession.environment.repositoryRoot && (
+              <button
+                type="button"
+                disabled={sessionActionBusyId === activeSession.id || loading}
+                onClick={() => void handoffActiveSession(
+                  activeSession.environment?.kind === "worktree" ? "local" : "worktree"
+                )}
+              >
+                切到{activeSession.environment.kind === "worktree" ? "本地" : "Worktree"}
+              </button>
+            )}
+            {sessionActionError?.id === activeSession.id && <em>{sessionActionError.message}</em>}
+          </div>
+        )}
+
+        {rightPanelMode === "changes" && activeSession?.environment?.repositoryRoot && activeProject && (
+          <ProjectIntegrationPanel
+            key={activeSession.id}
+            sessionId={activeSession.id}
+            targetBranch={activeProject.targetBranch}
+            shared={activeSession.environment.kind === "local" || sessions.some((item) => item.id !== activeSession.id && item.environment?.cwd === activeSession.environment?.cwd)}
+            running={runningSessionIds.has(activeSession.id) || sessionActionBusyId === activeSession.id}
+            onChanged={() => setWorkspaceRevision((current) => current + 1)}
+          />
+        )}
 
         {rightPanelMode === "trace" ? (
           <div className="inspector-scroll">
@@ -3721,6 +3896,31 @@ export function App() {
               )}
             </InspectorSection>
           </div>
+        ) : rightPanelMode === "changes" ? !sessionId ? (
+          <ContentStage
+            embedded
+            items={[]}
+            selectedId={null}
+            onSelect={() => undefined}
+            emptyTitle="先打开或创建会话"
+            emptyHint="Git Project 会话的文件变更会出现在这里"
+          />
+        ) : (
+          <ContentStage
+            embedded
+            items={changeItems}
+            selectedId={selectedChangePath}
+            onSelect={(path) => { void openChangeFile(path); }}
+            resolveFile={resolveChangeAsset}
+            emptyTitle={changesLoading ? "正在读取 Git 变更…" : "当前没有文件变更"}
+            emptyHint={changesError || (
+              activeSession?.environment?.kind === "worktree"
+                ? `独立 Worktree · ${activeSession.environment.cwd}`
+                : activeSession?.environment?.repositoryRoot
+                  ? "共享项目目录，变更可能来自本项目的其他会话"
+                  : "只有绑定 Git 工作区的会话会显示差异"
+            )}
+          />
         ) : !sessionId ? (
           <ContentStage
             embedded
@@ -3747,17 +3947,30 @@ export function App() {
       </aside>
     </div>
     {projectInfoCard && projectInfoCardProject && createPortal(
+      <div className={projectInfoCard.mode === "edit" ? "project-editor-backdrop" : undefined}>
       <section
         className={`project-info-card ${projectInfoCard.mode}`}
-        style={{ left: projectInfoCard.left, top: projectInfoCard.top }}
+        style={projectInfoCard.mode === "preview" ? { left: projectInfoCard.left, top: projectInfoCard.top } : undefined}
         role={projectInfoCard.mode === "edit" ? "dialog" : "tooltip"}
+        aria-modal={projectInfoCard.mode === "edit" ? true : undefined}
         aria-label={`${projectInfoCardProject.name} 项目信息`}
+        onKeyDown={(event) => {
+          if (projectInfoCard.mode !== "edit" || event.key !== "Tab") return;
+          const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled):not([tabindex="-1"]), input:not(:disabled)'));
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+          if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        }}
         onMouseEnter={clearProjectInfoTimers}
         onMouseLeave={scheduleProjectInfoHide}
       >
         <header>
           <ProjectFolderIcon open />
-          <strong>{projectInfoCardProject.name}</strong>
+          <strong>{projectInfoCard.mode === "edit" ? "编辑项目" : projectInfoCardProject.name}</strong>
+          {projectInfoCard.mode === "edit" && <button type="button" className="project-editor-close" aria-label="关闭项目编辑" onClick={() => { setProjectInfoCard(null); setProjectActionError(null); }}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg>
+          </button>}
         </header>
         {projectInfoCard.mode === "preview" ? (
           <>
@@ -3772,11 +3985,49 @@ export function App() {
             <button
               type="button"
               className="project-info-edit-button"
+              disabled={projectActionBusyId === projectInfoCardProject.id}
+              onClick={() => {
+                void startSessionInProject(projectInfoCardProject.id, "local");
+                setProjectInfoCard(null);
+              }}
+            >
+              <NewConversationIcon />
+              <span>在项目目录中新建对话</span>
+            </button>
+            <button
+              type="button"
+              className="project-info-edit-button"
               onClick={() => openProjectEditor(projectInfoCardProject)}
             >
               <ProjectEditIcon />
               <span>编辑项目</span>
             </button>
+            {projectInfoCardProject.isGitRepository && (<>
+              <button
+                type="button"
+                className="project-info-edit-button"
+                disabled={projectActionBusyId === projectInfoCardProject.id}
+                onClick={() => {
+                  void startSessionInProject(projectInfoCardProject.id, "worktree");
+                  setProjectInfoCard(null);
+                }}
+              >
+                <NewConversationIcon />
+                <span>在独立 Worktree 中新建对话</span>
+              </button>
+              <button
+                type="button"
+                className="project-info-edit-button"
+                disabled={projectActionBusyId === projectInfoCardProject.id}
+                onClick={() => {
+                  void startSessionInProject(projectInfoCardProject.id, "worktree", "working-tree");
+                  setProjectInfoCard(null);
+                }}
+              >
+                <NewConversationIcon />
+                <span>包含当前改动，新建 Worktree</span>
+              </button>
+            </>)}
           </>
         ) : (
           <form
@@ -3801,6 +4052,14 @@ export function App() {
                 }}
               />
             </label>
+            {projectInfoCardProject.isGitRepository && (
+              <div className="project-editor-field">
+                <span>目标分支</span>
+                <ProjectBranchSelect value={targetBranchDraft} branches={projectBranches}
+                  disabled={projectActionBusyId === projectInfoCardProject.id} onChange={setTargetBranchDraft} />
+                <p className="project-editor-hint">会话的改动将合入此分支</p>
+              </div>
+            )}
             <div className="project-info-readonly-path" title={projectInfoCardProject.rootPath}>
               <span>项目路径</span>
               <code>{projectInfoCardProject.rootPath}</code>
@@ -3829,7 +4088,8 @@ export function App() {
             </footer>
           </form>
         )}
-      </section>,
+      </section>
+      </div>,
       document.body
     )}
     <DesktopPet enabled={desktopPetEnabled} onEnabledChange={setDesktopPetEnabled} />
@@ -4608,14 +4868,11 @@ function ComposerAddMenu({
         )}
         </>
       )}
-      <button className="composer-add-trigger" type="button" aria-expanded={open} aria-haspopup="menu" onClick={() => open ? closeMenu() : openMenu()}>
+      <button className="composer-add-trigger" type="button" aria-label="添加附件和能力" title="添加附件和能力" aria-expanded={open} aria-haspopup="menu" onClick={() => open ? closeMenu() : openMenu()}>
         <svg className="composer-add-icon" viewBox="0 0 12 12" aria-hidden="true">
           <path d="M6 1.75v8.5M1.75 6h8.5" />
         </svg>
-        <strong>添加</strong>
-        <i className={selectedMcp.length + selectedSkills.length > 0 ? "has-count" : ""} aria-hidden={selectedMcp.length + selectedSkills.length === 0}>
-          {selectedMcp.length + selectedSkills.length > 0 ? selectedMcp.length + selectedSkills.length : null}
-        </i>
+
       </button>
     </div>
   );

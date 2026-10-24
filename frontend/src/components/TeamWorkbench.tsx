@@ -18,6 +18,9 @@ import {
   getRuntimeCatalog
 } from "../api/agui";
 import { MarkdownContent } from "./MarkdownContent";
+import { PinnedProjects } from "./PinnedProjects";
+import type { ProjectSummary, SessionSummary } from "../types";
+import { SidebarModeSwitcher } from "./SidebarModeSwitcher";
 import {
   ContentStage,
   type ContentStageItem
@@ -82,7 +85,12 @@ const STATUS_LABEL: Record<string, string> = {
 
 
 interface TeamWorkbenchProps {
+  pinnedProjects: ProjectSummary[];
+  pinnedSessions: SessionSummary[];
+  onOpenPinnedSession: (sessionId: string) => void;
+  onUnpinProject: (projectId: string) => void;
   onBack: () => void;
+  onNavigate: (page: "projects" | "skill" | "mcp" | "scheduled") => void;
   onOpenConfig: () => void;
   health: HealthState | null;
   onRefreshHealth: () => void;
@@ -104,7 +112,12 @@ interface TeamWorkbenchProps {
 }
 
 export function TeamWorkbench({
+  pinnedProjects,
+  pinnedSessions,
+  onOpenPinnedSession,
+  onUnpinProject,
   onBack,
+  onNavigate,
   onOpenConfig,
   health,
   onRefreshHealth,
@@ -385,28 +398,29 @@ export function TeamWorkbench({
       } as CSSProperties}
     >
       <button className={`scrim ${sidebarOpen ? "visible" : ""}`} type="button" aria-label="关闭团队侧栏" onClick={onCloseSidebar} />
-      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+      <aside className={`sidebar sidebar-recent sidebar-team ${sidebarOpen ? "open" : ""}`}>
         <div className="brand">
-          <img className="brand-symbol" src="/brand-k.png" alt="" width={32} height={32} />
-          <div><strong>K Agent</strong><small>本地执行台</small></div>
+          <img className="brand-symbol" src="/brand-k.png" alt="" width={24} height={24} />
+          <strong>K Agent</strong>
+          <button className="sidebar-collapse" type="button" aria-label="收起团队侧栏" onClick={() => { if (window.matchMedia("(max-width: 860px)").matches) onCloseSidebar(); else onToggleSidebar(); }}><TeamSidebarIcon side="left" /></button>
         </div>
-        <nav className="workspace-switch" aria-label="工作模式">
-          <button type="button" onClick={onBack}><span>◉</span><strong>Work</strong></button>
-          <button className="active" type="button" aria-current="page"><span>⌘</span><strong>Agent Team</strong></button>
+        <SidebarModeSwitcher mode="team" onChange={(mode) => { if (mode === "chat") onBack(); }} />
+        <nav className="sidebar-nav" aria-label="功能入口">
+          <button className="sidebar-nav-item" type="button" onClick={() => setCreating(true)}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 4H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-3M12.5 3.5a2.1 2.1 0 0 1 3 3L9 13l-4 1 1-4Z"/></svg><strong>新建团队</strong>
+          </button>
+          <button className="sidebar-nav-item" type="button" onClick={() => onNavigate("projects")}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 6V4.5h5L9 6h8.5v10h-15V6Zm0 2h15"/></svg><strong>项目</strong></button>
+          <button className="sidebar-nav-item" type="button" onClick={() => onNavigate("skill")}><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10 2 2.4 5 5.6.8-4 4 .9 5.5-4.9-2.6-4.9 2.6.9-5.5-4-4L7.6 7Z"/></svg><strong>技能</strong></button>
+          <button className="sidebar-nav-item" type="button" onClick={() => onNavigate("mcp")}><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="6" width="5" height="8" rx="1.5"/><rect x="12.5" y="6" width="5" height="8" rx="1.5"/><path d="M7.5 10h5"/></svg><strong>连接器</strong></button>
+          <button className="sidebar-nav-item" type="button" onClick={() => onNavigate("scheduled")}><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2"/></svg><strong>定时任务</strong></button>
         </nav>
-        <button className="new-session" type="button" onClick={() => setCreating(true)}>
-          <span>＋</span> 创建团队
-        </button>
+        <PinnedProjects projects={pinnedProjects} sessions={pinnedSessions} onBrowse={() => onNavigate("projects")} onOpenSession={onOpenPinnedSession} onUnpin={onUnpinProject} />
+        <div className="history-head recent-history-head"><span>最近团队</span><span>{teams.length}</span></div>
         <label className="session-search">
-          <span>⌕</span>
-          <input
-            value={teamQuery}
-            onChange={(event) => setTeamQuery(event.target.value)}
-            placeholder="搜索团队"
-            aria-label="搜索团队"
-          />
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 4 4"/></svg>
+          <input value={teamQuery} onChange={(event) => setTeamQuery(event.target.value)} placeholder="搜索团队" aria-label="搜索团队" />
         </label>
-        <div className="section-label"><span>最近团队</span><b>{teams.length}</b></div>
+        <div className="session-scroll">
         <nav className="session-list" aria-label="团队列表">
             {filteredTeams.map((item) => {
               const progress = item.taskCount ? Math.round(item.completedTaskCount / item.taskCount * 100) : 0;
@@ -428,17 +442,15 @@ export function TeamWorkbench({
               </p>
             )}
         </nav>
-        <button className="connection" type="button" onClick={onRefreshHealth} title={health?.ok ? "点击重新检查服务与沙箱状态" : "点击重新检查"}>
-          <span className={`connection-dot ${health?.ok ? "online" : ""}`} />
-          <span>
-            <strong>{health?.ok ? "服务运行正常" : "后端未连接"}</strong>
-            <small>{health ? `${health.model} · ${health.localToolCount + health.mcpToolCount} 个工具` : "点击重新检查"}</small>
-          </span>
-          <i>↻</i>
-        </button>
-        <button className="settings-link" type="button" onClick={onOpenConfig}>
-          <span>⚙</span><strong>配置中心</strong><small>MCP · Skills · 模型</small><i>→</i>
-        </button>
+        </div>
+        <div className="sidebar-team-footer">
+          <button className="settings-link" type="button" onClick={onOpenConfig}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h14M3 14h14"/><circle cx="7" cy="6" r="2"/><circle cx="13" cy="14" r="2"/></svg><strong>设置</strong>
+          </button>
+          <button className="sidebar-health-refresh" type="button" onClick={onRefreshHealth} aria-label="重新检查服务状态" title={health?.ok ? "服务正常，点击重新检查" : "重新检查服务状态"}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16 7a6 6 0 1 0 0 6M16 3v4h-4"/></svg>
+          </button>
+        </div>
       </aside>
       <div
         className="resize-handle resize-handle-left"

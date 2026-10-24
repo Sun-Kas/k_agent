@@ -22,6 +22,9 @@ def build_cli_child_env(
     """
 
     link_root = workspace if workspace is not None else ctx.workspace_dir
+    # Project/Worktree 的工具环境直接指向共享 runtime，不向仓库写 .runtime 链接。
+    if ctx.project_id:
+        link_root = None
     env = os.environ.copy()
     env.update(shared_runtime_tool_env(shared_runtime_prefix(link_root)))
     tool_env = ctx.options.get("toolEnv") if isinstance(ctx.options, dict) else None

@@ -3,11 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from ag_ui.core import RunAgentInput
 
 from access_layer.gateway import AgentAccessLayer
+from access_layer.concurrency import RequestConcurrencyLimiter
 from access_layer.sessions.store import (
     ResumeConflictError,
     SessionStore,
@@ -316,13 +317,6 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_gateway_persists_before_streaming_and_forwards_trusted_resume(self) -> None:
         store = SessionStore()
 
-        class Guard:
-            async def __aenter__(self): return None
-            async def __aexit__(self, *_args): return None
-
-        class Limiter:
-            def protect(self, _session_id, _project_id=None): return Guard()
-
         class Catalog:
             def selected_runtime(self, _mcp_ids, _skill_ids): return [], []
 
@@ -366,7 +360,7 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
 
         backend = Backend()
         layer = AgentAccessLayer(
-            session_store=store, request_limiter=Limiter(),
+            session_store=store, request_limiter=RequestConcurrencyLimiter(2, 1),
             agent_backend_client=backend, runtime_catalog=Catalog(),
         )
         first = RunAgentInput.model_validate({
@@ -375,7 +369,7 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
             "tools": [], "context": [],
             "forwardedProps": {"agentKind": "k_agent", "agentOptions": {"permissionMode": "default"}},
         })
-        with patch("access_layer.gateway.session_workspace_dir", return_value=Path("/tmp/thread-gateway/workspace")), patch(
+        with patch("access_layer.gateway.resolve_session_workspace", new=AsyncMock(return_value=Path("/tmp/thread-gateway/workspace"))), patch(
             "access_layer.gateway.to_managed_path", return_value="sessions/thread-gateway/workspace"
         ):
             response = await layer.run(first)
@@ -394,7 +388,7 @@ class DurableHitlStoreTests(unittest.IsolatedAsyncioTestCase):
             }],
             "forwardedProps": {"agentKind": "k_agent", "agentOptions": {"permissionMode": "default"}},
         })
-        with patch("access_layer.gateway.session_workspace_dir", return_value=Path("/tmp/thread-gateway/workspace")), patch(
+        with patch("access_layer.gateway.resolve_session_workspace", new=AsyncMock(return_value=Path("/tmp/thread-gateway/workspace"))), patch(
             "access_layer.gateway.to_managed_path", return_value="sessions/thread-gateway/workspace"
         ):
             response = await layer.run(second)

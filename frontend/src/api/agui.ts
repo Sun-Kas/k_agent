@@ -14,10 +14,14 @@ import type {
   McpServerConfig,
   ModelProfile,
   ProjectSummary,
+  ProjectRepository,
+  IntegrationState,
+  IntegrationFile,
   RuntimeOption,
   SkillConfig,
   SessionState,
   SessionContextStatus,
+  SessionChanges,
   SessionSummary,
   SessionWorkspaceFileContent,
   SessionWorkspaceListing
@@ -55,6 +59,26 @@ export async function getSessionWorkspaceFile(
     throw new Error(`Unable to read workspace file (${response.status})`);
   }
   return response.json() as Promise<SessionWorkspaceFileContent>;
+}
+
+export async function getSessionChanges(sessionId: string): Promise<SessionChanges> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/changes`));
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法读取 Git 变更"));
+  }
+  return response.json() as Promise<SessionChanges>;
+}
+
+export async function getSessionDiff(sessionId: string, path: string): Promise<string> {
+  const query = new URLSearchParams({ path });
+  const response = await fetch(
+    apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/diff?${query}`)
+  );
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法读取文件差异"));
+  }
+  const payload = await response.json() as { diff: string };
+  return payload.diff;
 }
 
 export async function getHealth(): Promise<HealthState> {
@@ -255,7 +279,7 @@ export async function compactSession(
 
 export async function forkSession(
   sessionId: string,
-  anchor?: { throughMessageId?: string; throughRunId?: string }
+  anchor?: { throughMessageId?: string; throughRunId?: string; environment?: "same-directory" | "worktree" }
 ): Promise<SessionSummary> {
   const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/fork`), {
     method: "POST",
@@ -323,11 +347,11 @@ export async function createProject(rootPath: string, name?: string): Promise<Pr
   return response.json() as Promise<ProjectSummary>;
 }
 
-export async function renameProject(projectId: string, name: string): Promise<ProjectSummary> {
+export async function renameProject(projectId: string, name: string, targetBranch?: string | null): Promise<ProjectSummary> {
   const response = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}`), {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name })
+    body: JSON.stringify({ name, ...(targetBranch !== undefined ? { targetBranch } : {}) })
   });
   if (!response.ok) {
     throw new Error(await sessionActionError(response, "无法重命名 Project"));
@@ -344,10 +368,16 @@ export async function deleteProject(projectId: string): Promise<void> {
   }
 }
 
-/** 在某个 Project 下新建一个归属会话；cwd 直接是该 Project 的 root_path。 */
-export async function createProjectSession(projectId: string): Promise<SessionSummary> {
+/** 默认共享项目目录；独立 worktree 只能由用户显式选择。 */
+export async function createProjectSession(
+  projectId: string,
+  environment: "auto" | "local" | "worktree" = "auto",
+  startingState: "default" | "working-tree" = "default"
+): Promise<SessionSummary> {
   const response = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}/sessions`), {
-    method: "POST"
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ environment, startingState: { type: startingState } })
   });
   if (!response.ok) {
     throw new Error(await sessionActionError(response, "无法在 Project 下新建对话"));
@@ -369,6 +399,64 @@ export async function bindSessionToProject(
     throw new Error(await sessionActionError(response, "无法把对话移入 Project"));
   }
   return response.json() as Promise<SessionSummary>;
+}
+
+export async function handoffSessionEnvironment(
+  sessionId: string,
+  target: "local" | "worktree"
+): Promise<SessionSummary> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/handoff`), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target })
+  });
+  if (!response.ok) {
+    throw new Error(await sessionActionError(response, "无法切换会话工作区"));
+  }
+  return response.json() as Promise<SessionSummary>;
+}
+
+export async function getProjectRepository(projectId: string): Promise<ProjectRepository> {
+  const response = await fetch(apiUrl(`/api/projects/${encodeURIComponent(projectId)}/repository`));
+  if (!response.ok) throw new Error(await sessionActionError(response, "无法读取项目分支"));
+  return response.json() as Promise<ProjectRepository>;
+}
+
+export async function getIntegration(sessionId: string): Promise<IntegrationState> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/integration`));
+  if (!response.ok) throw new Error(await sessionActionError(response, "无法读取合并状态"));
+  return response.json() as Promise<IntegrationState>;
+}
+
+export async function runIntegration(sessionId: string, action: "start" | "continue" | "abort"): Promise<IntegrationState> {
+  const suffix = action === "start" ? "" : `/${action}`;
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/integration${suffix}`), { method: "POST" });
+  if (!response.ok) throw new Error(await sessionActionError(response, "合入目标分支失败"));
+  return response.json() as Promise<IntegrationState>;
+}
+
+export async function commitSessionWorkspace(sessionId: string, message: string): Promise<void> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/git/commit`), {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message })
+  });
+  if (!response.ok) throw new Error(await sessionActionError(response, "提交失败"));
+}
+
+export async function getIntegrationFile(sessionId: string, path: string): Promise<IntegrationFile> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/integration/file?${new URLSearchParams({ path })}`));
+  if (!response.ok) throw new Error(await sessionActionError(response, "无法读取冲突文件"));
+  return response.json() as Promise<IntegrationFile>;
+}
+
+export async function resolveIntegrationFile(
+  sessionId: string, file: IntegrationFile, choice: "manual" | "ours" | "theirs" | "delete", content: string
+): Promise<IntegrationState> {
+  const response = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/integration/file`), {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: file.path, expectedHash: file.hash, choice, content })
+  });
+  if (!response.ok) throw new Error(await sessionActionError(response, "冲突解决失败"));
+  return response.json() as Promise<IntegrationState>;
 }
 
 async function sessionActionError(response: Response, fallback: string): Promise<string> {

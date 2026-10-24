@@ -49,6 +49,7 @@ async def run_codex_app_server(
     resume_authorization: dict[str, Any] | None,
     mapper: CodexItemMapper,
     env: dict[str, str] | None = None,
+    config_overrides: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Run one Codex turn and bridge JSON-RPC server requests to the UI."""
 
@@ -118,6 +119,8 @@ async def run_codex_app_server(
             "sandbox": "danger-full-access" if full_access else "workspace-write",
             "model": model,
         }
+        if config_overrides:
+            thread_params["config"] = config_overrides
         if resume_thread_id:
             thread_result = await call(
                 "thread/resume",

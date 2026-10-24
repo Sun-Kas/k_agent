@@ -94,9 +94,8 @@ def teams_dir() -> Path:
 def projects_dir() -> Path:
     """Project 索引与归属会话簿记根：`state/projects/`。
 
-    注意：这里只放 index.json 和归属会话的 {sessionId}.json/history.jsonl 等
-    簿记文件；Project 真正的工作内容在用户指定的 root_path（可在磁盘任意位置），
-    绝不会落在这个目录下。
+    除 index.json 和会话簿记外，还在 worktrees/ 中托管隔离工作目录。
+    用户的 Local Checkout 仍在 root_path，删除索引和会话不删除这些工作内容。
     """
 
     return state_dir() / "projects"
@@ -110,6 +109,16 @@ def project_sessions_dir(project_id: str) -> Path:
     """某个 Project 下所有归属会话的簿记目录：state/projects/{id}/sessions/。"""
 
     return projects_dir() / project_id / "sessions"
+
+
+def project_worktrees_dir(project_id: str) -> Path:
+    """K Agent 为 Project 会话托管的 Git worktree 根目录。"""
+
+    return projects_dir() / project_id / "worktrees"
+
+
+def session_worktree_dir(project_id: str, session_id: str) -> Path:
+    return project_worktrees_dir(project_id) / session_id
 
 
 def shared_runtime_dir() -> Path:
@@ -225,8 +234,8 @@ def session_json_path(session_id: str, project_id: str | None = None) -> Path:
 def session_workspace_dir(session_id: str, project_id: str | None = None) -> Path:
     """对话绑定的 CLI/本地工具 cwd（非 Team 任务目录）。
 
-    归属 Project 的会话没有私有 workspace/：cwd 直接就是 Project 的 root_path，
-    调用方应该优先用 Project 的 root_path，这里仅为未归属会话保留旧布局。
+    Project 会话必须通过环境 resolver 读取 Local/Worktree 绑定；此函数仅为
+    非 Project 会话保留旧布局。
     """
 
     return session_bundle_dir(session_id, project_id) / "workspace"

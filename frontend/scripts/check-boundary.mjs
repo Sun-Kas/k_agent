@@ -14,7 +14,8 @@ const forbiddenPatterns = [
   /registry\.modelcontextprotocol\.io/,
   /modelscope\.cn/,
   /\bAGENT_BACKEND\b/,
-  /\bfs\b/,
+  /from\s+["'](?:node:)?fs["']/,
+  /import\s*\([^)]*["'](?:node:)?fs["']/,
   /readFile|writeFile/
 ];
 

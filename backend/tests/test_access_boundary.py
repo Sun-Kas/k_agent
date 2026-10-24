@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 from ag_ui.core import RunAgentInput
 from access_layer.gateway import AgentAccessLayer
+from access_layer.concurrency import RequestConcurrencyLimiter
 from access_layer.sessions.store import SessionRecord
 from backend.api.schemas import ChatMessage
 from backend.agent import AgentRunRequest
@@ -266,17 +267,6 @@ class FullHistoryForwardingTests(unittest.IsolatedAsyncioTestCase):
             async def append_event(self, _session_id, _event):
                 return None
 
-        class Guard:
-            async def __aenter__(self):
-                return None
-
-            async def __aexit__(self, *_args):
-                return None
-
-        class Limiter:
-            def protect(self, _session_id, _project_id=None):
-                return Guard()
-
         class Catalog:
             def selected_runtime(self, _mcp_ids, _skill_ids):
                 return [], []
@@ -293,7 +283,7 @@ class FullHistoryForwardingTests(unittest.IsolatedAsyncioTestCase):
         backend = Backend()
         layer = AgentAccessLayer(
             session_store=Store(),
-            request_limiter=Limiter(),
+            request_limiter=RequestConcurrencyLimiter(2, 1),
             agent_backend_client=backend,
             runtime_catalog=Catalog(),
         )
@@ -308,8 +298,8 @@ class FullHistoryForwardingTests(unittest.IsolatedAsyncioTestCase):
         })
 
         with unittest.mock.patch(
-            "access_layer.gateway.session_workspace_dir",
-            return_value=Path("/managed/state/sessions/session-history/workspace"),
+            "access_layer.gateway.resolve_session_workspace",
+            new=unittest.mock.AsyncMock(return_value=Path("/managed/state/sessions/session-history/workspace")),
         ), unittest.mock.patch(
             "access_layer.gateway.to_managed_path",
             return_value="state/sessions/session-history/workspace",

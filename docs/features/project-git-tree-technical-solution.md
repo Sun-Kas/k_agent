@@ -1,6 +1,6 @@
 # 参考 Codex 的 Project Git 工作区与 Session 右侧栏技术方案
 
-> 状态：设计稿，待评审后实施。
+> 状态：本机主要流程已实现。2026-10-24 调整为默认共享项目目录，独立 Worktree 显式选择；增加统一目标分支、成果合并和隔离冲突解决。
 >
 > 关联方案：[项目制（Project Workspace）技术方案](project-workspace-technical-solution.md)。本方案重新定义 Project、Session、Git 仓库、checkout 与 worktree 的关系，并替代此前“所有 Session 永远共享一个工作目录”或“每个 Session 自动创建分支”的设计。
 
@@ -101,7 +101,7 @@ Session 创建或 handoff 时记录的基线提交 OID。右侧栏用它计算�
 
 1. **Project 管仓库，Session 管执行环境。** Project 不替所有 Session 强制选择同一个 cwd。
 2. **Worktree 是隔离手段，branch 是用户选择。** 默认 worktree 使用 detached HEAD，不自动制造大量 `k-agent/*` 分支。
-3. **Git 项目新 Session 默认使用 Managed Worktree。** 用户明确选择“直接在项目目录工作”时使用 Local Checkout。
+3. **所有 Project 的新 Session 默认共享 Local Checkout。** 讨论、分析和连续修改无需复制项目；用户明确选择隔离并行任务时才创建 Managed Worktree。
 4. **非 Git 项目使用 Local Checkout。** 不为了创建会话而偷偷 `git init`。
 5. **变更审查以 Session 的 baseline 和 cwd 为边界。** 右侧栏回答“这个任务相对开始时改了什么”。
 6. **环境可以 handoff。** 用户可以把隔离工作移回主 checkout，也可以把 local 工作转入 worktree。
@@ -131,12 +131,12 @@ Project 创建只登记目录并探测环境：
 
 ### 4.2 在 Project 下新建 Session
 
-Git Project 默认直接创建 Managed Worktree；新建按钮旁的二级菜单允许选择：
+Project 默认直接使用共享目录；项目信息菜单提供显式环境选项：
 
 ```text
 新建任务
-  ├── 在 Worktree 中开始（默认）
-  └── 在项目目录中开始
+  ├── 在项目目录中开始（默认）
+  └── 在独立 Worktree 中开始
 ```
 
 选择 Worktree 后还可展开高级项：
@@ -146,7 +146,7 @@ Git Project 默认直接创建 Managed Worktree；新建按钮旁的二级菜单
 - 包含当前 checkout 的未提交修改；
 - 创建用户指定的新分支。
 
-普通点击不弹复杂对话框，按默认分支创建 detached worktree。只有用户展开高级项时才要求选择基线或分支。
+普通点击不弹复杂对话框，不创建 Worktree，也不切换当前分支。独立 Worktree 默认从项目目标分支创建 detached worktree；高级项允许选择其他基线或分支。
 
 非 Git Project 直接创建 Local Session，不展示无效的 Worktree 选项。
 
@@ -469,7 +469,7 @@ Local checkout · master-mac
 
 ### 12.3 新 Session 和环境切换入口
 
-Project 行右侧的新建会话按钮保持一键默认行为：Git Project 创建 Worktree，非 Git Project 使用 Local。长按/二级菜单才选择环境和 starting state。
+Project 行右侧的新建会话按钮一键创建 Local 共享会话。项目信息菜单显式选择独立 Worktree 或包含当前改动的 Worktree。
 
 环境标签可以点击打开详情，但切换必须走 Handoff，不能直接改一个 `cwd` 字段。
 
@@ -631,7 +631,7 @@ GET /api/sessions/{sessionId}/compare?baseRef=<ref>
 
 新版本启用后：
 
-- 新建 Git Project Session 默认 Worktree；
+- 新建 Git Project Session 默认共享 Local；
 - 新建非 Git Project Session 默认 Local；
 - 已有 Session 行为不变；
 - 原 Project 级长锁继续保护所有 legacy local Session；
@@ -688,7 +688,7 @@ GET /api/sessions/{sessionId}/compare?baseRef=<ref>
 
 ### 前端测试
 
-- Git Project 一键新建默认为 Worktree；
+- Git Project 一键新建默认为共享 Local，显式选择才创建 Worktree；
 - 非 Git Project 不显示 Worktree 默认项；
 - setup pending/failed/ready 状态；
 - Local/Worktree/共享目录标签准确；
@@ -700,7 +700,7 @@ GET /api/sessions/{sessionId}/compare?baseRef=<ref>
 
 ### 验收场景
 
-1. 同一 Project 新建两个默认 Session，得到两个共享同一 Repository 的 detached Worktree；
+1. 同一 Project 新建两个默认 Session，共用同一个目录和当前分支；显式创建的独立 Worktree 共享 Repository，但文件和暂存区隔离；
 2. 两个 Worktree 可以并行修改同名文件而互不覆盖；
 3. 两个 Session 的右侧栏分别显示相对各自 baseline 的变更；
 4. 用户选择“在项目目录中开始”后，Session 直接使用 `rootPath`；
@@ -711,11 +711,53 @@ GET /api/sessions/{sessionId}/compare?baseRef=<ref>
 9. 删除带变更的 Session 不会静默删除 Worktree；
 10. MCP/Codex 运行配置不污染 Review。
 
-## 21. 关键决策
+## 21. 当前代码落地状态（2026-10-24）
+
+已实现的本机主链路：
+
+- Project 仓库探测；登记项目时不再自动初始化 Git 或写入模板文件。
+- Session 持久化 Local/Worktree 绑定；旧 Project Session 兼容迁移为 Local。
+- 新会话默认共享 Local 项目目录；用户显式选择才创建独立 worktree。已有会话保留原环境绑定，显式分支通过 `startingState` 请求选择。
+- 创建入口支持 `startingState=working-tree`，分别复制 staged/unstaged patch 与未跟踪文件，并核验源状态未发生变化。
+- Agent、终端、文件预览、Review 共用 cwd resolver；运行锁按实际 cwd 生效。
+- 右侧栏“轨迹 / 变更 / 文件”、环境标识、共享目录提示、按基线的已提交及未提交变更、逐文件 Diff 与刷新失效。
+- 同目录 Fork 和新 Worktree Fork；后者包含源工作树的未提交状态。
+- Local → Worktree 支持复制未提交状态并保留原目录；Worktree → Local 当前要求两端干净且能快进，分叉历史或脏目标明确拒绝。
+- Handoff 保留原 worktree，关闭旧 cwd 的终端并清空 CLI 原生 resume id；不会删除其他同目录 Fork 仍在使用的目录。
+- Codex 使用 app-server 请求级配置覆盖，Claude 使用单次运行的临时 MCP 配置；Project 工具环境不再注入 `.runtime` 链接。
+- 删除 Project/Session 保留工作树内容；Diff 限制文件大小与响应长度。
+- Project `targetBranch` 可在项目编辑界面选择已有本地分支，默认采用项目当前分支；设置目标只更新配置，不切换用户 checkout。
+- 右侧“变更”面板提供“提交全部改动”和“合入目标分支”。共享会话明确提示提交范围包含共享目录中所有改动。
+- 合入要求源改动已提交；在隔离合并目录创建 merge commit，可汇总历史已分叉的多个 Session。冲突解决前不修改用户的源目录和目标分支。
+- 冲突面板支持逐文件编辑、保留目标版本、保留会话版本和删除；验证文件 hash，防止覆盖过期编辑。二进制/符号链接冲突可选择一方或删除。
+- 合并操作及固定 source/target OID 持久化，支持刷新/重启后继续或取消。发布前校验目标仍为预期 OID；未被检出的分支用 update-ref CAS 更新，被检出的干净目标通过快进更新。
+- 目标被外部推进、目标有未提交改动或源/目标正在运行时拒绝覆盖；取消只删除本次隔离冲突编辑，保留原 Session Worktree。
+
+成果汇总接口：
+
+```text
+PATCH /api/projects/{id}                       # name / targetBranch
+GET   /api/projects/{id}/repository            # 当前仓库及本地分支选项
+POST  /api/sessions/{id}/git/commit             # 显式提交全部未忽略改动
+GET   /api/sessions/{id}/integration            # 持久合并状态
+POST  /api/sessions/{id}/integration            # 预检并尝试合入
+POST  /api/sessions/{id}/integration/continue   # 冲突解决后继续
+POST  /api/sessions/{id}/integration/abort      # 取消本次合并
+GET   /api/sessions/{id}/integration/file       # 冲突文本和 hash
+PUT   /api/sessions/{id}/integration/file       # 编辑/选择版本/删除并标记已解决
+```
+
+后续阶段仍包括：异步 setup operation 与可恢复日志、repair/reconcile/reclaim 管理入口、带未提交改动的 Worktree → Local 事务式迁移、Diff 分层切换和行评论、跨 Host 交接。本文其余章节仍描述目标设计；以上清单用于区分当前可用行为和后续阶段。
+
+验证包含真实临时 Git 仓库的 HTTP 创建 → Fork → Review → Handoff 流程、工作树快照、共享目录锁和 Runner 配置隔离。完整后端套件中的既有 ToolCallResult 契约失败已在原始 HEAD 临时副本中复现；本次相关测试单独验证。
+
+2026-10-24 补充验收：新建普通会话显示 `Local · 共享`；项目编辑可选择统一目标分支；在临时仓库中通过真实浏览器完成冲突文件编辑 → 保存结果 → 继续合入，界面显示“已合入目标分支”。自动化验证覆盖多 Session 的分叉提交汇总、二进制冲突、脏目标拒绝、过期编辑、目标推进拒绝、提交后状态写入中断恢复以及未检出目标分支的 CAS 更新。
+
+## 22. 关键决策
 
 - 同一 Project 共享一个 Git Repository/common dir；
 - Session 显式绑定 Local Checkout 或 Managed Worktree；
-- Git Project 新 Session 默认 Worktree，非 Git Project 默认 Local；
+- 所有 Project 新 Session 默认共享 Local；独立 Worktree 仅显式创建；
 - 默认 Worktree 使用 detached HEAD，不自动创建 Session 分支；
 - Session 可以 same-directory Fork、Worktree Fork 和双向 Handoff；
 - Review 相对 Session baseline，不把整个 Project 状态误称为本任务变更；

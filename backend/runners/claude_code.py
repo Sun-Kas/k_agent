@@ -18,6 +18,7 @@ from backend.runners.claude_approval_bridge import (
     ClaudeApprovalBridge,
 )
 from backend.runners.base import RunnerContext
+from backend.runners.runtime_config import runtime_config_dir
 from backend.runners.cli_env import build_cli_child_env
 from backend.runners.cli_process import (
     _CliStreamState,
@@ -84,7 +85,7 @@ class ClaudeCodeRunner:
             )
         mode = cli_session_mode(ctx)
         resume_id = resume_session_id(ctx) if mode == "resume" else None
-        async with _approval_bridge(ctx) as approval_bridge:
+        async with _approval_bridge(ctx) as approval_bridge, runtime_config_dir() as config_dir:
             full_access = ctx.options.get("permissionMode") == "full_access"
             permission_mode = _claude_permission_mode(
                 ctx, approval_available=approval_bridge is not None
@@ -98,7 +99,7 @@ class ClaudeCodeRunner:
                 # installed in full-access runs while ordinary tools remain
                 # bypassed by Claude's own permission mode.
                 claude_mcp_servers.append(approval_bridge.mcp_server())
-            mcp_config = write_claude_mcp_config(workspace, claude_mcp_servers)
+            mcp_config = write_claude_mcp_config(config_dir, claude_mcp_servers)
 
             argv = [
                 command,

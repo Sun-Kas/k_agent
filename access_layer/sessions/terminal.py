@@ -284,6 +284,14 @@ class TerminalRegistry:
                     if self._terminals.get(key) is terminal:
                         self._terminals.pop(key, None)
 
+    async def close_session(self, session_id: str) -> None:
+        """Handoff 后关闭旧 cwd 的 PTY，重新连接时使用新的执行环境。"""
+        async with self._lock:
+            keys = [key for key in self._terminals if key.startswith(f"{session_id}\n")]
+            terminals = [self._terminals.pop(key) for key in keys]
+        for terminal in terminals:
+            await terminal.close()
+
     async def close_all(self) -> None:
         async with self._lock:
             terminals = list(self._terminals.values())

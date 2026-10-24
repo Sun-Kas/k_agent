@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 import json
 import os
@@ -40,19 +41,32 @@ from access_layer.sessions.terminal import TERMINAL_ID_RE, TerminalRegistry, enc
 from access_layer.sessions.workspace import (
     list_session_workspace,
     read_session_workspace_file,
-    resolve_session_workspace,
+)
+from access_layer.sessions.workspace_resolver import (
+    resolve_session_workspace as resolve_bound_session_workspace,
 )
 from access_layer.scheduled_tasks import ScheduledTaskRuntime, ScheduledTaskStore
 from access_layer.scheduled_tasks.router import build_scheduled_task_router
 from access_layer.teams import TeamRuntime, TeamStore, build_team_router
 from access_layer.projects import ProjectStore
+from access_layer.projects.git import (
+    GitWorkspaceError,
+    diff_for_path,
+    handoff_environment,
+    inspect_repository,
+    list_changes,
+    prepare_session_environment,
+    remove_managed_worktree,
+)
 from access_layer.projects.router import build_project_router
+from access_layer.projects.integration_router import build_integration_router
 from access_layer.fs_browse import create_directory, list_directories
 from access_layer.schemas import (
     HealthResponse,
     McpConfigUpdate,
     ModelsConfigUpdate,
     SessionForkInput,
+    SessionEnvironment,
     SessionRunCancelInput,
     SessionCompactInput,
     SessionContextStatus,
@@ -62,7 +76,7 @@ from access_layer.schemas import (
     SkillsConfigUpdate,
 )
 from access_layer.settings import Settings, get_or_init_settings
-from access_layer.home import ensure_home_layout, skills_dir, teams_dir
+from access_layer.home import ensure_home_layout, session_worktree_dir, skills_dir, teams_dir
 from access_layer.logging_config import configure_agent_backend_logging
 from access_layer.storage import create_storage, write_json_atomic
 from access_layer.models_catalog import (
@@ -402,6 +416,10 @@ def create_app() -> FastAPI:
             _LazyAttrProxy("project_store"), _LazyAttrProxy("session_store")
         )
     )
+    app.include_router(build_integration_router(
+        _LazyAttrProxy("project_store"), _LazyAttrProxy("session_store"),
+        _LazyAttrProxy("request_limiter"),
+    ))
 
     # "新建 Project" 弹窗的目录选择器用：浏览器拿不到原生文件夹选择器返回的
     # 磁盘绝对路径，所以用这两个只读/半只读接口在服务端（本机进程）代为浏览。
@@ -722,10 +740,10 @@ def create_app() -> FastAPI:
                 and session.skill_ids is not None
                 else None
             ),
+            environment=session.environment,
         )
 
-    @app.post("/api/sessions/{session_id}/fork", response_model=SessionSummary)
-    async def fork_session(
+    async def _fork_session(
         session_id: str,
         payload: SessionForkInput | None = None,
     ) -> SessionSummary:
@@ -735,16 +753,59 @@ def create_app() -> FastAPI:
         """
 
         fork_at = payload or SessionForkInput()
+        source = await app.state.session_store.get(session_id)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        branch_id: str | None = None
+        branch_environment: SessionEnvironment | None = None
+        if fork_at.environment == "worktree":
+            if not source.project_id:
+                raise HTTPException(
+                    status_code=400, detail="Only Project sessions can create a Git worktree"
+                )
+            project = await app.state.project_store.get(source.project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            branch_id = str(uuid.uuid4())
+            start_ref = None
+            copy_from = None
+            if source.environment and source.environment.repository_root:
+                source_repository = await asyncio.to_thread(
+                    inspect_repository, source.environment.cwd
+                )
+                start_ref = source_repository.head_oid
+                copy_from = source_repository.repository_root
+            try:
+                branch_environment = await asyncio.to_thread(
+                    prepare_session_environment,
+                    project,
+                    branch_id,
+                    "worktree",
+                    start_ref,
+                    copy_from,
+                )
+            except GitWorkspaceError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             branch = await app.state.session_store.fork_session(
                 session_id,
                 through_message_id=fork_at.through_message_id,
                 through_run_id=fork_at.through_run_id,
+                branch_id=branch_id,
+                environment=branch_environment,
             )
         except SessionBusyError as exc:
+            if branch_environment is not None:
+                await asyncio.to_thread(remove_managed_worktree, branch_environment)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SessionForkAnchorError as exc:
+            if branch_environment is not None:
+                await asyncio.to_thread(remove_managed_worktree, branch_environment)
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception:
+            if branch_environment is not None:
+                await asyncio.to_thread(remove_managed_worktree, branch_environment)
+            raise
         if branch is None:
             raise HTTPException(status_code=404, detail="Session not found")
         return SessionSummary(
@@ -753,7 +814,23 @@ def create_app() -> FastAPI:
             updatedAt=branch.updated_at,
             messageCount=len(branch.messages),
             projectId=branch.project_id,
+            environment=branch.environment,
         )
+
+    @app.post("/api/sessions/{session_id}/fork", response_model=SessionSummary)
+    async def fork_session(
+        session_id: str, payload: SessionForkInput | None = None
+    ) -> SessionSummary:
+        try:
+            async with app.state.request_limiter.protect_idle_session(session_id):
+                source = await app.state.session_store.get(session_id)
+                if source is None:
+                    raise HTTPException(status_code=404, detail="Session not found")
+                cwd = await resolve_bound_session_workspace(source, app.state.project_store)
+                async with app.state.request_limiter.protect_idle_workspaces([str(cwd)]):
+                    return await _fork_session(session_id, payload)
+        except (SessionAlreadyRunning, ValueError, GitWorkspaceError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/sessions/{session_id}/project")
     async def bind_session_project(session_id: str, payload: dict) -> SessionSummary:
@@ -785,6 +862,77 @@ def create_app() -> FastAPI:
             updatedAt=session.updated_at,
             messageCount=len(session.messages),
             projectId=session.project_id,
+            environment=session.environment,
+        )
+
+    @app.get("/api/sessions/{session_id}/environment")
+    async def get_session_environment(session_id: str) -> dict:
+        session = await app.state.session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if session.environment is None:
+            return {"sessionId": session_id, "environment": None}
+        return {
+            "sessionId": session_id,
+            "environment": session.environment.model_dump(by_alias=True, mode="json"),
+        }
+
+    @app.post("/api/sessions/{session_id}/handoff", response_model=SessionSummary)
+    @app.post(
+        "/api/sessions/{session_id}/environment",
+        response_model=SessionSummary,
+        include_in_schema=False,
+    )
+    async def handoff_session_environment(session_id: str, payload: dict) -> SessionSummary:
+        """在 local checkout 与托管 worktree 之间切换会话执行目录。
+
+        Local 转 Worktree 可以复制未提交状态并保留原文件；返回 Local 要求源和
+        目标干净且可快进，冲突时保留 Worktree 等待显式合并。
+        """
+
+        target = str(payload.get("target") or "").strip()
+        if target not in {"local", "worktree"}:
+            raise HTTPException(status_code=400, detail="target must be local or worktree")
+        session = await app.state.session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if not session.project_id:
+            raise HTTPException(status_code=400, detail="Session is not bound to a Project")
+        project = await app.state.project_store.get(session.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        try:
+            async with app.state.request_limiter.protect_idle_session(session.id):
+                current = session.environment or await asyncio.to_thread(
+                    prepare_session_environment, project, session.id, "local", None
+                )
+                # 目标目录也可能被同 Project 的另一会话使用，必须同时占用两处。
+                paths = [
+                    str(Path(current.cwd).resolve()),
+                    str(Path(project.root_path).resolve()),
+                    str(session_worktree_dir(project.id, session.id).resolve()),
+                ]
+                async with app.state.request_limiter.protect_idle_workspaces(paths):
+                    next_environment = await asyncio.to_thread(
+                        handoff_environment, project, session.id, current, target
+                    )
+                    updated = await app.state.session_store.update_environment(
+                        session.id, next_environment
+                    )
+        except (SessionAlreadyRunning, SessionBusyError, GitWorkspaceError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        await app.state.terminals.close_session(session_id)
+        return SessionSummary(
+            id=updated.id,
+            title=updated.title,
+            updatedAt=updated.updated_at,
+            messageCount=len(updated.messages),
+            projectId=updated.project_id,
+            environment=updated.environment,
         )
 
     @app.get(
@@ -929,12 +1077,7 @@ def create_app() -> FastAPI:
         cwd 到底是哪"的理解永远一致，不会因为各自单独实现而出现分歧。
         """
 
-        if session.project_id:
-            project = await app.state.project_store.get(session.project_id)
-            if project is None:
-                raise ValueError("Project not found for this session")
-            return resolve_session_workspace(session.id, root=project.root_path)
-        return resolve_session_workspace(session.id)
+        return await resolve_bound_session_workspace(session, app.state.project_store)
 
     @app.websocket("/api/sessions/{session_id}/terminal/{terminal_id}")
     async def session_terminal(websocket: WebSocket, session_id: str, terminal_id: str):
@@ -1013,6 +1156,49 @@ def create_app() -> FastAPI:
             "binary": payload.binary,
             "size": payload.size,
         }
+
+    async def _git_environment_or_400(session) -> SessionEnvironment:
+        environment = session.environment
+        if environment is None or environment.repository_root is None:
+            raise HTTPException(
+                status_code=400, detail="This session is not bound to a Git workspace"
+            )
+        try:
+            await resolve_bound_session_workspace(session, app.state.project_store)
+        except (ValueError, GitWorkspaceError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return environment
+
+    @app.get("/api/sessions/{session_id}/changes")
+    async def get_session_changes(session_id: str) -> dict:
+        session = await app.state.session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        environment = await _git_environment_or_400(session)
+        try:
+            changes = await asyncio.to_thread(list_changes, environment)
+        except GitWorkspaceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "sessionId": session_id,
+            "baseOid": environment.base_oid,
+            "files": [
+                {"path": item.path, "status": item.status, "originalPath": item.original_path}
+                for item in changes
+            ],
+        }
+
+    @app.get("/api/sessions/{session_id}/diff")
+    async def get_session_diff(session_id: str, path: str) -> dict:
+        session = await app.state.session_store.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        environment = await _git_environment_or_400(session)
+        try:
+            diff = await asyncio.to_thread(diff_for_path, environment, path)
+        except GitWorkspaceError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"sessionId": session_id, "path": path, "diff": diff}
 
     # 本地一体部署只暴露 Access Layer。在全部 API 之后挂载编译后的前端，
     # 保证 /api 优先，同时同源提供工作台静态资源。

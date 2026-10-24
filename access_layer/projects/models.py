@@ -7,6 +7,7 @@ default_mcp_server_ids、permission_mode 等重字段——那些仍然是 Sessi
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,6 +36,10 @@ class ProjectRecord(BaseModel):
     name: str
     # 绝对路径，入库前已 resolve；创建后不可变（改路径语义上等于换一个 Project）。
     root_path: str = Field(alias="rootPath")
+    is_git_repository: bool = Field(default=False, alias="isGitRepository")
+    repository_root: str | None = Field(default=None, alias="repositoryRoot")
+    git_common_dir: str | None = Field(default=None, alias="gitCommonDir")
+    target_branch: str | None = Field(default=None, alias="targetBranch")
     # 归属该 Project 的会话数量；由 SessionStore 在创建/删除/迁移会话时维护，
     # 仅用于列表展示，不是任何校验的真相源。
     session_count: int = Field(default=0, alias="sessionCount")
@@ -45,11 +50,12 @@ class ProjectRecord(BaseModel):
 
 
 class ProjectUpdateInput(BaseModel):
-    """首版唯一可编辑字段就是 name；root_path 创建后不可改。"""
+    """项目名称和成果汇总分支；路径保持稳定。"""
 
     model_config = ConfigDict(populate_by_name=True)
 
-    name: str = Field(min_length=1, max_length=120)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    target_branch: str | None = Field(default=None, alias="targetBranch", max_length=255)
 
 
 class ProjectSummary(BaseModel):
@@ -60,6 +66,39 @@ class ProjectSummary(BaseModel):
     id: str
     name: str
     root_path: str = Field(alias="rootPath")
+    is_git_repository: bool = Field(default=False, alias="isGitRepository")
+    repository_root: str | None = Field(default=None, alias="repositoryRoot")
+    git_common_dir: str | None = Field(default=None, alias="gitCommonDir")
+    target_branch: str | None = Field(default=None, alias="targetBranch")
     session_count: int = Field(default=0, alias="sessionCount")
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(alias="updatedAt")
+
+
+class SessionStartingState(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    type: Literal["default", "branch", "working-tree"] = "default"
+    branch_name: str | None = Field(default=None, alias="branchName", min_length=1, max_length=255)
+    on_missing: Literal["error", "create-branch"] = Field(default="error", alias="onMissing")
+
+
+class ProjectSessionCreateInput(BaseModel):
+    """auto 默认共享项目目录；worktree 仅由用户显式选择。"""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    environment: Literal["auto", "local", "worktree"] = "auto"
+    start_ref: str | None = Field(default=None, alias="startRef", max_length=512)
+    starting_state: SessionStartingState = Field(default_factory=SessionStartingState, alias="startingState")
+
+
+class RepositoryInfo(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    is_git_repository: bool = Field(alias="isGitRepository")
+    repository_root: str | None = Field(default=None, alias="repositoryRoot")
+    git_common_dir: str | None = Field(default=None, alias="gitCommonDir")
+    head_oid: str | None = Field(default=None, alias="headOid")
+    branch_ref: str | None = Field(default=None, alias="branchRef")
+    detached: bool = False

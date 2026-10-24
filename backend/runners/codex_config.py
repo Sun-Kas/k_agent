@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
+import tomllib
+from tempfile import TemporaryDirectory
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 
 logger = logging.getLogger("k_agent.runners.codex.config")
+
+
+def build_codex_runtime_config(mcp_servers: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """复用 TOML 序列化后通过 app-server config 覆盖，不写用户 .codex/。"""
+    with TemporaryDirectory(prefix="k-agent-codex-config-") as temporary:
+        path = write_codex_mcp_config(Path(temporary), mcp_servers)
+        config = tomllib.loads(path.read_text(encoding="utf-8")) if path else {}
+    return {**config, "model_reasoning_summary": "detailed", "hide_agent_reasoning": False}
 
 
 def write_codex_mcp_config(
@@ -50,13 +61,13 @@ def write_codex_mcp_config(
                     + ", ".join(_toml_string(str(arg)) for arg in args)
                     + "]"
                 )
+            if server.get("cwd"):
+                lines.append(f"cwd = {_toml_string(str(server['cwd']))}")
             env = server.get("env")
             if isinstance(env, dict) and env:
                 lines.append(f"[mcp_servers.{_toml_key(server_id)}.env]")
                 for key, value in env.items():
-                    lines.append(f"{key} = {_toml_string(str(value))}")
-            if server.get("cwd"):
-                lines.append(f"cwd = {_toml_string(str(server['cwd']))}")
+                    lines.append(f"{_toml_key(str(key))} = {_toml_string(str(value))}")
         count += 1
     if count == 0:
         return None
@@ -81,8 +92,7 @@ def write_codex_mcp_config(
 
 
 def _toml_string(value: Any) -> str:
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def _toml_key(name: str) -> str:

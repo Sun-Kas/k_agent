@@ -422,10 +422,11 @@ def create_app() -> FastAPI:
             permission_token = set_tool_permission_mode(
                 str(request_context.options.get("permissionMode") or "default")
             )
-            # PATH/npm 走工作区 `.runtime`（指向共享 cache），不要把 cache 实路径
-            # 灌进子进程；无 workspace 时才用 cache。冲突键以 agentOptions.toolEnv 为准。
+            # Project 工具直接使用共享 cache，避免向用户仓库注入 .runtime 链接。
             tool_env = shared_runtime_tool_env(
-                shared_runtime_prefix(request_context.workspace_dir)
+                shared_runtime_prefix(
+                    None if request_context.project_id else request_context.workspace_dir
+                )
             )
             option_env = (
                 request_context.options.get("toolEnv")

@@ -73,6 +73,24 @@ class SessionForkInput(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     through_message_id: str | None = Field(default=None, alias="throughMessageId")
     through_run_id: str | None = Field(default=None, alias="throughRunId")
+    environment: Literal["same-directory", "worktree"] = "same-directory"
+
+
+class SessionEnvironment(BaseModel):
+    """会话实际执行目录的持久绑定；Project 只负责归属，不再隐式决定 cwd。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: Literal["local", "worktree"]
+    cwd: str
+    project_id: str = Field(alias="projectId")
+    repository_root: str | None = Field(default=None, alias="repositoryRoot")
+    git_common_dir: str | None = Field(default=None, alias="gitCommonDir")
+    base_oid: str | None = Field(default=None, alias="baseOid")
+    branch_ref: str | None = Field(default=None, alias="branchRef")
+    detached: bool = False
+    # 同目录 Fork 可以引用源会话拥有的 worktree，所有权与会话归属分开。
+    worktree_id: str | None = Field(default=None, alias="worktreeId")
 
 
 class SessionSummary(BaseModel):
@@ -84,6 +102,7 @@ class SessionSummary(BaseModel):
     message_count: int = Field(alias="messageCount")
     # 归属的 Project id；None 表示未归属任何 Project（旧的扁平会话）。
     project_id: str | None = Field(default=None, alias="projectId")
+    environment: SessionEnvironment | None = None
 
 
 class SessionCapabilities(BaseModel):
@@ -103,6 +122,7 @@ class SessionState(BaseModel):
         default_factory=list, alias="openInterrupts"
     )
     capabilities: SessionCapabilities | None = None
+    environment: SessionEnvironment | None = None
 
 
 class SessionRunCancelInput(BaseModel):

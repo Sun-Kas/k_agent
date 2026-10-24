@@ -33,6 +33,19 @@ export interface SessionSummary {
   messageCount: number;
   /** 归属的 Project id；undefined/null 表示未归属任何 Project。 */
   projectId?: string | null;
+  environment?: SessionEnvironment | null;
+}
+
+export interface SessionEnvironment {
+  kind: "local" | "worktree";
+  cwd: string;
+  projectId: string;
+  repositoryRoot?: string | null;
+  gitCommonDir?: string | null;
+  baseOid?: string | null;
+  branchRef?: string | null;
+  detached: boolean;
+  worktreeId?: string | null;
 }
 
 /** Project：稳定文件夹 + 会话归属关系，不是新的运行时。 */
@@ -40,6 +53,10 @@ export interface ProjectSummary {
   id: string;
   name: string;
   rootPath: string;
+  isGitRepository?: boolean;
+  repositoryRoot?: string | null;
+  gitCommonDir?: string | null;
+  targetBranch?: string | null;
   sessionCount: number;
   createdAt: string;
   updatedAt: string;
@@ -49,6 +66,28 @@ export interface ProjectSummary {
 export interface DirectoryEntry {
   name: string;
   path: string;
+}
+
+export interface ProjectRepository {
+  isGitRepository: boolean;
+  branchRef?: string | null;
+  targetBranch?: string | null;
+  branches: string[];
+}
+
+export interface IntegrationState {
+  status: "idle" | "merging" | "conflicts" | "ready" | "publishing" | "completed" | "aborted" | "failed";
+  targetBranch?: string | null;
+  conflicts: string[];
+  message?: string;
+  resultOid?: string;
+}
+
+export interface IntegrationFile {
+  path: string;
+  content: string;
+  binary: boolean;
+  hash: string;
 }
 
 /** `/api/fs/browse` 的返回：当前目录、父目录（到盘符根时为 null）和子目录列表。 */
@@ -81,6 +120,18 @@ export interface SessionWorkspaceFileContent {
   size: number;
 }
 
+export interface SessionGitChange {
+  path: string;
+  status: string;
+  originalPath?: string | null;
+}
+
+export interface SessionChanges {
+  sessionId: string;
+  baseOid?: string | null;
+  files: SessionGitChange[];
+}
+
 /** 打开会话时的服务端快照：UI 只重放完整 history 事件。 */
 export interface SessionState {
   sessionId: string;
@@ -94,6 +145,7 @@ export interface SessionState {
     skillIds: string[];
     permissionMode?: PermissionMode;
   } | null;
+  environment?: SessionEnvironment | null;
 }
 
 export interface BashSandboxHealth {

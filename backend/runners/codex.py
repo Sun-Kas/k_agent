@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 import uuid
@@ -30,7 +29,7 @@ from backend.runners.cli_process import (
 )
 from backend.runners.claude_code import _catalog_skill_block
 from backend.runners.codex_app_server import CodexStreamState, run_codex_app_server
-from backend.runners.codex_config import write_codex_mcp_config
+from backend.runners.codex_config import build_codex_runtime_config
 from backend.runners.network_policy import network_access_enabled
 from backend.runners.resolve_cli import resolve_cli
 
@@ -64,13 +63,13 @@ class CodexRunner:
             prompt = f"{skill_preamble}\n\n---\n\n{prompt}"
         mode = cli_session_mode(ctx)
         resume_id = resume_session_id(ctx) if mode == "resume" else None
-        write_codex_mcp_config(workspace, ctx.mcp_servers)
-        _write_codex_reasoning(workspace, ctx.reasoning_effort)
+        runtime_config = build_codex_runtime_config(ctx.mcp_servers)
 
         if ctx.approval_broker is None:
             raise RuntimeError("CodexRunner requires an approval broker")
         yield {
             "command": command,
+            "config_overrides": runtime_config,
             "cwd": workspace,
             "prompt": prompt,
             "model": str(ctx.model_id) if ctx.model_id else None,
@@ -106,9 +105,6 @@ class CodexRunner:
                 yield event
 
 
-_CODEX_EFFORT_VALUES = {"minimal", "low", "medium", "high", "xhigh"}
-
-
 def build_codex_skill_preamble(skills: list[dict[str, Any]]) -> str:
     """List selected skills from request catalog metadata. Do not load SKILL.md."""
 
@@ -118,45 +114,6 @@ def build_codex_skill_preamble(skills: list[dict[str, Any]]) -> str:
         if block:
             parts.append(block)
     return "\n\n".join(parts)
-
-
-def _write_codex_reasoning(workspace: Path, effort: str | None) -> None:
-    """Set model_reasoning_effort in .codex/config.toml via a managed marker block.
-
-    Codex CLI reads reasoning effort from config.toml, not a CLI flag.
-    Valid values: minimal, low, medium, high, xhigh.
-    """
-
-    normalized = (effort or "").strip().lower()
-    if normalized in {"", "none"}:
-        normalized = "medium"
-    if normalized not in _CODEX_EFFORT_VALUES:
-        normalized = "medium"
-    config_dir = Path(workspace) / ".codex"
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / "config.toml"
-    marker_start = "# >>> k_agent managed reasoning >>>"
-    marker_end = "# <<< k_agent managed reasoning <<<"
-    managed_block = (
-        f"{marker_start}\n"
-        f'model_reasoning_effort = "{normalized}"\n'
-        f'model_reasoning_summary = "detailed"\n'
-        f'hide_agent_reasoning = false\n'
-        f"{marker_end}\n"
-    )
-    existing = ""
-    if config_path.is_file():
-        existing = config_path.read_text(encoding="utf-8")
-    if marker_start in existing:
-        import re as _re
-        existing = _re.sub(
-            _re.escape(marker_start) + r".*?" + _re.escape(marker_end) + r"\n?",
-            "",
-            existing,
-            flags=_re.DOTALL,
-        )
-    merged = existing.rstrip() + ("\n\n" if existing.strip() else "") + managed_block
-    config_path.write_text(merged, encoding="utf-8")
 
 
 _CHUNK_SIZE = 60

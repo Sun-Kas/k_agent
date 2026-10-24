@@ -19,6 +19,8 @@
     "check": "npm run check:boundary && tsc --noEmit",
     "check:boundary": "node scripts/check-boundary.mjs",
     "test:history": "node --import tsx scripts/test-history.ts",
+    "test:sidebar": "node --import tsx scripts/test-sidebar-sessions.ts",
+    "test:composer-session": "node --import tsx scripts/test-composer-session.ts",
     "test:transcript": "node --import tsx scripts/test-conversation-transcript.ts",
     "test:file-change": "node --import tsx scripts/test-file-change-preview.ts",
     "test:approval": "node --import tsx scripts/test-live-approval.ts",

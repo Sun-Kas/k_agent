@@ -8,15 +8,30 @@ import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 
 from access_layer.sessions.terminal import (
     TERMINAL_ID_RE,
+    TerminalRegistry,
     decode_client_message,
     encode_bytes_message,
     encode_message,
     prepare_private_shell_home,
     shell_host_name,
 )
+
+
+class TerminalRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handoff_closes_only_the_selected_sessions_terminals(self):
+        registry = TerminalRegistry()
+        first = SimpleNamespace(close=mock.AsyncMock())
+        second = SimpleNamespace(close=mock.AsyncMock())
+        registry._terminals[registry._key("session", "one")] = first
+        registry._terminals[registry._key("session-two", "one")] = second
+        await registry.close_session("session")
+        first.close.assert_awaited_once()
+        second.close.assert_not_awaited()
+        self.assertEqual(list(registry._terminals), [registry._key("session-two", "one")])
 
 
 class TerminalMessageTests(unittest.TestCase):

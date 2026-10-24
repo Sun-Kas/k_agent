@@ -45,7 +45,13 @@ from access_layer.sessions.history import (
 from access_layer.sessions.migrate_history import migrate_session_record
 from access_layer.sessions.context_store import ContextStateStore, empty_context_state
 from access_layer.settings import get_or_init_settings
-from access_layer.schemas import ChatMessage, ChatMeta, SessionSummary, ToolCallRecord
+from access_layer.schemas import (
+    ChatMessage,
+    ChatMeta,
+    SessionEnvironment,
+    SessionSummary,
+    ToolCallRecord,
+)
 from access_layer.storage import StorageBackend
 from access_layer.user_questions import normalize_user_question_answers
 
@@ -105,8 +111,11 @@ class SessionRecord:
     source_ref: str | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # 归属的 Project id；None=未归属，走旧的 sessions/{id}/ 平铺布局。
-    # 归属的会话没有私有 workspace/：cwd 直接是 Project 的 root_path。
+    # Project 会话的 cwd 由 environment 指定，簿记仍保存在 Project sessions/ 下。
     project_id: str | None = None
+    # Project 会话绑定到具体 local checkout 或托管 worktree。旧记录为空时，
+    # resolver 按 local checkout 兼容，避免升级后改变已有会话的 cwd。
+    environment: SessionEnvironment | None = None
 
 
 class SessionStore:
@@ -175,13 +184,25 @@ class SessionStore:
         source: str = "interactive",
         source_ref: str | None = None,
         project_id: str | None = None,
+        environment: SessionEnvironment | None = None,
     ) -> SessionRecord:
-        """创建新会话并写入存储后端；project_id 非空时绑定到该 Project 根目录。"""
+        """创建会话并保存执行环境；旧调用未指定环境时保持 Local 语义。"""
+        await self._ensure_loaded()
         settings = await get_or_init_settings()
+        if project_id and environment is None and self._project_store is not None:
+            from access_layer.projects.git import prepare_session_environment
+            project = await self._project_store.get(project_id)
+            if project is not None:
+                environment = await asyncio.to_thread(
+                    prepare_session_environment, project, session_id or "", "local"
+                )
         title = title or settings.default_session_title
         session = SessionRecord(
             id=session_id or str(uuid.uuid4()), title=title,
-            source=source, source_ref=source_ref, project_id=project_id,
+            source=source,
+            source_ref=source_ref,
+            project_id=project_id,
+            environment=environment,
         )
         async with self._lock:
             self._sessions[session.id] = session
@@ -222,6 +243,7 @@ class SessionStore:
                 updatedAt=session.updated_at,
                 messageCount=len(session.messages),
                 projectId=session.project_id,
+                environment=session.environment,
             )
             for session in sessions
         ]
@@ -1154,6 +1176,8 @@ class SessionStore:
         *,
         through_message_id: str | None = None,
         through_run_id: str | None = None,
+        branch_id: str | None = None,
+        environment: SessionEnvironment | None = None,
     ) -> SessionRecord | None:
         """Clone a stable conversation and workspace into an independent branch.
 
@@ -1185,7 +1209,7 @@ class SessionStore:
                 else source.history_records
             )
 
-            branch_id = str(uuid.uuid4())
+            branch_id = branch_id or str(uuid.uuid4())
             branch = SessionRecord(
                 id=branch_id,
                 title=self._next_branch_title(source.title),
@@ -1202,8 +1226,19 @@ class SessionStore:
                 # 分支继承同一 Project 归属：既保持 cwd 一致，也避免分支凭空
                 # 获得一份本不存在的私有 workspace/。
                 project_id=source.project_id,
+                # 默认分支复制对话并继续使用同一执行目录；需要隔离工作区时由
+                # 上层显式创建新 worktree，不能在 Store 内暗中执行 Git 命令。
+                environment=(
+                    environment.model_copy(deep=True)
+                    if environment is not None
+                    else source.environment.model_copy(deep=True)
+                    if source.environment is not None
+                    else None
+                ),
             )
             self._sessions[branch_id] = branch
+            if branch.environment and branch.environment.kind == "worktree" and not branch.environment.worktree_id:
+                branch.environment.worktree_id = source.id
 
             if self._storage is not None and source.project_id is None:
                 # 只有未归属 Project 的会话才有私有 workspace/ 需要复制；
@@ -1284,7 +1319,10 @@ class SessionStore:
                 if branch_bundle is not None:
                     await asyncio.to_thread(shutil.rmtree, branch_bundle, True)
                 raise
-            return branch
+            created_branch = branch
+        if created_branch.project_id and self._project_store is not None:
+            await self._project_store.adjust_session_count(created_branch.project_id, 1)
+        return created_branch
 
     @staticmethod
     def _history_prefix(
@@ -1421,11 +1459,46 @@ class SessionStore:
                 await asyncio.to_thread(_migrate)
             else:
                 session.project_id = project_id
+            session.environment = SessionEnvironment(
+                kind="local",
+                cwd=str(Path(project_root_path).resolve()),
+                projectId=project_id,
+            )
             session.updated_at = datetime.now(timezone.utc)
             await self._persist(session)
         if self._project_store is not None:
             await self._project_store.adjust_session_count(project_id, 1)
         return session
+
+    async def update_environment(
+        self, session_id: str, environment: SessionEnvironment
+    ) -> SessionRecord | None:
+        """在会话空闲时原子更新 cwd 绑定；Git 文件搬运由路由层负责。"""
+
+        await self._ensure_loaded()
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            if self._session_is_active(session_id):
+                raise SessionBusyError("Cannot hand off a session while it is running")
+            if session.project_id != environment.project_id:
+                raise ValueError("Session environment belongs to another Project")
+            previous_environment = session.environment
+            previous_cli_sessions = dict(session.cli_sessions)
+            previous_updated_at = session.updated_at
+            session.environment = environment
+            # CLI 原生 resume 与 cwd 绑定，交接后从 Access Layer 历史重新构建上下文。
+            session.cli_sessions.clear()
+            session.updated_at = datetime.now(timezone.utc)
+            try:
+                await self._persist(session)
+            except BaseException:
+                session.environment = previous_environment
+                session.cli_sessions = previous_cli_sessions
+                session.updated_at = previous_updated_at
+                raise
+            return session
 
     def _session_is_active(self, session_id: str) -> bool:
         """Treat any active run or unfinished projection buffer as busy."""
@@ -1802,13 +1875,22 @@ class SessionStore:
                         "updatedAt": datetime.now(timezone.utc).isoformat(),
                     })
                     await self._write_approval_locked(session.id, interrupt_id, record)
+            if self._project_store is not None:
+                from access_layer.projects.git import prepare_session_environment
+                for session in self._sessions.values():
+                    if session.project_id and session.environment is None:
+                        project = await self._project_store.get(session.project_id)
+                        if project is not None:
+                            session.environment = await asyncio.to_thread(
+                                prepare_session_environment, project, session.id, "local"
+                            )
+                            await self._persist(session)
             self._loaded = True
 
     async def _ensure_workspace(self, session_id: str) -> None:
         """Create the per-session workspace directory next to the JSON record.
 
-        归属 Project 的会话没有私有 workspace/——cwd 直接是 Project 的
-        root_path，这里直接跳过，避免在 Project 簿记目录下建一个永远不用的空壳。
+        Project 会话使用显式绑定的 Local/Worktree，不在簿记目录里再建 workspace/。
         """
 
         if self._storage is None:
@@ -1927,6 +2009,11 @@ class SessionStore:
             "source": session.source,
             "sourceRef": session.source_ref,
             "projectId": session.project_id,
+            "environment": (
+                session.environment.model_dump(by_alias=True, mode="json")
+                if session.environment is not None
+                else None
+            ),
             "updatedAt": session.updated_at.isoformat(),
         }
 
@@ -1984,6 +2071,11 @@ class SessionStore:
             source=str(payload.get("source") or "interactive"),
             source_ref=(str(payload["sourceRef"]) if payload.get("sourceRef") is not None else None),
             project_id=(str(payload["projectId"]) if payload.get("projectId") else None),
+            environment=(
+                SessionEnvironment.model_validate(payload["environment"])
+                if isinstance(payload.get("environment"), dict)
+                else None
+            ),
             updated_at=datetime.fromisoformat(updated_at) if updated_at else datetime.now(timezone.utc),
         )
 

@@ -20,8 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from access_layer.home import agent_home
+from access_layer.projects.git import inspect_repository, _git, GitWorkspaceError
 from access_layer.projects.models import ProjectCreateInput, ProjectRecord, ProjectUpdateInput
-from access_layer.projects.scaffold import scaffold_new_project
 from access_layer.storage import StorageBackend
 
 logger = logging.getLogger("k_agent.access_layer.projects")
@@ -116,14 +116,28 @@ class ProjectStore:
     async def list(self) -> list[ProjectRecord]:
         await self._ensure_loaded()
         async with self._lock:
-            return sorted(
+            records = sorted(
                 self._projects.values(), key=lambda project: project.updated_at, reverse=True
             )
+        return list(await asyncio.gather(*(self._repository_view(record) for record in records)))
 
     async def get(self, project_id: str) -> ProjectRecord | None:
         await self._ensure_loaded()
         async with self._lock:
-            return self._projects.get(project_id)
+            record = self._projects.get(project_id)
+        return await self._repository_view(record) if record is not None else None
+
+    async def _repository_view(self, record: ProjectRecord) -> ProjectRecord:
+        """Git 状态以磁盘为准，兼容升级前索引及项目登记后才初始化 Git 的情况。"""
+        repository = await asyncio.to_thread(inspect_repository, record.root_path)
+        return record.model_copy(update={
+            "is_git_repository": repository.is_git_repository,
+            "repository_root": repository.repository_root,
+            "git_common_dir": repository.git_common_dir,
+            "target_branch": record.target_branch or (
+                repository.branch_ref.removeprefix("refs/heads/") if repository.branch_ref else None
+            ),
+        })
 
     async def create(self, payload: ProjectCreateInput) -> ProjectRecord:
         """创建或复用已存在的 Project：同一 root_path 永远落到同一个 id。"""
@@ -139,15 +153,17 @@ class ProjectStore:
                 return existing
             now = datetime.now(timezone.utc)
             name = (payload.name or "").strip() or resolved_root.name or project_id
-            # 只在真正新建记录时搭骨架（git init + .gitignore + README），不是
-            # 每次 create() 调用都跑一遍——上面 existing 分支已经把"复用已登记
-            # 的 root_path"挡掉了。丢到线程池里跑，因为内部有阻塞的 subprocess
-            # 和文件 IO，不能直接占住事件循环。失败只记日志，不阻断 Project 创建。
-            await asyncio.to_thread(scaffold_new_project, resolved_root, name)
+            # 登记 Project 不修改用户目录。Git、README、CLAUDE.md、Skill/MCP 配置
+            # 都是显式动作；这里只探测已有仓库，让创建 Project 保持可逆。
+            repository = await asyncio.to_thread(inspect_repository, resolved_root)
             record = ProjectRecord(
                 id=project_id,
                 name=name,
                 rootPath=str(resolved_root),
+                isGitRepository=repository.is_git_repository,
+                repositoryRoot=repository.repository_root,
+                gitCommonDir=repository.git_common_dir,
+                targetBranch=(repository.branch_ref.removeprefix("refs/heads/") if repository.branch_ref else None),
                 sessionCount=0,
                 createdAt=now,
                 updatedAt=now,
@@ -159,16 +175,30 @@ class ProjectStore:
             return record
 
     async def update(self, project_id: str, payload: ProjectUpdateInput) -> ProjectRecord | None:
-        """目前只允许改 name；root_path 创建后不可变。"""
+        """目标分支只保存指向，不切换或改写当前用户 checkout。"""
 
         await self._ensure_loaded()
         async with self._lock:
             existing = self._projects.get(project_id)
             if existing is None:
                 return None
+            changes = {}
+            if "name" in payload.model_fields_set:
+                if not payload.name or not payload.name.strip():
+                    raise ProjectValidationError("项目名称不能为空")
+                changes["name"] = payload.name.strip()
+            if "target_branch" in payload.model_fields_set:
+                branch = (payload.target_branch or "").strip()
+                if branch:
+                    try:
+                        await asyncio.to_thread(_git, Path(existing.root_path), "check-ref-format", "--branch", branch)
+                        await asyncio.to_thread(_git, Path(existing.root_path), "show-ref", "--verify", f"refs/heads/{branch}")
+                    except GitWorkspaceError as exc:
+                        raise ProjectValidationError("目标分支必须是已有的本地分支") from exc
+                changes["target_branch"] = branch or None
             updated = existing.model_copy(
                 update={
-                    "name": payload.name.strip(),
+                    **changes,
                     "updated_at": datetime.now(timezone.utc),
                     "revision": existing.revision + 1,
                 }
